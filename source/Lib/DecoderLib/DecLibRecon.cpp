@@ -96,7 +96,15 @@ extern __itt_counter itt_frame_counter;
 //! \ingroup DecoderLib
 //! \{
 
-void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool _doALF, bool _doSAO, bool _doDeblock )
+// VVDEC_DEBUG_NO_FILTERS_POC=<poc>: no in-loop filters for that picture, on the
+// CPU or on the GPU, so their reconstructions can be compared
+static int debugNoFiltersPoc()
+{
+  static const int poc = getenv( "VVDEC_DEBUG_NO_FILTERS_POC" ) ? atoi( getenv( "VVDEC_DEBUG_NO_FILTERS_POC" ) ) : INT_MIN;
+  return poc;
+}
+
+void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool _doALF, bool _doSAO, bool _doDeblock, bool _gpuIntra )
 {
   this->cs = &cs;
 
@@ -111,6 +119,7 @@ void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int ta
   doALF         = _doALF;
   doSAO         = _doSAO;
   doDeblock     = _doDeblock;
+  gpuIntra      = _gpuIntra;
 }
 
 DecLibRecon::DecLibRecon()
@@ -613,19 +622,37 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 #endif
 
   const TaskType ctuStartState = MIDER;
-  const bool     doALF         = cs.sps->getUseALF() && !AdaptiveLoopFilter::getAlfSkipPic( cs );
-  const bool     doSAO         = cs.sps->getUseSAO();
+  const bool     noFilters     = pcPic->poc == debugNoFiltersPoc();
+  const bool     doALF         = cs.sps->getUseALF() && !AdaptiveLoopFilter::getAlfSkipPic( cs ) && !noFilters;
+  const bool     doSAO         = cs.sps->getUseSAO() && !noFilters;
+  m_doALF                      = doALF;
+  m_doSAO                      = doSAO;
+  m_doDeblock                  = !noFilters;
 #if VVDEC_VULKAN
   // the GPU applies the in-loop filters to the whole picture once its CTUs are
   // reconstructed (finishReconTask)
   m_gpuFilters = m_gpuRecon && gpu::GpuRecon::filtersSupported( cs );
-  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuFilters, doSAO && !m_gpuFilters, !m_gpuFilters );
+  // and, before the filters, the intra and IBC blocks, in waves of blocks the
+  // CTU tasks list (TaskGpuIntraCtu)
+  m_gpuIntra   = m_gpuFilters && gpu::GpuRecon::intraSupported( cs );
+  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuFilters, doSAO && !m_gpuFilters, m_doDeblock && !m_gpuFilters, m_gpuIntra );
   if( m_gpuRecon )
   {
     ( m_gpuFilters ? m_filterPicturesGpu : m_filterPicturesCpu )++;
+    ( m_gpuIntra ? m_intraPicturesGpu : m_intraPicturesCpu )++;
+  }
+  if( m_gpuIntra )
+  {
+    m_waveMap.reset( pcv->lumaWidth, pcv->lumaHeight, getChannelTypeScaleX( CH_C, pcv->chrFormat ), getChannelTypeScaleY( CH_C, pcv->chrFormat ),
+                     isChromaEnabled( pcv->chrFormat ) );
+    m_gpuIntraJobs.resize( pcv->sizeInCtus );
+    for( auto& jobs: m_gpuIntraJobs )
+    {
+      jobs.clear();
+    }
   }
 #else
-  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF, doSAO, true );
+  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF, doSAO, m_doDeblock, false );
 #endif
 
   tasksFinishMotion = std::vector<LineTaskParam>( heightInCtus, LineTaskParam{ commonTaskParam, -1 } );
@@ -690,13 +717,12 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       DecLibRecon* dec = param->decLib;
       if( dec->m_gpuFilters )
       {
-        const bool alf = cs.sps->getUseALF() && !AdaptiveLoopFilter::getAlfSkipPic( cs );
-        dec->m_gpuRecon->filterPicture( cs, cs.sps->getUseSAO() ? &dec->m_cSAO : nullptr, alf ? &dec->m_cALF : nullptr,
-                                        cs.picture->m_bufs[PIC_RECONSTRUCTION] );
+        dec->m_gpuRecon->finishPicture( cs, dec->m_gpuIntra ? &dec->m_gpuIntraJobs : nullptr, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr,
+                                        dec->m_doALF ? &dec->m_cALF : nullptr, cs.picture->m_bufs[PIC_RECONSTRUCTION] );
       }
       else
 #endif
-      if( cs.sps->getUseALF() && !AdaptiveLoopFilter::getAlfSkipPic( cs ) )
+      if( param->decLib->m_doALF )
       {
         param->decLib->swapBufs( cs );
       }
@@ -956,6 +982,13 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
     {
       const int ctuRsAddr    = ctu + line * cs.pcv->widthInCtus;
       const UnitArea ctuArea = getCtuArea( cs, ctu, line, true );
+#if VVDEC_VULKAN
+      if( param->common.gpuIntra )
+      {
+        decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskGpuIntraCtu( cs, ctuRsAddr, ctuArea, decLib.m_gpuIntraJobs[ctuRsAddr], decLib.m_waveMap );
+      }
+      else
+#endif
       decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskCriticalIntraKernel( cs, ctuRsAddr, ctuArea );
 
       thisCtuState = INTRA_cont;

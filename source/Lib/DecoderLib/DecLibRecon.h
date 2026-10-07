@@ -95,9 +95,10 @@ struct CommonTaskParam
   bool                     doALF        = true;
   bool                     doSAO        = true;   // the CTU tasks apply SAO (not when the GPU does)
   bool                     doDeblock    = true;   // the CTU tasks deblock (not when the GPU does)
+  bool                     gpuIntra     = false;  // the GPU predicts the intra and IBC blocks: the CTU tasks make its jobs
 
   explicit CommonTaskParam( DecLibRecon* dec ) : decLib( *dec ) {}
-  void reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool doALF, bool doSAO, bool doDeblock );
+  void reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool doALF, bool doSAO, bool doDeblock, bool gpuIntra );
 };
 
 struct LineTaskParam
@@ -168,11 +169,20 @@ private:
 
   PelStorage           m_fltBuf;
 
+  bool                 m_doALF     = false;   // the in-loop filters of the current picture
+  bool                 m_doSAO     = false;
+  bool                 m_doDeblock = true;
+
 #if VVDEC_VULKAN
   std::unique_ptr<gpu::GpuRecon> m_gpuRecon;        // when the pictures are reconstructed on the GPU
   bool                           m_gpuFilters = false;   // the current picture's in-loop filters run on the GPU
+  bool                           m_gpuIntra   = false;   // and its intra and IBC blocks
+  gpu::WaveMap                   m_waveMap;
+  std::vector<std::vector<gpu::IntraJob>> m_gpuIntraJobs;   // per CTU
   int                            m_filterPicturesGpu = 0;
   int                            m_filterPicturesCpu = 0;
+  int                            m_intraPicturesGpu  = 0;
+  int                            m_intraPicturesCpu  = 0;
 #endif
 
   CommonTaskParam            commonTaskParam{ this };
@@ -201,6 +211,8 @@ public:
 #if VVDEC_VULKAN
   int      filterPicturesGpu() const { return m_filterPicturesGpu; }
   int      filterPicturesCpu() const { return m_filterPicturesCpu; }
+  int      intraPicturesGpu()  const { return m_intraPicturesGpu; }
+  int      intraPicturesCpu()  const { return m_intraPicturesCpu; }
 #endif
 
 

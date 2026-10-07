@@ -53,6 +53,10 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "CommonLib/Reshape.h"
 #include "ContextModelling.h"
 
+#if VVDEC_VULKAN
+#  include "VulkanLib/GpuJobs.h"
+#endif
+
 namespace vvdec
 {
 
@@ -70,6 +74,11 @@ public:
   void TaskTrafoCtu            ( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea );
   void TaskCriticalIntraKernel ( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea );
   void TaskFinishMotionInfo    ( CodingStructure &cs, const int ctuRsAddr, const int col, const int row );
+#if VVDEC_VULKAN
+  // instead of TaskCriticalIntraKernel when the GPU predicts: the jobs of the
+  // CTU's intra and IBC blocks, with their waves; the inter blocks are finished here
+  void TaskGpuIntraCtu         ( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves );
+#endif
 
 public:
   DecCu();
@@ -88,6 +97,10 @@ protected:
   void reconstructResi    ( CodingUnit&      cu );
 
   void xIntraRecACT       ( CodingUnit&      cu );
+#if VVDEC_VULKAN
+  void xGpuIntraJobs      ( CodingUnit&      cu, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves );
+  void xGpuIbcJobs        ( CodingUnit&      cu, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves );
+#endif
   void xDeriveCUMV        ( CodingUnit&      cu, MotionHist& hist );
 
 private:

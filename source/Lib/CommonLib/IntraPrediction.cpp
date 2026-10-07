@@ -1102,41 +1102,7 @@ void IntraPrediction::xFillReferenceSamples( const CPelBuf &recoBuf, Pel* refBuf
   CHECK( numAboveUnits <= 0 || numLeftUnits <= 0 || numAboveRightUnits <= 0 || numLeftBelowUnits <= 0, "Size not supported" );
 
   // ----- Step 1: analyze neighborhood -----
-  if( m_lastCUidx == tu.cu->idx && area.compID() != getFirstComponentOfChannel( tu.cu->chType() ) )
-  {
-  }
-  else
-  {
-    const Position posLT = area.pos();
-  
-    const bool sameCTUx  = !!( posLT.x & ( pcv.maxCUWidthMask  >> csx ) );
-    const bool sameCTUy  = !!( posLT.y & ( pcv.maxCUHeightMask >> csy ) );
-    const bool sameCTU   = sameCTUx && sameCTUy;
-
-    m_neighborSize[0]    = sameCTU ? 1 : !!cu.cs->getCURestricted( posLT.offset( -1, -1 ), cu, chType, cu.left ? cu.left : cu.above );
-
-    if( cu.above || area.y > tu.cu->blocks[chType].y )
-    {
-      m_neighborSize[1] = numAboveUnits;
-
-      Position posAR{ posLT.x + ( PosType ) area.width, posLT.y };
-      m_neighborSize[1] += isAboveAvailable( tu, chType, posAR, numAboveRightUnits, unitWidth );
-    }
-    else
-      m_neighborSize[1] = 0;
-
-    if( cu.left || area.x > tu.cu->blocks[chType].x )
-    {
-      m_neighborSize[2] = numLeftUnits;
-
-      Position posLB{ posLT.x, posLT.y + ( PosType ) area.height };
-      m_neighborSize[2] += isLeftAvailable( tu, chType, posLB, numLeftBelowUnits, unitHeight );
-    }
-    else
-      m_neighborSize[2] = 0;
-
-    m_lastCUidx = tu.cu->idx;
-  }
+  xDeriveNeighborSize( area, tu );
 
   int numIntraNeighbor = m_neighborSize[0] + m_neighborSize[1] + m_neighborSize[2];
 
@@ -1944,6 +1910,143 @@ void IntraPrediction::predIntraMip( const ComponentID compId, PelBuf &piPred, co
 
   const int bitDepth = cu.sps->getBitDepth();
   m_matrixIntraPred.predBlock( piPred, modeIdx, piPred, transposeFlag, bitDepth, compId, m_piYuvExt[0] );
+}
+
+void IntraPrediction::xDeriveNeighborSize( const CompArea &area, const TransformUnit &tu )
+{
+  if( m_lastCUidx == tu.cu->idx && area.compID() != getFirstComponentOfChannel( tu.cu->chType() ) )
+  {
+    return;
+  }
+
+  const ChannelType    chType = toChannelType( area.compID() );
+  const CodingUnit    &cu     = *tu.cu;
+  const PreCalcValues &pcv    = *cu.cs->pcv;
+
+  const int csx                = getChannelTypeScaleX( chType, pcv.chrFormat );
+  const int csy                = getChannelTypeScaleY( chType, pcv.chrFormat );
+  const int unitWidth          = pcv.minCUWidth  >> csx;
+  const int unitHeight         = pcv.minCUHeight >> csy;
+  const int totalAboveUnits    = ( m_topRefLength  + ( unitWidth  - 1 ) ) / unitWidth;
+  const int totalLeftUnits     = ( m_leftRefLength + ( unitHeight - 1 ) ) / unitHeight;
+  const int numAboveUnits      = area.width  / unitWidth;
+  const int numLeftUnits       = area.height / unitHeight;
+  const int numAboveRightUnits = totalAboveUnits - numAboveUnits;
+  const int numLeftBelowUnits  = totalLeftUnits  - numLeftUnits;
+
+  const Position posLT = area.pos();
+
+  const bool sameCTUx  = !!( posLT.x & ( pcv.maxCUWidthMask  >> csx ) );
+  const bool sameCTUy  = !!( posLT.y & ( pcv.maxCUHeightMask >> csy ) );
+  const bool sameCTU   = sameCTUx && sameCTUy;
+
+  m_neighborSize[0]    = sameCTU ? 1 : !!cu.cs->getCURestricted( posLT.offset( -1, -1 ), cu, chType, cu.left ? cu.left : cu.above );
+
+  if( cu.above || area.y > tu.cu->blocks[chType].y )
+  {
+    m_neighborSize[1] = numAboveUnits;
+
+    Position posAR{ posLT.x + ( PosType ) area.width, posLT.y };
+    m_neighborSize[1] += isAboveAvailable( tu, chType, posAR, numAboveRightUnits, unitWidth );
+  }
+  else
+    m_neighborSize[1] = 0;
+
+  if( cu.left || area.x > tu.cu->blocks[chType].x )
+  {
+    m_neighborSize[2] = numLeftUnits;
+
+    Position posLB{ posLT.x, posLT.y + ( PosType ) area.height };
+    m_neighborSize[2] += isLeftAvailable( tu, chType, posLB, numLeftBelowUnits, unitHeight );
+  }
+  else
+    m_neighborSize[2] = 0;
+
+  m_lastCUidx = tu.cu->idx;
+}
+
+void IntraPrediction::getNeighborUnits( const TransformUnit& tu, const CompArea& area, int units[3] )
+{
+  setReferenceArrayLengths( area );
+  xDeriveNeighborSize( area, tu );
+  units[0] = m_neighborSize[0];
+  units[1] = m_neighborSize[1];
+  units[2] = m_neighborSize[2];
+}
+
+IntraPrediction::LmAvailability IntraPrediction::getLmAvailability( const CodingUnit& cu, const CompArea& chromaArea )
+{
+  LmAvailability lm{};
+  const int      chromaMode = cu.intraDir[1];
+  const int      cWidth     = chromaArea.width;
+  const int      cHeight    = chromaArea.height;
+
+  // xGetLumaRecPixels: the luma template is there when the CU has a neighbour on that side
+  {
+    const CompArea lumaArea   = CompArea( COMPONENT_Y, chromaArea.lumaPos( cu.chromaFormat ),
+                                          recalcSize( cu.chromaFormat, CHANNEL_TYPE_CHROMA, CHANNEL_TYPE_LUMA, chromaArea.size() ) );
+    const CompArea& area      = isChroma( cu.chType() ) ? chromaArea : lumaArea;
+    const int baseUnitSize    = 1 << MIN_CU_LOG2;
+    const int unitWidth       = baseUnitSize >> getComponentScaleX( area.compID(), cu.chromaFormat );
+    const int unitHeight      = baseUnitSize >> getComponentScaleY( area.compID(), cu.chromaFormat );
+    const int tuWidthInUnits  = area.width / unitWidth;
+    const int tuHeightInUnits = area.height / unitHeight;
+    const int chromaUnitWidth  = baseUnitSize >> getComponentScaleX( COMPONENT_Cb, cu.chromaFormat );
+    const int chromaUnitHeight = baseUnitSize >> getComponentScaleY( COMPONENT_Cb, cu.chromaFormat );
+    const int totalAboveUnits = chromaMode == MDLM_T_IDX ? ( 2 * cWidth + ( chromaUnitWidth - 1 ) ) / chromaUnitWidth : tuWidthInUnits;
+    const int totalLeftUnits  = chromaMode == MDLM_L_IDX ? ( 2 * cHeight + ( chromaUnitHeight - 1 ) ) / chromaUnitHeight : tuHeightInUnits;
+    const int leftUnits       = ( cu.left || chromaArea.x > cu.blocks[CH_C].x ) ? totalLeftUnits : 0;
+    const int aboveUnits      = ( cu.above || chromaArea.y > cu.blocks[CH_C].y ) ? totalAboveUnits : 0;
+    lm.lumaLeft               = leftUnits >= tuHeightInUnits;
+    lm.lumaAbove              = aboveUnits >= tuWidthInUnits;
+  }
+
+  // xGetLMParameters (its unit height follows the horizontal subsampling, as there)
+  {
+    const int unitWidth       = ( 1 << MIN_CU_LOG2 ) >> getComponentScaleX( chromaArea.compID(), cu.chromaFormat );
+    const int unitHeight      = ( 1 << MIN_CU_LOG2 ) >> getComponentScaleX( chromaArea.compID(), cu.chromaFormat );
+    const int tuWidthInUnits  = cWidth / unitWidth;
+    const int tuHeightInUnits = cHeight / unitHeight;
+    const int totalAboveUnits = ( 2 * cWidth + ( unitWidth - 1 ) ) / unitWidth;
+    const int totalLeftUnits  = ( 2 * cHeight + ( unitHeight - 1 ) ) / unitHeight;
+    int       aboveRightUnits = totalAboveUnits - tuWidthInUnits;
+    int       leftBelowUnits  = totalLeftUnits - tuHeightInUnits;
+    const TransformUnit& tu   = *getTU( cu, chromaArea.pos(), CH_C );
+    const Position       posLT = chromaArea;
+
+    if( chromaMode == MDLM_T_IDX )
+    {
+      int avaiAboveUnits = 0;
+      if( tu.cu->above || chromaArea.y > tu.cu->blocks[CH_C].y )
+      {
+        avaiAboveUnits  = tuWidthInUnits;
+        aboveRightUnits = aboveRightUnits > ( cHeight / unitWidth ) ? cHeight / unitWidth : aboveRightUnits;
+        avaiAboveUnits += isAboveAvailable( tu, CHANNEL_TYPE_CHROMA, { posLT.x + ( PosType ) cWidth, posLT.y }, aboveRightUnits, unitWidth );
+      }
+      lm.above     = avaiAboveUnits >= tuWidthInUnits;
+      lm.actualTop = unitWidth * avaiAboveUnits;
+    }
+    else if( chromaMode == MDLM_L_IDX )
+    {
+      int avaiLeftUnits = 0;
+      if( tu.cu->left || chromaArea.x > tu.cu->blocks[CH_C].x )
+      {
+        avaiLeftUnits  = tuHeightInUnits;
+        leftBelowUnits = leftBelowUnits > ( cWidth / unitHeight ) ? cWidth / unitHeight : leftBelowUnits;
+        avaiLeftUnits += isLeftAvailable( tu, CHANNEL_TYPE_CHROMA, { posLT.x, posLT.y + ( PosType ) cHeight }, leftBelowUnits, unitHeight );
+      }
+      lm.left       = avaiLeftUnits >= tuHeightInUnits;
+      lm.actualLeft = unitHeight * avaiLeftUnits;
+    }
+    else if( chromaMode == LM_CHROMA_IDX )
+    {
+      lm.above      = tu.cu->above || chromaArea.y > tu.cu->blocks[CH_C].y;
+      lm.left       = tu.cu->left || chromaArea.x > tu.cu->blocks[CH_C].x;
+      lm.actualTop  = cWidth;
+      lm.actualLeft = cHeight;
+    }
+  }
+  return lm;
 }
 
 }

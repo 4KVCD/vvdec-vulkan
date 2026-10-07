@@ -106,6 +106,7 @@ protected:
   Pel  xGetPredValDc              ( const CPelBuf &pSrc, const Size &dstSize, const int mrlIdx );
   
   void xFillReferenceSamples      ( const CPelBuf &recoBuf,      Pel* refBufUnfiltered, const CompArea &area, const TransformUnit &tu );
+  void xDeriveNeighborSize        ( const CompArea &area, const TransformUnit &tu );   // step 1 of xFillReferenceSamples: m_neighborSize
   void xFilterReferenceSamples    ( const Pel* refBufUnfiltered, Pel* refBufFiltered, const CompArea &area, const SPS &sps, int multiRefIdx, ptrdiff_t predStride = 0 ) const;
 
   static int getWideAngle         ( int width, int height, int predMode );
@@ -136,6 +137,24 @@ public:
   void predIntraMip               (const ComponentID compId, PelBuf &piPred, const CodingUnit &cu);
 
   static bool useFilteredIntraRefSamples( const ComponentID &compID, const CodingUnit &cu, const UnitArea &tuArea );
+
+  // for the GPU's intra prediction (VulkanLib): the reference samples
+  // initIntraPatternChType would find available around area, in units:
+  // top-left, above (above-right included), left (below-left included), with
+  // the same reuse across the components of a CU (call in its order)
+  void getNeighborUnits( const TransformUnit& tu, const CompArea& area, int units[3] );
+  // and what CCLM finds available: xGetLumaRecPixels (lumaAbove/Left) and
+  // xGetLMParameters (above/left, the template samples it takes)
+  struct LmAvailability
+  {
+    bool lumaAbove;
+    bool lumaLeft;
+    bool above;
+    bool left;
+    int  actualTop;
+    int  actualLeft;
+  };
+  static LmAvailability getLmAvailability( const CodingUnit& cu, const CompArea& chromaArea );
 
   void predBlendIntraCiip         (PelUnitBuf &predUnit, const CodingUnit &cu);
 

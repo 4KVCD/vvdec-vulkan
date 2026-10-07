@@ -234,6 +234,136 @@ void DecCu::TaskFinishMotionInfo( CodingStructure &cs, const int ctuRsAddr, cons
     }
   }
 }
+#if VVDEC_VULKAN
+void DecCu::TaskGpuIntraCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves )
+{
+  PROFILER_SCOPE_AND_STAGE_EXT( 1, g_timeProfiler, P_CONTROL_PARSE_DERIVE_LL, cs, CH_L );
+
+  for( auto &currCU : cs.traverseCUs( ctuRsAddr ) )
+  {
+    CHECK( !ctuArea.blocks[currCU.chType()].contains( currCU.blocks[currCU.chType()] ), "Should never happen!" );
+
+    if( CU::isIntra( currCU ) )
+    {
+      xGpuIntraJobs( currCU, jobs, waves );
+    }
+    else if( CU::isIBC( currCU ) )
+    {
+      xGpuIbcJobs( currCU, jobs, waves );
+    }
+    else if( currCU.rootCbf() )
+    {
+      finishLMCSAndReco( currCU );
+    }
+  }
+}
+
+void DecCu::xGpuIntraJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves )
+{
+  // the transform blocks and components in the order predAndReco takes them:
+  // the reuse of the neighbourhood across a CU's components depends on it
+  for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
+  {
+    for( const CompArea &area : tu.blocks )
+    {
+      if( !area.valid() )
+      {
+        continue;
+      }
+
+      const ComponentID compID = area.compID();
+      const ChannelType chType = toChannelType( compID );
+      const uint32_t    mode   = PU::getFinalIntraMode( cu, chType );
+      const int         bdpcm  = isLuma( compID ) ? cu.bdpcmMode() : cu.bdpcmModeChroma();
+
+      int kind = gpu::IntraJob::kAngular;
+      if( bdpcm )
+      {
+        kind = gpu::IntraJob::kBdpcm;
+      }
+      else if( !isLuma( compID ) && PU::isLMCMode( mode ) )
+      {
+        kind = gpu::IntraJob::kCclm;
+      }
+
+      int units[3];
+      m_pcIntraPred->getNeighborUnits( tu, area, units );
+
+      int flags = 0;
+      if( TU::getCbf( tu, compID ) || ( isChroma( compID ) && tu.jointCbCr ) )
+      {
+        flags |= gpu::IntraJob::kResidual;
+      }
+      if( kind == gpu::IntraJob::kAngular && isLuma( compID ) && IntraPrediction::useFilteredIntraRefSamples( compID, cu, tu ) )
+      {
+        flags |= gpu::IntraJob::kFiltered;
+      }
+
+      gpu::IntraJob job;
+      job.set( area.x, area.y, area.width, area.height, compID, kind, kind == gpu::IntraJob::kAngular ? int( mode ) : 0, flags, bdpcm );
+      job.setNeighbors( units[0], units[1], units[2] );
+
+      // what the block reads: its references (the row above with the
+      // above-right samples, the column to the left with the below-left ones),
+      // for CCLM also the luma at and around the block
+      int wave = std::max( waves.maxIn( compID, area.x - 1, area.y - 1, 2 * area.width + 1, 1 ),
+                           waves.maxIn( compID, area.x - 1, area.y, 1, 2 * area.height ) );
+      if( kind == gpu::IntraJob::kCclm )
+      {
+        const IntraPrediction::LmAvailability lm = IntraPrediction::getLmAvailability( cu, area );
+        job.setCclm( lm.lumaAbove, lm.lumaLeft, lm.above, lm.left, lm.actualTop, lm.actualLeft );
+
+        const int sx = getComponentScaleX( compID, cu.chromaFormat );
+        const int sy = getComponentScaleY( compID, cu.chromaFormat );
+        const int lx = area.x << sx, ly = area.y << sy, lw = area.width << sx, lh = area.height << sy;
+        wave = std::max( wave, waves.maxIn( COMPONENT_Y, lx - 4, ly - 4, 2 * lw + 8, 2 * lh + 8 ) );
+      }
+      job.setWave( wave + 1 );
+      waves.set( compID, area.x, area.y, area.width, area.height, wave + 1 );
+      jobs.push_back( job );
+    }
+  }
+}
+
+void DecCu::xGpuIbcJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves )
+{
+  Mv bv = cu.mv[REF_PIC_LIST_0][0];
+  bv.changePrecision( MV_PRECISION_INTERNAL, MV_PRECISION_INT );
+
+  for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
+  {
+    for( const CompArea &area : tu.blocks )
+    {
+      // the components of the CU, as predAndReco takes them: a skipped CU's
+      // transform units (addEmptyTUs) span the chroma of a luma-tree CU too
+      if( !area.valid() || !cu.blocks[area.compID()].valid() )
+      {
+        continue;
+      }
+
+      const ComponentID compID = area.compID();
+      const int         bvx    = isLuma( compID ) ? bv.hor : bv.hor >> getComponentScaleX( compID, cu.chromaFormat );
+      const int         bvy    = isLuma( compID ) ? bv.ver : bv.ver >> getComponentScaleY( compID, cu.chromaFormat );
+
+      int flags = 0;
+      if( TU::getCbf( tu, compID ) || ( isChroma( compID ) && tu.jointCbCr ) )
+      {
+        flags |= gpu::IntraJob::kResidual;
+      }
+
+      gpu::IntraJob job;
+      job.set( area.x, area.y, area.width, area.height, compID, gpu::IntraJob::kIbc, 0, flags, 0 );
+      job.setBlockVector( bvx, bvy );
+
+      const int wave = waves.maxIn( compID, area.x + bvx, area.y + bvy, area.width, area.height ) + 1;
+      job.setWave( wave );
+      waves.set( compID, area.x, area.y, area.width, area.height, wave );
+      jobs.push_back( job );
+    }
+  }
+}
+#endif
+
 // ====================================================================================================================
 // Constructor / destructor / create / destroy
 // ====================================================================================================================

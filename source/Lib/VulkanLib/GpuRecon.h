@@ -50,6 +50,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include "GpuContext.h"
+#include "GpuJobs.h"
 
 #include "CommonLib/Common.h"
 #include "CommonLib/Buffer.h"
@@ -86,14 +87,21 @@ public:
   // (not with luma-adaptive QP offsets), SAO and ALF
   static bool filtersSupported( const CodingStructure& cs );
 
+  // whether the GPU predicts the intra and IBC blocks of the picture: 4:2:0,
+  // none of the tools it lacks (MIP, ISP, multiple reference lines, CIIP, ACT,
+  // LMCS, reference wraparound)
+  static bool intraSupported( const CodingStructure& cs );
+
   // the deblocking parameters of the current picture (vvdec's LF_INIT writes
   // them): count of them, in host memory the GPU reads
   LoopFilterParam* loopFilterParams( size_t count );
 
-  // the in-loop filters of the picture in pic, which the CPU reconstructed:
-  // deblocking, SAO (when sao is given), ALF with CC-ALF (when alf is given);
-  // the result back in pic
-  void filterPicture( CodingStructure& cs, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, PelStorage& pic );
+  // the rest of the picture in pic: the intra and IBC blocks of intraJobs
+  // (one list per CTU) on top of what the CPU reconstructed, then the in-loop
+  // filters: deblocking (when deblock), SAO (when sao is given), ALF with
+  // CC-ALF (when alf is given); the result back in pic
+  void finishPicture( CodingStructure& cs, const std::vector<std::vector<IntraJob>>* intraJobs, bool deblock, SampleAdaptiveOffset* sao,
+                      const AdaptiveLoopFilter* alf, PelStorage& pic );
 
 private:
   void     beginCommands();
@@ -118,6 +126,7 @@ private:
   void          prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alf, uint8_t* params );
   bool          prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8_t* params );   // false: no CTU uses SAO
   void          recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params );
+  void          recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes );
   void          recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
   void          recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
 
@@ -133,6 +142,7 @@ private:
   Buffer          m_params;
   Buffer          m_mirror[2][MAX_NUM_COMPONENT];   // pictures in the GPU's own memory
   Buffer          m_lfp;                            // the deblocking parameters
+  Buffer          m_intraJobs;                      // the intra jobs of a picture, wave by wave
 };
 
 }   // namespace gpu
