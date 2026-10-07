@@ -162,6 +162,7 @@ GpuRecon::~GpuRecon()
     vk.vkDestroyCommandPool( m_ctx->device(), m_pool, nullptr );
   }
   m_ctx->free( m_params );
+  m_ctx->free( m_lfp );
   for( auto& mirror: m_mirror )
   {
     for( Buffer& buf: mirror )
@@ -584,18 +585,122 @@ void GpuRecon::copyPlanes( const PelStorage& pic, int mirror, bool toMirror )
   }
 }
 
-void GpuRecon::loopFilters( CodingStructure& cs, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, PelStorage& pic )
+// the push constants of shaders/deblock.slang
+struct DeblockPush
 {
+  VkDeviceAddress pic0, pic1, lfp, ctus;
+  int32_t         stride, width, height, ctuLog2, widthInCtus, bitDepth, num4x4, dir, scaleX, scaleY;
+};
+
+bool GpuRecon::filtersSupported( const CodingStructure& cs )
+{
+  return alfSupported( cs ) && saoSupported( cs ) && !cs.sps->getLadfEnabled();
+}
+
+LoopFilterParam* GpuRecon::loopFilterParams( size_t count )
+{
+  const size_t size = count * sizeof( LoopFilterParam );
+  if( m_lfp.size < size )
+  {
+    m_ctx->free( m_lfp );
+    m_lfp = m_ctx->alloc( size, MemKind::HostCached );
+  }
+  return reinterpret_cast<LoopFilterParam*>( m_lfp.mapped );
+}
+
+size_t GpuRecon::deblockParamSize( const CodingStructure& cs )
+{
+  return ( size_t( cs.pcv->sizeInCtus ) * 8 + 255 ) & ~size_t( 255 );
+}
+
+bool GpuRecon::prepareDeblock( const CodingStructure& cs, uint8_t* base )
+{
+  bool any = false;
+  for( int ctuIdx = 0; ctuIdx < (int) cs.pcv->sizeInCtus; ctuIdx++ )
+  {
+    const Slice& slice = *cs.getCtuData( ctuIdx ).slice;
+    int8_t*      ctu   = reinterpret_cast<int8_t*>( base + ctuIdx * 8 );
+    ctu[0] = slice.getDeblockingFilterDisable() ? 1 : 0;
+    ctu[1] = int8_t( slice.getDeblockingFilterBetaOffsetDiv2() );
+    ctu[2] = int8_t( slice.getDeblockingFilterTcOffsetDiv2() );
+    ctu[3] = int8_t( slice.getDeblockingFilterCbBetaOffsetDiv2() );
+    ctu[4] = int8_t( slice.getDeblockingFilterCbTcOffsetDiv2() );
+    ctu[5] = int8_t( slice.getDeblockingFilterCrBetaOffsetDiv2() );
+    ctu[6] = int8_t( slice.getDeblockingFilterCrTcOffsetDiv2() );
+    ctu[7] = 0;
+    any |= !slice.getDeblockingFilterDisable();
+  }
+  return any;
+}
+
+void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params )
+{
+  const PreCalcValues& pcv = *cs.pcv;
+  const Api&           vk  = m_ctx->api();
+  const bool           chroma = isChromaEnabled( pcv.chrFormat );
+
+  DeblockPush push{};
+  push.lfp         = m_lfp.addr;
+  push.ctus        = params;
+  push.ctuLog2     = getLog2( pcv.maxCUWidth );
+  push.widthInCtus = pcv.widthInCtus;
+  push.bitDepth    = cs.sps->getBitDepth();
+  push.num4x4      = int32_t( pcv.num4x4CtuBlks );
+  push.scaleX      = chroma ? getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) : 0;
+  push.scaleY      = chroma ? getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) : 0;
+
+  for( int dir = 0; dir < 2; dir++ )
+  {
+    if( dir == 1 )
+    {
+      computeBarrier();   // the horizontal edges take what the vertical ones left
+    }
+    push.dir = dir;
+
+    push.pic0   = planes.addr[COMPONENT_Y];
+    push.pic1   = 0;
+    push.stride = planes.stride[COMPONENT_Y];
+    push.width  = pcv.lumaWidth;
+    push.height = pcv.lumaHeight;
+    vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_deblock_luma ) );
+    vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+    vk.vkCmdDispatch( m_cmd, ( ( push.width + 3 ) / 4 + 7 ) / 8, ( ( push.height + 3 ) / 4 + 7 ) / 8, 1 );
+
+    if( chroma )
+    {
+      CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
+      push.pic0   = planes.addr[COMPONENT_Cb];
+      push.pic1   = planes.addr[COMPONENT_Cr];
+      push.stride = planes.stride[COMPONENT_Cb];
+      push.width  = pcv.lumaWidth >> push.scaleX;
+      push.height = pcv.lumaHeight >> push.scaleY;
+      // as shaders/deblock.slang walks the segments
+      const int along  = dir == 0 ? ( 4 >> push.scaleY ) : ( 4 >> push.scaleX );
+      const int across = dir == 0 ? ( ( 8 << push.scaleX ) / 4 * ( 4 >> push.scaleX ) ) : ( ( 8 << push.scaleY ) / 4 * ( 4 >> push.scaleY ) );
+      const int threadsX = dir == 0 ? ( push.width + across - 1 ) / across : ( push.width + along - 1 ) / along;
+      const int threadsY = dir == 0 ? ( push.height + along - 1 ) / along : ( push.height + across - 1 ) / across;
+      vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_deblock_chroma ) );
+      vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+      vk.vkCmdDispatch( m_cmd, ( threadsX + 7 ) / 8, ( threadsY + 7 ) / 8, 1 );
+    }
+    mark( dir == 0 ? "deblock ver" : "deblock hor" );
+  }
+}
+
+void GpuRecon::filterPicture( CodingStructure& cs, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, PelStorage& pic )
+{
+  const size_t dbSize  = deblockParamSize( cs );
   const size_t alfSize = alf ? alfParamSize( cs ) : 0;
   const size_t saoSize = sao ? saoParamSize( cs ) : 0;
-  uint8_t*     base    = params( alfSize + saoSize );
+  uint8_t*     base    = params( dbSize + alfSize + saoSize );
 
-  const bool doSao = sao && prepareSao( cs, *sao, base + alfSize );
+  const bool doDeblock = prepareDeblock( cs, base );
+  const bool doSao     = sao && prepareSao( cs, *sao, base + dbSize + alfSize );
   if( alf )
   {
-    prepareAlf( cs, *alf, base );
+    prepareAlf( cs, *alf, base + dbSize );
   }
-  if( !doSao && !alf )
+  if( !doDeblock && !doSao && !alf )
   {
     return;
   }
@@ -606,18 +711,26 @@ void GpuRecon::loopFilters( CodingStructure& cs, SampleAdaptiveOffset* sao, cons
   const Planes planes[2] = { mirrorPlanes( 0, pic ), mirrorPlanes( 1, pic ) };
   int          cur       = 0;
   copyPlanes( pic, 0, true );
+  if( doDeblock )
+  {
+    recordDeblock( cs, planes[cur], m_params.addr );   // in place
+  }
   if( doSao )
   {
-    recordSao( cs, planes[cur], planes[1 - cur], m_params.addr + alfSize );
+    if( doDeblock )
+    {
+      computeBarrier();
+    }
+    recordSao( cs, planes[cur], planes[1 - cur], m_params.addr + dbSize + alfSize );
     cur = 1 - cur;
   }
   if( alf )
   {
-    if( doSao )
+    if( doDeblock || doSao )
     {
       computeBarrier();
     }
-    recordAlf( cs, planes[cur], planes[1 - cur], m_params.addr );
+    recordAlf( cs, planes[cur], planes[1 - cur], m_params.addr + dbSize );
     cur = 1 - cur;
   }
   VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };

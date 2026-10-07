@@ -82,10 +82,18 @@ public:
   static bool alfSupported( const CodingStructure& cs );
   // whether the GPU's SAO covers the picture: no virtual boundaries
   static bool saoSupported( const CodingStructure& cs );
+  // whether the GPU covers all the in-loop filters of the picture: deblocking
+  // (not with luma-adaptive QP offsets), SAO and ALF
+  static bool filtersSupported( const CodingStructure& cs );
 
-  // SAO (when sao is given) and then ALF with CC-ALF (when alf is given) of the
-  // whole deblocked picture in pic, the result back in pic
-  void loopFilters( CodingStructure& cs, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, PelStorage& pic );
+  // the deblocking parameters of the current picture (vvdec's LF_INIT writes
+  // them): count of them, in host memory the GPU reads
+  LoopFilterParam* loopFilterParams( size_t count );
+
+  // the in-loop filters of the picture in pic, which the CPU reconstructed:
+  // deblocking, SAO (when sao is given), ALF with CC-ALF (when alf is given);
+  // the result back in pic
+  void filterPicture( CodingStructure& cs, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, PelStorage& pic );
 
 private:
   void     beginCommands();
@@ -103,10 +111,13 @@ private:
   Planes        mirrorPlanes( int mirror, const PelStorage& pic );   // GPU memory laid out as pic's buffers
   void          copyPlanes( const PelStorage& pic, int mirror, bool toMirror );
 
+  static size_t deblockParamSize( const CodingStructure& cs );
   static size_t alfParamSize( const CodingStructure& cs );
   static size_t saoParamSize( const CodingStructure& cs );
+  bool          prepareDeblock( const CodingStructure& cs, uint8_t* params );   // false: no slice deblocks
   void          prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alf, uint8_t* params );
   bool          prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8_t* params );   // false: no CTU uses SAO
+  void          recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params );
   void          recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
   void          recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
 
@@ -121,6 +132,7 @@ private:
   uint32_t        m_marks   = 0;
   Buffer          m_params;
   Buffer          m_mirror[2][MAX_NUM_COMPONENT];   // pictures in the GPU's own memory
+  Buffer          m_lfp;                            // the deblocking parameters
 };
 
 }   // namespace gpu

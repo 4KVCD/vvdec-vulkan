@@ -7,6 +7,8 @@ set( VVDEC_GPU_SHADERS
   "alf_luma|alf|CHROMA=0"
   "alf_chroma|alf|CHROMA=1"
   "sao|sao"
+  "deblock_luma|deblock|CHROMA=0"
+  "deblock_chroma|deblock|CHROMA=1"
 )
 
 if( NOT VVDEC_SLANGC OR NOT EXISTS "${VVDEC_SLANGC}" )

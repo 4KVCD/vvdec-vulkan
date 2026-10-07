@@ -209,15 +209,13 @@ void DecLib::destroy()
 #if VVDEC_VULKAN
   if( m_gpu )
   {
-    int alfGpu = 0, alfCpu = 0, saoGpu = 0, saoCpu = 0;
+    int filtersGpu = 0, filtersCpu = 0;
     for( auto& dec: m_decLibRecon )
     {
-      alfGpu += dec.alfPicturesGpu();
-      alfCpu += dec.alfPicturesCpu();
-      saoGpu += dec.saoPicturesGpu();
-      saoCpu += dec.saoPicturesCpu();
+      filtersGpu += dec.filterPicturesGpu();
+      filtersCpu += dec.filterPicturesCpu();
     }
-    msg( INFO, "GPU: SAO of %d pictures on the GPU, %d on the CPU; ALF of %d on the GPU, %d on the CPU\n", saoGpu, saoCpu, alfGpu, alfCpu );
+    msg( INFO, "GPU: in-loop filters of %d pictures on the GPU, %d on the CPU\n", filtersGpu, filtersCpu );
   }
 #endif
   for( auto &dec: m_decLibRecon )

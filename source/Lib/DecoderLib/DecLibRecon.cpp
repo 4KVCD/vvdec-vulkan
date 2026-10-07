@@ -96,7 +96,7 @@ extern __itt_counter itt_frame_counter;
 //! \ingroup DecoderLib
 //! \{
 
-void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool _doALF, bool _doSAO )
+void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool _doALF, bool _doSAO, bool _doDeblock )
 {
   this->cs = &cs;
 
@@ -110,6 +110,7 @@ void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int ta
   perLineMiHist = std::vector<MotionHist>( heightInCtus );
   doALF         = _doALF;
   doSAO         = _doSAO;
+  doDeblock     = _doDeblock;
 }
 
 DecLibRecon::DecLibRecon()
@@ -199,6 +200,9 @@ void DecLibRecon::destroy()
 
   if( m_loopFilterParam )
   {
+#if VVDEC_VULKAN
+    if( !m_gpuRecon )   // else the GPU's buffer
+#endif
     free( m_loopFilterParam );
     m_loopFilterParam = nullptr;
   }
@@ -526,12 +530,22 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 
   if( m_num4x4Elements != cs.pcv->num4x4CtuBlks * cs.pcv->sizeInCtus )
   {
+#if VVDEC_VULKAN
+    if( m_loopFilterParam && !m_gpuRecon ) free( m_loopFilterParam );
+#else
     if( m_loopFilterParam ) free( m_loopFilterParam );
+#endif
     if( m_motionInfo      ) free( m_motionInfo );
 
     m_num4x4Elements = cs.pcv->num4x4CtuBlks * cs.pcv->sizeInCtus;
 
+#if VVDEC_VULKAN
+    // with the GPU, in host memory it reads: the deblocking shaders take them from there
+    m_loopFilterParam = m_gpuRecon ? m_gpuRecon->loopFilterParams( m_num4x4Elements * 2 )
+                                   : ( LoopFilterParam* ) malloc( sizeof( LoopFilterParam ) * m_num4x4Elements * 2 );
+#else
     m_loopFilterParam = ( LoopFilterParam* ) malloc( sizeof( LoopFilterParam ) * m_num4x4Elements * 2 );
+#endif
     m_motionInfo      = ( MotionInfo* )      malloc( sizeof( MotionInfo      ) * m_num4x4Elements );
   }
   // finished
@@ -602,21 +616,16 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   const bool     doALF         = cs.sps->getUseALF() && !AdaptiveLoopFilter::getAlfSkipPic( cs );
   const bool     doSAO         = cs.sps->getUseSAO();
 #if VVDEC_VULKAN
-  // the GPU filters the whole picture once its CTUs are done (finishReconTask);
-  // SAO only goes there when ALF, which follows it, does too
-  m_gpuAlf = m_gpuRecon && doALF && gpu::GpuRecon::alfSupported( cs );
-  m_gpuSao = m_gpuRecon && doSAO && gpu::GpuRecon::saoSupported( cs ) && ( !doALF || m_gpuAlf );
-  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuAlf, doSAO && !m_gpuSao );
-  if( m_gpuRecon && doALF )
+  // the GPU applies the in-loop filters to the whole picture once its CTUs are
+  // reconstructed (finishReconTask)
+  m_gpuFilters = m_gpuRecon && gpu::GpuRecon::filtersSupported( cs );
+  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuFilters, doSAO && !m_gpuFilters, !m_gpuFilters );
+  if( m_gpuRecon )
   {
-    ( m_gpuAlf ? m_alfPicturesGpu : m_alfPicturesCpu )++;
-  }
-  if( m_gpuRecon && doSAO )
-  {
-    ( m_gpuSao ? m_saoPicturesGpu : m_saoPicturesCpu )++;
+    ( m_gpuFilters ? m_filterPicturesGpu : m_filterPicturesCpu )++;
   }
 #else
-  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF, doSAO );
+  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF, doSAO, true );
 #endif
 
   tasksFinishMotion = std::vector<LineTaskParam>( heightInCtus, LineTaskParam{ commonTaskParam, -1 } );
@@ -679,10 +688,11 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 
 #if VVDEC_VULKAN
       DecLibRecon* dec = param->decLib;
-      if( dec->m_gpuSao || dec->m_gpuAlf )
+      if( dec->m_gpuFilters )
       {
-        dec->m_gpuRecon->loopFilters( cs, dec->m_gpuSao ? &dec->m_cSAO : nullptr, dec->m_gpuAlf ? &dec->m_cALF : nullptr,
-                                      cs.picture->m_bufs[PIC_RECONSTRUCTION] );
+        const bool alf = cs.sps->getUseALF() && !AdaptiveLoopFilter::getAlfSkipPic( cs );
+        dec->m_gpuRecon->filterPicture( cs, cs.sps->getUseSAO() ? &dec->m_cSAO : nullptr, alf ? &dec->m_cALF : nullptr,
+                                        cs.picture->m_bufs[PIC_RECONSTRUCTION] );
       }
       else
 #endif
@@ -997,7 +1007,10 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
 
     for( int ctu = ctuStart; ctu < ctuEnd; ctu++ )
     {
-      decLib.m_cLoopFilter.loopFilterCTU( cs, MAX_NUM_CHANNEL_TYPE, ctu, line, EDGE_VER );
+      if( param->common.doDeblock )
+      {
+        decLib.m_cLoopFilter.loopFilterCTU( cs, MAX_NUM_CHANNEL_TYPE, ctu, line, EDGE_VER );
+      }
 
       thisCtuState = LF_V_cont;
     }
@@ -1025,7 +1038,10 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
 
     for( int ctu = ctuStart; ctu < ctuEnd; ctu++ )
     {
-      decLib.m_cLoopFilter.loopFilterCTU( cs, MAX_NUM_CHANNEL_TYPE, ctu, line, EDGE_HOR );
+      if( param->common.doDeblock )
+      {
+        decLib.m_cLoopFilter.loopFilterCTU( cs, MAX_NUM_CHANNEL_TYPE, ctu, line, EDGE_HOR );
+      }
     }
 
     thisCtuState = PRESAO;
