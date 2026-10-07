@@ -477,6 +477,23 @@ void SampleAdaptiveOffset::SAOPrepareCTULine( CodingStructure &cs, const UnitAre
   }
 }
 
+void SampleAdaptiveOffset::reconstructCtuParam( CodingStructure& cs, int ctuRsAddr )
+{
+  SAOBlkParam* mergeList[NUM_SAO_MERGE_TYPES] = { nullptr, nullptr };
+  getMergeList( cs, ctuRsAddr, mergeList );
+
+  reconstructBlkSAOParam( cs.m_ctuData[ctuRsAddr].saoParam, mergeList );
+}
+
+uint8_t SampleAdaptiveOffset::neighbourAvailability( CodingStructure& cs, int ctuRsAddr ) const
+{
+  const Position pos( ( ctuRsAddr % cs.pcv->widthInCtus ) * cs.pcv->maxCUWidth, ( ctuRsAddr / cs.pcv->widthInCtus ) * cs.pcv->maxCUHeight );
+  bool left, right, above, below, aboveLeft, aboveRight, belowLeft, belowRight;
+  deriveLoopFilterBoundaryAvailibility( cs, pos, left, right, above, below, aboveLeft, aboveRight, belowLeft, belowRight );
+  return uint8_t( int( left ) | int( right ) << 1 | int( above ) << 2 | int( below ) << 3 | int( aboveLeft ) << 4 | int( aboveRight ) << 5
+                  | int( belowLeft ) << 6 | int( belowRight ) << 7 );
+}
+
 void SampleAdaptiveOffset::SAOProcessCTULine( CodingStructure &cs, const UnitArea &lineArea )
 {
   PROFILER_SCOPE_AND_STAGE( 1, g_timeProfiler, P_SAO );

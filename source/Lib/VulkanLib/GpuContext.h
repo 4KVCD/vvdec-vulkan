@@ -57,6 +57,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace vvdec
 {
@@ -134,6 +135,11 @@ public:
   double             timestampPeriod() const { return m_timestampPeriod; }
   const std::string& deviceName()      const { return m_deviceName; }
 
+  // VVDEC_GPU_PROFILE=1: the decoders add up the time of their passes, printed
+  // when the context goes
+  bool profiling() const { return m_profiling; }
+  void addTime( const char* label, double milliseconds );
+
 private:
   Context() = default;
   ~Context();
@@ -154,6 +160,16 @@ private:
   std::string                      m_deviceName;
   std::mutex                       m_queueMutex;
   std::mutex                       m_pipelineMutex;
+
+  struct Time
+  {
+    std::string label;
+    double      milliseconds;
+    long        count;
+  };
+  bool                             m_profiling = false;
+  std::vector<Time>                m_times;
+  std::mutex                       m_timeMutex;
 
   static std::mutex s_mutex;
   static Context*   s_context;

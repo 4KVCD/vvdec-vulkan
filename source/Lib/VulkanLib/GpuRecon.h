@@ -59,6 +59,7 @@ namespace vvdec
 
 class CodingStructure;
 class AdaptiveLoopFilter;
+class SampleAdaptiveOffset;
 
 namespace gpu
 {
@@ -79,20 +80,47 @@ public:
   // slice, tile or subpicture boundary the filters may not cross, nor by a
   // virtual boundary
   static bool alfSupported( const CodingStructure& cs );
+  // whether the GPU's SAO covers the picture: no virtual boundaries
+  static bool saoSupported( const CodingStructure& cs );
 
-  // ALF and CC-ALF of the picture, from src (the reconstruction after SAO) into dst
-  void alf( const CodingStructure& cs, const AdaptiveLoopFilter& alf, const PelStorage& src, PelStorage& dst );
+  // SAO (when sao is given) and then ALF with CC-ALF (when alf is given) of the
+  // whole deblocked picture in pic, the result back in pic
+  void loopFilters( CodingStructure& cs, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, PelStorage& pic );
 
 private:
   void     beginCommands();
+  void     computeBarrier();
+  void     mark( const char* label );   // with VVDEC_GPU_PROFILE: the GPU time since the last mark counts as label
   void     submitAndWait();
   uint8_t* params( size_t size );   // the host-visible parameter buffer, at least size bytes
 
+  // the planes of a picture as the shaders see them
+  struct Planes
+  {
+    VkDeviceAddress addr[MAX_NUM_COMPONENT];
+    int32_t         stride[MAX_NUM_COMPONENT];
+  };
+  Planes        mirrorPlanes( int mirror, const PelStorage& pic );   // GPU memory laid out as pic's buffers
+  void          copyPlanes( const PelStorage& pic, int mirror, bool toMirror );
+
+  static size_t alfParamSize( const CodingStructure& cs );
+  static size_t saoParamSize( const CodingStructure& cs );
+  void          prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alf, uint8_t* params );
+  bool          prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8_t* params );   // false: no CTU uses SAO
+  void          recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
+  void          recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
+
+  static constexpr uint32_t kMaxMarks = 64;
+
   Context*        m_ctx;
-  VkCommandPool   m_pool  = VK_NULL_HANDLE;
-  VkCommandBuffer m_cmd   = VK_NULL_HANDLE;
-  VkFence         m_fence = VK_NULL_HANDLE;
+  VkCommandPool   m_pool    = VK_NULL_HANDLE;
+  VkCommandBuffer m_cmd     = VK_NULL_HANDLE;
+  VkFence         m_fence   = VK_NULL_HANDLE;
+  VkQueryPool     m_queries = VK_NULL_HANDLE;   // the profiling timestamps
+  const char*     m_labels[kMaxMarks];
+  uint32_t        m_marks   = 0;
   Buffer          m_params;
+  Buffer          m_mirror[2][MAX_NUM_COMPONENT];   // pictures in the GPU's own memory
 };
 
 }   // namespace gpu

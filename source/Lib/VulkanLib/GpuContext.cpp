@@ -273,12 +273,40 @@ bool Context::init()
     m_pipelines[i] = VK_NULL_HANDLE;
   }
 
+  const char* profile = getenv( "VVDEC_GPU_PROFILE" );
+  m_profiling         = profile && atoi( profile ) != 0;
+
   msg( INFO, "Vulkan: %s\n", m_deviceName.c_str() );
   return true;
 }
 
+void Context::addTime( const char* label, double milliseconds )
+{
+  std::lock_guard<std::mutex> lock( m_timeMutex );
+  for( Time& time: m_times )
+  {
+    if( time.label == label )
+    {
+      time.milliseconds += milliseconds;
+      time.count++;
+      return;
+    }
+  }
+  m_times.push_back( Time{ label, milliseconds, 1 } );
+}
+
 Context::~Context()
 {
+  if( m_profiling && !m_times.empty() )
+  {
+    msg( INFO, "GPU profile (milliseconds):\n" );
+    for( const Time& time: m_times )
+    {
+      msg( INFO, "  %-16s total %10.1f  count %7ld  mean %8.3f\n", time.label.c_str(), time.milliseconds, time.count,
+           time.milliseconds / double( time.count ) );
+    }
+  }
+
   if( m_device )
   {
     m_api.vkDeviceWaitIdle( m_device );

@@ -96,7 +96,7 @@ extern __itt_counter itt_frame_counter;
 //! \ingroup DecoderLib
 //! \{
 
-void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool _doALF )
+void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool _doALF, bool _doSAO )
 {
   this->cs = &cs;
 
@@ -109,6 +109,7 @@ void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int ta
   }
   perLineMiHist = std::vector<MotionHist>( heightInCtus );
   doALF         = _doALF;
+  doSAO         = _doSAO;
 }
 
 DecLibRecon::DecLibRecon()
@@ -599,16 +600,23 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 
   const TaskType ctuStartState = MIDER;
   const bool     doALF         = cs.sps->getUseALF() && !AdaptiveLoopFilter::getAlfSkipPic( cs );
+  const bool     doSAO         = cs.sps->getUseSAO();
 #if VVDEC_VULKAN
-  // the GPU filters the whole picture once its CTUs are done (finishReconTask)
+  // the GPU filters the whole picture once its CTUs are done (finishReconTask);
+  // SAO only goes there when ALF, which follows it, does too
   m_gpuAlf = m_gpuRecon && doALF && gpu::GpuRecon::alfSupported( cs );
-  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuAlf );
+  m_gpuSao = m_gpuRecon && doSAO && gpu::GpuRecon::saoSupported( cs ) && ( !doALF || m_gpuAlf );
+  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuAlf, doSAO && !m_gpuSao );
   if( m_gpuRecon && doALF )
   {
     ( m_gpuAlf ? m_alfPicturesGpu : m_alfPicturesCpu )++;
   }
+  if( m_gpuRecon && doSAO )
+  {
+    ( m_gpuSao ? m_saoPicturesGpu : m_saoPicturesCpu )++;
+  }
 #else
-  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF );
+  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF, doSAO );
 #endif
 
   tasksFinishMotion = std::vector<LineTaskParam>( heightInCtus, LineTaskParam{ commonTaskParam, -1 } );
@@ -669,14 +677,17 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
       CodingStructure& cs = *param->pic->cs;
 
+#if VVDEC_VULKAN
+      DecLibRecon* dec = param->decLib;
+      if( dec->m_gpuSao || dec->m_gpuAlf )
+      {
+        dec->m_gpuRecon->loopFilters( cs, dec->m_gpuSao ? &dec->m_cSAO : nullptr, dec->m_gpuAlf ? &dec->m_cALF : nullptr,
+                                      cs.picture->m_bufs[PIC_RECONSTRUCTION] );
+      }
+      else
+#endif
       if( cs.sps->getUseALF() && !AdaptiveLoopFilter::getAlfSkipPic( cs ) )
       {
-#if VVDEC_VULKAN
-        if( param->decLib->m_gpuAlf )
-        {
-          param->decLib->m_gpuRecon->alf( cs, param->decLib->m_cALF, cs.picture->m_bufs[PIC_RECONSTRUCTION], param->decLib->m_fltBuf );
-        }
-#endif
         param->decLib->swapBufs( cs );
       }
 
@@ -1043,7 +1054,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
 
       ITT_TASKSTART( itt_domain_dec, itt_handle_presao );
 
-      if( cs.sps->getUseSAO() )
+      if( param->common.doSAO )
       {
         decLib.m_cSAO.SAOPrepareCTULine( cs, getLineArea( cs, line, true ) );
       }
@@ -1066,7 +1077,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       return true;
 
     // only last CTU processes full line
-    if( cs.sps->getUseSAO() )
+    if( param->common.doSAO )
     {
       ITT_TASKSTART( itt_domain_dec, itt_handle_sao );
 

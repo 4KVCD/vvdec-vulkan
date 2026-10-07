@@ -6,6 +6,7 @@
 set( VVDEC_GPU_SHADERS
   "alf_luma|alf|CHROMA=0"
   "alf_chroma|alf|CHROMA=1"
+  "sao|sao"
 )
 
 if( NOT VVDEC_SLANGC OR NOT EXISTS "${VVDEC_SLANGC}" )

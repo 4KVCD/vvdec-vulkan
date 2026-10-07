@@ -87,6 +87,14 @@ public:
   void SAOProcessCTULine( CodingStructure& cs, const UnitArea& lineArea );
   void SAOPrepareCTULine( CodingStructure& cs, const UnitArea& lineArea );
 
+  // for the GPU's SAO (VulkanLib/GpuRecon): the parameters of a CTU, merge
+  // resolved and offsets scaled as SAOPrepareCTULine does it (call in raster
+  // order, once per picture), and which of its 8 neighbour CTUs the filter may
+  // read (bits: left, right, above, below, above-left, above-right, below-left,
+  // below-right)
+  void    reconstructCtuParam  ( CodingStructure& cs, int ctuRsAddr );
+  uint8_t neighbourAvailability( CodingStructure& cs, int ctuRsAddr ) const;
+
   static int getMaxOffsetQVal( const int channelBitDepth ) { return ( 1 << ( std::min<int>( channelBitDepth, MAX_SAO_TRUNCATED_BITDEPTH ) - 5 ) ) - 1; }   // Table 9-32, inclusive
   void setReshaper(Reshape * p) { m_pcReshape = p; }
 

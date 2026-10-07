@@ -93,9 +93,10 @@ struct CommonTaskParam
   std::vector<MotionHist>  perLineMiHist;
 
   bool                     doALF        = true;
+  bool                     doSAO        = true;   // the CTU tasks apply SAO (not when the GPU does)
 
   explicit CommonTaskParam( DecLibRecon* dec ) : decLib( *dec ) {}
-  void reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool doALF );
+  void reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool doALF, bool doSAO );
 };
 
 struct LineTaskParam
@@ -169,8 +170,11 @@ private:
 #if VVDEC_VULKAN
   std::unique_ptr<gpu::GpuRecon> m_gpuRecon;        // when the pictures are reconstructed on the GPU
   bool                           m_gpuAlf = false;  // the current picture's ALF runs on the GPU
+  bool                           m_gpuSao = false;  // the current picture's SAO runs on the GPU
   int                            m_alfPicturesGpu = 0;
   int                            m_alfPicturesCpu = 0;
+  int                            m_saoPicturesGpu = 0;
+  int                            m_saoPicturesCpu = 0;
 #endif
 
   CommonTaskParam            commonTaskParam{ this };
@@ -199,6 +203,8 @@ public:
 #if VVDEC_VULKAN
   int      alfPicturesGpu() const { return m_alfPicturesGpu; }
   int      alfPicturesCpu() const { return m_alfPicturesCpu; }
+  int      saoPicturesGpu() const { return m_saoPicturesGpu; }
+  int      saoPicturesCpu() const { return m_saoPicturesCpu; }
 #endif
 
 
