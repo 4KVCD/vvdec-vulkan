@@ -190,6 +190,7 @@ public:
     std::cout <<   "\t Decoder Options" << std::endl;
     std::cout <<   std::endl;
     std::cout <<   "\t\t [--threads,-t  <int>       ] : number of threads (default: <= 0 auto detection )" << std::endl;
+    std::cout <<   "\t\t [--gpu <int>               ] : 1: reconstruct on the GPU with Vulkan, 0: on the CPU (default: 0)" << std::endl;
     if( fullHelp )
     {
       std::cout << "\t\t [--parsedelay,-p  <int>    ] : maximal number of frames to read before decoding (default: <= 0 auto detection )" << std::endl;
@@ -355,6 +356,11 @@ public:
       {
         if( rcParams.logLevel > VVDEC_VERBOSE )
           fprintf( stdout, "[threads]    : %d\n", rcParams.threads );
+      }
+      else if( parse_param( { "--gpu" }, rcParams.gpu ) )
+      {
+        if( rcParams.logLevel > VVDEC_VERBOSE )
+          fprintf( stdout, "[gpu]        : %d\n", rcParams.gpu );
       }
       else if( parse_param( { "-p", "--parsedelay" }, rcParams.parseDelay ) )
       {

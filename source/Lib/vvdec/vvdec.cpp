@@ -72,6 +72,7 @@ VVDEC_DECL void vvdec_params_default(vvdecParams *params)
   params->simd               = VVDEC_SIMD_DEFAULT;      // set specific simd optimization (default: max. availalbe)
   params->errHandlingFlags   = VVDEC_ERR_HANDLING_OFF;  // no special error handling
   params->filmGrainSynthesis = true;                    // enable film grain synthesis using Film Grain Charactersitics SEI ( default: true )
+  params->gpu                = 0;                       // reconstruct on the CPU
 }
 
 VVDEC_DECL vvdecParams* vvdec_params_alloc()

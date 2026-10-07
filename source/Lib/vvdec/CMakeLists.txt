@@ -17,6 +17,15 @@ file( GLOB BASE_SRC_FILES CONFIGURE_DEPENDS "*.cpp"  "../CommonLib/*.cpp"  "../U
 # get include files
 file( GLOB BASE_INC_FILES CONFIGURE_DEPENDS "*.h" "../CommonLib/*.h"  "../Utilities/*.h" "../DecoderLib/*.h" )
 
+# the reconstruction on the GPU (vvdecParams::gpu)
+if( VVDEC_ENABLE_VULKAN )
+  include( vvdecVulkanShaders )
+  file( GLOB VULKAN_SRC_FILES CONFIGURE_DEPENDS "../VulkanLib/*.cpp" )
+  file( GLOB VULKAN_INC_FILES CONFIGURE_DEPENDS "../VulkanLib/*.h" )
+  list( APPEND BASE_SRC_FILES ${VULKAN_SRC_FILES} )
+  list( APPEND BASE_INC_FILES ${VULKAN_INC_FILES} )
+endif()
+
 
 if( NOT DEFINED VVDEC_ENABLE_X86_SIMD )
   message( FATAL_ERROR "VVDEC_ENABLE_X86_SIMD is not defined. Please include TopLevel CMakeLists.txt file of vvdec to set all dependencies!" )
@@ -201,6 +210,16 @@ target_compile_definitions( ${LIB_NAME} PUBLIC $<$<STREQUAL:$<TARGET_PROPERTY:${
 target_include_directories( ${LIB_NAME} SYSTEM INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../../include> $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}> )
 
 target_link_libraries( ${LIB_NAME} ${INTEL_ITT_LINK_TARGET} Threads::Threads )
+
+if( VVDEC_ENABLE_VULKAN )
+  add_dependencies( ${LIB_NAME} vvdec_gpu_shaders )
+  target_compile_definitions( ${LIB_NAME} PRIVATE VVDEC_VULKAN=1 )
+  target_include_directories( ${LIB_NAME} PRIVATE ${VVDEC_GPU_INCLUDE_DIR} )
+  target_include_directories( ${LIB_NAME} SYSTEM PRIVATE ${VVDEC_VULKAN_HEADERS} )
+  if( UNIX )
+    target_link_libraries( ${LIB_NAME} ${CMAKE_DL_LIBS} )
+  endif()
+endif()
 
 set_target_properties( ${LIB_NAME} PROPERTIES
                                    SOVERSION ${PROJECT_VERSION_MAJOR}

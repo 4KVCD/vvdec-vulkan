@@ -139,10 +139,12 @@ int VVDecImpl::init( const vvdecParams& params, vvdecCreateBufferCallback create
 
     initROM();
 
-    // create decoder class
-    m_cDecLib->create( params.threads, params.parseDelay, m_cUserAllocator, static_cast<ErrHandlingFlags>(params.errHandlingFlags) );
-
+    // set before creating the decoder, so its messages (e.g. about the GPU) follow the verbosity asked for
     g_verbosity = MsgLevel( params.logLevel );
+
+    // create decoder class
+    m_cDecLib->create( params.threads, params.parseDelay, m_cUserAllocator, static_cast<ErrHandlingFlags>(params.errHandlingFlags), params.gpu != 0 );
+
     g_context   = this;
 
     // initialize decoder class

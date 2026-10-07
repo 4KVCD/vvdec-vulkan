@@ -60,6 +60,10 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "DecCu.h"
 #include "Utilities/ThreadPool.h"
 
+#if VVDEC_VULKAN
+#  include "VulkanLib/GpuRecon.h"
+#endif
+
 
 namespace vvdec
 {
@@ -162,6 +166,13 @@ private:
 
   PelStorage           m_fltBuf;
 
+#if VVDEC_VULKAN
+  std::unique_ptr<gpu::GpuRecon> m_gpuRecon;        // when the pictures are reconstructed on the GPU
+  bool                           m_gpuAlf = false;  // the current picture's ALF runs on the GPU
+  int                            m_alfPicturesGpu = 0;
+  int                            m_alfPicturesCpu = 0;
+#endif
+
   CommonTaskParam            commonTaskParam{ this };
   std::vector<LineTaskParam> tasksFinishMotion;
   std::vector<CtuTaskParam>  tasksCtu;
@@ -173,7 +184,11 @@ public:
   ~DecLibRecon() = default;
   CLASS_COPY_MOVE_DELETE( DecLibRecon )
 
+#if VVDEC_VULKAN
+  void create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled, gpu::Context* gpu = nullptr );
+#else
   void create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled );
+#endif
   void destroy();
 
   void     decompressPicture( Picture* pcPic );
@@ -181,6 +196,10 @@ public:
   void     cleanupOnException();
   Picture* getCurrPic() const { return m_currDecompPic; }
   void     swapBufs( CodingStructure& cs );
+#if VVDEC_VULKAN
+  int      alfPicturesGpu() const { return m_alfPicturesGpu; }
+  int      alfPicturesCpu() const { return m_alfPicturesCpu; }
+#endif
 
 
 private:

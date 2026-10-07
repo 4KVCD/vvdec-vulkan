@@ -262,6 +262,11 @@ set( VVDEC_ENABLE_LINK_TIME_OPT             ON  CACHE BOOL   "Enable link time o
 
 set( VVDEC_ENABLE_WERROR                    ON  CACHE BOOL   "Treat warnings as errors (-Werror or /WX)" )
 
+# the reconstruction on the GPU with Vulkan (vvdecParams::gpu, vvdecapp --gpu 1)
+set( VVDEC_ENABLE_VULKAN                    OFF CACHE BOOL     "Build the reconstruction on the GPU with Vulkan" )
+set( VVDEC_SLANGC                           ""  CACHE FILEPATH "slangc, the Slang compiler of the Vulkan shaders" )
+set( VVDEC_VULKAN_HEADERS                   ""  CACHE PATH     "Include directory of the Vulkan headers" )
+
 set( VVDEC_USE_ADDRESS_SANITIZER            OFF CACHE BOOL   "Enable or disable address sanitizer" )
 
 set( VVDEC_FUZZING_BUILD                    OFF CACHE BOOL   "Build fuzz-testing binaries using clang -fsanitize=fuzzer" )

@@ -64,6 +64,7 @@ private:
   int                                m_parseFrameDelay = -1;
   int                                m_parallelDecInst = 1;
   UserAllocator                      m_userAllocator;
+  UserAllocator*                     m_gpuAllocator   = nullptr;   // the decoder's own, for pictures the GPU reaches
   int                                m_tuneInDelay    = 0;
   bool                               m_firstOutputPic = true;
   std::unordered_set<const Picture*> m_allRefPics;
@@ -72,7 +73,7 @@ public:
   PicListManager() = default;
   ~PicListManager() { deleteBuffers(); }
 
-  void create( int frameDelay, int decInstances, const UserAllocator& userAllocator );
+  void create( int frameDelay, int decInstances, const UserAllocator& userAllocator, UserAllocator* gpuAllocator = nullptr );
   void restart()
   {
     m_firstOutputPic = true;

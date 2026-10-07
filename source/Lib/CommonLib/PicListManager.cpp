@@ -117,11 +117,12 @@ void PicListManager::deleteBuffers()
   m_cPicList.clear();
 }
 
-void PicListManager::create(int frameDelay, int decInstances, const UserAllocator& userAllocator )
+void PicListManager::create(int frameDelay, int decInstances, const UserAllocator& userAllocator, UserAllocator* gpuAllocator )
 {
   m_parseFrameDelay      = frameDelay;
   m_parallelDecInst      = decInstances;
   m_userAllocator        = userAllocator;
+  m_gpuAllocator         = gpuAllocator;
 }
 
 Picture* PicListManager::getNewPicBuffer( const SPS& sps, const PPS& pps, const uint32_t temporalLayer, const int layerId, const VPS* vps )
@@ -142,7 +143,8 @@ Picture* PicListManager::getNewPicBuffer( const SPS& sps, const PPS& pps, const 
       externAllocator = false;
     }
   }
-  UserAllocator* userAllocator = externAllocator ? &m_userAllocator : nullptr;
+  // the GPU's allocator is the decoder's own: the pictures are reused as with the internal one
+  UserAllocator* userAllocator = externAllocator ? &m_userAllocator : m_gpuAllocator;
 
   if( m_cPicList.size() < (uint32_t)iMaxRefPicNum + m_parseFrameDelay )
   {

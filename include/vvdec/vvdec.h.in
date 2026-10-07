@@ -495,8 +495,8 @@ typedef struct vvdecParams
   void                 *opaque;             // opaque pointer for private user data ( can be used to carry application specific data or contexts )
   vvdecErrHandlingFlags errHandlingFlags;   // set of flags defining how to handle bitstream errors
 
-  int32_t               reserved_1;         // reserved space for future parameters
-  int32_t               reserved_2;         // ...
+  int32_t               gpu;                // 1: reconstruct the pictures on the GPU with Vulkan, when the library has it ( default: 0, the CPU )
+  int32_t               reserved_2;         // reserved space for future parameters
   int32_t               reserved_3;         // ...
   int32_t               reserved_4;         // ...
 } vvdecParams;

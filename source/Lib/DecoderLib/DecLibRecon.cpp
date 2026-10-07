@@ -129,11 +129,22 @@ DecLibRecon::DecLibRecon()
 #endif
 }
 
+#if VVDEC_VULKAN
+void DecLibRecon::create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled, gpu::Context* gpu )
+#else
 void DecLibRecon::create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled )
+#endif
 {
   // run constructor again to ensure all variables, especially in DecLibParser have been reset
   this->~DecLibRecon();
   new( this ) DecLibRecon;
+
+#if VVDEC_VULKAN
+  if( gpu )
+  {
+    m_gpuRecon = std::make_unique<gpu::GpuRecon>( gpu );
+  }
+#endif
 
 
 #if TRACE_ENABLE_ITT
@@ -201,6 +212,12 @@ void DecLibRecon::destroy()
 
   for( int i = 0; i < m_numDecThreads; i++ ) delete m_pcThreadResource[i];
   delete[] m_pcThreadResource; m_pcThreadResource = nullptr;
+
+  // the filter buffer may be in the GPU's memory: free it while the device is there
+  m_fltBuf.destroy();
+#if VVDEC_VULKAN
+  m_gpuRecon.reset();
+#endif
 }
 
 
@@ -582,7 +599,17 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 
   const TaskType ctuStartState = MIDER;
   const bool     doALF         = cs.sps->getUseALF() && !AdaptiveLoopFilter::getAlfSkipPic( cs );
+#if VVDEC_VULKAN
+  // the GPU filters the whole picture once its CTUs are done (finishReconTask)
+  m_gpuAlf = m_gpuRecon && doALF && gpu::GpuRecon::alfSupported( cs );
+  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuAlf );
+  if( m_gpuRecon && doALF )
+  {
+    ( m_gpuAlf ? m_alfPicturesGpu : m_alfPicturesCpu )++;
+  }
+#else
   commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF );
+#endif
 
   tasksFinishMotion = std::vector<LineTaskParam>( heightInCtus, LineTaskParam{ commonTaskParam, -1 } );
   tasksCtu          = std::vector<CtuTaskParam >( heightInCtus * numTasksPerLine, CtuTaskParam{ commonTaskParam, -1, -1, {} } );
@@ -644,6 +671,12 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 
       if( cs.sps->getUseALF() && !AdaptiveLoopFilter::getAlfSkipPic( cs ) )
       {
+#if VVDEC_VULKAN
+        if( param->decLib->m_gpuAlf )
+        {
+          param->decLib->m_gpuRecon->alf( cs, param->decLib->m_cALF, cs.picture->m_bufs[PIC_RECONSTRUCTION], param->decLib->m_fltBuf );
+        }
+#endif
         param->decLib->swapBufs( cs );
       }
 

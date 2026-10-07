@@ -112,7 +112,7 @@ DecLib::DecLib()
 #endif
 }
 
-void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocator& userAllocator, ErrHandlingFlags errHandlingFlags )
+void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocator& userAllocator, ErrHandlingFlags errHandlingFlags, bool useGpu )
 {
   // run constructor again to ensure all variables, especially in DecLibParser have been reset
   this->~DecLib();
@@ -132,19 +132,54 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
   }
   m_parseFrameDelay = parserFrameDelay;
 
+  UserAllocator* gpuAllocator = nullptr;
+#if VVDEC_VULKAN
+  if( useGpu )
+  {
+    if( userAllocator.enabled )
+    {
+      msg( WARNING, "GPU reconstruction off: it needs the decoder's own picture buffers, not an external allocator\n" );
+    }
+    else if( ( m_gpu = gpu::Context::acquire() ) == nullptr )
+    {
+      msg( WARNING, "GPU reconstruction off: no usable Vulkan device\n" );
+    }
+    else
+    {
+      m_gpuAllocator = gpu::hostPictureAllocator( m_gpu );
+      gpuAllocator   = &m_gpuAllocator;
+    }
+  }
+#else
+  if( useGpu )
+  {
+    msg( WARNING, "GPU reconstruction off: this vvdec is built without Vulkan\n" );
+  }
+#endif
+
   bool upscalingEnabled = false;
-  m_picListManager.create( m_parseFrameDelay, (int) m_decLibRecon.size(), userAllocator );
+  m_picListManager.create( m_parseFrameDelay, (int) m_decLibRecon.size(), userAllocator, gpuAllocator );
   m_decLibParser.create  ( m_decodeThreadPool.get(), m_parseFrameDelay, (int) m_decLibRecon.size(), numDecThreads, errHandlingFlags );
 
   int id=0;
   for( auto &dec: m_decLibRecon )
   {
+#if VVDEC_VULKAN
+    dec.create( m_decodeThreadPool.get(), id++, upscalingEnabled, m_gpu );
+#else
     dec.create( m_decodeThreadPool.get(), id++, upscalingEnabled );
+#endif
   }
 
   std::stringstream cssCap;
   cssCap << "THREADS="     << numDecThreads << "; "
          << "PARSE_DELAY=" << parserFrameDelay << "; ";
+#if VVDEC_VULKAN
+  if( m_gpu )
+  {
+    cssCap << "GPU=" << m_gpu->deviceName() << "; ";
+  }
+#endif
 #if ENABLE_SIMD_OPT
 #  if defined( TARGET_SIMD_ARM )
   cssCap << "SIMD=" << read_arm_extension_name();
@@ -171,12 +206,33 @@ void DecLib::destroy()
   }
 
   m_decLibParser.destroy();
+#if VVDEC_VULKAN
+  if( m_gpu )
+  {
+    int alfGpu = 0, alfCpu = 0;
+    for( auto& dec: m_decLibRecon )
+    {
+      alfGpu += dec.alfPicturesGpu();
+      alfCpu += dec.alfPicturesCpu();
+    }
+    msg( INFO, "GPU: ALF of %d pictures on the GPU, %d on the CPU\n", alfGpu, alfCpu );
+  }
+#endif
   for( auto &dec: m_decLibRecon )
   {
     dec.destroy();
   }
 
   m_picListManager.deleteBuffers();
+
+#if VVDEC_VULKAN
+  // after the last picture buffer is gone
+  if( m_gpu )
+  {
+    gpu::Context::release();
+    m_gpu = nullptr;
+  }
+#endif
 }
 
 Picture* DecLib::decode( InputNALUnit& nalu )

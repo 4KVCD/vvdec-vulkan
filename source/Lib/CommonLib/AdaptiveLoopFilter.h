@@ -125,6 +125,10 @@ public:
   static void reconstructCoeffAPSs( Slice& slice );
   static void reconstructCoeff    ( AlfSliceParam& alfSliceParam, ChannelType channel, const int inputBitDepth );
 
+  // the tables of the fixed filter sets, for the GPU's ALF (VulkanLib/GpuRecon)
+  const short* getFixedFilterSetCoeff( int filterSetIndex ) const { return m_fixedFilterSetCoeffDec[filterSetIndex]; }
+  const short* getClipDefault        ()                     const { return m_clipDefault; }
+
   void ( *m_filter5x5Blk )( const AlfClassifier* classifier, const PelUnitBuf& recDst, const CPelUnitBuf& recSrc,
                             const Area& blk, const ComponentID compId, const short* filterSet, const short* fClipSet,
                             const ClpRng& clpRng, int vbCTUHeight, int vbPos, const bool isFixedFilterSet );

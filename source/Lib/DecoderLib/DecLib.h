@@ -83,11 +83,16 @@ class DecLib
   std::vector<NalUnitType> m_pictureUnitNals;
   std::list<InputNALUnit>  m_pictureSeiNalus;
 
+#if VVDEC_VULKAN
+  gpu::Context*            m_gpu = nullptr;   // the Vulkan device, when the pictures are reconstructed on the GPU
+  UserAllocator            m_gpuAllocator;    // the picture buffers then: host memory the GPU reaches
+#endif
+
 public:
   DecLib();
   ~DecLib() = default;
 
-  void create( int numDecThreads, int parserFrameDelay, const UserAllocator& userAllocator, ErrHandlingFlags errHandlingFlags);
+  void create( int numDecThreads, int parserFrameDelay, const UserAllocator& userAllocator, ErrHandlingFlags errHandlingFlags, bool useGpu = false );
   void destroy();
 
   const char* getDecoderCapabilities() const { return m_sDecoderCapabilities.c_str(); }
