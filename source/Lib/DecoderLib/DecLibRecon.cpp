@@ -685,6 +685,11 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     {
       jobs.clear();
     }
+    m_gpuDmvrCus.resize( pcv->sizeInCtus );
+    for( auto& cus: m_gpuDmvrCus )
+    {
+      cus.clear();
+    }
     // DMVR's refinements: the GPU's, in memory it writes
     pcPic->cs->m_dmvrMvCache = m_gpuRecon->dmvrMvCache( m_dmvrMvCacheSize );
   }
@@ -774,20 +779,13 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
                                         cs.picture->m_bufs[PIC_RECONSTRUCTION] );
         cs.picture->gpuCurrent = true;
 
-        // with DMVR's refinements, which the GPU made, the motion of the
-        // picture for the next ones (TMVP), as the CTU tasks do without the GPU
+        // with DMVR's refinements, which the GPU made, the motion for TMVP in
+        // the next pictures of the CUs DMVR refined (the CTU tasks stored the rest)
         if( dec->m_gpuInter && cs.picture->stillReferenced )
         {
-          for( int line = 0; line < (int) cs.pcv->heightInCtus; line++ )
+          for( int ctuRsAddr = 0; ctuRsAddr < (int) cs.pcv->sizeInCtus; ctuRsAddr++ )
           {
-            for( int col = 0; col < (int) cs.pcv->widthInCtus; col++ )
-            {
-              const int ctuRsAddr = col + line * cs.pcv->widthInCtus;
-              if( !cs.getCtuData( ctuRsAddr ).slice->isIntra() )
-              {
-                dec->m_pcThreadResource[tid]->m_cCuDecoder.TaskFinishMotionInfo( cs, ctuRsAddr, col, line );
-              }
-            }
+            DecCu::finishDmvrMotion( cs, ctuRsAddr, dec->m_gpuDmvrCus[ctuRsAddr] );
           }
         }
       }
@@ -1020,11 +1018,18 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskTrafoCtu( cs, ctuRsAddr, ctuArea );
 
 #if VVDEC_VULKAN
-      // with the GPU, its inter jobs (TaskGpuCtu), and the motion at the end (finishReconTask)
-      if( !ctuData.slice->isIntra() && !param->common.gpuInter )
-#else
-      if( !ctuData.slice->isIntra() )
+      // with the GPU, its inter jobs (TaskGpuCtu); the motion for TMVP here, but
+      // that of the CUs DMVR refines once the GPU has refined it (finishReconTask)
+      if( !ctuData.slice->isIntra() && param->common.gpuInter )
+      {
+        if( cs.picture->stillReferenced )
+        {
+          decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskColMotion( cs, ctuRsAddr );
+        }
+      }
+      else
 #endif
+      if( !ctuData.slice->isIntra() )
       {
         decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskInterCtu( cs, ctuRsAddr, ctuArea );
 
@@ -1073,6 +1078,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
         gpu::CtuJobs jobs;
         jobs.trafo = param->common.gpuResidual ? &decLib.m_gpuTrafoJobs[ctuRsAddr] : nullptr;
         jobs.inter = param->common.gpuInter ? &decLib.m_gpuInterJobs[ctuRsAddr] : nullptr;
+        jobs.dmvr  = param->common.gpuInter ? &decLib.m_gpuDmvrCus[ctuRsAddr] : nullptr;
         jobs.intra = &decLib.m_gpuIntraJobs[ctuRsAddr];
         jobs.waves = &decLib.m_waveMap;
         jobs.refs  = &decLib.m_refTable;

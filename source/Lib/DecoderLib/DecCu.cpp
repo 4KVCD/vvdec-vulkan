@@ -158,60 +158,49 @@ void DecCu::TaskCriticalIntraKernel( CodingStructure &cs, const int ctuRsAddr, c
   }
 }
 
-void DecCu::TaskFinishMotionInfo( CodingStructure &cs, const int ctuRsAddr, const int col, const int row )
+// DMVR's refined motion of a CU where TMVP takes it, on the 8x8 grid: in the
+// motion at( position ) returns, a MotionInfo or a ColocatedMotionInfo
+template<typename At>
+static void storeDmvrMotion( const CodingStructure &cs, const CodingUnit &cu, At at )
 {
-  PROFILER_SCOPE_AND_STAGE_EXT( 1, g_timeProfiler, P_CONTROL_PARSE_DERIVE_LL, cs, CH_L );
+  const int dy = std::min<int>( cu.lumaSize().height, DMVR_SUBCU_HEIGHT );
+  const int dx = std::min<int>( cu.lumaSize().width,  DMVR_SUBCU_WIDTH );
 
-  // first, finish DMVR motion
+  static constexpr unsigned scale = 4 * AMVP_DECIMATION_FACTOR;
+  static constexpr unsigned mask  = scale - 1;
 
-  UnitArea    ctuArea = getCtuArea( cs, col, row, true );
-  MotionBuf   mb      = cs.getMotionBuf( ctuArea.Y() );
-  MotionInfo* orgPtr  = mb.buf;
+  const Position puPos = cu.lumaPos();
+  const Mv mv0 = cu.mv[0][0];
+  const Mv mv1 = cu.mv[1][0];
 
-  for( CodingUnit &cu : cs.traverseCUs( ctuRsAddr ) )
+  for( int y = puPos.y, num = 0; y < ( puPos.y + cu.lumaSize().height ); y = y + dy )
   {
-    CHECKD( !ctuArea.blocks[cu.chType()].contains( cu.blocks[cu.chType()] ), "Should never happen!" );
-    
-    if( isLuma( cu.chType() ) && cu.dmvrCondition() )
+    for( int x = puPos.x; x < ( puPos.x + cu.lumaSize().width ); x = x + dx, num++ )
     {
-      const int dy = std::min<int>( cu.lumaSize().height, DMVR_SUBCU_HEIGHT );
-      const int dx = std::min<int>( cu.lumaSize().width,  DMVR_SUBCU_WIDTH );
-      
-      static constexpr unsigned scale = 4 * AMVP_DECIMATION_FACTOR;
-      static constexpr unsigned mask  = scale - 1;
+      const Mv subPuMv0 = mv0 + cs.m_dmvrMvCache[cu.mvdL0SubPuOff + num];
+      const Mv subPuMv1 = mv1 - cs.m_dmvrMvCache[cu.mvdL0SubPuOff + num];
 
-      const Position puPos = cu.lumaPos();
-      const Mv mv0 = cu.mv[0][0];
-      const Mv mv1 = cu.mv[1][0];
+      int y2 = ( ( y - 1 ) & ~mask ) + scale;
 
-      for( int y = puPos.y, num = 0; y < ( puPos.y + cu.lumaSize().height ); y = y + dy )
+      for( ; y2 < y + dy; y2 += scale )
       {
-        for( int x = puPos.x; x < ( puPos.x + cu.lumaSize().width ); x = x + dx, num++ )
+        int x2 = ( ( x - 1 ) & ~mask ) + scale;
+
+        for( ; x2 < x + dx; x2 += scale )
         {
-          const Mv subPuMv0 = mv0 + cs.m_dmvrMvCache[cu.mvdL0SubPuOff + num];
-          const Mv subPuMv1 = mv1 - cs.m_dmvrMvCache[cu.mvdL0SubPuOff + num];
+          auto& mi = at( Position{ x2, y2 } );
 
-          int y2 = ( ( y - 1 ) & ~mask ) + scale;
-
-          for( ; y2 < y + dy; y2 += scale )
-          {
-            int x2 = ( ( x - 1 ) & ~mask ) + scale;
-
-            for( ; x2 < x + dx; x2 += scale )
-            {
-              mb.buf = orgPtr + cs.inCtuPos( Position{ x2, y2 }, CH_L );
-
-              MotionInfo& mi = *mb.buf;
-
-              mi.mv[0] = subPuMv0;
-              mi.mv[1] = subPuMv1;
-            }
-          }
+          mi.mv[0] = subPuMv0;
+          mi.mv[1] = subPuMv1;
         }
       }
     }
   }
+}
 
+// the motion of a CTU for TMVP in the next pictures: its colocated motion
+static void storeColMotion( CodingStructure &cs, const int ctuRsAddr )
+{
   CtuData &ctuData = cs.getCtuData( ctuRsAddr );
 
   const int size4x4 = (int)cs.get4x4MapStride();
@@ -234,7 +223,48 @@ void DecCu::TaskFinishMotionInfo( CodingStructure &cs, const int ctuRsAddr, cons
     }
   }
 }
+
+void DecCu::TaskFinishMotionInfo( CodingStructure &cs, const int ctuRsAddr, const int col, const int row )
+{
+  PROFILER_SCOPE_AND_STAGE_EXT( 1, g_timeProfiler, P_CONTROL_PARSE_DERIVE_LL, cs, CH_L );
+
+  // first, finish DMVR motion
+
+  UnitArea    ctuArea = getCtuArea( cs, col, row, true );
+  MotionBuf   mb      = cs.getMotionBuf( ctuArea.Y() );
+  MotionInfo* orgPtr  = mb.buf;
+
+  for( CodingUnit &cu : cs.traverseCUs( ctuRsAddr ) )
+  {
+    CHECKD( !ctuArea.blocks[cu.chType()].contains( cu.blocks[cu.chType()] ), "Should never happen!" );
+
+    if( isLuma( cu.chType() ) && cu.dmvrCondition() )
+    {
+      storeDmvrMotion( cs, cu, [&]( Position pos ) -> MotionInfo& { return orgPtr[cs.inCtuPos( pos, CH_L )]; } );
+    }
+  }
+
+  storeColMotion( cs, ctuRsAddr );
+}
 #if VVDEC_VULKAN
+void DecCu::TaskColMotion( CodingStructure &cs, const int ctuRsAddr )
+{
+  PROFILER_SCOPE_AND_STAGE_EXT( 1, g_timeProfiler, P_CONTROL_PARSE_DERIVE_LL, cs, CH_L );
+
+  storeColMotion( cs, ctuRsAddr );
+}
+
+void DecCu::finishDmvrMotion( CodingStructure &cs, const int ctuRsAddr, const std::vector<const CodingUnit*>& cus )
+{
+  // into the colocated motion only, which TaskColMotion copied: nothing reads
+  // the CTU's motion any more
+  ColocatedMotionInfo* colMotion = cs.getCtuData( ctuRsAddr ).colMotion;
+  for( const CodingUnit* cu: cus )
+  {
+    storeDmvrMotion( cs, *cu, [&]( Position pos ) -> ColocatedMotionInfo& { return colMotion[cs.colMotPos( pos )]; } );
+  }
+}
+
 void DecCu::TaskGpuCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, const gpu::CtuJobs& jobs )
 {
   PROFILER_SCOPE_AND_STAGE_EXT( 1, g_timeProfiler, P_CONTROL_PARSE_DERIVE_LL, cs, CH_L );
@@ -259,6 +289,10 @@ void DecCu::TaskGpuCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea
     else if( jobs.inter )
     {
       xGpuInterJobs( currCU, *jobs.inter, *jobs.refs, jobs.trafo );
+      if( jobs.dmvr && currCU.dmvrCondition() )
+      {
+        jobs.dmvr->push_back( &currCU );
+      }
     }
     else if( currCU.rootCbf() )
     {
