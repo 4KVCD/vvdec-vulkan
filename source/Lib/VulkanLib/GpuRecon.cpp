@@ -322,7 +322,8 @@ void GpuRecon::beginCommands()
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vk.vkBeginCommandBuffer( m_cmd, &begin );
 
-  m_marks = 0;
+  m_marks   = 0;
+  m_gapMark = 0;
   if( m_queries )
   {
     vk.vkCmdResetQueryPool( m_cmd, m_queries, 0, kMaxMarks );
@@ -379,6 +380,13 @@ void GpuRecon::splitCommands()
   barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
   barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
   vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+  // the GPU profile: the time until the rest begins (other pictures' work may
+  // run between the parts) counts apart, not as the picture's or its next pass's
+  if( m_queries )
+  {
+    mark( "between the parts" );
+    m_gapMark = m_marks - 1;
+  }
 }
 
 void GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
@@ -471,7 +479,8 @@ void GpuRecon::readTimestamps( double waited )
     {
       m_ctx->addTime( m_labels[i], double( stamps[i] - stamps[i - 1] ) * toMs );
     }
-    m_ctx->addTime( "submission (GPU)", double( stamps[m_marks - 1] - stamps[0] ) * toMs );
+    const uint64_t between = m_gapMark > 0 ? stamps[m_gapMark] - stamps[m_gapMark - 1] : 0;
+    m_ctx->addTime( "submission (GPU)", double( stamps[m_marks - 1] - stamps[0] - between ) * toMs );
   }
 }
 

@@ -190,6 +190,7 @@ private:
   VkQueryPool     m_transferQueries = VK_NULL_HANDLE;
   const char*     m_labels[kMaxMarks];
   uint32_t        m_marks   = 0;
+  uint32_t        m_gapMark = 0;   // the mark that ends the time between the picture's parts (0: none)
   Buffer          m_params;
   Buffer          m_scratch[MAX_NUM_COMPONENT];     // a picture's worth of GPU memory (SAO's or ALF's output), from the pool while its work is recorded
   Buffer          m_lfp;                            // the deblocking parameters
