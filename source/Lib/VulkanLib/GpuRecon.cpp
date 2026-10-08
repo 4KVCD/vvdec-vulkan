@@ -841,7 +841,8 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
     }
     computeBarrier();   // the waves before
     vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
-    vk.vkCmdDispatch( m_cmd, ( push.count + 63 ) / 64, 1, 1 );
+    // a workgroup per job, in rows of 32768 (shaders/intra.slang)
+    vk.vkCmdDispatch( m_cmd, uint32_t( std::min( push.count, 32768 ) ), uint32_t( ( push.count + 32767 ) / 32768 ), 1 );
   }
   mark( "intra" );
 }

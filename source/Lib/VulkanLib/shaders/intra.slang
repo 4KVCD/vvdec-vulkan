@@ -87,116 +87,102 @@ int sampleAt( int comp, int x, int y )
 // the reference samples, as vvdec's xFillReferenceSamples (and
 // xFilterReferenceSamples) lay them out: t[0] is the top-left sample, t[1..]
 // the row above (above-right included), l[0] the top-left again, l[1..] the
-// column to the left (below-left included)
-static int t[MAX_REF];
-static int l[MAX_REF];
-static int tf[MAX_REF];
-static int lf[MAX_REF];
+// column to the left (below-left included); shared by the block's threads
+groupshared int t[MAX_REF];
+groupshared int l[MAX_REF];
+groupshared int tf[MAX_REF];
+groupshared int lf[MAX_REF];
+groupshared int  s_dc;      // DC's value
+groupshared int3 s_model;   // CCLM's a, b, shift
 
-void fillReferences( int comp, int x0, int y0, int w, int h, int nTL, int nAbove, int nLeft )
+// xFillReferenceSamples, each sample by itself: the available ones read, the
+// others padded from the nearest available one (or the middle value)
+void fillReferences( int tid, int comp, int x0, int y0, int w, int h, int nTL, int nAbove, int nLeft )
 {
-  const int predSize  = w << 1;
-  const int predHSize = h << 1;
-  const int unitW     = comp == 0 ? 4 : ( 4 >> pc.scaleX );
-  const int unitH     = comp == 0 ? 4 : ( 4 >> pc.scaleY );
-  const int totalUnits = predSize / unitW + predHSize / unitH + 1;
+  const int predSize    = w << 1;
+  const int predHSize   = h << 1;
+  const int unitW       = comp == 0 ? 4 : ( 4 >> pc.scaleX );
+  const int unitH       = comp == 0 ? 4 : ( 4 >> pc.scaleY );
+  const int totalUnits  = predSize / unitW + predHSize / unitH + 1;
   const int numNeighbor = nTL + nAbove + nLeft;
+  const int tmpA        = min( nAbove * unitW, predSize );
+  const int tmpL        = min( nLeft * unitH, predHSize );
+  const int dc          = 1 << ( pc.bitDepth - 1 );
+  const bool all        = numNeighbor == totalUnits;
 
+  int topLeft;
   if( numNeighbor == 0 )
   {
-    const int dc = 1 << ( pc.bitDepth - 1 );
-    for( int j = 0; j <= predSize; j++ )
-    {
-      t[j] = dc;
-    }
-    for( int i = 0; i <= predHSize; i++ )
-    {
-      l[i] = dc;
-    }
-    return;
+    topLeft = dc;
   }
-  if( numNeighbor == totalUnits )
+  else if( all || ( nLeft > 0 && nTL != 0 ) )
   {
-    for( int j = 0; j <= predSize; j++ )
-    {
-      t[j] = sampleAt( comp, x0 - 1 + j, y0 - 1 );
-    }
-    l[0] = t[0];
-    for( int i = 1; i <= predHSize; i++ )
-    {
-      l[i] = sampleAt( comp, x0 - 1, y0 + i - 1 );
-    }
-    return;
-  }
-  if( nLeft > 0 )
-  {
-    const int tmpSize = min( nLeft * unitH, predHSize );
-    for( int i = 0; i < tmpSize; i++ )
-    {
-      l[1 + i] = sampleAt( comp, x0 - 1, y0 + i );
-    }
-    for( int i = tmpSize; i < predHSize; i++ )
-    {
-      l[1 + i] = l[tmpSize];
-    }
-    t[0] = nTL != 0 ? sampleAt( comp, x0 - 1, y0 - 1 ) : sampleAt( comp, x0 - 1, y0 );
-    if( nAbove != 0 )
-    {
-      const int tmpA = min( nAbove * unitW, predSize );
-      for( int i = 0; i < tmpA; i++ )
-      {
-        t[1 + i] = sampleAt( comp, x0 + i, y0 - 1 );
-      }
-      for( int i = tmpA; i < predSize; i++ )
-      {
-        t[1 + i] = t[tmpA];
-      }
-    }
-    else
-    {
-      for( int i = 0; i < predSize; i++ )
-      {
-        t[1 + i] = t[0];
-      }
-    }
+    topLeft = sampleAt( comp, x0 - 1, y0 - 1 );
   }
   else
   {
-    const int tmpA = min( nAbove * unitW, predSize );
-    for( int i = 0; i < tmpA; i++ )
-    {
-      t[1 + i] = sampleAt( comp, x0 + i, y0 - 1 );
-    }
-    for( int i = tmpA; i < predSize; i++ )
-    {
-      t[1 + i] = t[tmpA];
-    }
-    const int first = sampleAt( comp, x0, y0 - 1 );
-    t[0] = first;
-    for( int i = 0; i < predHSize; i++ )
-    {
-      l[1 + i] = first;
-    }
+    // left: the top of the left column; else the first above (vvdec: when the
+    // left is missing, the above is there)
+    topLeft = nLeft > 0 ? sampleAt( comp, x0 - 1, y0 ) : sampleAt( comp, x0, y0 - 1 );
   }
-  l[0] = t[0];
+
+  for( int j = tid; j <= predSize; j += 64 )
+  {
+    int v;
+    if( j == 0 || numNeighbor == 0 )
+    {
+      v = topLeft;
+    }
+    else if( all )
+    {
+      v = sampleAt( comp, x0 - 1 + j, y0 - 1 );
+    }
+    else if( nAbove != 0 )
+    {
+      v = sampleAt( comp, x0 + min( j - 1, tmpA - 1 ), y0 - 1 );
+    }
+    else
+    {
+      v = topLeft;
+    }
+    t[j] = v;
+  }
+  for( int i = tid; i <= predHSize; i += 64 )
+  {
+    int v;
+    if( i == 0 || numNeighbor == 0 )
+    {
+      v = topLeft;
+    }
+    else if( all )
+    {
+      v = sampleAt( comp, x0 - 1, y0 + i - 1 );
+    }
+    else if( nLeft > 0 )
+    {
+      v = sampleAt( comp, x0 - 1, y0 + min( i - 1, tmpL - 1 ) );
+    }
+    else
+    {
+      v = topLeft;
+    }
+    l[i] = v;
+  }
 }
 
-void filterReferences( int w, int h )
+// xFilterReferenceSamples' [1 2 1] filter, each sample by itself (after the fill)
+void filterReferences( int tid, int w, int h )
 {
   const int predSize  = w << 1;
   const int predHSize = h << 1;
-  lf[predHSize] = l[predHSize];
-  for( int i = predHSize - 1; i >= 1; i-- )
+  for( int i = tid; i <= predHSize; i += 64 )
   {
-    lf[i] = ( l[i + 1] + 2 * l[i] + l[i - 1] + 2 ) >> 2;
+    lf[i] = i == predHSize ? l[i] : ( i == 0 ? ( l[1] + 2 * t[0] + t[1] + 2 ) >> 2 : ( l[i + 1] + 2 * l[i] + l[i - 1] + 2 ) >> 2 );
   }
-  tf[0] = ( l[1] + 2 * t[0] + t[1] + 2 ) >> 2;
-  lf[0] = tf[0];
-  for( int i = 1; i < predSize; i++ )
+  for( int i = tid; i <= predSize; i += 64 )
   {
-    tf[i] = ( t[i + 1] + 2 * t[i] + t[i - 1] + 2 ) >> 2;
+    tf[i] = i == predSize ? t[i] : ( i == 0 ? ( l[1] + 2 * t[0] + t[1] + 2 ) >> 2 : ( t[i + 1] + 2 * t[i] + t[i - 1] + 2 ) >> 2 );
   }
-  tf[predSize] = t[predSize];
 }
 
 int refT( bool filtered, int i )
@@ -558,15 +544,19 @@ int3 cclmParameters( int x0, int y0, uint lm, uint lm2 )
   return int3( a, minC - ( ( a * minY ) >> shift ), shift );
 }
 
+// a workgroup per job (a block of a component): the threads fill the
+// references together, then share out the block's samples
 [shader( "compute" )]
 [numthreads( 64, 1, 1 )]
-void main( uint3 id : SV_DispatchThreadID )
+void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
-  if( int( id.x ) >= pc.count )
+  const int index = int( group.x ) + int( group.y ) * 32768;
+  if( index >= pc.count )
   {
-    return;
+    return;   // the whole workgroup
   }
-  uint*       job    = pc.jobs + ( pc.first + int( id.x ) ) * 8;
+  const int   tid    = int( local.x );
+  uint*       job    = pc.jobs + ( pc.first + index ) * 8;
   const int   x0     = int( job[0] & 0xffff );
   const int   y0     = int( job[0] >> 16 );
   const int   w      = int( job[1] & 255 );
@@ -584,41 +574,53 @@ void main( uint3 id : SV_DispatchThreadID )
 
   // per block: the references and what the predictor needs of them
   Angular ang;
-  int     dc    = 0;
-  int3    model = int3( 0, 0, 0 );
   bool    lmAbove = false, lmLeft = false;
   if( kind != 3 )
   {
     const uint nb = job[3];
-    fillReferences( comp, x0, y0, w, h, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ) );
+    fillReferences( tid, comp, x0, y0, w, h, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ) );
+    GroupMemoryBarrierWithGroupSync();
     if( filtered )
     {
-      filterReferences( w, h );
+      filterReferences( tid, w, h );
+      GroupMemoryBarrierWithGroupSync();
     }
     if( kind == 2 )
     {
-      model   = cclmParameters( x0, y0, job[4], job[5] );
+      if( tid == 0 )
+      {
+        s_model = cclmParameters( x0, y0, job[4], job[5] );
+      }
       lmAbove = ( ( job[4] >> 16 ) & 1 ) != 0;
       lmLeft  = ( ( job[4] >> 17 ) & 1 ) != 0;
+      GroupMemoryBarrierWithGroupSync();
     }
     else if( kind == 0 && mode == DC_IDX )
     {
-      dc = dcValue( filtered, w, h );
+      if( tid == 0 )
+      {
+        s_dc = dcValue( filtered, w, h );
+      }
+      GroupMemoryBarrierWithGroupSync();
     }
     else if( kind == 0 && mode != PLANAR_IDX )
     {
       ang = setupAngular( comp, w, h, mode );
     }
   }
+  const int  dc    = s_dc;
+  const int3 model = s_model;
 
   const int  bdpcmDir = int( ( job[2] >> 16 ) & 255 );
   const bool doPdpcPlanarDc = kind == 0 && ( mode == PLANAR_IDX || mode == DC_IDX ) && w >= 4 && h >= 4;
   const int  bvx = int( int16_t( job[6] & 0xffff ) );
   const int  bvy = int( int16_t( job[6] >> 16 ) );
+  const int  log2W = log2Int( w );
 
-  for( int y = 0; y < h; y++ )
+  for( int s = tid; s < w * h; s += 64 )
   {
-    for( int x = 0; x < w; x++ )
+    const int x = s & ( w - 1 );
+    const int y = s >> log2W;
     {
       int v;
       if( kind == 3 )
