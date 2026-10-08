@@ -200,6 +200,11 @@ private:
     bool           deblock = false, sao = false;
     size_t         dbSize = 0, alfSize = 0, saoSize = 0, refs = 0;
   } m_prepared;
+  // the buffers the CPU only writes, in order, and the shaders read -- the
+  // filters' parameters with the reference table, the jobs, the edges, the
+  // transform matrices -- are MemKind::Upload: in the GPU's own memory where
+  // the BAR allows (VideoQ 4K: the GPU's time a picture -1%; the CPU's
+  // write-combined copies of the jobs no slower)
   Buffer          m_params;
   Buffer          m_scratch[MAX_NUM_COMPONENT];     // a picture's worth of GPU memory (SAO's or ALF's output), from the pool while its work is recorded
   Buffer          m_dmvr;                           // DMVR's refinements

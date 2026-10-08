@@ -232,7 +232,7 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
       count += size_t( matrix.second ) * matrix.second;
     }
     CHECK_FATAL( count != 8180, "Vulkan: the transform matrices are not those of shaders/trafo.slang" );
-    m_matrices = m_ctx->alloc( count * sizeof( int16_t ), MemKind::HostCached );
+    m_matrices = m_ctx->alloc( count * sizeof( int16_t ), MemKind::Upload );
     int16_t* to = reinterpret_cast<int16_t*>( m_matrices.mapped );
     for( const auto& matrix: matrices )
     {
@@ -313,7 +313,7 @@ uint8_t* GpuRecon::params( size_t size )
   if( m_params.size < size )
   {
     m_ctx->free( m_params );
-    m_params = m_ctx->alloc( size, MemKind::HostCached );
+    m_params = m_ctx->alloc( size, MemKind::Upload );
   }
   return m_params.mapped;
 }
@@ -975,7 +975,7 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
   if( m_edges.size < first[4] * sizeof( Edge ) )
   {
     m_ctx->free( m_edges );
-    m_edges = m_ctx->alloc( std::max<size_t>( first[4], 1024 ) * 2 * sizeof( Edge ), MemKind::HostCached );
+    m_edges = m_ctx->alloc( std::max<size_t>( first[4], 1024 ) * 2 * sizeof( Edge ), MemKind::Upload );
   }
   Edge* all = reinterpret_cast<Edge*>( m_edges.mapped );
   for( int l = 0; l < 4; l++ )
@@ -1003,7 +1003,9 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
     }
     push.dir = dir;
 
-    // a thread per edge of the list
+    // a thread per edge of the list (the luma filters load and store 4
+    // samples at a time, from multiples of 4: the rows 8-byte aligned)
+    CHECK_FATAL( planes.addr[COMPONENT_Y] % 8 != 0 || planes.stride[COMPONENT_Y] % 4 != 0, "Vulkan: the luma rows are not 8-byte aligned" );
     push.pic0   = planes.addr[COMPONENT_Y];
     push.pic1   = 0;
     push.stride = planes.stride[COMPONENT_Y];
@@ -1013,7 +1015,7 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
     push.count  = int32_t( first[dir + 1] - first[dir] );
     if( push.count > 0 )
     {
-      vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_deblock_luma ) );
+      vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( dir == 0 ? kShader_deblock_luma_ver : kShader_deblock_luma_hor ) );
       vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
       vk.vkCmdDispatch( m_cmd, uint32_t( ( push.count + 63 ) / 64 ), 1, 1 );
     }
@@ -1097,7 +1099,7 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   if( m_intraJobs.size < size )
   {
     m_ctx->free( m_intraJobs );
-    m_intraJobs = m_ctx->alloc( size * 2, MemKind::HostCached );
+    m_intraJobs = m_ctx->alloc( size * 2, MemKind::Upload );
   }
   IntraJob*             sorted = reinterpret_cast<IntraJob*>( m_intraJobs.mapped );
   uint32_t*             waits  = reinterpret_cast<uint32_t*>( sorted + total );
@@ -1109,9 +1111,10 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
       const int rows = bandRows( job );
       for( int row = 0; row < job.height(); row += rows )
       {
-        const uint32_t at = next[job.wave()]++;
-        sorted[at]        = job;
-        sorted[at].setRows( row, std::min( rows, job.height() - row ) );
+        const uint32_t at   = next[job.wave()]++;
+        IntraJob       band = job;
+        band.setRows( row, std::min( rows, job.height() - row ) );
+        sorted[at] = band;
         waits[at] = first[job.wave()];
       }
     }
@@ -1219,7 +1222,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   if( m_interJobs.size < size )
   {
     m_ctx->free( m_interJobs );
-    m_interJobs = m_ctx->alloc( size * 2, MemKind::HostCached );
+    m_interJobs = m_ctx->alloc( size * 2, MemKind::Upload );
   }
   InterJob* all = reinterpret_cast<InterJob*>( m_interJobs.mapped );
   for( const auto& ctu: jobs )
@@ -1312,7 +1315,7 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   if( m_trafoJobs.size < size )
   {
     m_ctx->free( m_trafoJobs );
-    m_trafoJobs = m_ctx->alloc( size * 2, MemKind::HostCached );
+    m_trafoJobs = m_ctx->alloc( size * 2, MemKind::Upload );
   }
   TrafoJob* all = reinterpret_cast<TrafoJob*>( m_trafoJobs.mapped );
   for( const auto& ctu: jobs )

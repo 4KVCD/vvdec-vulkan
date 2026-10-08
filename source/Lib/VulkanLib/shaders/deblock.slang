@@ -3,7 +3,8 @@
 // another dispatch, all horizontal ones (dir 1). VVC keeps the edges of one
 // direction apart enough that each can be filtered on its own.
 //
-// CHROMA=0: a thread filters 4 lines across one luma edge of a 4x4 block.
+// CHROMA=0: a thread filters 4 lines across one luma edge of a 4x4 block,
+//           the vertical edges with DIR=0, the horizontal ones with DIR=1.
 // CHROMA=1: a thread filters the lines across one chroma edge segment, for Cb
 //           and Cr, at the positions vvdec's xDeblockCtuArea visits.
 // The edges come as a list, those the CPU found to filter, each with the
@@ -13,6 +14,10 @@
 // of Y, Cb, Cr.
 
 #include "common.slang"
+
+#ifndef DIR
+#define DIR 0
+#endif
 
 struct Params
 {
@@ -124,28 +129,82 @@ int calcDQ( int16_t* p, int base, int off )
 #if CHROMA == 0
 
 static const int kDbCoeffs7[7] = { 59, 50, 41, 32, 23, 14, 5 };
-static const int kDbCoeffs5[5] = { 58, 45, 32, 19, 6 };
-static const int kDbCoeffs3[3] = { 53, 32, 11 };
+static const int kDbCoeffs5[7] = { 58, 45, 32, 19, 6, 0, 0 };
+static const int kDbCoeffs3[7] = { 53, 32, 11, 0, 0, 0, 0 };
 static const int kTc7[7]       = { 6, 5, 4, 3, 2, 1, 1 };
-static const int kTc3[3]       = { 6, 4, 2 };
+static const int kTc3[7]       = { 6, 4, 2, 0, 0, 0, 0 };
+
+// A line across the edge, in registers: s[7 - j] = p_j, s[8 + j] = q_j (p7 .. q7; the samples a filter does not
+// reach are left out of the loads, and of these arrays' uses).
+
+// sample c of 4 in 8 bytes
+int sample4( uint2 u, int c )
+{
+  return c == 0 ? int( u.x & 0xffff ) : ( c == 1 ? int( u.x >> 16 ) : ( c == 2 ? int( u.y & 0xffff ) : int( u.y >> 16 ) ) );
+}
+
+uint2 pack4( int a, int b, int c, int d )
+{
+  return uint2( uint( a ) | uint( b ) << 16, uint( c ) | uint( d ) << 16 );
+}
+
+// xUseStrongFiltering on a line
+bool strongLine( int s[16], int d, int beta, int tc, bool largeP, bool largeQ, int maxP, int maxQ )
+{
+  const int p0 = s[7];
+  const int q0 = s[8];
+  if( !( d < ( beta >> 2 ) && abs( p0 - q0 ) < ( ( tc * 5 + 1 ) >> 1 ) ) )
+  {
+    return false;
+  }
+  const int p3      = s[4];
+  const int q3      = s[11];
+  int       sp3     = abs( p3 - p0 );
+  int       sq3     = abs( q3 - q0 );
+  const int dStrong = sp3 + sq3;
+  if( largeP || largeQ )
+  {
+    if( largeP )
+    {
+      const int pMax = maxP == 7 ? s[0] : s[2];   // p7 or p5
+      if( maxP == 7 )
+      {
+        sp3 = sp3 + abs( s[3] - s[2] - s[1] + pMax );   // p4 - p5 - p6 + p7
+      }
+      sp3 = ( sp3 + abs( p3 - pMax ) + 1 ) >> 1;
+    }
+    if( largeQ )
+    {
+      const int qMax = maxQ == 7 ? s[15] : s[13];   // q7 or q5
+      if( maxQ == 7 )
+      {
+        sq3 = sq3 + abs( s[12] - s[13] - s[14] + qMax );   // q4 - q5 - q6 + q7
+      }
+      sq3 = ( sq3 + abs( qMax - q3 ) + 1 ) >> 1;
+    }
+    return ( sp3 + sq3 ) < ( ( beta * 3 ) >> 5 ) && d < ( beta >> 4 ) && abs( p0 - q0 ) < ( ( tc * 5 + 1 ) >> 1 );
+  }
+  return dStrong < ( beta >> 3 );
+}
 
 int dbCoeff( int n, int pos )
 {
   return n == 7 ? kDbCoeffs7[pos] : ( n == 5 ? kDbCoeffs5[pos] : kDbCoeffs3[pos] );
 }
 
-// the long filters (xFilteringPandQCore), one line
-void filteringPandQ( int base, int off, int nP, int nQ, int tc )
+// the long filters (xFilteringPandQCore) on a line: p0 .. p(nP - 1), q0 .. q(nQ - 1), nP and nQ 3, 5 or 7
+void longLine( inout int s[16], int nP, int nQ, int tc )
 {
   int ps[8], qs[8];
+  [unroll]
   for( int k = 0; k < 8; k++ )
   {
-    ps[k] = rd( pc.pic0, base, off, -1 - k );
-    qs[k] = rd( pc.pic0, base, off, k );
+    ps[k] = s[7 - k];
+    qs[k] = s[8 + k];
   }
-  const int refP = ( ps[nP - 1] + ps[nP] + 1 ) >> 1;
-  const int refQ = ( qs[nQ - 1] + qs[nQ] + 1 ) >> 1;
-  int refMiddle;
+  const int refP = nP == 7 ? ( ps[6] + ps[7] + 1 ) >> 1 : ( nP == 5 ? ( ps[4] + ps[5] + 1 ) >> 1 : ( ps[2] + ps[3] + 1 ) >> 1 );
+  const int refQ = nQ == 7 ? ( qs[6] + qs[7] + 1 ) >> 1 : ( nQ == 5 ? ( qs[4] + qs[5] + 1 ) >> 1 : ( qs[2] + qs[3] + 1 ) >> 1 );
+  int       refMiddle;
   if( nP == nQ )
   {
     if( nP == 5 )
@@ -168,10 +227,12 @@ void filteringPandQ( int base, int off, int nP, int nQ, int tc )
     else if( longN == 7 && shortN == 3 )
     {
       int ls[7], ss[3];
+      [unroll]
       for( int k = 0; k < 7; k++ )
       {
         ls[k] = nP == 7 ? ps[k] : qs[k];
       }
+      [unroll]
       for( int k = 0; k < 3; k++ )
       {
         ss[k] = nP == 7 ? qs[k] : ps[k];
@@ -183,41 +244,45 @@ void filteringPandQ( int base, int off, int nP, int nQ, int tc )
       refMiddle = ( ps[0] + qs[0] + ps[1] + qs[1] + ps[2] + qs[2] + ps[3] + qs[3] + 4 ) >> 3;
     }
   }
-  for( int pos = 0; pos < nP; pos++ )
+  [unroll]
+  for( int pos = 0; pos < 7; pos++ )
   {
-    const int src    = ps[pos];
-    const int cvalue = ( tc * ( nP == 3 ? kTc3[pos] : kTc7[pos] ) ) >> 1;
-    const int c      = dbCoeff( nP, pos );
-    wr( pc.pic0, base, off, -1 - pos, clip3( src - cvalue, src + cvalue, ( refMiddle * c + refP * ( 64 - c ) + 32 ) >> 6 ) );
-  }
-  for( int pos = 0; pos < nQ; pos++ )
-  {
-    const int src    = qs[pos];
-    const int cvalue = ( tc * ( nQ == 3 ? kTc3[pos] : kTc7[pos] ) ) >> 1;
-    const int c      = dbCoeff( nQ, pos );
-    wr( pc.pic0, base, off, pos, clip3( src - cvalue, src + cvalue, ( refMiddle * c + refQ * ( 64 - c ) + 32 ) >> 6 ) );
+    if( pos < nP )
+    {
+      const int src    = ps[pos];
+      const int cvalue = ( tc * ( nP == 3 ? kTc3[pos] : kTc7[pos] ) ) >> 1;
+      const int c      = dbCoeff( nP, pos );
+      s[7 - pos]       = clip3( src - cvalue, src + cvalue, ( refMiddle * c + refP * ( 64 - c ) + 32 ) >> 6 );
+    }
+    if( pos < nQ )
+    {
+      const int src    = qs[pos];
+      const int cvalue = ( tc * ( nQ == 3 ? kTc3[pos] : kTc7[pos] ) ) >> 1;
+      const int c      = dbCoeff( nQ, pos );
+      s[8 + pos]       = clip3( src - cvalue, src + cvalue, ( refMiddle * c + refQ * ( 64 - c ) + 32 ) >> 6 );
+    }
   }
 }
 
-// the normal filters (xPelFilterLumaCorePel), one line
-void pelFilterLuma( int base, int off, int tc, bool sw, int thrCut, bool filterSecondP, bool filterSecondQ, int maxVal )
+// the normal filters (xPelFilterLumaCorePel) on a line
+void normalLine( inout int s[16], int tc, bool sw, int thrCut, bool filterSecondP, bool filterSecondQ, int maxVal )
 {
-  const int m1 = rd( pc.pic0, base, off, -3 );
-  const int m2 = rd( pc.pic0, base, off, -2 );
-  const int m3 = rd( pc.pic0, base, off, -1 );
-  const int m4 = rd( pc.pic0, base, off, 0 );
-  const int m5 = rd( pc.pic0, base, off, 1 );
-  const int m6 = rd( pc.pic0, base, off, 2 );
+  const int m1 = s[5];
+  const int m2 = s[6];
+  const int m3 = s[7];
+  const int m4 = s[8];
+  const int m5 = s[9];
+  const int m6 = s[10];
   if( sw )
   {
-    const int m0 = rd( pc.pic0, base, off, -4 );
-    const int m7 = rd( pc.pic0, base, off, 3 );
-    wr( pc.pic0, base, off, -3, clip3( m1 - tc, m1 + tc, ( 2 * m0 + 3 * m1 + m2 + m3 + m4 + 4 ) >> 3 ) );
-    wr( pc.pic0, base, off, -2, clip3( m2 - 2 * tc, m2 + 2 * tc, ( m1 + m2 + m3 + m4 + 2 ) >> 2 ) );
-    wr( pc.pic0, base, off, -1, clip3( m3 - 3 * tc, m3 + 3 * tc, ( m1 + 2 * m2 + 2 * m3 + 2 * m4 + m5 + 4 ) >> 3 ) );
-    wr( pc.pic0, base, off, 0, clip3( m4 - 3 * tc, m4 + 3 * tc, ( m2 + 2 * m3 + 2 * m4 + 2 * m5 + m6 + 4 ) >> 3 ) );
-    wr( pc.pic0, base, off, 1, clip3( m5 - 2 * tc, m5 + 2 * tc, ( m3 + m4 + m5 + m6 + 2 ) >> 2 ) );
-    wr( pc.pic0, base, off, 2, clip3( m6 - tc, m6 + tc, ( m3 + m4 + m5 + 3 * m6 + 2 * m7 + 4 ) >> 3 ) );
+    const int m0 = s[4];
+    const int m7 = s[11];
+    s[5]  = clip3( m1 - tc, m1 + tc, ( 2 * m0 + 3 * m1 + m2 + m3 + m4 + 4 ) >> 3 );
+    s[6]  = clip3( m2 - 2 * tc, m2 + 2 * tc, ( m1 + m2 + m3 + m4 + 2 ) >> 2 );
+    s[7]  = clip3( m3 - 3 * tc, m3 + 3 * tc, ( m1 + 2 * m2 + 2 * m3 + 2 * m4 + m5 + 4 ) >> 3 );
+    s[8]  = clip3( m4 - 3 * tc, m4 + 3 * tc, ( m2 + 2 * m3 + 2 * m4 + 2 * m5 + m6 + 4 ) >> 3 );
+    s[9]  = clip3( m5 - 2 * tc, m5 + 2 * tc, ( m3 + m4 + m5 + m6 + 2 ) >> 2 );
+    s[10] = clip3( m6 - tc, m6 + tc, ( m3 + m4 + m5 + 3 * m6 + 2 * m7 + 4 ) >> 3 );
   }
   else
   {
@@ -226,21 +291,31 @@ void pelFilterLuma( int base, int off, int tc, bool sw, int thrCut, bool filterS
     {
       delta         = clip3( -tc, tc, delta );
       const int tc2 = tc >> 1;
-      wr( pc.pic0, base, off, -1, clip3( 0, maxVal, m3 + delta ) );
+      s[7]          = clip3( 0, maxVal, m3 + delta );
       if( filterSecondP )
       {
-        const int delta1 = clip3( -tc2, tc2, ( ( ( m1 + m3 + 1 ) >> 1 ) - m2 + delta ) >> 1 );
-        wr( pc.pic0, base, off, -2, clip3( 0, maxVal, m2 + delta1 ) );
+        s[6] = clip3( 0, maxVal, m2 + clip3( -tc2, tc2, ( ( ( m1 + m3 + 1 ) >> 1 ) - m2 + delta ) >> 1 ) );
       }
-      wr( pc.pic0, base, off, 0, clip3( 0, maxVal, m4 - delta ) );
+      s[8] = clip3( 0, maxVal, m4 - delta );
       if( filterSecondQ )
       {
-        const int delta2 = clip3( -tc2, tc2, ( ( ( m6 + m4 + 1 ) >> 1 ) - m5 - delta ) >> 1 );
-        wr( pc.pic0, base, off, 1, clip3( 0, maxVal, m5 + delta2 ) );
+        s[9] = clip3( 0, maxVal, m5 + clip3( -tc2, tc2, ( ( ( m6 + m4 + 1 ) >> 1 ) - m5 - delta ) >> 1 ) );
       }
     }
   }
 }
+
+// The samples of the edge's 4 lines, 8 bytes a load: with DIR 0 (a vertical edge at x), line i is the row y + i,
+// v[4 i + g] its samples x - 8 + 4 g .. x - 5 + 4 g (g 1 and 2: p3 .. q3; 0 and 3: the long filters' p7 .. p4 and
+// q4 .. q7); with DIR 1 (a horizontal edge at y), v[r] is the row y - 8 + r, sample i of it line i's (the columns x
+// .. x + 3). (A thread made some 40 loads of 2 bytes before: VideoQ 4K's vertical edges took 8% longer. What remains
+// of their cost, twice the horizontal edges' an edge, is the cache lines: each line of a vertical edge's 4 is in
+// another, of which it uses 16 bytes.)
+#if DIR == 0
+#define SMP( i, k ) sample4( v[4 * ( i ) + ( ( k ) >> 2 )], ( k ) & 3 )
+#else
+#define SMP( i, k ) sample4( v[k], i )
+#endif
 
 [shader( "compute" )]
 [numthreads( 64, 1, 1 )]
@@ -265,10 +340,12 @@ void main( uint3 id : SV_DispatchThreadID )
   const int maxFilterLengthQ = sideMax & 7;
   bool      largeP           = maxFilterLengthP > 3;
   const bool largeQ          = maxFilterLengthQ > 3;
-  if( pc.dir == 1 && ( y & ( ( 1 << pc.ctuLog2 ) - 1 ) ) == 0 )
+#if DIR == 1
+  if( ( y & ( ( 1 << pc.ctuLog2 ) - 1 ) ) == 0 )
   {
     largeP = false;
   }
+#endif
 
   const int betaOffsetDiv2 = ctuParam( x, y, 1 );
   const int tcOffsetDiv2   = ctuParam( x, y, 2 );
@@ -280,66 +357,211 @@ void main( uint3 id : SV_DispatchThreadID )
   const int thrCut         = tc * 10;
   const int maxVal         = ( 1 << pc.bitDepth ) - 1;
 
-  // across the edge: off; along it: step
-  const int off   = pc.dir == 0 ? 1 : pc.stride;
-  const int step  = pc.dir == 0 ? pc.stride : 1;
-  const int base0 = y * pc.stride + x;
-  const int base3 = base0 + 3 * step;
+  // all the loads at once
+  uint2 v[16];
+  [unroll]
+  for( int a = 0; a < 16; a++ )
+  {
+    v[a] = uint2( 0, 0 );
+  }
+#if DIR == 0
+  int16_t* at = pc.pic0 + y * pc.stride + x - 8;
+  [unroll]
+  for( int i = 0; i < 4; i++ )
+  {
+    v[4 * i + 1] = *(uint2*)( at + i * pc.stride + 4 );
+    v[4 * i + 2] = *(uint2*)( at + i * pc.stride + 8 );
+    if( largeP )
+    {
+      v[4 * i] = *(uint2*)( at + i * pc.stride );
+    }
+    if( largeQ )
+    {
+      v[4 * i + 3] = *(uint2*)( at + i * pc.stride + 12 );
+    }
+  }
+#else
+  int16_t* at = pc.pic0 + ( y - 8 ) * pc.stride + x;
+  [unroll]
+  for( int r = 4; r < 12; r++ )
+  {
+    v[r] = *(uint2*)( at + r * pc.stride );
+  }
+  if( largeP )
+  {
+    [unroll]
+    for( int r = 0; r < 4; r++ )
+    {
+      v[r] = *(uint2*)( at + r * pc.stride );
+    }
+  }
+  if( largeQ )
+  {
+    [unroll]
+    for( int r = 12; r < 16; r++ )
+    {
+      v[r] = *(uint2*)( at + r * pc.stride );
+    }
+  }
+#endif
 
-  const int dp0 = calcDP( pc.pic0, base0, off, false );
-  const int dq0 = calcDQ( pc.pic0, base0, off );
-  const int dp3 = calcDP( pc.pic0, base3, off, false );
-  const int dq3 = calcDQ( pc.pic0, base3, off );
+  // the decisions, from lines 0 and 3
+  int l0[16], l3[16];
+  [unroll]
+  for( int k = 0; k < 16; k++ )
+  {
+    l0[k] = SMP( 0, k );
+    l3[k] = SMP( 3, k );
+  }
+  const int dp0 = abs( l0[5] - 2 * l0[6] + l0[7] );    // |p2 - 2 p1 + p0|
+  const int dq0 = abs( l0[8] - 2 * l0[9] + l0[10] );   // |q0 - 2 q1 + q2|
+  const int dp3 = abs( l3[5] - 2 * l3[6] + l3[7] );
+  const int dq3 = abs( l3[8] - 2 * l3[9] + l3[10] );
   const int d0  = dp0 + dq0;
   const int d3  = dp3 + dq3;
 
+  // what the filters change: 0 nothing, 1 the normal filters, 2 the long ones
+  int  mode    = 0;
+  int  nP      = 3, nQ = 3;
+  bool sw      = false;
+  bool filterP = false;
+  bool filterQ = false;
   if( largeP || largeQ )
   {
-    const int off3 = 3 * off;
-    const int dp0L = largeP ? ( ( dp0 + calcDP( pc.pic0, base0 - off3, off, false ) + 1 ) >> 1 ) : dp0;
-    const int dq0L = largeQ ? ( ( dq0 + calcDQ( pc.pic0, base0 + off3, off ) + 1 ) >> 1 ) : dq0;
-    const int dp3L = largeP ? ( ( dp3 + calcDP( pc.pic0, base3 - off3, off, false ) + 1 ) >> 1 ) : dp3;
-    const int dq3L = largeQ ? ( ( dq3 + calcDQ( pc.pic0, base3 + off3, off ) + 1 ) >> 1 ) : dq3;
+    const int dp0L = largeP ? ( ( dp0 + abs( l0[2] - 2 * l0[3] + l0[4] ) + 1 ) >> 1 ) : dp0;   // |p5 - 2 p4 + p3|
+    const int dq0L = largeQ ? ( ( dq0 + abs( l0[11] - 2 * l0[12] + l0[13] ) + 1 ) >> 1 ) : dq0;   // |q3 - 2 q4 + q5|
+    const int dp3L = largeP ? ( ( dp3 + abs( l3[2] - 2 * l3[3] + l3[4] ) + 1 ) >> 1 ) : dp3;
+    const int dq3L = largeQ ? ( ( dq3 + abs( l3[11] - 2 * l3[12] + l3[13] ) + 1 ) >> 1 ) : dq3;
     const int d0L  = dp0L + dq0L;
     const int d3L  = dp3L + dq3L;
-    if( d0L + d3L < beta )
+    if( d0L + d3L < beta && strongLine( l0, 2 * d0L, beta, tc, largeP, largeQ, maxFilterLengthP, maxFilterLengthQ )
+        && strongLine( l3, 2 * d3L, beta, tc, largeP, largeQ, maxFilterLengthP, maxFilterLengthQ ) )
     {
-      const bool swL = useStrongFiltering( pc.pic0, base0, off, 2 * d0L, beta, tc, largeP, largeQ, maxFilterLengthP, maxFilterLengthQ, false )
-                       && useStrongFiltering( pc.pic0, base3, off, 2 * d3L, beta, tc, largeP, largeQ, maxFilterLengthP, maxFilterLengthQ, false );
-      if( swL )
-      {
-        for( int i = 0; i < 4; i++ )
-        {
-          filteringPandQ( base0 + i * step, off, largeP ? maxFilterLengthP : 3, largeQ ? maxFilterLengthQ : 3, tc );
-        }
-        return;
-      }
+      mode = 2;
+      nP   = largeP ? maxFilterLengthP : 3;
+      nQ   = largeQ ? maxFilterLengthQ : 3;
     }
   }
-
-  const int dp = dp0 + dp3;
-  const int dq = dq0 + dq3;
-  const int d  = d0 + d3;
-  if( d < beta )
+  if( mode == 0 && d0 + d3 < beta )
   {
-    bool filterP = false;
-    bool filterQ = false;
+    mode = 1;
     if( maxFilterLengthP > 1 && maxFilterLengthQ > 1 )
     {
-      filterP = dp < sideThreshold;
-      filterQ = dq < sideThreshold;
+      filterP = dp0 + dp3 < sideThreshold;
+      filterQ = dq0 + dq3 < sideThreshold;
     }
-    bool sw = false;
     if( maxFilterLengthP > 2 && maxFilterLengthQ > 2 )
     {
-      sw = useStrongFiltering( pc.pic0, base0, off, 2 * d0, beta, tc, false, false, 7, 7, false )
-           && useStrongFiltering( pc.pic0, base3, off, 2 * d3, beta, tc, false, false, 7, 7, false );
-    }
-    for( int i = 0; i < 4; i++ )
-    {
-      pelFilterLuma( base0 + i * step, off, tc, sw, thrCut, filterP, filterQ, maxVal );
+      sw = strongLine( l0, 2 * d0, beta, tc, false, false, 7, 7 ) && strongLine( l3, 2 * d3, beta, tc, false, false, 7, 7 );
     }
   }
+  if( mode == 0 )
+  {
+    return;
+  }
+
+  // the lines filtered, back into v
+  [unroll]
+  for( int i = 0; i < 4; i++ )
+  {
+    int s[16];
+    [unroll]
+    for( int k = 0; k < 16; k++ )
+    {
+      s[k] = SMP( i, k );
+    }
+    if( mode == 2 )
+    {
+      longLine( s, nP, nQ, tc );
+    }
+    else
+    {
+      normalLine( s, tc, sw, thrCut, filterP, filterQ, maxVal );
+    }
+#if DIR == 0
+    [unroll]
+    for( int g = 0; g < 4; g++ )
+    {
+      v[4 * i + g] = pack4( s[4 * g], s[4 * g + 1], s[4 * g + 2], s[4 * g + 3] );
+    }
+#else
+    [unroll]
+    for( int k = 0; k < 16; k++ )
+    {
+      const uint shift = ( i & 1 ) * 16;
+      const uint keep  = 0xffffu << ( 16 - shift );
+      if( i < 2 )
+      {
+        v[k].x = ( v[k].x & keep ) | uint( s[k] ) << shift;
+      }
+      else
+      {
+        v[k].y = ( v[k].y & keep ) | uint( s[k] ) << shift;
+      }
+    }
+#endif
+  }
+
+  // the stores: the samples a filter may change, and around them only those no other edge's filter changes
+  // (VVC keeps the edges of a direction apart enough for that)
+  const int changedP = mode == 2 ? nP : ( sw ? 3 : ( filterP ? 2 : 1 ) );
+  const int changedQ = mode == 2 ? nQ : ( sw ? 3 : ( filterQ ? 2 : 1 ) );
+#if DIR == 0
+  // a vertical edge: p3 .. p0 in 8 bytes when the P side's filters may reach 3 samples (the next edge is 8 samples
+  // or more away then), else p1, p0 in 4 bytes; the long filters' p4 .. p7 as far as they reach (p7 is never
+  // changed, nor reached by another edge); the same on the Q side
+  [unroll]
+  for( int i = 0; i < 4; i++ )
+  {
+    int16_t* line = at + i * pc.stride;
+    if( maxFilterLengthP > 2 )
+    {
+      *(uint2*)( line + 4 ) = v[4 * i + 1];
+    }
+    else
+    {
+      *(uint*)( line + 6 ) = v[4 * i + 1].y;
+    }
+    if( changedP == 7 )
+    {
+      *(uint2*)line = v[4 * i];
+    }
+    else if( changedP == 5 )
+    {
+      line[3] = int16_t( v[4 * i].y >> 16 );   // p4
+    }
+    if( maxFilterLengthQ > 2 )
+    {
+      *(uint2*)( line + 8 ) = v[4 * i + 2];
+    }
+    else
+    {
+      *(uint*)( line + 8 ) = v[4 * i + 2].x;
+    }
+    if( changedQ == 7 )
+    {
+      *(uint2*)( line + 12 ) = v[4 * i + 3];
+    }
+    else if( changedQ == 5 )
+    {
+      line[12] = int16_t( v[4 * i + 3].x & 0xffff );   // q4
+    }
+  }
+#else
+  // a horizontal edge: the rows the filters may change, whole (the edge's 4 columns are this thread's)
+  [unroll]
+  for( int j = 0; j < 7; j++ )
+  {
+    if( j < changedP )
+    {
+      *(uint2*)( at + ( 7 - j ) * pc.stride ) = v[7 - j];
+    }
+    if( j < changedQ )
+    {
+      *(uint2*)( at + ( 8 + j ) * pc.stride ) = v[8 + j];
+    }
+  }
+#endif
 }
 
 #else   // CHROMA
