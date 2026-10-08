@@ -187,20 +187,22 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
     // inside the picture (most blocks): the samples as they are, no clamping
     const int stride = comp == 0 ? pc.stride0 : pc.stride12;
     int16_t*  src    = ref + ( baseY - oy ) * stride + baseX - ox;
-    // the thread's sample (c, r), THREADS samples on each step
+    // the thread's sample (c, r) at src[at], THREADS samples on each step
     const int stepR  = THREADS / rw;
     const int stepC  = THREADS - stepR * rw;
-    int       r      = tid / rw;
+    const int stepAt = stepR * stride + stepC;
+    const int r      = tid / rw;
     int       c      = tid - r * rw;
+    int       at     = r * stride + c;
     for( int s = tid; s < rw * rh; s += THREADS )
     {
-      s_pool[REF_AT + s] = src[r * stride + c];
-      c += stepC;
-      r += stepR;
+      s_pool[REF_AT + s] = src[at];
+      c  += stepC;
+      at += stepAt;
       if( c >= rw )
       {
-        c -= rw;
-        r++;
+        c  -= rw;
+        at += stride - rw;
       }
     }
   }
@@ -225,10 +227,11 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
       const int r   = s >> log2W;
       const int i   = s & ( w - 1 );
       int       sum = 0;
+      const int at  = s + r * ( N - 1 );   // r * rw + i, rw = w + N - 1
       [unroll]
       for( int k = 0; k < N; k++ )
       {
-        sum += int( cx[k] ) * s_ref( r * rw + i + k );
+        sum += int( cx[k] ) * s_ref( at + k );
       }
       s_pool[TMP_AT + s] = int16_t( ( sum + offset1 ) >> shift1 );
     }
@@ -244,7 +247,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
         [unroll]
         for( int t = 0; t < N; t++ )
         {
-          sum += int( cy[t] ) * s_tmp( ( j + t ) * w + i );
+          sum += int( cy[t] ) * s_tmp( s + ( t << log2W ) );   // ( j + t ) * w + i
         }
         out[k] = bi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
       }
@@ -263,7 +266,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
         const int i = s & ( w - 1 );
         if( xFrac == 0 && yFrac == 0 )
         {
-          const int v = s_ref( j * rw + i );
+          const int v = s_ref( s );   // rw = w
           out[k]      = bi ? v * ( 1 << headRoom ) - IF_INTERNAL_OFFS : v;
         }
         else
@@ -274,15 +277,16 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
             [unroll]
             for( int t = 0; t < N; t++ )
             {
-              sum += int( cy[t] ) * s_ref( ( j + t ) * rw + i );
+              sum += int( cy[t] ) * s_ref( s + ( t << log2W ) );   // ( j + t ) * rw + i, rw = w
             }
           }
           else
           {
+            const int at = s + j * ( N - 1 );   // j * rw + i, rw = w + N - 1
             [unroll]
             for( int t = 0; t < N; t++ )
             {
-              sum += int( cx[t] ) * s_ref( j * rw + i + t );
+              sum += int( cx[t] ) * s_ref( at + t );
             }
           }
           const int v = ( sum + offset ) >> shiftV;
@@ -326,11 +330,10 @@ int bilinearAt( int slot, int cuX, int cuY, int2 mvStart, int u, int v )
   return ( kBilinear[yFrac * 2] * t0 + kBilinear[yFrac * 2 + 1] * t1 + 8 ) >> 4;
 }
 
-// bilinearAt where its reads stay inside the picture: src the sample of (u, v)
-// = (0, 0), no clamping
-int bilinearInside( int16_t* src, int xFrac, int yFrac, int u, int v )
+// bilinearAt where its reads stay inside the picture: p the sample (u, v), no
+// clamping
+int bilinearInside( int16_t* p, int xFrac, int yFrac )
 {
-  int16_t*  p     = src + v * pc.stride0 + u;
   const int      shift = 4 - ( 10 - pc.bitDepth );
   if( xFrac == 0 && yFrac == 0 )
   {
@@ -487,21 +490,28 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       // inside the picture (most subblocks): no clamping
       int16_t*  src0  = refPlane( ref0, 0 ) + y00 * pc.stride0 + x00;
       int16_t*  src1  = refPlane( ref1, 0 ) + y01 * pc.stride0 + x01;
-      // the thread's sample (u, v), THREADS samples on each step
-      const int stepV = THREADS / bw;
-      const int stepU = THREADS - stepV * bw;
-      int       v     = tid / bw;
-      int       u     = tid - v * bw;
+      // the thread's sample (u, v): at in the pictures, out in shared
+      // memory (rows of 20), THREADS samples on each step
+      const int stepV   = THREADS / bw;
+      const int stepU   = THREADS - stepV * bw;
+      const int stepAt  = stepV * pc.stride0 + stepU;
+      const int stepOut = stepV * 20 + stepU;
+      const int v       = tid / bw;
+      int       u       = tid - v * bw;
+      int       at      = v * pc.stride0 + u;
+      int       out     = v * 20 + u;
       for( int s = tid; s < bw * ( h + 4 ); s += THREADS )
       {
-        s_pool[BIL0_AT + v * 20 + u] = int16_t( bilinearInside( src0, start0.x & 15, start0.y & 15, u, v ) );
-        s_pool[BIL1_AT + v * 20 + u] = int16_t( bilinearInside( src1, start1.x & 15, start1.y & 15, u, v ) );
-        u += stepU;
-        v += stepV;
+        s_pool[BIL0_AT + out] = int16_t( bilinearInside( src0 + at, start0.x & 15, start0.y & 15 ) );
+        s_pool[BIL1_AT + out] = int16_t( bilinearInside( src1 + at, start1.x & 15, start1.y & 15 ) );
+        u   += stepU;
+        at  += stepAt;
+        out += stepOut;
         if( u >= bw )
         {
-          u -= bw;
-          v++;
+          u   -= bw;
+          at  += pc.stride0 - bw;
+          out += 20 - bw;
         }
       }
     }
