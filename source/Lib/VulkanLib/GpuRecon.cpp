@@ -140,6 +140,28 @@ static VkDeviceSize planeOffset( const PelStorage& storage, ComponentID comp )
   return VkDeviceSize( origin - host.mapped );
 }
 
+// a plane on the GPU (the twin of a host plane, or scratch memory like it):
+// the host plane's rows of the picture -- its extension to whole CTUs
+// included, not its margins above and below, which no shader reads -- with
+// the same stride, so that a sample's place in its row is the same
+struct GpuLayout
+{
+  VkDeviceSize hostOffset;   // where its first row is in the host buffer
+  VkDeviceSize size;         // its bytes
+  VkDeviceSize origin;       // where sample (0, 0) is in it
+};
+
+static GpuLayout gpuLayout( const PelStorage& storage, ComponentID comp )
+{
+  const Buffer&      host   = hostPlane( storage, comp )->host;
+  const VkDeviceSize offset = planeOffset( storage, comp );
+  const VkDeviceSize stride = VkDeviceSize( storage.bufs[comp].stride ) * sizeof( Pel );
+  const VkDeviceSize top    = offset / stride;                // the rows of margin above (as many below)
+  const VkDeviceSize rows   = host.size / stride - 2 * top;   // host.size: the rows, an extra sample, rounding
+  CHECK_FATAL( rows < VkDeviceSize( storage.bufs[comp].height ), "Vulkan: a plane laid out unexpectedly" );
+  return { top * stride, rows * stride, offset % stride };
+}
+
 // ====================================================================================================================
 // GpuRecon
 // ====================================================================================================================
@@ -390,8 +412,9 @@ void GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
     }
     for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
     {
-      const HostPlane* plane = hostPlane( pic, ComponentID( comp ) );
-      VkBufferCopy     region{ 0, 0, plane->host.size };
+      const HostPlane* plane  = hostPlane( pic, ComponentID( comp ) );
+      const GpuLayout  layout = gpuLayout( pic, ComponentID( comp ) );
+      VkBufferCopy     region{ 0, layout.hostOffset, layout.size };
       vk.vkCmdCopyBuffer( m_transferCmd, plane->twin.buffer, plane->host.buffer, 1, &region );
     }
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -762,9 +785,9 @@ GpuRecon::Planes GpuRecon::twinPlanes( const PelStorage& pic )
     HostPlane* plane = hostPlane( pic, ComponentID( comp ) );
     if( !plane->twin.valid() )
     {
-      plane->twin = m_ctx->allocPooled( size_t( plane->host.size ) );
+      plane->twin = m_ctx->allocPooled( size_t( gpuLayout( pic, ComponentID( comp ) ).size ) );
     }
-    planes.addr[comp]   = plane->twin.addr + planeOffset( pic, ComponentID( comp ) );
+    planes.addr[comp]   = plane->twin.addr + gpuLayout( pic, ComponentID( comp ) ).origin;
     planes.stride[comp] = int32_t( pic.bufs[comp].stride );
   }
   return planes;
@@ -775,13 +798,13 @@ GpuRecon::Planes GpuRecon::scratchPlanes( const PelStorage& pic )
   Planes planes{};
   for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
   {
-    const HostPlane* plane = hostPlane( pic, ComponentID( comp ) );
-    if( m_scratch[comp].size != plane->host.size )
+    const GpuLayout layout = gpuLayout( pic, ComponentID( comp ) );
+    if( m_scratch[comp].size != ( ( layout.size + 255 ) & ~VkDeviceSize( 255 ) ) )
     {
       m_ctx->free( m_scratch[comp] );
-      m_scratch[comp] = m_ctx->alloc( size_t( plane->host.size ), MemKind::Device );
+      m_scratch[comp] = m_ctx->alloc( size_t( layout.size ), MemKind::Device );
     }
-    planes.addr[comp]   = m_scratch[comp].addr + planeOffset( pic, ComponentID( comp ) );
+    planes.addr[comp]   = m_scratch[comp].addr + layout.origin;
     planes.stride[comp] = int32_t( pic.bufs[comp].stride );
   }
   return planes;
@@ -804,7 +827,8 @@ void GpuRecon::copyPlanes( const PelStorage& pic, int from, int to )
   {
     const HostPlane* plane    = hostPlane( pic, ComponentID( comp ) );
     const Buffer*    bufs[3]  = { &plane->host, &plane->twin, &m_scratch[comp] };
-    VkBufferCopy     region{ 0, 0, plane->host.size };
+    const GpuLayout  layout   = gpuLayout( pic, ComponentID( comp ) );
+    VkBufferCopy     region{ from == kHost ? layout.hostOffset : 0, to == kHost ? layout.hostOffset : 0, layout.size };
     vk.vkCmdCopyBuffer( m_cmd, bufs[from]->buffer, bufs[to]->buffer, 1, &region );
   }
   mark( from == kHost ? "upload" : ( to == kHost ? "download" : "copy" ) );
