@@ -194,7 +194,9 @@ bool Context::init()
 
   VkPhysicalDeviceVulkan12Features features12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
   VkPhysicalDeviceVulkan11Features features11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
-  features12.pNext = &features11;
+  VkPhysicalDeviceSubgroupSizeControlFeatures sizeControl{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES };
+  features12.pNext  = &features11;
+  features11.pNext  = &sizeControl;
   VkPhysicalDeviceFeatures2 features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
   features.pNext = &features12;
   m_api.vkGetPhysicalDeviceFeatures2( m_physical, &features );
@@ -243,8 +245,20 @@ bool Context::init()
   queueInfos[1].queueCount       = 1;
   queueInfos[1].pQueuePriorities = &priority;
 
+  // waves of 32 threads where the shaders run better so (GPUs with both
+  // sizes, AMD's): the size, subgroup size control
+  VkPhysicalDeviceSubgroupSizeControlProperties sizes{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES };
+  VkPhysicalDeviceProperties2                   props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+  props2.pNext = &sizes;
+  m_api.vkGetPhysicalDeviceProperties2( m_physical, &props2 );
+  m_wave32 = props.apiVersion >= VK_API_VERSION_1_3 && sizeControl.subgroupSizeControl && sizes.minSubgroupSize <= 32 && sizes.maxSubgroupSize >= 32
+             && ( sizes.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT );
+
   VkPhysicalDeviceVulkan12Features enable12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
   VkPhysicalDeviceVulkan11Features enable11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
+  VkPhysicalDeviceSubgroupSizeControlFeatures enableSize{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES };
+  enableSize.subgroupSizeControl    = VK_TRUE;
+  enable11.pNext                    = m_wave32 ? &enableSize : nullptr;
   enable12.pNext                    = &enable11;
   enable12.bufferDeviceAddress      = VK_TRUE;
   enable12.storageBuffer8BitAccess  = VK_TRUE;
@@ -534,6 +548,15 @@ VkPipeline Context::pipeline( int shaderId )
   info.stage.module = module;
   info.stage.pName  = "main";
   info.layout       = m_layout;
+  // waves of 32 threads, but for inter (VideoQ 4K on a Radeon 780M: intra
+  // 1.50 -> 1.31 ms, ALF luma 1.54 -> 1.36, the residuals 0.33 -> 0.28, but
+  // inter 4.4 -> 5.2 ms, where the driver's choice, waves of 64, is better)
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
+  size.requiredSubgroupSize = 32;
+  if( m_wave32 && shaderId != kShader_inter )
+  {
+    info.stage.pNext = &size;
+  }
   VkPipeline pipe   = VK_NULL_HANDLE;
   const VkResult result = m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
   m_api.vkDestroyShaderModule( m_device, module, nullptr );

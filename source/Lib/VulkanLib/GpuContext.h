@@ -181,6 +181,7 @@ private:
   };
   bool                             m_profiling = false;
   PFN_vkGetShaderInfoAMD           m_getShaderInfo = nullptr;   // with VVDEC_GPU_PROFILE, where VK_AMD_shader_info is
+  bool                             m_wave32 = false;            // the shaders may ask for waves of 32 threads
   std::vector<Time>                m_times;
   std::mutex                       m_timeMutex;
 
