@@ -154,10 +154,7 @@ void DecLibRecon::create( ThreadPool* threadPool, unsigned instanceId, bool upsc
   new( this ) DecLibRecon;
 
 #if VVDEC_VULKAN
-  if( gpu )
-  {
-    m_gpuRecon = std::make_unique<gpu::GpuRecon>( gpu );
-  }
+  m_gpu = gpu;   // m_gpuRecon made with the instance's first picture (decompressPicture)
 #endif
 
 
@@ -185,12 +182,7 @@ void DecLibRecon::create( ThreadPool* threadPool, unsigned instanceId, bool upsc
   m_loopFilterParam  = nullptr;
   m_motionInfo       = nullptr;
 
-  m_pcThreadResource    = new PerThreadResource*[m_numDecThreads];
-  m_pcThreadResource[0] = new PerThreadResource();
-  for( int i = 1; i < m_numDecThreads; i++ )
-  {
-    m_pcThreadResource[i] = new PerThreadResource( m_pcThreadResource[0]->m_cTrQuant );
-  }
+  m_pcThreadResource = nullptr;   // with the instance's first picture (decompressPicture)
 }
 
 void DecLibRecon::destroy()
@@ -227,8 +219,11 @@ void DecLibRecon::destroy()
 
   m_num4x4Elements = 0;
 
-  for( int i = 0; i < m_numDecThreads; i++ ) delete m_pcThreadResource[i];
-  delete[] m_pcThreadResource; m_pcThreadResource = nullptr;
+  if( m_pcThreadResource )
+  {
+    for( int i = 0; i < m_numDecThreads; i++ ) delete m_pcThreadResource[i];
+    delete[] m_pcThreadResource; m_pcThreadResource = nullptr;
+  }
 
   // the filter buffer may be in the GPU's memory: free it while the device is there
   m_fltBuf.destroy();
@@ -478,6 +473,25 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   // Initialise the various objects for the new set of settings
   const SPS * sps = cs.sps.get();
   const PPS * pps = cs.pps.get();
+
+  // the threads' resources and the GPU's commands, made with the instance's
+  // first picture: an instance left idle (with the GPU, the pictures up to
+  // 1080p take two of the four) goes without them
+#if VVDEC_VULKAN
+  if( m_gpu && !m_gpuRecon )
+  {
+    m_gpuRecon = std::make_unique<gpu::GpuRecon>( m_gpu );
+  }
+#endif
+  if( !m_pcThreadResource )
+  {
+    m_pcThreadResource    = new PerThreadResource*[m_numDecThreads];
+    m_pcThreadResource[0] = new PerThreadResource();
+    for( int i = 1; i < m_numDecThreads; i++ )
+    {
+      m_pcThreadResource[i] = new PerThreadResource( m_pcThreadResource[0]->m_cTrQuant );
+    }
+  }
 
   for( int i = 0; i < m_numDecThreads; i++ )
   {

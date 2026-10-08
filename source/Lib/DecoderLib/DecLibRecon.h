@@ -177,7 +177,8 @@ private:
   bool                 m_doDeblock = true;
 
 #if VVDEC_VULKAN
-  std::unique_ptr<gpu::GpuRecon> m_gpuRecon;        // when the pictures are reconstructed on the GPU
+  gpu::Context*                  m_gpu = nullptr;   // the Vulkan device, when the pictures are reconstructed on the GPU
+  std::unique_ptr<gpu::GpuRecon> m_gpuRecon;        // then, from the instance's first picture on
   bool                           m_gpuFilters = false;   // the current picture's in-loop filters run on the GPU
   bool                           m_gpuIntra   = false;   // and its intra and IBC blocks
   bool                           m_gpuInter   = false;   // and its inter blocks
