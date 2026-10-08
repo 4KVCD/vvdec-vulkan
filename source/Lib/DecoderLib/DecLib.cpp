@@ -157,6 +157,15 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
   }
 #endif
 
+#if VVDEC_VULKAN
+  // with the GPU, more pictures in reconstruction at a time: the GPU finishes
+  // one while the CPU readies the next ones (VideoQ 4K: 2 -> 4 instances,
+  // 107 -> 126 fps; 5 no better, 8 worse)
+  if( m_gpu )
+  {
+    m_decLibRecon.resize( 4 );
+  }
+#endif
   bool upscalingEnabled = false;
   m_picListManager.create( m_parseFrameDelay, (int) m_decLibRecon.size(), userAllocator, gpuAllocator );
   m_decLibParser.create  ( m_decodeThreadPool.get(), m_parseFrameDelay, (int) m_decLibRecon.size(), numDecThreads, errHandlingFlags );
