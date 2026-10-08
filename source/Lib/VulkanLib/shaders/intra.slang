@@ -1,9 +1,15 @@
 // Intra prediction, intra block copy (IBC) and the reconstruction of their
 // transform blocks, as vvdec's IntraPrediction and DecCu::predAndReco do it: a
-// thread predicts one transform block of one component, adds its residual
+// workgroup predicts one transform block of one component, adds its residual
 // (already in the picture, where vvdec's TrQuant left it) and writes the
 // result. The blocks come in waves: a block's wave is above the waves of
 // every block whose samples it reads, so a dispatch per wave keeps the order.
+//
+// A wave lasts as long as its slowest workgroup, which mostly waits for
+// memory: so a workgroup makes 256 samples at most (GpuRecon::recordIntra
+// cuts the big blocks into bands of rows), four a thread, and first sends
+// out all its reads of the picture together (the references, the residual,
+// CCLM's luma, IBC's source), to compute from shared memory after that.
 //
 // A job, 8 uints (VulkanLib/GpuRecon.h, GpuIntraJob):
 //   0: x | y << 16                (in samples of its component)
@@ -13,7 +19,8 @@
 //   4: CCLM: luma above units | luma left units << 8 | bAbove << 16 | bLeft << 17 | aboveAvail << 18 | leftAvail << 19 | lm mode << 24
 //   5: CCLM: actual top template samples | actual left << 16
 //   6: IBC: block vector x | y << 16 (int16, samples of the component)
-//   7: wave
+//   7: the rows of the block this workgroup makes: first | count << 16, at
+//      most 256 samples (on the CPU: the block's wave)
 
 #include "common.slang"
 
@@ -94,10 +101,24 @@ groupshared int tf[MAX_REF];
 groupshared int lf[MAX_REF];
 groupshared int  s_dc;      // DC's value
 groupshared int3 s_model;   // CCLM's a, b, shift
+groupshared int16_t s_res[256];    // the residual of the workgroup's samples, out of the picture
+groupshared int16_t s_luma[256];   // CCLM: the downsampled luma of the workgroup's samples
+groupshared int     s_tmpl[4];         // CCLM: the luma of the template samples the model picks
+groupshared int     s_cubic[128];      // kCubic, for luma's angular modes
 
-// xFillReferenceSamples, each sample by itself: the available ones read, the
-// others padded from the nearest available one (or the middle value)
-void fillReferences( int tid, int comp, int x0, int y0, int w, int h, int nTL, int nAbove, int nLeft )
+// xFillReferenceSamples' reads: the samples of the thread's references,
+// t[tid + 64 k] and l[tid + 64 k] (k < 3); where a flag of fromTopLeft is
+// set (bit k: t's, bit 3 + k: l's), the sample is the top-left one, which
+// is padded from the nearest available one (or the middle value) itself
+struct References
+{
+  int topLeft;
+  int t[3];
+  int l[3];
+  int fromTopLeft;
+};
+
+References loadReferences( int tid, int comp, int x0, int y0, int w, int h, int nTL, int nAbove, int nLeft )
 {
   const int predSize    = w << 1;
   const int predHSize   = h << 1;
@@ -110,63 +131,70 @@ void fillReferences( int tid, int comp, int x0, int y0, int w, int h, int nTL, i
   const int dc          = 1 << ( pc.bitDepth - 1 );
   const bool all        = numNeighbor == totalUnits;
 
-  int topLeft;
+  References r;
   if( numNeighbor == 0 )
   {
-    topLeft = dc;
+    r.topLeft = dc;
   }
   else if( all || ( nLeft > 0 && nTL != 0 ) )
   {
-    topLeft = sampleAt( comp, x0 - 1, y0 - 1 );
+    r.topLeft = sampleAt( comp, x0 - 1, y0 - 1 );
   }
   else
   {
     // left: the top of the left column; else the first above (vvdec: when the
     // left is missing, the above is there)
-    topLeft = nLeft > 0 ? sampleAt( comp, x0 - 1, y0 ) : sampleAt( comp, x0, y0 - 1 );
+    r.topLeft = nLeft > 0 ? sampleAt( comp, x0 - 1, y0 ) : sampleAt( comp, x0, y0 - 1 );
   }
 
-  for( int j = tid; j <= predSize; j += 64 )
+  r.fromTopLeft = 0;
+  [unroll]
+  for( int k = 0; k < 3; k++ )
   {
-    int v;
-    if( j == 0 || numNeighbor == 0 )
+    const int j = tid + 64 * k;
+    r.t[k]      = 0;
+    if( j <= predSize && j != 0 && numNeighbor != 0 && ( all || nAbove != 0 ) )
     {
-      v = topLeft;
-    }
-    else if( all )
-    {
-      v = sampleAt( comp, x0 - 1 + j, y0 - 1 );
-    }
-    else if( nAbove != 0 )
-    {
-      v = sampleAt( comp, x0 + min( j - 1, tmpA - 1 ), y0 - 1 );
+      r.t[k] = all ? sampleAt( comp, x0 - 1 + j, y0 - 1 ) : sampleAt( comp, x0 + min( j - 1, tmpA - 1 ), y0 - 1 );
     }
     else
     {
-      v = topLeft;
+      r.fromTopLeft |= 1 << k;
     }
-    t[j] = v;
   }
-  for( int i = tid; i <= predHSize; i += 64 )
+  [unroll]
+  for( int k = 0; k < 3; k++ )
   {
-    int v;
-    if( i == 0 || numNeighbor == 0 )
+    const int i = tid + 64 * k;
+    r.l[k]      = 0;
+    if( i <= predHSize && i != 0 && numNeighbor != 0 && ( all || nLeft > 0 ) )
     {
-      v = topLeft;
-    }
-    else if( all )
-    {
-      v = sampleAt( comp, x0 - 1, y0 + i - 1 );
-    }
-    else if( nLeft > 0 )
-    {
-      v = sampleAt( comp, x0 - 1, y0 + min( i - 1, tmpL - 1 ) );
+      r.l[k] = all ? sampleAt( comp, x0 - 1, y0 + i - 1 ) : sampleAt( comp, x0 - 1, y0 + min( i - 1, tmpL - 1 ) );
     }
     else
     {
-      v = topLeft;
+      r.fromTopLeft |= 8 << k;
     }
-    l[i] = v;
+  }
+  return r;
+}
+
+// xFillReferenceSamples' writes
+void storeReferences( int tid, int w, int h, References r )
+{
+  [unroll]
+  for( int k = 0; k < 3; k++ )
+  {
+    const int j = tid + 64 * k;
+    if( j <= ( w << 1 ) )
+    {
+      t[j] = ( r.fromTopLeft & ( 1 << k ) ) != 0 ? r.topLeft : r.t[k];
+    }
+    const int i = tid + 64 * k;
+    if( i <= ( h << 1 ) )
+    {
+      l[i] = ( r.fromTopLeft & ( 8 << k ) ) != 0 ? r.topLeft : r.l[k];
+    }
   }
 }
 
@@ -320,11 +348,13 @@ int predictAngular( Angular a, int comp, bool filtered, int x, int y, int maxVal
     const int f = deltaFract << 2;
     if( a.cubic )
     {
-      v = clip3( 0, maxVal, ( kCubic[f] * p[0] + kCubic[f + 1] * p[1] + kCubic[f + 2] * p[2] + kCubic[f + 3] * p[3] + 32 ) >> 6 );
+      v = clip3( 0, maxVal, ( s_cubic[f] * p[0] + s_cubic[f + 1] * p[1] + s_cubic[f + 2] * p[2] + s_cubic[f + 3] * p[3] + 32 ) >> 6 );
     }
     else
     {
-      v = ( kGauss[f] * p[0] + kGauss[f + 1] * p[1] + kGauss[f + 2] * p[2] + kGauss[f + 3] * p[3] + 32 ) >> 6;
+      // kGauss, whose taps of phase deltaFract are 16 - d, 32 - d, 16 + d, d for d = deltaFract / 2
+      const int d = deltaFract >> 1;
+      v = ( ( 16 - d ) * p[0] + ( 32 - d ) * p[1] + ( 16 + d ) * p[2] + d * p[3] + 32 ) >> 6;
     }
   }
   else
@@ -442,47 +472,67 @@ int lumaTemplateLeft( int lx, int ly, int j, bool bAbove )
   return ( lumaAt( x, y ) * 2 + lumaAt( x - 1, y ) + lumaAt( x + 1, y ) + lumaAt( x, y + 1 ) * 2 + lumaAt( x - 1, y + 1 ) + lumaAt( x + 1, y + 1 ) + 4 ) >> 3;
 }
 
-// the linear model: a, b, shift
-int3 cclmParameters( int x0, int y0, uint lm, uint lm2 )
+// the template samples the linear model picks: cntT above (t[1 + startPos0 +
+// k * pickStep0]), then cntL to the left (l[1 + startPos1 + k * pickStep1]);
+// four at most
+struct CclmPicks
 {
-  const int  lx             = x0 << 1;
-  const int  ly             = y0 << 1;
-  const bool bAbove         = ( ( lm >> 16 ) & 1 ) != 0;
-  const bool bLeft          = ( ( lm >> 17 ) & 1 ) != 0;
+  int cntT;
+  int cntL;
+  int startPos0;
+  int pickStep0;
+  int startPos1;
+  int pickStep1;
+};
+
+CclmPicks cclmPicks( uint lm, uint lm2 )
+{
   const bool aboveAvailable = ( ( lm >> 18 ) & 1 ) != 0;
   const bool leftAvailable  = ( ( lm >> 19 ) & 1 ) != 0;
   const int  actualTop      = int( lm2 & 0xffff );
   const int  actualLeft     = int( lm2 >> 16 );
 
-  const int aboveIs4  = leftAvailable ? 0 : 1;
-  const int leftIs4   = aboveAvailable ? 0 : 1;
-  const int startPos0 = actualTop >> ( 2 + aboveIs4 );
-  const int pickStep0 = max( 1, actualTop >> ( 1 + aboveIs4 ) );
-  const int startPos1 = actualLeft >> ( 2 + leftIs4 );
-  const int pickStep1 = max( 1, actualLeft >> ( 1 + leftIs4 ) );
+  const int aboveIs4 = leftAvailable ? 0 : 1;
+  const int leftIs4  = aboveAvailable ? 0 : 1;
+  CclmPicks p;
+  p.startPos0 = actualTop >> ( 2 + aboveIs4 );
+  p.pickStep0 = max( 1, actualTop >> ( 1 + aboveIs4 ) );
+  p.startPos1 = actualLeft >> ( 2 + leftIs4 );
+  p.pickStep1 = max( 1, actualLeft >> ( 1 + leftIs4 ) );
+  p.cntT      = aboveAvailable ? min( actualTop, ( 1 + aboveIs4 ) << 1 ) : 0;
+  p.cntL      = leftAvailable ? min( actualLeft, ( 1 + leftIs4 ) << 1 ) : 0;
+  return p;
+}
+
+// the downsampled luma of template sample k (< cntT + cntL)
+int cclmTemplateLuma( int x0, int y0, uint lm, CclmPicks p, int k )
+{
+  const bool bAbove = ( ( lm >> 16 ) & 1 ) != 0;
+  const bool bLeft  = ( ( lm >> 17 ) & 1 ) != 0;
+  return k < p.cntT ? lumaTemplateAbove( x0 << 1, y0 << 1, p.startPos0 + k * p.pickStep0, bLeft )
+                    : lumaTemplateLeft( x0 << 1, y0 << 1, p.startPos1 + ( k - p.cntT ) * p.pickStep1, bAbove );
+}
+
+// the linear model: a, b, shift (from the template's luma in s_tmpl and its
+// chroma in t and l)
+int3 cclmParameters( uint lm, uint lm2 )
+{
+  const bool aboveAvailable = ( ( lm >> 18 ) & 1 ) != 0;
+  const bool leftAvailable  = ( ( lm >> 19 ) & 1 ) != 0;
+  const CclmPicks p         = cclmPicks( lm, lm2 );
 
   int selLuma[4]   = { 0, 0, 0, 0 };
   int selChroma[4] = { 0, 0, 0, 0 };
-  int cntT = 0, cntL = 0;
-  if( aboveAvailable )
+  const int cntT = p.cntT, cntL = p.cntL;
+  for( int k = 0; k < cntT; k++ )
   {
-    cntT = min( actualTop, ( 1 + aboveIs4 ) << 1 );
-    for( int k = 0; k < cntT; k++ )
-    {
-      const int pos = startPos0 + k * pickStep0;
-      selLuma[k]    = lumaTemplateAbove( lx, ly, pos, bLeft );
-      selChroma[k]  = t[1 + pos];
-    }
+    selLuma[k]   = s_tmpl[k];
+    selChroma[k] = t[1 + p.startPos0 + k * p.pickStep0];
   }
-  if( leftAvailable )
+  for( int k = 0; k < cntL; k++ )
   {
-    cntL = min( actualLeft, ( 1 + leftIs4 ) << 1 );
-    for( int k = 0; k < cntL; k++ )
-    {
-      const int pos       = startPos1 + k * pickStep1;
-      selLuma[cntT + k]   = lumaTemplateLeft( lx, ly, pos, bAbove );
-      selChroma[cntT + k] = l[1 + pos];
-    }
+    selLuma[cntT + k]   = s_tmpl[cntT + k];
+    selChroma[cntT + k] = l[1 + p.startPos1 + k * p.pickStep1];
   }
   if( cntT + cntL == 2 )
   {
@@ -544,8 +594,8 @@ int3 cclmParameters( int x0, int y0, uint lm, uint lm2 )
   return int3( a, minC - ( ( a * minY ) >> shift ), shift );
 }
 
-// a workgroup per job (a block of a component): the threads fill the
-// references together, then share out the block's samples
+// a workgroup per job (a block of a component): the threads read what the
+// block needs of the picture together, then share out the block's samples
 [shader( "compute" )]
 [numthreads( 64, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
@@ -568,87 +618,152 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int   maxVal = ( 1 << pc.bitDepth ) - 1;
   const bool  filtered = ( flags & 2 ) != 0;
   const bool  residual = ( flags & 1 ) != 0;
+  const int   log2W  = log2Int( w );
+  // the workgroup's samples: the block's rows first .. first + count, m of
+  // them (256 at most: four a thread), the i-th the block's sample s0 + i
+  const int   s0     = int( job[7] & 0xffff ) * w;
+  const int   m      = int( job[7] >> 16 ) * w;
 
   int16_t*  dst    = planeOf( comp );
   const int stride = strideOf( comp );
 
-  // per block: the references and what the predictor needs of them
-  Angular ang;
-  bool    lmAbove = false, lmLeft = false;
-  if( kind != 3 )
+  if( kind == 3 )
   {
-    const uint nb = job[3];
-    fillReferences( tid, comp, x0, y0, w, h, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ) );
+    // IBC: the block from elsewhere in the picture, plus the residual (the
+    // reads together, then the writes)
+    const int bvx = int( int16_t( job[6] & 0xffff ) );
+    const int bvy = int( int16_t( job[6] >> 16 ) );
+    int       pred[4];
+    int       res[4];
+    [unroll]
+    for( int k = 0; k < 4; k++ )
+    {
+      const int i = tid + 64 * k;
+      const int x = ( s0 + i ) & ( w - 1 );
+      const int y = ( s0 + i ) >> log2W;
+      pred[k]     = i < m ? sampleAt( comp, x0 + x + bvx, y0 + y + bvy ) : 0;
+      res[k]      = i < m && residual ? int( dst[( y0 + y ) * stride + x0 + x] ) : 0;
+    }
+    [unroll]
+    for( int k = 0; k < 4; k++ )
+    {
+      const int i = tid + 64 * k;
+      if( i < m )
+      {
+        const int at = ( y0 + ( ( s0 + i ) >> log2W ) ) * stride + x0 + ( ( s0 + i ) & ( w - 1 ) );
+        dst[at]      = int16_t( residual ? clip3( 0, maxVal, pred[k] + res[k] ) : pred[k] );
+      }
+    }
+    return;   // the whole workgroup
+  }
+
+  // the reads: the references, then (while those are on their way) the
+  // residual and CCLM's luma, kCubic for luma's angular modes
+  const uint       nb   = job[3];
+  const References refs = loadReferences( tid, comp, x0, y0, w, h, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ) );
+  const bool       lmAbove = ( ( job[4] >> 16 ) & 1 ) != 0;
+  const bool       lmLeft  = ( ( job[4] >> 17 ) & 1 ) != 0;
+  if( kind == 2 )
+  {
+    // the downsampled luma of the samples and of the template's (a thread each)
+    const CclmPicks picks = cclmPicks( job[4], job[5] );
+    if( tid < picks.cntT + picks.cntL )
+    {
+      s_tmpl[tid] = cclmTemplateLuma( x0, y0, job[4], picks, tid );
+    }
+  }
+  if( kind == 2 || residual )
+  {
+    int luma[4];
+    int res[4];
+    [unroll]
+    for( int k = 0; k < 4; k++ )
+    {
+      const int i = tid + 64 * k;
+      const int x = ( s0 + i ) & ( w - 1 );
+      const int y = ( s0 + i ) >> log2W;
+      luma[k]     = i < m && kind == 2 ? lumaDown( x0 << 1, y0 << 1, x, y, lmAbove, lmLeft ) : 0;
+      res[k]      = i < m && residual ? int( dst[( y0 + y ) * stride + x0 + x] ) : 0;
+    }
+    [unroll]
+    for( int k = 0; k < 4; k++ )
+    {
+      const int i = tid + 64 * k;
+      if( i < m )
+      {
+        s_luma[i] = int16_t( luma[k] );
+        s_res[i]  = int16_t( res[k] );
+      }
+    }
+  }
+  if( kind == 0 && comp == 0 )
+  {
+    s_cubic[tid]      = kCubic[tid];
+    s_cubic[tid + 64] = kCubic[tid + 64];
+  }
+  storeReferences( tid, w, h, refs );
+  GroupMemoryBarrierWithGroupSync();
+
+  // per block: what the predictor needs of the references
+  if( filtered )
+  {
+    filterReferences( tid, w, h );
     GroupMemoryBarrierWithGroupSync();
-    if( filtered )
+  }
+  Angular ang;
+  if( kind == 2 )
+  {
+    if( tid == 0 )
     {
-      filterReferences( tid, w, h );
-      GroupMemoryBarrierWithGroupSync();
+      s_model = cclmParameters( job[4], job[5] );
     }
-    if( kind == 2 )
+    GroupMemoryBarrierWithGroupSync();
+  }
+  else if( kind == 0 && mode == DC_IDX )
+  {
+    if( tid == 0 )
     {
-      if( tid == 0 )
-      {
-        s_model = cclmParameters( x0, y0, job[4], job[5] );
-      }
-      lmAbove = ( ( job[4] >> 16 ) & 1 ) != 0;
-      lmLeft  = ( ( job[4] >> 17 ) & 1 ) != 0;
-      GroupMemoryBarrierWithGroupSync();
+      s_dc = dcValue( filtered, w, h );
     }
-    else if( kind == 0 && mode == DC_IDX )
-    {
-      if( tid == 0 )
-      {
-        s_dc = dcValue( filtered, w, h );
-      }
-      GroupMemoryBarrierWithGroupSync();
-    }
-    else if( kind == 0 && mode != PLANAR_IDX )
-    {
-      ang = setupAngular( comp, w, h, mode );
-    }
+    GroupMemoryBarrierWithGroupSync();
+  }
+  else if( kind == 0 && mode != PLANAR_IDX )
+  {
+    ang = setupAngular( comp, w, h, mode );
   }
   const int  dc    = s_dc;
   const int3 model = s_model;
 
   const int  bdpcmDir = int( ( job[2] >> 16 ) & 255 );
   const bool doPdpcPlanarDc = kind == 0 && ( mode == PLANAR_IDX || mode == DC_IDX ) && w >= 4 && h >= 4;
-  const int  bvx = int( int16_t( job[6] & 0xffff ) );
-  const int  bvy = int( int16_t( job[6] >> 16 ) );
-  const int  log2W = log2Int( w );
 
-  for( int s = tid; s < w * h; s += 64 )
+  // the samples, from shared memory alone
+  for( int i = tid; i < m; i += 64 )
   {
-    const int x = s & ( w - 1 );
-    const int y = s >> log2W;
+    const int x = ( s0 + i ) & ( w - 1 );
+    const int y = ( s0 + i ) >> log2W;
+    int       v;
+    if( kind == 2 )
     {
-      int v;
-      if( kind == 3 )
-      {
-        v = sampleAt( comp, x0 + x + bvx, y0 + y + bvy );
-      }
-      else if( kind == 2 )
-      {
-        v = clip3( 0, maxVal, ( ( model.x * lumaDown( x0 << 1, y0 << 1, x, y, lmAbove, lmLeft ) ) >> model.z ) + model.y );
-      }
-      else if( kind == 1 )
-      {
-        v = bdpcmDir == 1 ? refL( false, y + 1 ) : refT( false, x + 1 );
-      }
-      else if( mode == PLANAR_IDX || mode == DC_IDX )
-      {
-        v = mode == PLANAR_IDX ? predictPlanar( filtered, w, h, x, y ) : dc;
-        if( doPdpcPlanarDc )
-        {
-          v = pdpcPlanarDc( filtered, w, h, x, y, v );
-        }
-      }
-      else
-      {
-        v = ang.isVer ? predictAngular( ang, comp, filtered, x, y, maxVal ) : predictAngular( ang, comp, filtered, y, x, maxVal );
-      }
-      const int i = ( y0 + y ) * stride + x0 + x;
-      dst[i]      = int16_t( residual ? clip3( 0, maxVal, v + int( dst[i] ) ) : v );
+      v = clip3( 0, maxVal, ( ( model.x * int( s_luma[i] ) ) >> model.z ) + model.y );
     }
+    else if( kind == 1 )
+    {
+      v = bdpcmDir == 1 ? refL( false, y + 1 ) : refT( false, x + 1 );
+    }
+    else if( mode == PLANAR_IDX || mode == DC_IDX )
+    {
+      v = mode == PLANAR_IDX ? predictPlanar( filtered, w, h, x, y ) : dc;
+      if( doPdpcPlanarDc )
+      {
+        v = pdpcPlanarDc( filtered, w, h, x, y, v );
+      }
+    }
+    else
+    {
+      v = ang.isVer ? predictAngular( ang, comp, filtered, x, y, maxVal ) : predictAngular( ang, comp, filtered, y, x, maxVal );
+    }
+    const int at = ( y0 + y ) * stride + x0 + x;
+    dst[at]      = int16_t( residual ? clip3( 0, maxVal, v + int( s_res[i] ) ) : v );
   }
 }

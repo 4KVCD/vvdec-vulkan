@@ -958,7 +958,12 @@ bool GpuRecon::intraSupported( const SPS& sps )
 
 void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes )
 {
-  // the jobs, wave by wave
+  // the jobs, wave by wave, a big block in bands of rows of kBand samples at
+  // most, a workgroup each: a wave lasts as long as its slowest workgroup,
+  // and that is the one with the most samples a thread (shaders/intra.slang)
+  static constexpr int kBand = 256;
+  const auto bandRows = []( const IntraJob& job ) { return std::max( 1, kBand / job.width() ); };
+  const auto bands    = [&]( const IntraJob& job ) { return ( job.height() + bandRows( job ) - 1 ) / bandRows( job ); };
   int    maxWave = 0;
   size_t total   = 0;
   for( const auto& ctu: jobs )
@@ -966,8 +971,8 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
     for( const IntraJob& job: ctu )
     {
       maxWave = std::max( maxWave, job.wave() );
+      total  += bands( job );
     }
-    total += ctu.size();
   }
   if( total == 0 )
   {
@@ -978,7 +983,7 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   {
     for( const IntraJob& job: ctu )
     {
-      first[job.wave() + 1]++;
+      first[job.wave() + 1] += bands( job );
     }
   }
   for( int wave = 1; wave <= maxWave + 1; wave++ )
@@ -997,7 +1002,13 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   {
     for( const IntraJob& job: ctu )
     {
-      sorted[next[job.wave()]++] = job;
+      const int rows = bandRows( job );
+      for( int row = 0; row < job.height(); row += rows )
+      {
+        IntraJob& band = sorted[next[job.wave()]++];
+        band           = job;
+        band.setRows( row, std::min( rows, job.height() - row ) );
+      }
     }
   }
 

@@ -122,6 +122,11 @@ struct IntraJob
   void setBlockVector( int x, int y ) { w[6] = uint32_t( uint16_t( int16_t( x ) ) ) | uint32_t( uint16_t( int16_t( y ) ) ) << 16; }
   void setWave( int wave ) { w[7] = uint32_t( wave ); }
   int  wave() const { return int( w[7] ); }
+  int  width() const { return int( w[1] & 255 ); }
+  int  height() const { return int( ( w[1] >> 8 ) & 255 ); }
+  // on the GPU, in place of the wave: the rows of the block one workgroup
+  // makes (GpuRecon::recordIntra cuts the big blocks into bands)
+  void setRows( int first, int count ) { w[7] = uint32_t( first ) | uint32_t( count ) << 16; }
 };
 
 // a tile of up to 16x16 luma samples of an inter CU (DMVR's subblock when it
