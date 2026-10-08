@@ -140,14 +140,18 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
   VkCommandBufferAllocateInfo cmdInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
   cmdInfo.commandPool        = m_pool;
   cmdInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cmdInfo.commandBufferCount = 1;
-  if( vk.vkAllocateCommandBuffers( m_ctx->device(), &cmdInfo, &m_cmd ) != VK_SUCCESS )
+  cmdInfo.commandBufferCount = 2;
+  VkCommandBuffer cmds[2];
+  if( vk.vkAllocateCommandBuffers( m_ctx->device(), &cmdInfo, cmds ) != VK_SUCCESS )
   {
     THROW_FATAL( "Vulkan: vkAllocateCommandBuffers failed" );
   }
+  m_cmdFirst = m_cmd = cmds[0];
+  m_cmdRest  = cmds[1];
 
   VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-  if( vk.vkCreateFence( m_ctx->device(), &fenceInfo, nullptr, &m_fence ) != VK_SUCCESS )
+  if( vk.vkCreateFence( m_ctx->device(), &fenceInfo, nullptr, &m_fence ) != VK_SUCCESS
+      || vk.vkCreateFence( m_ctx->device(), &fenceInfo, nullptr, &m_fenceFirst ) != VK_SUCCESS )
   {
     THROW_FATAL( "Vulkan: vkCreateFence failed" );
   }
@@ -237,6 +241,10 @@ GpuRecon::~GpuRecon()
   {
     vk.vkDestroyFence( m_ctx->device(), m_fence, nullptr );
   }
+  if( m_fenceFirst )
+  {
+    vk.vkDestroyFence( m_ctx->device(), m_fenceFirst, nullptr );
+  }
   if( m_pool )
   {
     vk.vkDestroyCommandPool( m_ctx->device(), m_pool, nullptr );
@@ -305,11 +313,12 @@ void GpuRecon::computeBarrier()
                                      nullptr );
 }
 
-void GpuRecon::submitAndWait()
+void GpuRecon::splitCommands()
 {
   const Api& vk = m_ctx->api();
 
-  // the writes of the shaders and the copies, made visible to the CPU
+  // the first part's writes (DMVR's refinements in host memory among them)
+  // visible to the CPU
   VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
   barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
   barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -317,65 +326,85 @@ void GpuRecon::submitAndWait()
                            nullptr, 0, nullptr );
   vk.vkEndCommandBuffer( m_cmd );
 
-  vk.vkResetFences( m_ctx->device(), 1, &m_fence );
-  const auto start = std::chrono::steady_clock::now();
-  m_ctx->submit( m_cmd, m_fence );
-  const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_fence, VK_TRUE, UINT64_MAX );
-  if( result != VK_SUCCESS )
-  {
-    THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
-  }
-  readTimestamps( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - start ).count() );
-}
-
-void GpuRecon::submitDownloadAndWait( const PelStorage& pic )
-{
-  const Api& vk = m_ctx->api();
-
-  // the compute commands: their writes (the DMVR refinements in host memory
-  // among them) visible to the CPU, the copies wait for them
-  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0,
-                           nullptr, 0, nullptr );
-  vk.vkEndCommandBuffer( m_cmd );
-  const auto start = std::chrono::steady_clock::now();
-  m_ctx->submit( m_cmd, VK_NULL_HANDLE, m_semaphore );
-
-  // the copies: the picture's planes on the GPU to host memory
-  vk.vkResetCommandPool( m_ctx->device(), m_transferPool, 0 );
+  // the rest, after what the first part wrote
+  m_cmd = m_cmdRest;
   VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vk.vkBeginCommandBuffer( m_transferCmd, &begin );
-  if( m_transferQueries )
-  {
-    vk.vkCmdResetQueryPool( m_transferCmd, m_transferQueries, 0, 2 );
-    vk.vkCmdWriteTimestamp( m_transferCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_transferQueries, 0 );
-  }
-  for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
-  {
-    const HostPlane* plane = hostPlane( pic, ComponentID( comp ) );
-    VkBufferCopy     region{ 0, 0, plane->host.size };
-    vk.vkCmdCopyBuffer( m_transferCmd, plane->twin.buffer, plane->host.buffer, 1, &region );
-  }
-  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  vk.vkCmdPipelineBarrier( m_transferCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
-  if( m_transferQueries )
-  {
-    vk.vkCmdWriteTimestamp( m_transferCmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_transferQueries, 1 );
-  }
-  vk.vkEndCommandBuffer( m_transferCmd );
+  vk.vkBeginCommandBuffer( m_cmd, &begin );
+  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+}
 
-  vk.vkResetFences( m_ctx->device(), 1, &m_fence );
-  m_ctx->submitTransfer( m_transferCmd, m_semaphore, m_fence );
+void GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
+{
+  const Api& vk = m_ctx->api();
+
+  // the rest's commands: without the copy engine, the download at their end;
+  // their writes visible to the CPU (and to the copies)
+  if( !m_ctx->transferQueue() )
+  {
+    copyPlanes( pic, kTwin, kHost );
+  }
+  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0,
+                           nullptr, 0, nullptr );
+  vk.vkEndCommandBuffer( m_cmd );
+
+  if( m_ctx->transferQueue() )
+  {
+    // the copies: the picture's planes on the GPU to host memory
+    vk.vkResetCommandPool( m_ctx->device(), m_transferPool, 0 );
+    VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vk.vkBeginCommandBuffer( m_transferCmd, &begin );
+    if( m_transferQueries )
+    {
+      vk.vkCmdResetQueryPool( m_transferCmd, m_transferQueries, 0, 2 );
+      vk.vkCmdWriteTimestamp( m_transferCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_transferQueries, 0 );
+    }
+    for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
+    {
+      const HostPlane* plane = hostPlane( pic, ComponentID( comp ) );
+      VkBufferCopy     region{ 0, 0, plane->host.size };
+      vk.vkCmdCopyBuffer( m_transferCmd, plane->twin.buffer, plane->host.buffer, 1, &region );
+    }
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vk.vkCmdPipelineBarrier( m_transferCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+    if( m_transferQueries )
+    {
+      vk.vkCmdWriteTimestamp( m_transferCmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_transferQueries, 1 );
+    }
+    vk.vkEndCommandBuffer( m_transferCmd );
+  }
+
+  VkFence fences[2] = { m_fenceFirst, m_fence };
+  vk.vkResetFences( m_ctx->device(), 2, fences );
+  m_submitted = std::chrono::steady_clock::now();
+  m_ctx->submitPicture( m_cmdFirst, m_fenceFirst, m_cmdRest, m_ctx->transferQueue() ? m_semaphore : VK_NULL_HANDLE,
+                        m_ctx->transferQueue() ? m_transferCmd : VK_NULL_HANDLE, m_fence );
+  if( waitFirst )
+  {
+    const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_fenceFirst, VK_TRUE, UINT64_MAX );
+    if( result != VK_SUCCESS )
+    {
+      THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
+    }
+  }
+}
+
+void GpuRecon::endPicture()
+{
+  const Api&     vk     = m_ctx->api();
   const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_fence, VK_TRUE, UINT64_MAX );
   if( result != VK_SUCCESS )
   {
     THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
   }
-  readTimestamps( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - start ).count() );
+  readTimestamps( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - m_submitted ).count() );
   if( m_transferQueries )
   {
     uint64_t stamps[2];
@@ -1211,8 +1240,8 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   mark( "trafo" );
 }
 
-void GpuRecon::finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
-                              PelStorage& pic )
+void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
+                             PelStorage& pic, bool waitFirst )
 {
   const size_t dbSize  = deblockParamSize( cs );
   const size_t alfSize = alf ? alfParamSize( cs ) : 0;
@@ -1256,6 +1285,7 @@ void GpuRecon::finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool
   // there as a reference, and comes back for the output. When the GPU makes
   // all of it, from the residuals on, nothing goes in: the residual pass reads
   // the levels from the host's picture.
+  m_cmd = m_cmdFirst;
   beginCommands();
   for( const Picture* refPic: uploads )
   {
@@ -1278,6 +1308,7 @@ void GpuRecon::finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool
     recordInter( cs, *jobs.inter, planes[cur], m_params.addr + refAt );   // in place
     computeBarrier();
   }
+  splitCommands();
   if( jobs.intra )
   {
     recordIntra( cs, *jobs.intra, planes[cur] );   // in place
@@ -1315,18 +1346,10 @@ void GpuRecon::finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool
       std::swap( hostPlane( pic, ComponentID( comp ) )->twin, m_scratch[comp] );
     }
   }
-  if( m_ctx->transferQueue() )
-  {
-    submitDownloadAndWait( pic );
-  }
-  else
-  {
-    copyPlanes( pic, kTwin, kHost );
-    submitAndWait();
-  }
+  submitPicture( pic, waitFirst );
   for( const Picture* refPic: uploads )
   {
-    refPic->gpuCurrent = true;
+    refPic->gpuCurrent = true;   // for the work queued after this
   }
 }
 

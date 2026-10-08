@@ -130,6 +130,9 @@ void Picture::resetForUse( int _layerId )
   stillReferenced         = false;
 #if VVDEC_VULKAN
   gpuCurrent              = false;
+  gpuEarlyRef             = false;
+  gpuRefReady.clearException();
+  gpuRefReady.lock();
 #endif
   isReferencePic          = false;
   progress                = Picture::init;
@@ -410,7 +413,8 @@ void Picture::fillGrey( const SPS* fallbackSPS )
   getRecoBuf().Cb().fill( cFill );
   getRecoBuf().Cr().fill( cFill );
 #if VVDEC_VULKAN
-  gpuCurrent = false;
+  gpuCurrent  = false;
+  gpuEarlyRef = false;
 #endif
 
   progress = Picture::reconstructed;

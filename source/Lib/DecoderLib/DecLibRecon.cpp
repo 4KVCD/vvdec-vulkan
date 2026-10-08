@@ -581,9 +581,38 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 
   const int numSubPic = cs.pps->getNumSubPics();
 
+  const bool isIntra = std::all_of( pcPic->slices.begin(), pcPic->slices.end(), []( const Slice* pcSlice ) { return pcSlice->isIntra(); } );
+#if VVDEC_VULKAN
+  // the GPU applies the in-loop filters to the whole picture once its CTUs are
+  // reconstructed (the finish tasks)
+  m_gpuFilters = m_gpuRecon && gpu::GpuRecon::filtersSupported( cs );
+  // and, before the filters, the intra and IBC blocks, in waves of blocks the
+  // CTU tasks list (TaskGpuCtu)
+  m_gpuIntra   = m_gpuFilters && gpu::GpuRecon::intraSupported( cs );
+  // and, before those, the inter blocks, from the reference pictures on the GPU
+  m_gpuInter   = m_gpuIntra && !isIntra && gpu::GpuRecon::interSupported( cs );
+  // and, first of all, the residuals, when the CPU predicts nothing
+  m_gpuResidual = m_gpuIntra && ( isIntra || m_gpuInter ) && gpu::GpuRecon::residualSupported( cs );
+  pcPic->gpuEarlyRef = false;
+#endif
+
   std::vector<Picture*> borderExtRefPics( pcPic->buildAllRefPicsVec() );
   for( Picture* refPic : borderExtRefPics )
   {
+#if VVDEC_VULKAN
+    // inter prediction on the GPU reads the reference pictures there (no border
+    // extension in host memory): the CTU tasks wait for a reference the GPU
+    // reconstructs only until it can be referenced (its motion for TMVP final,
+    // its GPU work queued), not for the whole picture
+    if( m_gpuInter && refPic->gpuEarlyRef && !refPic->gpuRefReady.hasException() )
+    {
+      if( refPic->gpuRefReady.isBlocked() && std::find( picBarriers.cbegin(), picBarriers.cend(), &refPic->gpuRefReady ) == picBarriers.cend() )
+      {
+        picBarriers.push_back( &refPic->gpuRefReady );
+      }
+      continue;
+    }
+#endif
     if( !refPic->borderExtStarted )
     {
       // TODO: (GH) Can we bypass this border extension, when all subpics (>1) are treated as pics?
@@ -612,8 +641,6 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     m_decodeThreadPool->processTasksOnMainThread();
   }
 
-  const bool isIntra = std::all_of( pcPic->slices.begin(), pcPic->slices.end(), []( const Slice* pcSlice ) { return pcSlice->isIntra(); } );
-
   const int numColPerTask = std::max( std::min( widthInCtus, ( widthInCtus / std::max( m_numDecThreads * ( isIntra ? 2 : 1 ), 1 ) ) + ( isIntra ? 0 : 1 ) ), 1 );
   const int numTasksPerLine = widthInCtus / numColPerTask + !!( widthInCtus % numColPerTask );
 
@@ -632,16 +659,6 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   m_doSAO                      = doSAO;
   m_doDeblock                  = !noFilters;
 #if VVDEC_VULKAN
-  // the GPU applies the in-loop filters to the whole picture once its CTUs are
-  // reconstructed (finishReconTask)
-  m_gpuFilters = m_gpuRecon && gpu::GpuRecon::filtersSupported( cs );
-  // and, before the filters, the intra and IBC blocks, in waves of blocks the
-  // CTU tasks list (TaskGpuCtu)
-  m_gpuIntra   = m_gpuFilters && gpu::GpuRecon::intraSupported( cs );
-  // and, before those, the inter blocks, from the reference pictures on the GPU
-  m_gpuInter   = m_gpuIntra && !isIntra && gpu::GpuRecon::interSupported( cs );
-  // and, first of all, the residuals, when the CPU predicts nothing
-  m_gpuResidual = m_gpuIntra && ( isIntra || m_gpuInter ) && gpu::GpuRecon::residualSupported( cs );
   commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuFilters, doSAO && !m_gpuFilters, m_doDeblock && !m_gpuFilters, m_gpuIntra,
                          m_gpuInter, m_gpuResidual );
   if( m_gpuRecon )
@@ -759,38 +776,82 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     }
   }
 
+#if VVDEC_VULKAN
+  if( m_gpuFilters )
+  {
+    // with the GPU, two tasks. The first queues the picture's work on the GPU,
+    // and when DMVR refines motion there, waits for that part of the work, to
+    // store the refined motion for TMVP; then (gpuRefReady) the pictures whose
+    // inter prediction the GPU makes can reference this one, their work queued
+    // after its. The second waits for the rest, the download included.
+    static auto queueGpuTask = []( int tid, void* task_param )
+    {
+      FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
+      CodingStructure&    cs    = *param->pic->cs;
+      DecLibRecon*        dec   = param->decLib;
+
+      gpu::PictureJobs jobs;
+      jobs.trafo = dec->m_gpuResidual ? &dec->m_gpuTrafoJobs : nullptr;
+      jobs.inter = dec->m_gpuInter ? &dec->m_gpuInterJobs : nullptr;
+      jobs.intra = dec->m_gpuIntra ? &dec->m_gpuIntraJobs : nullptr;
+      jobs.refs  = &dec->m_refTable;
+      jobs.edges = &dec->m_gpuEdges;
+      // with DMVR's refinements, which the GPU makes, the motion for TMVP in
+      // the next pictures of the CUs DMVR refined (the CTU tasks stored the rest)
+      const bool refine = dec->m_gpuInter && cs.picture->stillReferenced;
+      dec->m_gpuRecon->startPicture( cs, jobs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr,
+                                     cs.picture->m_bufs[PIC_RECONSTRUCTION], refine );
+      cs.picture->gpuCurrent = true;   // for the work queued after this
+      if( refine )
+      {
+        for( int ctuRsAddr = 0; ctuRsAddr < (int) cs.pcv->sizeInCtus; ctuRsAddr++ )
+        {
+          DecCu::finishDmvrMotion( cs, ctuRsAddr, dec->m_gpuDmvrCus[ctuRsAddr] );
+        }
+      }
+      return true;
+    };
+    static auto finishGpuTask = []( int tid, void* task_param )
+    {
+      FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
+      param->decLib->m_gpuRecon->endPicture();
+      param->pic->cs->deallocTempInternals();
+
+#ifdef TRACE_ENABLE_ITT
+      // mark end of frame
+      __itt_frame_end_v3( param->pic->m_itt_decLibInst, nullptr );
+#endif
+      param->pic->stopProcessingTimer();
+
+      param->pic->progress = Picture::reconstructed;
+      return true;
+    };
+
+    taskFinishPic = FinishPicTaskParam( this, pcPic );
+    pcPic->gpuRefReady.lock();
+    m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " queueGpuTask" )
+                                        queueGpuTask,
+                                        &taskFinishPic,
+                                        &pcPic->m_divTasksCounter,
+                                        &pcPic->gpuRefReady,
+                                        { pcPic->m_ctuTaskCounter.donePtr() } );
+    m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " finishPicTask" )
+                                        finishGpuTask,
+                                        &taskFinishPic,
+                                        &pcPic->m_divTasksCounter,
+                                        &pcPic->reconDone,
+                                        { &pcPic->gpuRefReady } );
+    // from now on, the next pictures may reference this one early
+    pcPic->gpuEarlyRef = true;
+  }
+  else
+#endif
   {
     static auto finishReconTask = []( int tid, void* task_param )
     {
       FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
       CodingStructure& cs = *param->pic->cs;
 
-#if VVDEC_VULKAN
-      DecLibRecon* dec = param->decLib;
-      if( dec->m_gpuFilters )
-      {
-        gpu::PictureJobs jobs;
-        jobs.trafo = dec->m_gpuResidual ? &dec->m_gpuTrafoJobs : nullptr;
-        jobs.inter = dec->m_gpuInter ? &dec->m_gpuInterJobs : nullptr;
-        jobs.intra = dec->m_gpuIntra ? &dec->m_gpuIntraJobs : nullptr;
-        jobs.refs  = &dec->m_refTable;
-        jobs.edges = &dec->m_gpuEdges;
-        dec->m_gpuRecon->finishPicture( cs, jobs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr,
-                                        cs.picture->m_bufs[PIC_RECONSTRUCTION] );
-        cs.picture->gpuCurrent = true;
-
-        // with DMVR's refinements, which the GPU made, the motion for TMVP in
-        // the next pictures of the CUs DMVR refined (the CTU tasks stored the rest)
-        if( dec->m_gpuInter && cs.picture->stillReferenced )
-        {
-          for( int ctuRsAddr = 0; ctuRsAddr < (int) cs.pcv->sizeInCtus; ctuRsAddr++ )
-          {
-            DecCu::finishDmvrMotion( cs, ctuRsAddr, dec->m_gpuDmvrCus[ctuRsAddr] );
-          }
-        }
-      }
-      else
-#endif
       if( param->decLib->m_doALF )
       {
         param->decLib->swapBufs( cs );

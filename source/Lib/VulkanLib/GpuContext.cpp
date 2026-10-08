@@ -598,35 +598,41 @@ VkPipeline Context::pipeline( int shaderId )
   return pipe;
 }
 
-void Context::submit( VkCommandBuffer cmd, VkFence fence, VkSemaphore signal )
+void Context::submitPicture( VkCommandBuffer first, VkFence firstDone, VkCommandBuffer rest, VkSemaphore restDone, VkCommandBuffer transfer, VkFence fence )
 {
-  VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-  info.commandBufferCount   = 1;
-  info.pCommandBuffers      = &cmd;
-  info.signalSemaphoreCount = signal ? 1 : 0;
-  info.pSignalSemaphores    = &signal;
-  std::lock_guard<std::mutex> lock( m_queueMutex );
-  const VkResult result = m_api.vkQueueSubmit( m_queue, 1, &info, fence );
-  if( result != VK_SUCCESS )
   {
-    THROW_FATAL( "Vulkan: vkQueueSubmit failed (" << result << ")" );
+    std::lock_guard<std::mutex> lock( m_queueMutex );
+    VkSubmitInfo                info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    info.commandBufferCount = 1;
+    info.pCommandBuffers    = &first;
+    VkResult result         = m_api.vkQueueSubmit( m_queue, 1, &info, firstDone );
+    if( result == VK_SUCCESS )
+    {
+      info.pCommandBuffers      = &rest;
+      info.signalSemaphoreCount = transfer ? 1 : 0;
+      info.pSignalSemaphores    = &restDone;
+      result                    = m_api.vkQueueSubmit( m_queue, 1, &info, transfer ? VK_NULL_HANDLE : fence );
+    }
+    if( result != VK_SUCCESS )
+    {
+      THROW_FATAL( "Vulkan: vkQueueSubmit failed (" << result << ")" );
+    }
   }
-}
-
-void Context::submitTransfer( VkCommandBuffer cmd, VkSemaphore wait, VkFence fence )
-{
-  const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-  VkSubmitInfo               info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-  info.commandBufferCount = 1;
-  info.pCommandBuffers    = &cmd;
-  info.waitSemaphoreCount = 1;
-  info.pWaitSemaphores    = &wait;
-  info.pWaitDstStageMask  = &stage;
-  std::lock_guard<std::mutex> lock( m_transferMutex );
-  const VkResult result = m_api.vkQueueSubmit( m_transferQueue, 1, &info, fence );
-  if( result != VK_SUCCESS )
+  if( transfer )
   {
-    THROW_FATAL( "Vulkan: vkQueueSubmit (copies) failed (" << result << ")" );
+    const VkPipelineStageFlags  stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo                info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    info.commandBufferCount = 1;
+    info.pCommandBuffers    = &transfer;
+    info.waitSemaphoreCount = 1;
+    info.pWaitSemaphores    = &restDone;
+    info.pWaitDstStageMask  = &stage;
+    std::lock_guard<std::mutex> lock( m_transferMutex );
+    const VkResult              result = m_api.vkQueueSubmit( m_transferQueue, 1, &info, fence );
+    if( result != VK_SUCCESS )
+    {
+      THROW_FATAL( "Vulkan: vkQueueSubmit (copies) failed (" << result << ")" );
+    }
   }
 }
 

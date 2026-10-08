@@ -210,6 +210,10 @@ public:
   std::atomic_bool stillReferenced         { false };        // set as long as there is a picture in progress, that references this one. ('referenced' might be unset during parsing)
 #if VVDEC_VULKAN
   mutable std::atomic_bool gpuCurrent      { false };        // the reconstruction is on the GPU too (gpu::GpuRecon)
+  // the picture is reconstructed on the GPU: the pictures whose inter
+  // prediction the GPU makes may reference it before it is done, once
+  // gpuRefReady (its motion for TMVP final, its GPU work queued: DecLibRecon)
+  bool                     gpuEarlyRef     = false;
 #endif
   bool             isReferencePic          = false;          // mainly for setting vvdecPicAttributes::isRefPic for the library output frame
   bool             wasLost                 = false;
@@ -263,6 +267,9 @@ public:
   Barrier         m_copyWrapBufDone;
   BlockingBarrier parseDone;
   BlockingBarrier reconDone;
+#if VVDEC_VULKAN
+  Barrier         gpuRefReady;
+#endif
 #if RECO_WHILE_PARSE
   std::vector<Barrier> ctuParsedBarrier;
 #endif

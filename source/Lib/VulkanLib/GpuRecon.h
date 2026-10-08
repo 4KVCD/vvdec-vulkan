@@ -50,6 +50,8 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #pragma once
 
+#include <chrono>
+
 #include "GpuContext.h"
 #include "GpuJobs.h"
 
@@ -119,18 +121,24 @@ public:
   // reference pictures of jobs.refs, the intra and IBC blocks of jobs.intra,
   // then the in-loop filters: deblocking (when deblock), SAO (when sao is
   // given), ALF with CC-ALF (when alf is given); the result stays on the GPU as
-  // a reference (the picture is gpuCurrent then) and comes back to pic
-  void finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
-                      PelStorage& pic );
+  // a reference (the picture is gpuCurrent then) and comes back to pic.
+  // startPicture queues the work, in two parts: the first, the residuals and
+  // the inter blocks, the rest. waitFirst: it returns once the first part is
+  // done, DMVR's refinements in host memory (dmvrMvCache). endPicture waits
+  // for the rest, the download of pic included.
+  void startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
+                     PelStorage& pic, bool waitFirst );
+  void endPicture();
 
 private:
   void     beginCommands();
   void     computeBarrier();
   void     mark( const char* label );   // with VVDEC_GPU_PROFILE: the GPU time since the last mark counts as label
-  void     submitAndWait();
-  // the download of pic on the copy engine (Context::transferQueue): the
-  // compute commands go first, signalling m_semaphore, the copies wait for it
-  void     submitDownloadAndWait( const PelStorage& pic );
+  void     splitCommands();   // the first part's commands end, the rest's begin
+  // the commands of both parts queued, and the download of pic: on the copy
+  // engine (Context::transferQueue), after the rest's m_semaphore, else at the
+  // end of the rest
+  void     submitPicture( const PelStorage& pic, bool waitFirst );
   void     readTimestamps( double waited );
   uint8_t* params( size_t size );   // the host-visible parameter buffer, at least size bytes
 
@@ -165,8 +173,12 @@ private:
 
   Context*        m_ctx;
   VkCommandPool   m_pool    = VK_NULL_HANDLE;
-  VkCommandBuffer m_cmd     = VK_NULL_HANDLE;
-  VkFence         m_fence   = VK_NULL_HANDLE;
+  VkCommandBuffer m_cmd     = VK_NULL_HANDLE;   // the one being recorded: m_cmdFirst or m_cmdRest
+  VkCommandBuffer m_cmdFirst = VK_NULL_HANDLE;  // a picture's first part
+  VkCommandBuffer m_cmdRest  = VK_NULL_HANDLE;  // and the rest
+  VkFence         m_fenceFirst = VK_NULL_HANDLE;   // the first part done
+  VkFence         m_fence   = VK_NULL_HANDLE;   // all done
+  std::chrono::steady_clock::time_point m_submitted;
   VkQueryPool     m_queries = VK_NULL_HANDLE;   // the profiling timestamps
   VkCommandPool   m_transferPool    = VK_NULL_HANDLE;   // the copy engine's commands
   VkCommandBuffer m_transferCmd     = VK_NULL_HANDLE;
