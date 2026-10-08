@@ -1122,12 +1122,12 @@ void GpuRecon::finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool
   transferBarrier( true );
   if( cur == 1 )
   {
-    // the result to the picture's own planes on the GPU
-    copyPlanes( pic, kScratch, kTwin );
-    VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    m_ctx->api().vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+    // the result is in the scratch planes: they become the picture's own
+    // planes on the GPU, and its former ones the scratch planes (same sizes)
+    for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
+    {
+      std::swap( hostPlane( pic, ComponentID( comp ) )->twin, m_scratch[comp] );
+    }
   }
   copyPlanes( pic, kTwin, kHost );
   submitAndWait();
