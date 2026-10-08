@@ -82,10 +82,19 @@ static const int kBilinear[32] = { 16, 0, 15, 1, 14, 2, 13, 3, 12, 4, 11, 5, 10,
 // shared by the workgroup: the reference samples a block's filter reads, the
 // horizontal pass of a 2-D filter; DMVR's bilinear predictions, its SADs and
 // its result
-groupshared int  s_ref[( 16 + 7 ) * ( 16 + 7 )];
-groupshared int  s_tmp[( 16 + 7 ) * 16];
-groupshared int  s_bil0[20 * 20];
-groupshared int  s_bil1[20 * 20];
+// The filters' and DMVR's arrays share one pool of 16-bit values (each of
+// them fits), so that more workgroups fit a compute unit: the filters' the
+// reference samples (s_ref) and the horizontal pass (s_tmp), DMVR's bilinear
+// predictions (s_bil0, s_bil1), never in use at the same time.
+#define REF_AT 0
+#define TMP_AT ( ( 16 + 7 ) * ( 16 + 7 ) )
+#define BIL0_AT 0
+#define BIL1_AT ( 20 * 20 )
+groupshared int16_t s_pool[( 16 + 7 ) * ( 16 + 7 ) + ( 16 + 7 ) * 16];
+#define s_ref( i ) int( s_pool[REF_AT + ( i )] )
+#define s_tmp( i ) int( s_pool[TMP_AT + ( i )] )
+#define s_bil0( i ) int( s_pool[BIL0_AT + ( i )] )
+#define s_bil1( i ) int( s_pool[BIL1_AT + ( i )] )
 groupshared int  s_sad[25];
 groupshared int2 s_delta;
 
@@ -175,7 +184,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
   {
     const int r = s / rw;
     const int c = s - r * rw;
-    s_ref[s] = refSample( ref, comp, baseX - ox + c, baseY - oy + r, windowed, window );
+    s_pool[REF_AT + s] = int16_t( refSample( ref, comp, baseX - ox + c, baseY - oy + r, windowed, window ) );
   }
   GroupMemoryBarrierWithGroupSync();
 
@@ -192,9 +201,9 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
       [unroll]
       for( int k = 0; k < N; k++ )
       {
-        sum += cx[k] * s_ref[r * rw + i + k];
+        sum += cx[k] * s_ref( r * rw + i + k );
       }
-      s_tmp[s] = ( sum + offset1 ) >> shift1;
+      s_pool[TMP_AT + s] = int16_t( ( sum + offset1 ) >> shift1 );
     }
     GroupMemoryBarrierWithGroupSync();
     for( int k = 0; k < PER_THREAD; k++ )
@@ -208,7 +217,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
         [unroll]
         for( int t = 0; t < N; t++ )
         {
-          sum += cy[t] * s_tmp[( j + t ) * w + i];
+          sum += cy[t] * s_tmp( ( j + t ) * w + i );
         }
         out[k] = bi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
       }
@@ -227,7 +236,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
         const int i = s & ( w - 1 );
         if( xFrac == 0 && yFrac == 0 )
         {
-          const int v = s_ref[j * rw + i];
+          const int v = s_ref( j * rw + i );
           out[k]      = bi ? v * ( 1 << headRoom ) - IF_INTERNAL_OFFS : v;
         }
         else
@@ -238,7 +247,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
             [unroll]
             for( int t = 0; t < N; t++ )
             {
-              sum += cy[t] * s_ref[( j + t ) * rw + i];
+              sum += cy[t] * s_ref( ( j + t ) * rw + i );
             }
           }
           else
@@ -246,7 +255,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
             [unroll]
             for( int t = 0; t < N; t++ )
             {
-              sum += cx[t] * s_ref[j * rw + i + t];
+              sum += cx[t] * s_ref( j * rw + i + t );
             }
           }
           const int v = ( sum + offset ) >> shiftV;
@@ -290,16 +299,13 @@ int bilinearAt( int slot, int cuX, int cuY, int2 mvStart, int u, int v )
   return ( kBilinear[yFrac * 2] * t0 + kBilinear[yFrac * 2 + 1] * t1 + 8 ) >> 4;
 }
 
-// the SAD of L0 moved by (hor, ver) against L1 moved by (-hor, -ver), every other row
-int dmvrSad( int dx, int dy, int hor, int ver )
+// row j of the SAD of L0 moved by (hor, ver) against L1 moved by (-hor, -ver)
+int dmvrSadRow( int dx, int j, int hor, int ver )
 {
   int sum = 0;
-  for( int j = 0; j < dy; j += 2 )
+  for( int i = 0; i < dx; i++ )
   {
-    for( int i = 0; i < dx; i++ )
-    {
-      sum += abs( s_bil0[( 2 + ver + j ) * 20 + 2 + hor + i] - s_bil1[( 2 - ver + j ) * 20 + 2 - hor + i] );
-    }
+    sum += abs( s_bil0( ( 2 + ver + j ) * 20 + 2 + hor + i ) - s_bil1( ( 2 - ver + j ) * 20 + 2 - hor + i ) );
   }
   return sum;
 }
@@ -417,6 +423,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   int2 refined0 = mv0, refined1 = mv1;
   if( dmvr )
   {
+    // the bilinear predictions of the subblock's (w + 4) x (h + 4) samples
+    // from the merge motion minus 2 samples
     const int2 start0 = clipMv( mv0, cuX, cuY ) - int2( 32, 32 );
     const int2 start1 = clipMv( mv1, cuX, cuY ) - int2( 32, 32 );
     const int  bw     = w + 4;
@@ -424,22 +432,25 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       const int v = s / bw;
       const int u = s - v * bw;
-      s_bil0[v * 20 + u] = bilinearAt( ref0, cuX, cuY, start0, x - cuX + u, y - cuY + v );
-      s_bil1[v * 20 + u] = bilinearAt( ref1, cuX, cuY, start1, x - cuX + u, y - cuY + v );
+      s_pool[BIL0_AT + v * 20 + u] = int16_t( bilinearAt( ref0, cuX, cuY, start0, x - cuX + u, y - cuY + v ) );
+      s_pool[BIL1_AT + v * 20 + u] = int16_t( bilinearAt( ref1, cuX, cuY, start1, x - cuX + u, y - cuY + v ) );
     }
-    GroupMemoryBarrierWithGroupSync();
     if( tid < 25 )
     {
-      int sad = dmvrSad( w, h, tid % 5 - 2, tid / 5 - 2 );
-      if( tid == 12 )
-      {
-        sad -= sad >> 2;
-      }
-      s_sad[tid] = sad;
+      s_sad[tid] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // the SADs of the 25 offsets on every other row: a row of an offset per
+    // step, summed up in shared memory
+    for( int p = tid; p < 25 * ( h >> 1 ); p += THREADS )
+    {
+      const int pos = p % 25;
+      InterlockedAdd( s_sad[pos], dmvrSadRow( w, 2 * ( p / 25 ), pos % 5 - 2, pos / 5 - 2 ) );
     }
     GroupMemoryBarrierWithGroupSync();
     if( tid == 0 )
     {
+      s_sad[12] -= s_sad[12] >> 2;
       const int2 delta       = dmvrDelta( w, h );
       const int  index8      = int( job[8] );
       pc.dmvr[index8 * 2]     = delta.x;
