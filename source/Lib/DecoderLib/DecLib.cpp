@@ -717,8 +717,38 @@ void DecLib::reconPicture( Picture* pcPic )
   CHECK_FATAL( std::any_of( m_decLibRecon.begin(), m_decLibRecon.end(), [=]( auto& rec ) { return rec.getCurrPic() == pcPic; } ),
          "(Reused) Picture structure is still in progress in decLibRecon." );
 
+  // the instances in turn: the first takes the picture and goes behind the
+  // last of those in turn
+  size_t inTurn = m_decLibRecon.size();
+#if VVDEC_VULKAN
+  // with the GPU, the pictures up to 1080p take the first two only: as fast as
+  // with four (VideoQ 1080p 685 vs 675 fps; two films' 1080p within 0.5%),
+  // with two pictures fewer in reconstruction and two instances' buffers not
+  // allocated (VideoQ 1080p: peak commit 580 -> 477 MB). Larger pictures take
+  // all four (3840x1608 and 4K: 1.3% and 2.0% faster than with two).
+  if( m_gpu && pcPic->lumaSize().area() <= 1920 * 1088 )
+  {
+    inTurn = std::min<size_t>( inTurn, 2 );
+  }
+  if( inTurn < m_reconInTurn )
+  {
+    // the pictures of the instances leaving the turns finished now
+    auto leaving = m_decLibRecon.begin();
+    std::advance( leaving, inTurn );
+    for( ; leaving != m_decLibRecon.end(); ++leaving )
+    {
+      if( Picture* donePic = leaving->waitForPrevDecompressedPic() )
+      {
+        finishPicture( donePic );
+      }
+    }
+  }
+  m_reconInTurn = inTurn;
+#endif
   DecLibRecon* reconInstance = &m_decLibRecon.front();
-  move_to_end( m_decLibRecon.begin(), m_decLibRecon );
+  auto         behind        = m_decLibRecon.begin();
+  std::advance( behind, inTurn );
+  m_decLibRecon.splice( behind, m_decLibRecon, m_decLibRecon.begin() );
 
   Picture* donePic = reconInstance->waitForPrevDecompressedPic();
   try

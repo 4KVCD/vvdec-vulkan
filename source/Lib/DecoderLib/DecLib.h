@@ -86,6 +86,7 @@ class DecLib
 #if VVDEC_VULKAN
   gpu::Context*            m_gpu = nullptr;   // the Vulkan device, when the pictures are reconstructed on the GPU
   UserAllocator            m_gpuAllocator;    // the picture buffers then: host memory the GPU reaches
+  size_t                   m_reconInTurn = 0; // the reconstruction instances the pictures take in turn (fewer for small pictures)
 #endif
 
 public:
