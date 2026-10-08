@@ -4,7 +4,9 @@
 // boundary splits: there the filters see the whole picture, with the samples
 // beyond its edges replicated (vvdec's border extension).
 //
-// CHROMA=0: a thread classifies one 4x4 luma block and filters it (7x7 diamond).
+// CHROMA=0: a thread classifies one 4x4 luma block and filters it (7x7 diamond),
+//           from the workgroup's 32x32 samples and their 3-sample margin,
+//           read once into shared memory.
 // CHROMA=1: a thread filters one 4x4 block of Cb and of Cr (5x5 diamond), then
 //           adds the cross-component filter of the luma below them.
 //
@@ -60,9 +62,17 @@ int clipAlf( int c, int cur, int a, int b )
 
 #if CHROMA == 0
 
+// the workgroup's samples: 32 x 32 from (s_x0, s_y0) and a margin of 3, as
+// the picture's edges replicate them (vvdec's border extension)
+#define TILE 32
+#define MARGIN 3
+#define TILE_W ( TILE + 2 * MARGIN )
+groupshared int16_t s_tile[TILE_W * TILE_W];
+static int          s_x0, s_y0;
+
 int px( int x, int y )
 {
-  return loadClamped( pc.src0, pc.srcStride, x, y, pc.width, pc.height );
+  return int( s_tile[( y - s_y0 + MARGIN ) * TILE_W + x - s_x0 + MARGIN] );
 }
 
 static const int kTh[16] = { 0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4 };
@@ -70,8 +80,17 @@ static const int kTransposeTable[8] = { 0, 1, 0, 2, 2, 3, 1, 3 };
 
 [shader( "compute" )]
 [numthreads( 8, 8, 1 )]
-void main( uint3 id : SV_DispatchThreadID )
+void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
+  s_x0 = int( group.x ) * TILE;
+  s_y0 = int( group.y ) * TILE;
+  for( int s = int( local.y * 8 + local.x ); s < TILE_W * TILE_W; s += 64 )
+  {
+    const int r = s / TILE_W;
+    s_tile[s]   = int16_t( loadClamped( pc.src0, pc.srcStride, s_x0 - MARGIN + s - r * TILE_W, s_y0 - MARGIN + r, pc.width, pc.height ) );
+  }
+  GroupMemoryBarrierWithGroupSync();
+
   const int bx = int( id.x ) * 4;
   const int by = int( id.y ) * 4;
   if( bx >= pc.width || by >= pc.height )
@@ -79,6 +98,7 @@ void main( uint3 id : SV_DispatchThreadID )
     return;
   }
 
+  // a CTU holds whole tiles (CTUs of 32 luma samples or more)
   const int ctu = ( by >> pc.ctuLog2 ) * pc.widthInCtus + ( bx >> pc.ctuLog2 );
   const int set = int( pc.ctus[ctu * 8 + CTU_LUMA_SET] );
   if( set == 255 )
@@ -87,7 +107,7 @@ void main( uint3 id : SV_DispatchThreadID )
     {
       for( int x = bx; x < bx + 4; x++ )
       {
-        storePel( pc.dst0, pc.dstStride, x, y, loadPel( pc.src0, pc.srcStride, x, y ) );
+        storePel( pc.dst0, pc.dstStride, x, y, px( x, y ) );
       }
     }
     return;
