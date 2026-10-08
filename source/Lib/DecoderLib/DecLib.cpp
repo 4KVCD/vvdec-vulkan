@@ -123,8 +123,6 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
     numDecThreads = std::thread::hardware_concurrency();
   }
 
-  m_decodeThreadPool.reset( new ThreadPool( numDecThreads, "DecThread" ) );
-
   if( parserFrameDelay < 0 )
   {
     CHECK_FATAL( numDecThreads < 0, "invalid number of threads" );
@@ -155,6 +153,14 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
   {
     msg( WARNING, "GPU reconstruction off: this vvdec is built without Vulkan\n" );
   }
+#endif
+
+#if VVDEC_VULKAN
+  // with the GPU, the CPU waits for it a lot: its idle threads block at once
+  // instead of spinning (which on an APU takes power from the GPU too)
+  m_decodeThreadPool.reset( new ThreadPool( numDecThreads, "DecThread", m_gpu != nullptr ) );
+#else
+  m_decodeThreadPool.reset( new ThreadPool( numDecThreads, "DecThread" ) );
 #endif
 
 #if VVDEC_VULKAN

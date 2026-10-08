@@ -55,21 +55,23 @@ using namespace std::chrono_literals;
 
 std::mutex Barrier::s_exceptionLock{};
 
-// block threads after busy-waiting this long
-const static auto VVDEC_BUSY_WAIT_TIME_MIN = [] {
+// block threads after busy-waiting this long (shortBusyWait: not at all)
+static std::chrono::microseconds busyWaitTimeMin( bool shortBusyWait )
+{
   const char* env = getenv( "VVDEC_BUSY_WAIT_TIME_MIN" );
   if( env )
     return std::chrono::microseconds( int( atof( env ) * 1000 ) );
-  return std::chrono::microseconds( 1ms );
-}();
+  return shortBusyWait ? std::chrono::microseconds( 0 ) : std::chrono::microseconds( 1ms );
+}
 
-// block last waiting thread after this time
-const static auto VVDEC_BUSY_WAIT_TIME_MAX = [] {
+// block last waiting thread after this time (shortBusyWait: 1 ms)
+static std::chrono::microseconds busyWaitTimeMax( bool shortBusyWait )
+{
   const char* env = getenv( "VVDEC_BUSY_WAIT_TIME_MAX" );
   if( env )
     return atoi( env ) * 1ms;
-  return 5ms;
-}();
+  return shortBusyWait ? 1ms : 5ms;
+}
 
 
 struct ThreadPool::TaskException : public std::exception
@@ -96,8 +98,10 @@ public:
 // Thread Pool
 // ---------------------------------------------------------------------------
 
-ThreadPool::ThreadPool( int numThreads, const char* threadPoolName )
+ThreadPool::ThreadPool( int numThreads, const char* threadPoolName, bool shortBusyWait )
   : m_poolName( threadPoolName )
+  , m_busyWaitTimeMin( busyWaitTimeMin( shortBusyWait ) )
+  , m_busyWaitTimeMax( busyWaitTimeMax( shortBusyWait ) )
   , m_threads( numThreads < 0 ? std::thread::hardware_concurrency() : numThreads )
   , m_poolPause( m_threads.size() )
 {
@@ -229,7 +233,7 @@ void ThreadPool::threadProc( int threadId )
 
           if( !idleLock.owns_lock() )
           {
-            if( VVDEC_BUSY_WAIT_TIME_MIN.count() == 0 || std::chrono::steady_clock::now() - startWait > VVDEC_BUSY_WAIT_TIME_MIN )
+            if( m_busyWaitTimeMin.count() == 0 || std::chrono::steady_clock::now() - startWait > m_busyWaitTimeMin )
             {
               ITT_TASKSTART( itt_domain_thrd, itt_handle_TPblocked );
               ScopeIncDecCounter cntr( m_poolPause.m_waitingForLockThreads );
@@ -238,7 +242,7 @@ void ThreadPool::threadProc( int threadId )
               ITT_TASKEND( itt_domain_thrd, itt_handle_TPblocked );
             }
           }
-          else if( std::chrono::steady_clock::now() - startWait > VVDEC_BUSY_WAIT_TIME_MAX )
+          else if( std::chrono::steady_clock::now() - startWait > m_busyWaitTimeMax )
           {
 #if THREAD_POOL_TASK_NAMES
             printWaitingTasks();
