@@ -118,7 +118,8 @@ class Context
 {
 public:
   // the process-wide context: created by the first acquire(), destroyed with
-  // the last release(); acquire() returns null when no usable Vulkan device exists
+  // the last release() -- but for the Vulkan instance, which stays
+  // (s_instance); acquire() returns null when no usable Vulkan device exists
   static Context* acquire();
   static void     release();
 
@@ -172,8 +173,7 @@ private:
   int  memoryType( uint32_t typeBits, MemKind kind ) const;
 
   Api                              m_api;
-  void*                            m_library  = nullptr;
-  VkInstance                       m_instance = VK_NULL_HANDLE;
+  VkInstance                       m_instance = VK_NULL_HANDLE;   // s_instance
   VkPhysicalDevice                 m_physical = VK_NULL_HANDLE;
   VkDevice                         m_device   = VK_NULL_HANDLE;
   VkQueue                          m_queue    = VK_NULL_HANDLE;
@@ -211,6 +211,13 @@ private:
   static std::mutex s_mutex;
   static Context*   s_context;
   static int        s_refs;
+  // the Vulkan library and instance: made by the first init(), kept for the
+  // process (never destroyed: not at its exit either, where the driver may
+  // already be going). The loader unloads the driver with the last instance,
+  // and AMD's (32.0.31041) leaks 1.5 MB each time it is loaded again: 200
+  // decoders opened and closed one after the other, a process grew by 300 MB.
+  static void*      s_library;
+  static VkInstance s_instance;
 };
 
 }   // namespace gpu

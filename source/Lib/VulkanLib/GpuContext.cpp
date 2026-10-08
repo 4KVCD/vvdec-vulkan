@@ -69,8 +69,10 @@ namespace gpu
 {
 
 std::mutex Context::s_mutex;
-Context*   Context::s_context = nullptr;
-int        Context::s_refs    = 0;
+Context*   Context::s_context  = nullptr;
+int        Context::s_refs     = 0;
+void*      Context::s_library  = nullptr;
+VkInstance Context::s_instance = VK_NULL_HANDLE;
 
 static constexpr uint32_t kPushConstantSize = 256;
 
@@ -104,39 +106,50 @@ void Context::release()
 bool Context::init()
 {
 #ifdef _WIN32
-  HMODULE library = LoadLibraryW( L"vulkan-1.dll" );
-  m_library       = library;
-  if( !library )
+  if( !s_library )
+  {
+    s_library = LoadLibraryW( L"vulkan-1.dll" );
+  }
+  if( !s_library )
   {
     msg( WARNING, "Vulkan: vulkan-1.dll not found\n" );
     return false;
   }
-  m_api.vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr) (void*) GetProcAddress( library, "vkGetInstanceProcAddr" );
+  m_api.vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr) (void*) GetProcAddress( (HMODULE) s_library, "vkGetInstanceProcAddr" );
 #else
-  m_library = dlopen( "libvulkan.so.1", RTLD_NOW | RTLD_LOCAL );
-  if( !m_library )
+  if( !s_library )
+  {
+    s_library = dlopen( "libvulkan.so.1", RTLD_NOW | RTLD_LOCAL );
+  }
+  if( !s_library )
   {
     msg( WARNING, "Vulkan: libvulkan.so.1 not found\n" );
     return false;
   }
-  m_api.vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr) dlsym( m_library, "vkGetInstanceProcAddr" );
+  m_api.vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr) dlsym( s_library, "vkGetInstanceProcAddr" );
 #endif
   if( !m_api.vkGetInstanceProcAddr )
   {
     return false;
   }
 
-  auto createInstance = (PFN_vkCreateInstance) m_api.vkGetInstanceProcAddr( VK_NULL_HANDLE, "vkCreateInstance" );
-  VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
-  app.pApplicationName = "vvdec";
-  app.apiVersion       = VK_API_VERSION_1_2;
-  VkInstanceCreateInfo instanceInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
-  instanceInfo.pApplicationInfo = &app;
-  if( !createInstance || createInstance( &instanceInfo, nullptr, &m_instance ) != VK_SUCCESS )
+  if( !s_instance )
   {
-    msg( WARNING, "Vulkan: no instance\n" );
-    return false;
+    auto createInstance = (PFN_vkCreateInstance) m_api.vkGetInstanceProcAddr( VK_NULL_HANDLE, "vkCreateInstance" );
+    VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    app.pApplicationName = "vvdec";
+    app.apiVersion       = VK_API_VERSION_1_2;
+    VkInstanceCreateInfo instanceInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    instanceInfo.pApplicationInfo = &app;
+    VkInstance instance           = VK_NULL_HANDLE;
+    if( !createInstance || createInstance( &instanceInfo, nullptr, &instance ) != VK_SUCCESS )
+    {
+      msg( WARNING, "Vulkan: no instance\n" );
+      return false;
+    }
+    s_instance = instance;
   }
+  m_instance = s_instance;
 
 #define VVDEC_VK_LOAD_INSTANCE( name ) m_api.name = (PFN_##name) m_api.vkGetInstanceProcAddr( m_instance, #name );
   VVDEC_VK_INSTANCE_FUNCS( VVDEC_VK_LOAD_INSTANCE )
@@ -440,21 +453,7 @@ Context::~Context()
     m_api.vkDestroyDevice( m_device, nullptr );
   }
   delete[] m_pipelines;
-  if( m_instance )
-  {
-    m_api.vkDestroyInstance( m_instance, nullptr );
-  }
-#ifdef _WIN32
-  if( m_library )
-  {
-    FreeLibrary( (HMODULE) m_library );
-  }
-#else
-  if( m_library )
-  {
-    dlclose( m_library );
-  }
-#endif
+  // the instance and the Vulkan library stay (s_instance)
 }
 
 int Context::memoryType( uint32_t typeBits, MemKind kind ) const
