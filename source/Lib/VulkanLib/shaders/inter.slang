@@ -77,7 +77,7 @@ static const int kChroma[128] = {
   -4, 36, 36, -4,  -4, 33, 39, -4,  -4, 30, 42, -4,  -4, 29, 44, -5,  -4, 28, 46, -6,  -3, 24, 49, -6,  -2, 20, 52, -6,  -2, 18, 53, -5,
   -2, 16, 54, -4,  -2, 15, 55, -4,  -2, 14, 56, -4,  -2, 12, 57, -3,  -2, 10, 58, -2,  -1,  7, 60, -2,   0,  4, 62, -2,   0,  2, 63, -1
 };
-static const int kBilinear[32] = { 16, 0, 15, 1, 14, 2, 13, 3, 12, 4, 11, 5, 10, 6, 9, 7, 8, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+static const int16_t kBilinear[32] = { 16, 0, 15, 1, 14, 2, 13, 3, 12, 4, 11, 5, 10, 6, 9, 7, 8, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
 
 // shared by the workgroup: the reference samples a block's filter reads, the
 // horizontal pass of a 2-D filter; DMVR's bilinear predictions, its SADs and
@@ -167,12 +167,12 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
   const int maxVal   = ( 1 << pc.bitDepth ) - 1;
   const int log2W    = log2Int( w );
 
-  int cx[N], cy[N];
+  int16_t cx[N], cy[N];   // 16 bits: the compiler's full-rate 24-bit multiply-adds then
   [unroll]
   for( int k = 0; k < N; k++ )
   {
-    cx[k] = coeff( comp, xFrac, hpel, k );
-    cy[k] = coeff( comp, yFrac, hpel, k );
+    cx[k] = int16_t( coeff( comp, xFrac, hpel, k ) );
+    cy[k] = int16_t( coeff( comp, yFrac, hpel, k ) );
   }
 
   // the samples the filter reads: rw x rh from (baseX - ox, baseY - oy)
@@ -201,7 +201,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
       [unroll]
       for( int k = 0; k < N; k++ )
       {
-        sum += cx[k] * s_ref( r * rw + i + k );
+        sum += int( cx[k] ) * s_ref( r * rw + i + k );
       }
       s_pool[TMP_AT + s] = int16_t( ( sum + offset1 ) >> shift1 );
     }
@@ -217,7 +217,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
         [unroll]
         for( int t = 0; t < N; t++ )
         {
-          sum += cy[t] * s_tmp( ( j + t ) * w + i );
+          sum += int( cy[t] ) * s_tmp( ( j + t ) * w + i );
         }
         out[k] = bi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
       }
@@ -247,7 +247,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
             [unroll]
             for( int t = 0; t < N; t++ )
             {
-              sum += cy[t] * s_ref( ( j + t ) * rw + i );
+              sum += int( cy[t] ) * s_ref( ( j + t ) * rw + i );
             }
           }
           else
@@ -255,7 +255,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
             [unroll]
             for( int t = 0; t < N; t++ )
             {
-              sum += cx[t] * s_ref( j * rw + i + t );
+              sum += int( cx[t] ) * s_ref( j * rw + i + t );
             }
           }
           const int v = ( sum + offset ) >> shiftV;
@@ -462,6 +462,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     refined1 = clipStorage( mv1 - s_delta );
   }
 
+  [loop]
   for( int comp = 0; comp < 3; comp++ )
   {
     const int s     = comp == 0 ? 0 : 1;
@@ -469,6 +470,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     const int shift = comp == 0 ? 4 : 5;
     int       pred0[PER_THREAD], pred1[PER_THREAD];
 
+    [loop]
     for( int list = 0; list < 2; list++ )
     {
       if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) == 0 )
@@ -501,22 +503,24 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       {
         clipped = clipMv( mv, cuX, cuY );
       }
-      const bool first = list == 0 || ( flags & FLAG_L0 ) == 0;
-      if( comp == 0 && first )
+      // one call a filter length: the shader's code stays small (it ran slower
+      // when it outgrew the instruction cache)
+      int pred[PER_THREAD];
+      if( comp == 0 )
       {
-        predictBlock<8>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred0 );
-      }
-      else if( comp == 0 )
-      {
-        predictBlock<8>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred1 );
-      }
-      else if( first )
-      {
-        predictBlock<4>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred0 );
+        predictBlock<8>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred );
       }
       else
       {
-        predictBlock<4>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred1 );
+        predictBlock<4>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred );
+      }
+      if( list == 0 || ( flags & FLAG_L0 ) == 0 )
+      {
+        pred0 = pred;
+      }
+      else
+      {
+        pred1 = pred;
       }
     }
 
