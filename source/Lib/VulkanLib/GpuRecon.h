@@ -43,8 +43,9 @@ POSSIBILITY OF SUCH DAMAGE.
 /** \file     GpuRecon.h
     \brief    the stages of a picture's reconstruction that run on the GPU
 
-    The pictures live in host memory the GPU reaches (hostPictureAllocator), so
-    a stage on the GPU reads and writes vvdec's own picture buffers.
+    The pictures live in host memory the GPU reaches (hostPictureAllocator),
+    where vvdec's CPU code reads and writes them, and each has a twin in the
+    GPU's own memory, where the GPU finishes it and keeps it as a reference.
 */
 
 #pragma once
@@ -61,12 +62,14 @@ namespace vvdec
 class CodingStructure;
 class AdaptiveLoopFilter;
 class SampleAdaptiveOffset;
+class Mv;
+class SPS;
 
 namespace gpu
 {
 
 // UserAllocator callbacks putting the planes of the pictures in host memory
-// the GPU reaches; each plane's allocator handle is its gpu::Buffer
+// the GPU reaches; each plane's allocator handle is its HostPlane (GpuRecon.cpp)
 UserAllocator hostPictureAllocator( Context* context );
 
 class GpuRecon
@@ -91,17 +94,28 @@ public:
   // none of the tools it lacks (MIP, ISP, multiple reference lines, CIIP, ACT,
   // LMCS, reference wraparound)
   static bool intraSupported( const CodingStructure& cs );
+  static bool intraSupported( const SPS& sps );
+  // whether the GPU predicts the inter blocks of the pictures of the sequence:
+  // what intraSupported needs, 10 bits at most, none of affine, BDOF, GPM, BCW,
+  // SbTMVP, subpictures
+  static bool interSupported( const SPS& sps );
+  // and of the picture: no weighted prediction, no scaled references
+  static bool interSupported( const CodingStructure& cs );
 
   // the deblocking parameters of the current picture (vvdec's LF_INIT writes
   // them): count of them, in host memory the GPU reads
   LoopFilterParam* loopFilterParams( size_t count );
+  // vvdec's DMVR MV cache of the current picture, count of them, in host memory the GPU writes
+  Mv*              dmvrMvCache( size_t count );
 
-  // the rest of the picture in pic: the intra and IBC blocks of intraJobs
-  // (one list per CTU) on top of what the CPU reconstructed, then the in-loop
-  // filters: deblocking (when deblock), SAO (when sao is given), ALF with
-  // CC-ALF (when alf is given); the result back in pic
-  void finishPicture( CodingStructure& cs, const std::vector<std::vector<IntraJob>>* intraJobs, bool deblock, SampleAdaptiveOffset* sao,
-                      const AdaptiveLoopFilter* alf, PelStorage& pic );
+  // the rest of the picture in pic, on top of what the CPU reconstructed: the
+  // inter blocks of interJobs, from the reference pictures of refs, then the
+  // intra and IBC blocks of intraJobs (each one list per CTU), then the
+  // in-loop filters: deblocking (when deblock), SAO (when sao is given), ALF
+  // with CC-ALF (when alf is given); the result stays on the GPU as a
+  // reference (the picture is gpuCurrent then) and comes back to pic
+  void finishPicture( CodingStructure& cs, const std::vector<std::vector<IntraJob>>* intraJobs, const std::vector<std::vector<InterJob>>* interJobs,
+                      const RefTable& refs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, PelStorage& pic );
 
 private:
   void     beginCommands();
@@ -116,8 +130,11 @@ private:
     VkDeviceAddress addr[MAX_NUM_COMPONENT];
     int32_t         stride[MAX_NUM_COMPONENT];
   };
-  Planes        mirrorPlanes( int mirror, const PelStorage& pic );   // GPU memory laid out as pic's buffers
-  void          copyPlanes( const PelStorage& pic, int mirror, bool toMirror );
+  enum { kHost, kTwin, kScratch };
+  Planes        twinPlanes( const PelStorage& pic );     // the picture on the GPU (its memory made when missing)
+  Planes        scratchPlanes( const PelStorage& pic );  // GPU memory laid out as pic's buffers
+  void          copyPlanes( const PelStorage& pic, int from, int to );
+  void          transferBarrier( bool toTransfer );
 
   static size_t deblockParamSize( const CodingStructure& cs );
   static size_t alfParamSize( const CodingStructure& cs );
@@ -127,6 +144,7 @@ private:
   bool          prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8_t* params );   // false: no CTU uses SAO
   void          recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params );
   void          recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes );
+  void          recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, const Planes& planes, VkDeviceAddress refTable );
   void          recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
   void          recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
 
@@ -140,9 +158,11 @@ private:
   const char*     m_labels[kMaxMarks];
   uint32_t        m_marks   = 0;
   Buffer          m_params;
-  Buffer          m_mirror[2][MAX_NUM_COMPONENT];   // pictures in the GPU's own memory
+  Buffer          m_scratch[MAX_NUM_COMPONENT];     // a picture's worth of GPU memory (SAO's output)
   Buffer          m_lfp;                            // the deblocking parameters
+  Buffer          m_dmvr;                           // DMVR's refinements
   Buffer          m_intraJobs;                      // the intra jobs of a picture, wave by wave
+  Buffer          m_interJobs;
 };
 
 }   // namespace gpu

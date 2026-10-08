@@ -235,7 +235,8 @@ void DecCu::TaskFinishMotionInfo( CodingStructure &cs, const int ctuRsAddr, cons
   }
 }
 #if VVDEC_VULKAN
-void DecCu::TaskGpuIntraCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves )
+void DecCu::TaskGpuCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, std::vector<gpu::IntraJob>& intraJobs, gpu::WaveMap& waves,
+                        std::vector<gpu::InterJob>* interJobs, const gpu::RefTable& refs )
 {
   PROFILER_SCOPE_AND_STAGE_EXT( 1, g_timeProfiler, P_CONTROL_PARSE_DERIVE_LL, cs, CH_L );
 
@@ -245,11 +246,15 @@ void DecCu::TaskGpuIntraCtu( CodingStructure& cs, const int ctuRsAddr, const Uni
 
     if( CU::isIntra( currCU ) )
     {
-      xGpuIntraJobs( currCU, jobs, waves );
+      xGpuIntraJobs( currCU, intraJobs, waves );
     }
     else if( CU::isIBC( currCU ) )
     {
-      xGpuIbcJobs( currCU, jobs, waves );
+      xGpuIbcJobs( currCU, intraJobs, waves );
+    }
+    else if( interJobs )
+    {
+      xGpuInterJobs( currCU, *interJobs, refs );
     }
     else if( currCU.rootCbf() )
     {
@@ -358,6 +363,76 @@ void DecCu::xGpuIbcJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::
       const int wave = waves.maxIn( compID, area.x + bvx, area.y + bvy, area.width, area.height ) + 1;
       job.setWave( wave );
       waves.set( compID, area.x, area.y, area.width, area.height, wave );
+      jobs.push_back( job );
+    }
+  }
+}
+
+void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs )
+{
+  CHECK( cu.affineFlag() || cu.geoFlag() || cu.ciipFlag() || cu.mergeType() == MRG_TYPE_SUBPU_ATMVP, "an inter tool the GPU lacks" );
+
+  const Slice& slice = *cu.slice;
+  int          flags = 0;
+  int          ref[2] = { 0, 0 };
+  for( int list = 0; list < 2; list++ )
+  {
+    if( cu.refIdx[list] >= 0 )
+    {
+      flags     |= list == 0 ? gpu::InterJob::kL0 : gpu::InterJob::kL1;
+      ref[list]  = refs.slot( slice.getRefPic( RefPicList( list ), cu.refIdx[list] ) );
+    }
+  }
+
+  // as motionCompensation chooses: DMVR, else the same motion twice is a uni-prediction (xCheckIdenticalMotion)
+  const bool dmvr = PU::checkDMVRCondition( cu );
+  if( dmvr )
+  {
+    cu.setDmvrCondition( true );
+    flags |= gpu::InterJob::kDmvr;
+  }
+  else if( slice.isInterB() && !cu.pps->getWPBiPred() && cu.refIdx[0] >= 0 && cu.refIdx[1] >= 0
+           && slice.getRefPOC( REF_PIC_LIST_0, cu.refIdx[0] ) == slice.getRefPOC( REF_PIC_LIST_1, cu.refIdx[1] ) && cu.mv[0][0] == cu.mv[1][0] )
+  {
+    flags &= ~gpu::InterJob::kL1;
+  }
+  if( cu.imv() == IMV_HPEL )
+  {
+    flags |= gpu::InterJob::kHalfPel;
+  }
+
+  // the residual: the GPU adds it where a component has one; inside such a
+  // component, the transform blocks without one are cleared here
+  if( cu.rootCbf() )
+  {
+    for( int c = 0; c < getNumberValidComponents( cu.chromaFormat ); c++ )
+    {
+      const ComponentID compID = ComponentID( c );
+      if( !cu.planeCbf( compID ) )
+      {
+        continue;
+      }
+      flags |= gpu::InterJob::kResidualY << c;
+      for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
+      {
+        if( tu.blocks[compID].valid() && !TU::getCbf( tu, compID ) && !( isChroma( compID ) && tu.jointCbCr ) )
+        {
+          cu.cs->getRecoBuf( tu.blocks[compID] ).fill( 0 );
+        }
+      }
+    }
+  }
+
+  const int tileW = std::min<int>( cu.lwidth(), DMVR_SUBCU_WIDTH );
+  const int tileH = std::min<int>( cu.lheight(), DMVR_SUBCU_HEIGHT );
+  int       num   = 0;
+  for( int y = cu.ly(); y < cu.ly() + int( cu.lheight() ); y += tileH )
+  {
+    for( int x = cu.lx(); x < cu.lx() + int( cu.lwidth() ); x += tileW, num++ )
+    {
+      gpu::InterJob job;
+      job.set( x, y, tileW, tileH, flags, cu.mv[0][0].hor, cu.mv[0][0].ver, cu.mv[1][0].hor, cu.mv[1][0].ver, cu.lx(), cu.ly(), ref[0], ref[1],
+               dmvr ? int( cu.mvdL0SubPuOff ) + num : 0 );
       jobs.push_back( job );
     }
   }

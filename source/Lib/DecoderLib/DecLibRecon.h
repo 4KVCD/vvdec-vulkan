@@ -96,9 +96,10 @@ struct CommonTaskParam
   bool                     doSAO        = true;   // the CTU tasks apply SAO (not when the GPU does)
   bool                     doDeblock    = true;   // the CTU tasks deblock (not when the GPU does)
   bool                     gpuIntra     = false;  // the GPU predicts the intra and IBC blocks: the CTU tasks make its jobs
+  bool                     gpuInter     = false;  // and the inter blocks
 
   explicit CommonTaskParam( DecLibRecon* dec ) : decLib( *dec ) {}
-  void reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool doALF, bool doSAO, bool doDeblock, bool gpuIntra );
+  void reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool doALF, bool doSAO, bool doDeblock, bool gpuIntra, bool gpuInter );
 };
 
 struct LineTaskParam
@@ -177,12 +178,17 @@ private:
   std::unique_ptr<gpu::GpuRecon> m_gpuRecon;        // when the pictures are reconstructed on the GPU
   bool                           m_gpuFilters = false;   // the current picture's in-loop filters run on the GPU
   bool                           m_gpuIntra   = false;   // and its intra and IBC blocks
+  bool                           m_gpuInter   = false;   // and its inter blocks
   gpu::WaveMap                   m_waveMap;
   std::vector<std::vector<gpu::IntraJob>> m_gpuIntraJobs;   // per CTU
+  std::vector<std::vector<gpu::InterJob>> m_gpuInterJobs;   // per CTU
+  gpu::RefTable                  m_refTable;               // the reference pictures of the current picture
   int                            m_filterPicturesGpu = 0;
   int                            m_filterPicturesCpu = 0;
   int                            m_intraPicturesGpu  = 0;
   int                            m_intraPicturesCpu  = 0;
+  int                            m_interPicturesGpu  = 0;
+  int                            m_interPicturesCpu  = 0;
 #endif
 
   CommonTaskParam            commonTaskParam{ this };
@@ -213,6 +219,8 @@ public:
   int      filterPicturesCpu() const { return m_filterPicturesCpu; }
   int      intraPicturesGpu()  const { return m_intraPicturesGpu; }
   int      intraPicturesCpu()  const { return m_intraPicturesCpu; }
+  int      interPicturesGpu()  const { return m_interPicturesGpu; }
+  int      interPicturesCpu()  const { return m_interPicturesCpu; }
 #endif
 
 

@@ -104,7 +104,8 @@ static int debugNoFiltersPoc()
   return poc;
 }
 
-void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool _doALF, bool _doSAO, bool _doDeblock, bool _gpuIntra )
+void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool _doALF, bool _doSAO, bool _doDeblock, bool _gpuIntra,
+                             bool _gpuInter )
 {
   this->cs = &cs;
 
@@ -120,6 +121,7 @@ void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int ta
   doSAO         = _doSAO;
   doDeblock     = _doDeblock;
   gpuIntra      = _gpuIntra;
+  gpuInter      = _gpuInter;
 }
 
 DecLibRecon::DecLibRecon()
@@ -633,13 +635,42 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   // reconstructed (finishReconTask)
   m_gpuFilters = m_gpuRecon && gpu::GpuRecon::filtersSupported( cs );
   // and, before the filters, the intra and IBC blocks, in waves of blocks the
-  // CTU tasks list (TaskGpuIntraCtu)
+  // CTU tasks list (TaskGpuCtu)
   m_gpuIntra   = m_gpuFilters && gpu::GpuRecon::intraSupported( cs );
-  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuFilters, doSAO && !m_gpuFilters, m_doDeblock && !m_gpuFilters, m_gpuIntra );
+  // and, before those, the inter blocks, from the reference pictures on the GPU
+  m_gpuInter   = m_gpuIntra && !isIntra && gpu::GpuRecon::interSupported( cs );
+  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuFilters, doSAO && !m_gpuFilters, m_doDeblock && !m_gpuFilters, m_gpuIntra,
+                         m_gpuInter );
   if( m_gpuRecon )
   {
     ( m_gpuFilters ? m_filterPicturesGpu : m_filterPicturesCpu )++;
     ( m_gpuIntra ? m_intraPicturesGpu : m_intraPicturesCpu )++;
+    if( !isIntra )
+    {
+      ( m_gpuInter ? m_interPicturesGpu : m_interPicturesCpu )++;
+    }
+  }
+  if( m_gpuInter )
+  {
+    m_refTable.clear();
+    for( const Slice* slice: pcPic->slices )
+    {
+      for( int list = 0; list < NUM_REF_PIC_LIST_01; list++ )
+      {
+        for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ); refIdx++ )
+        {
+          m_refTable.add( slice->getRefPic( RefPicList( list ), refIdx ) );
+        }
+      }
+    }
+    CHECK( m_refTable.pictures().size() > 255, "too many reference pictures" );
+    m_gpuInterJobs.resize( pcv->sizeInCtus );
+    for( auto& jobs: m_gpuInterJobs )
+    {
+      jobs.clear();
+    }
+    // DMVR's refinements: the GPU's, in memory it writes
+    pcPic->cs->m_dmvrMvCache = m_gpuRecon->dmvrMvCache( m_dmvrMvCacheSize );
   }
   if( m_gpuIntra )
   {
@@ -652,7 +683,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     }
   }
 #else
-  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF, doSAO, m_doDeblock, false );
+  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF, doSAO, m_doDeblock, false, false );
 #endif
 
   tasksFinishMotion = std::vector<LineTaskParam>( heightInCtus, LineTaskParam{ commonTaskParam, -1 } );
@@ -708,7 +739,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   }
 
   {
-    static auto finishReconTask = []( int, void* task_param )
+    static auto finishReconTask = []( int tid, void* task_param )
     {
       FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
       CodingStructure& cs = *param->pic->cs;
@@ -717,8 +748,27 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       DecLibRecon* dec = param->decLib;
       if( dec->m_gpuFilters )
       {
-        dec->m_gpuRecon->finishPicture( cs, dec->m_gpuIntra ? &dec->m_gpuIntraJobs : nullptr, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr,
-                                        dec->m_doALF ? &dec->m_cALF : nullptr, cs.picture->m_bufs[PIC_RECONSTRUCTION] );
+        dec->m_gpuRecon->finishPicture( cs, dec->m_gpuIntra ? &dec->m_gpuIntraJobs : nullptr, dec->m_gpuInter ? &dec->m_gpuInterJobs : nullptr,
+                                        dec->m_refTable, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr,
+                                        cs.picture->m_bufs[PIC_RECONSTRUCTION] );
+        cs.picture->gpuCurrent = true;
+
+        // with DMVR's refinements, which the GPU made, the motion of the
+        // picture for the next ones (TMVP), as the CTU tasks do without the GPU
+        if( dec->m_gpuInter && cs.picture->stillReferenced )
+        {
+          for( int line = 0; line < (int) cs.pcv->heightInCtus; line++ )
+          {
+            for( int col = 0; col < (int) cs.pcv->widthInCtus; col++ )
+            {
+              const int ctuRsAddr = col + line * cs.pcv->widthInCtus;
+              if( !cs.getCtuData( ctuRsAddr ).slice->isIntra() )
+              {
+                dec->m_pcThreadResource[tid]->m_cCuDecoder.TaskFinishMotionInfo( cs, ctuRsAddr, col, line );
+              }
+            }
+          }
+        }
       }
       else
 #endif
@@ -939,7 +989,12 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
 
       decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskTrafoCtu( cs, ctuRsAddr, ctuArea );
 
+#if VVDEC_VULKAN
+      // with the GPU, its inter jobs (TaskGpuCtu), and the motion at the end (finishReconTask)
+      if( !ctuData.slice->isIntra() && !param->common.gpuInter )
+#else
       if( !ctuData.slice->isIntra() )
+#endif
       {
         decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskInterCtu( cs, ctuRsAddr, ctuArea );
 
@@ -985,7 +1040,8 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
 #if VVDEC_VULKAN
       if( param->common.gpuIntra )
       {
-        decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskGpuIntraCtu( cs, ctuRsAddr, ctuArea, decLib.m_gpuIntraJobs[ctuRsAddr], decLib.m_waveMap );
+        decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskGpuCtu( cs, ctuRsAddr, ctuArea, decLib.m_gpuIntraJobs[ctuRsAddr], decLib.m_waveMap,
+                                                                 param->common.gpuInter ? &decLib.m_gpuInterJobs[ctuRsAddr] : nullptr, decLib.m_refTable );
       }
       else
 #endif

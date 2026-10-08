@@ -208,6 +208,9 @@ public:
   RefMark          dpbReferenceMark        = unreferenced;   // only used during parsing, manage the DPB and to build the reference picture lists
   bool             neededForOutput         = false;
   std::atomic_bool stillReferenced         { false };        // set as long as there is a picture in progress, that references this one. ('referenced' might be unset during parsing)
+#if VVDEC_VULKAN
+  mutable std::atomic_bool gpuCurrent      { false };        // the reconstruction is on the GPU too (gpu::GpuRecon)
+#endif
   bool             isReferencePic          = false;          // mainly for setting vvdecPicAttributes::isRefPic for the library output frame
   bool             wasLost                 = false;
   std::atomic_bool error                   { false };

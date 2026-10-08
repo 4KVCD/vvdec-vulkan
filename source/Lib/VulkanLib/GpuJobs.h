@@ -92,6 +92,57 @@ struct IntraJob
   int  wave() const { return int( w[7] ); }
 };
 
+// a tile of up to 16x16 luma samples of an inter CU (DMVR's subblock when it
+// refines) with its chroma; the layout of shaders/inter.slang
+struct InterJob
+{
+  enum Flags
+  {
+    kL0        = 1,
+    kL1        = 2,
+    kDmvr      = 4,
+    kHalfPel   = 8,    // AMVR's half-sample luma filter
+    kResidualY = 16,   // and kResidualY << 1, << 2 for Cb, Cr: the picture holds the residual
+  };
+
+  uint32_t w[12];
+
+  void set( int x, int y, int width, int height, int flags, int mv0x, int mv0y, int mv1x, int mv1y, int cuX, int cuY, int ref0, int ref1,
+            int dmvrIndex )
+  {
+    w[0]  = uint32_t( x ) | uint32_t( y ) << 16;
+    w[1]  = uint32_t( width ) | uint32_t( height ) << 8 | uint32_t( flags ) << 16;
+    w[2]  = uint32_t( mv0x );
+    w[3]  = uint32_t( mv0y );
+    w[4]  = uint32_t( mv1x );
+    w[5]  = uint32_t( mv1y );
+    w[6]  = uint32_t( cuX ) | uint32_t( cuY ) << 16;
+    w[7]  = uint32_t( ref0 ) | uint32_t( ref1 ) << 8;
+    w[8]  = uint32_t( dmvrIndex );
+    w[9]  = w[10] = w[11] = 0;
+  }
+};
+
+// the reference pictures of a picture's inter jobs: a slot each
+class RefTable
+{
+public:
+  void clear() { m_pictures.clear(); }
+  // during the picture's set-up, before the CTU tasks look slots up
+  void add( const void* picture )
+  {
+    if( std::find( m_pictures.begin(), m_pictures.end(), picture ) == m_pictures.end() )
+    {
+      m_pictures.push_back( picture );
+    }
+  }
+  int slot( const void* picture ) const { return int( std::find( m_pictures.begin(), m_pictures.end(), picture ) - m_pictures.begin() ); }
+  const std::vector<const void*>& pictures() const { return m_pictures; }
+
+private:
+  std::vector<const void*> m_pictures;
+};
+
 // the wave of every block of a picture's planes, at the granularity of the
 // smallest block: a block's wave is one above the highest wave of the samples
 // it reads; inter blocks are wave 0, there before the waves begin

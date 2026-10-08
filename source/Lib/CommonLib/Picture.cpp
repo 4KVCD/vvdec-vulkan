@@ -128,6 +128,9 @@ void Picture::resetForUse( int _layerId )
   borderExtStarted        = false;
   dpbReferenceMark        = unreferenced;
   stillReferenced         = false;
+#if VVDEC_VULKAN
+  gpuCurrent              = false;
+#endif
   isReferencePic          = false;
   progress                = Picture::init;
   neededForOutput         = false;
@@ -406,6 +409,9 @@ void Picture::fillGrey( const SPS* fallbackSPS )
   getRecoBuf().Y().fill( yFill );
   getRecoBuf().Cb().fill( cFill );
   getRecoBuf().Cr().fill( cFill );
+#if VVDEC_VULKAN
+  gpuCurrent = false;
+#endif
 
   progress = Picture::reconstructed;
   reconDone.unlock();

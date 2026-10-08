@@ -67,25 +67,43 @@ namespace gpu
 // picture buffers
 // ====================================================================================================================
 
+// a plane of a picture: in host memory the GPU reaches, where vvdec's CPU
+// code reads and writes it, and its twin in the GPU's own memory, where the
+// GPU reconstructs the picture and keeps it as a reference (made when first used)
+struct HostPlane
+{
+  Buffer host;
+  Buffer twin;
+};
+
 static void* createHostPlane( void* opaque, vvdecComponentType, uint32_t size, uint32_t, void** allocator )
 {
-  Context* context = static_cast<Context*>( opaque );
-  Buffer*  buf     = new Buffer( context->alloc( size, MemKind::HostCached ) );
-  if( !buf->mapped )
+  Context*   context = static_cast<Context*>( opaque );
+  HostPlane* plane   = new HostPlane;
+  plane->host        = context->alloc( size, MemKind::HostCached );
+  if( !plane->host.mapped )
   {
-    context->free( *buf );
-    delete buf;
+    context->free( plane->host );
+    delete plane;
     return nullptr;
   }
-  *allocator = buf;
-  return buf->mapped;
+  *allocator = plane;
+  return plane->host.mapped;
 }
 
 static void unrefHostPlane( void* opaque, void* allocator )
 {
-  Buffer* buf = static_cast<Buffer*>( allocator );
-  static_cast<Context*>( opaque )->free( *buf );
-  delete buf;
+  HostPlane* plane = static_cast<HostPlane*>( allocator );
+  static_cast<Context*>( opaque )->free( plane->host );
+  static_cast<Context*>( opaque )->free( plane->twin );
+  delete plane;
+}
+
+static HostPlane* hostPlane( const PelStorage& storage, ComponentID comp )
+{
+  HostPlane* plane = static_cast<HostPlane*>( storage.getBufAllocator( comp ) );
+  CHECK_FATAL( !plane || !storage.isExternAllocator(), "Vulkan: a picture buffer the GPU cannot reach" );
+  return plane;
 }
 
 UserAllocator hostPictureAllocator( Context* context )
@@ -93,14 +111,13 @@ UserAllocator hostPictureAllocator( Context* context )
   return UserAllocator( createHostPlane, unrefHostPlane, context );
 }
 
-// the GPU address of a plane's sample (0, 0)
-static VkDeviceAddress planeAddress( const PelStorage& storage, ComponentID comp )
+// where a plane's sample (0, 0) is in its buffer
+static VkDeviceSize planeOffset( const PelStorage& storage, ComponentID comp )
 {
-  const Buffer* buf = static_cast<const Buffer*>( storage.getBufAllocator( comp ) );
-  CHECK_FATAL( !buf || !storage.isExternAllocator(), "Vulkan: a picture buffer the GPU cannot reach" );
+  const Buffer&  host   = hostPlane( storage, comp )->host;
   const uint8_t* origin = reinterpret_cast<const uint8_t*>( storage.bufs[comp].buf );
-  CHECK_FATAL( origin < buf->mapped || origin >= buf->mapped + buf->size, "Vulkan: a plane outside its buffer" );
-  return buf->addr + VkDeviceAddress( origin - buf->mapped );
+  CHECK_FATAL( origin < host.mapped || origin >= host.mapped + host.size, "Vulkan: a plane outside its buffer" );
+  return VkDeviceSize( origin - host.mapped );
 }
 
 // ====================================================================================================================
@@ -163,13 +180,12 @@ GpuRecon::~GpuRecon()
   }
   m_ctx->free( m_params );
   m_ctx->free( m_lfp );
+  m_ctx->free( m_dmvr );
   m_ctx->free( m_intraJobs );
-  for( auto& mirror: m_mirror )
+  m_ctx->free( m_interJobs );
+  for( Buffer& buf: m_scratch )
   {
-    for( Buffer& buf: mirror )
-    {
-      m_ctx->free( buf );
-    }
+    m_ctx->free( buf );
   }
 }
 
@@ -197,6 +213,12 @@ void GpuRecon::beginCommands()
     vk.vkCmdResetQueryPool( m_cmd, m_queries, 0, kMaxMarks );
     vk.vkCmdWriteTimestamp( m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_queries, m_marks++ );
   }
+
+  // what earlier submissions wrote (the reference pictures), visible to this one
+  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
 }
 
 void GpuRecon::mark( const char* label )
@@ -221,11 +243,12 @@ void GpuRecon::submitAndWait()
 {
   const Api& vk = m_ctx->api();
 
-  // the shaders' writes, made visible to the CPU
+  // the writes of the shaders and the copies, made visible to the CPU
   VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
   barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0,
+                           nullptr, 0, nullptr );
   vk.vkEndCommandBuffer( m_cmd );
 
   vk.vkResetFences( m_ctx->device(), 1, &m_fence );
@@ -543,47 +566,60 @@ void GpuRecon::recordSao( const CodingStructure& cs, const Planes& src, const Pl
   mark( "sao" );
 }
 
-GpuRecon::Planes GpuRecon::mirrorPlanes( int mirror, const PelStorage& pic )
+GpuRecon::Planes GpuRecon::twinPlanes( const PelStorage& pic )
 {
   Planes planes{};
   for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
   {
-    const Buffer* host = static_cast<const Buffer*>( pic.getBufAllocator( comp ) );
-    Buffer&       dev  = m_mirror[mirror][comp];
-    if( dev.size != host->size )
+    HostPlane* plane = hostPlane( pic, ComponentID( comp ) );
+    if( !plane->twin.valid() )
     {
-      m_ctx->free( dev );
-      dev = m_ctx->alloc( size_t( host->size ), MemKind::Device );
+      plane->twin = m_ctx->alloc( size_t( plane->host.size ), MemKind::Device );
     }
-    planes.addr[comp]   = dev.addr + ( planeAddress( pic, ComponentID( comp ) ) - host->addr );
+    planes.addr[comp]   = plane->twin.addr + planeOffset( pic, ComponentID( comp ) );
     planes.stride[comp] = int32_t( pic.bufs[comp].stride );
   }
   return planes;
 }
 
-void GpuRecon::copyPlanes( const PelStorage& pic, int mirror, bool toMirror )
+GpuRecon::Planes GpuRecon::scratchPlanes( const PelStorage& pic )
+{
+  Planes planes{};
+  for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
+  {
+    const HostPlane* plane = hostPlane( pic, ComponentID( comp ) );
+    if( m_scratch[comp].size != plane->host.size )
+    {
+      m_ctx->free( m_scratch[comp] );
+      m_scratch[comp] = m_ctx->alloc( size_t( plane->host.size ), MemKind::Device );
+    }
+    planes.addr[comp]   = m_scratch[comp].addr + planeOffset( pic, ComponentID( comp ) );
+    planes.stride[comp] = int32_t( pic.bufs[comp].stride );
+  }
+  return planes;
+}
+
+void GpuRecon::transferBarrier( bool toTransfer )
+{
+  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  barrier.srcAccessMask = toTransfer ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = toTransfer ? VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  m_ctx->api().vkCmdPipelineBarrier( m_cmd, toTransfer ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     toTransfer ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0,
+                                     nullptr );
+}
+
+void GpuRecon::copyPlanes( const PelStorage& pic, int from, int to )
 {
   const Api& vk = m_ctx->api();
   for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
   {
-    const Buffer* host = static_cast<const Buffer*>( pic.getBufAllocator( comp ) );
-    const Buffer& dev  = m_mirror[mirror][comp];
-    VkBufferCopy  region{ 0, 0, host->size };
-    vk.vkCmdCopyBuffer( m_cmd, toMirror ? host->buffer : dev.buffer, toMirror ? dev.buffer : host->buffer, 1, &region );
+    const HostPlane* plane    = hostPlane( pic, ComponentID( comp ) );
+    const Buffer*    bufs[3]  = { &plane->host, &plane->twin, &m_scratch[comp] };
+    VkBufferCopy     region{ 0, 0, plane->host.size };
+    vk.vkCmdCopyBuffer( m_cmd, bufs[from]->buffer, bufs[to]->buffer, 1, &region );
   }
-  if( toMirror )
-  {
-    // the shaders after an upload wait for it
-    VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
-    mark( "upload" );
-  }
-  else
-  {
-    mark( "download" );
-  }
+  mark( from == kHost ? "upload" : ( to == kHost ? "download" : "copy" ) );
 }
 
 // the push constants of shaders/deblock.slang
@@ -697,7 +733,11 @@ struct IntraPush
 
 bool GpuRecon::intraSupported( const CodingStructure& cs )
 {
-  const SPS& sps = *cs.sps;
+  return intraSupported( *cs.sps );
+}
+
+bool GpuRecon::intraSupported( const SPS& sps )
+{
   return sps.getChromaFormatIdc() == CHROMA_420 && !sps.getUseMIP() && !sps.getUseISP() && !sps.getUseMRL() && !sps.getUseCiip()
          && !sps.getUseColorTrans() && !sps.getUseReshaper() && !sps.getUseWrapAround();
 }
@@ -778,13 +818,134 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   mark( "intra" );
 }
 
-void GpuRecon::finishPicture( CodingStructure& cs, const std::vector<std::vector<IntraJob>>* intraJobs, bool deblock, SampleAdaptiveOffset* sao,
+// the push constants of shaders/inter.slang
+struct InterPush
+{
+  VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr;
+  int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth;
+};
+
+bool GpuRecon::interSupported( const SPS& sps )
+{
+  return intraSupported( sps ) && sps.getBitDepth() <= 10 && !sps.getUseAffine() && !sps.getUseBIO() && !sps.getUseGeo() && !sps.getUseBcw()
+         && !sps.getSBTMVPEnabledFlag() && !sps.getSubPicInfoPresentFlag();
+}
+
+bool GpuRecon::interSupported( const CodingStructure& cs )
+{
+  const PPS& pps = *cs.pps;
+  if( !interSupported( *cs.sps ) || pps.getUseWP() || pps.getWPBiPred() )
+  {
+    return false;
+  }
+  for( const Slice* slice: cs.picture->slices )
+  {
+    for( int list = 0; list < 2; list++ )
+    {
+      for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ); refIdx++ )
+      {
+        if( slice->getRefPic( RefPicList( list ), refIdx )->isRefScaled( &pps ) )
+        {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+Mv* GpuRecon::dmvrMvCache( size_t count )
+{
+  const size_t size = count * sizeof( Mv );
+  if( m_dmvr.size < size )
+  {
+    m_ctx->free( m_dmvr );
+    m_dmvr = m_ctx->alloc( size, MemKind::HostCached );
+  }
+  return reinterpret_cast<Mv*>( m_dmvr.mapped );
+}
+
+void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, const Planes& planes, VkDeviceAddress refTable )
+{
+  size_t total = 0;
+  for( const auto& ctu: jobs )
+  {
+    total += ctu.size();
+  }
+  if( total == 0 )
+  {
+    return;
+  }
+  const size_t size = total * sizeof( InterJob );
+  if( m_interJobs.size < size )
+  {
+    m_ctx->free( m_interJobs );
+    m_interJobs = m_ctx->alloc( size * 2, MemKind::HostCached );
+  }
+  InterJob* all = reinterpret_cast<InterJob*>( m_interJobs.mapped );
+  for( const auto& ctu: jobs )
+  {
+    memcpy( all, ctu.data(), ctu.size() * sizeof( InterJob ) );
+    all += ctu.size();
+  }
+
+  const PreCalcValues& pcv = *cs.pcv;
+  InterPush            push{};
+  push.jobs      = m_interJobs.addr;
+  push.refs      = refTable;
+  push.dst0      = planes.addr[COMPONENT_Y];
+  push.dst1      = planes.addr[COMPONENT_Cb];
+  push.dst2      = planes.addr[COMPONENT_Cr];
+  push.dmvr      = m_dmvr.addr;
+  push.stride0   = planes.stride[COMPONENT_Y];
+  push.stride12  = planes.stride[COMPONENT_Cb];
+  push.count     = int32_t( total );
+  push.picWidth  = pcv.lumaWidth;
+  push.picHeight = pcv.lumaHeight;
+  push.ctuSize   = pcv.maxCUWidth;
+  push.bitDepth  = cs.sps->getBitDepth();
+
+  const Api& vk = m_ctx->api();
+  vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_inter ) );
+  vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+  vk.vkCmdDispatch( m_cmd, uint32_t( ( total + 63 ) / 64 ), 1, 1 );
+  mark( "inter" );
+}
+
+void GpuRecon::finishPicture( CodingStructure& cs, const std::vector<std::vector<IntraJob>>* intraJobs,
+                              const std::vector<std::vector<InterJob>>* interJobs, const RefTable& refs, bool deblock, SampleAdaptiveOffset* sao,
                               const AdaptiveLoopFilter* alf, PelStorage& pic )
 {
   const size_t dbSize  = deblockParamSize( cs );
   const size_t alfSize = alf ? alfParamSize( cs ) : 0;
   const size_t saoSize = sao ? saoParamSize( cs ) : 0;
-  uint8_t*     base    = params( dbSize + alfSize + saoSize );
+  const size_t refSize = ( refs.pictures().size() * 4 * sizeof( VkDeviceAddress ) + 255 ) & ~size_t( 255 );
+  uint8_t*     base    = params( dbSize + alfSize + saoSize + refSize );
+  const size_t refAt   = dbSize + alfSize + saoSize;
+
+  // the reference pictures: their planes on the GPU, where a picture the CPU
+  // reconstructed alone (or filled in) goes first
+  std::vector<const Picture*> uploads;
+  if( interJobs )
+  {
+    VkDeviceAddress* table = reinterpret_cast<VkDeviceAddress*>( base + refAt );
+    for( const void* ref: refs.pictures() )
+    {
+      const Picture* refPic = static_cast<const Picture*>( ref );
+      const Planes   planes = twinPlanes( refPic->m_bufs[PIC_RECONSTRUCTION] );
+      table[0]              = planes.addr[COMPONENT_Y];
+      table[1]              = planes.addr[COMPONENT_Cb];
+      table[2]              = planes.addr[COMPONENT_Cr];
+      table[3]              = 0;
+      CHECK( planes.stride[COMPONENT_Y] != pic.bufs[COMPONENT_Y].stride || planes.stride[COMPONENT_Cb] != pic.bufs[COMPONENT_Cb].stride,
+             "Vulkan: a reference picture laid out differently" );
+      table += 4;
+      if( !refPic->gpuCurrent )
+      {
+        uploads.push_back( refPic );
+      }
+    }
+  }
 
   const bool doDeblock = deblock && prepareDeblock( cs, base );
   const bool doSao     = sao && prepareSao( cs, *sao, base + dbSize + alfSize );
@@ -792,17 +953,23 @@ void GpuRecon::finishPicture( CodingStructure& cs, const std::vector<std::vector
   {
     prepareAlf( cs, *alf, base + dbSize );
   }
-  if( !doDeblock && !doSao && !alf && !intraJobs )
-  {
-    return;
-  }
-
   // in the GPU's own memory, which its shaders reach faster than the host's:
-  // the picture goes in, is filtered there, and comes back
+  // the picture goes in (what the CPU made of it), is finished there, stays
+  // there as a reference, and comes back for the output
   beginCommands();
-  const Planes planes[2] = { mirrorPlanes( 0, pic ), mirrorPlanes( 1, pic ) };
+  for( const Picture* refPic: uploads )
+  {
+    copyPlanes( refPic->m_bufs[PIC_RECONSTRUCTION], kHost, kTwin );
+  }
+  const Planes planes[2] = { twinPlanes( pic ), scratchPlanes( pic ) };
   int          cur       = 0;
-  copyPlanes( pic, 0, true );
+  copyPlanes( pic, kHost, kTwin );
+  transferBarrier( false );
+  if( interJobs )
+  {
+    recordInter( cs, *interJobs, planes[cur], m_params.addr + refAt );   // in place
+    computeBarrier();
+  }
   if( intraJobs )
   {
     recordIntra( cs, *intraJobs, planes[cur] );   // in place
@@ -830,13 +997,22 @@ void GpuRecon::finishPicture( CodingStructure& cs, const std::vector<std::vector
     recordAlf( cs, planes[cur], planes[1 - cur], m_params.addr + dbSize );
     cur = 1 - cur;
   }
-  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-  m_ctx->api().vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0,
-                                     nullptr );
-  copyPlanes( pic, cur, false );
+  transferBarrier( true );
+  if( cur == 1 )
+  {
+    // the result to the picture's own planes on the GPU
+    copyPlanes( pic, kScratch, kTwin );
+    VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    m_ctx->api().vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+  }
+  copyPlanes( pic, kTwin, kHost );
   submitAndWait();
+  for( const Picture* refPic: uploads )
+  {
+    refPic->gpuCurrent = true;
+  }
 }
 
 }   // namespace gpu
