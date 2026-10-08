@@ -325,6 +325,10 @@ void GpuRecon::splitCommands()
   vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0,
                            nullptr, 0, nullptr );
   vk.vkEndCommandBuffer( m_cmd );
+  // to the GPU at once: the rest is recorded while it runs
+  vk.vkResetFences( m_ctx->device(), 1, &m_fenceFirst );
+  m_submitted = std::chrono::steady_clock::now();
+  m_ctx->submitFirst( m_cmdFirst, m_fenceFirst );
 
   // the rest, after what the first part wrote
   m_cmd = m_cmdRest;
@@ -381,11 +385,8 @@ void GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
     vk.vkEndCommandBuffer( m_transferCmd );
   }
 
-  VkFence fences[2] = { m_fenceFirst, m_fence };
-  vk.vkResetFences( m_ctx->device(), 2, fences );
-  m_submitted = std::chrono::steady_clock::now();
-  m_ctx->submitPicture( m_cmdFirst, m_fenceFirst, m_cmdRest, m_ctx->transferQueue() ? m_semaphore : VK_NULL_HANDLE,
-                        m_ctx->transferQueue() ? m_transferCmd : VK_NULL_HANDLE, m_fence );
+  vk.vkResetFences( m_ctx->device(), 1, &m_fence );
+  m_ctx->submitRest( m_cmdRest, m_ctx->transferQueue() ? m_semaphore : VK_NULL_HANDLE, m_ctx->transferQueue() ? m_transferCmd : VK_NULL_HANDLE, m_fence );
   if( waitFirst )
   {
     const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_fenceFirst, VK_TRUE, UINT64_MAX );

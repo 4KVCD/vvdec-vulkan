@@ -598,21 +598,29 @@ VkPipeline Context::pipeline( int shaderId )
   return pipe;
 }
 
-void Context::submitPicture( VkCommandBuffer first, VkFence firstDone, VkCommandBuffer rest, VkSemaphore restDone, VkCommandBuffer transfer, VkFence fence )
+void Context::submitFirst( VkCommandBuffer first, VkFence firstDone )
+{
+  VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+  info.commandBufferCount = 1;
+  info.pCommandBuffers    = &first;
+  std::lock_guard<std::mutex> lock( m_queueMutex );
+  const VkResult result = m_api.vkQueueSubmit( m_queue, 1, &info, firstDone );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkQueueSubmit failed (" << result << ")" );
+  }
+}
+
+void Context::submitRest( VkCommandBuffer rest, VkSemaphore restDone, VkCommandBuffer transfer, VkFence fence )
 {
   {
+    VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    info.commandBufferCount   = 1;
+    info.pCommandBuffers      = &rest;
+    info.signalSemaphoreCount = transfer ? 1 : 0;
+    info.pSignalSemaphores    = &restDone;
     std::lock_guard<std::mutex> lock( m_queueMutex );
-    VkSubmitInfo                info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    info.commandBufferCount = 1;
-    info.pCommandBuffers    = &first;
-    VkResult result         = m_api.vkQueueSubmit( m_queue, 1, &info, firstDone );
-    if( result == VK_SUCCESS )
-    {
-      info.pCommandBuffers      = &rest;
-      info.signalSemaphoreCount = transfer ? 1 : 0;
-      info.pSignalSemaphores    = &restDone;
-      result                    = m_api.vkQueueSubmit( m_queue, 1, &info, transfer ? VK_NULL_HANDLE : fence );
-    }
+    const VkResult result = m_api.vkQueueSubmit( m_queue, 1, &info, transfer ? VK_NULL_HANDLE : fence );
     if( result != VK_SUCCESS )
     {
       THROW_FATAL( "Vulkan: vkQueueSubmit failed (" << result << ")" );

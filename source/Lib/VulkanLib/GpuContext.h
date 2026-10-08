@@ -129,10 +129,11 @@ public:
   VkPipelineLayout layout() const { return m_layout; }
 
   // a picture's work on the compute queue, which the decoder instances of the
-  // process share: first, which signals firstDone, then rest, then (with
-  // transfer) the picture's download on the copy queue, which waits for
-  // restDone; fence signalled once all is done
-  void submitPicture( VkCommandBuffer first, VkFence firstDone, VkCommandBuffer rest, VkSemaphore restDone, VkCommandBuffer transfer, VkFence fence );
+  // process share: the first part, which signals firstDone, then the rest,
+  // then (with transfer) the picture's download on the copy queue, which
+  // waits for restDone; fence signalled once all is done
+  void submitFirst( VkCommandBuffer first, VkFence firstDone );
+  void submitRest( VkCommandBuffer rest, VkSemaphore restDone, VkCommandBuffer transfer, VkFence fence );
   // a queue for copies only (the GPU's copy engine), when the device has one:
   // its copies run alongside the compute queue's work. The buffers are shared
   // by both queues' families.

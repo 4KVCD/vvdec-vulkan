@@ -134,10 +134,10 @@ private:
   void     beginCommands();
   void     computeBarrier();
   void     mark( const char* label );   // with VVDEC_GPU_PROFILE: the GPU time since the last mark counts as label
-  void     splitCommands();   // the first part's commands end, the rest's begin
-  // the commands of both parts queued, and the download of pic: on the copy
-  // engine (Context::transferQueue), after the rest's m_semaphore, else at the
-  // end of the rest
+  void     splitCommands();   // the first part's commands end and go to the GPU, the rest's begin
+  // the rest's commands queued, and the download of pic: on the copy engine
+  // (Context::transferQueue), after the rest's m_semaphore, else at the end of
+  // the rest
   void     submitPicture( const PelStorage& pic, bool waitFirst );
   void     readTimestamps( double waited );
   uint8_t* params( size_t size );   // the host-visible parameter buffer, at least size bytes
