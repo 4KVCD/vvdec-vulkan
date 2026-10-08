@@ -155,7 +155,7 @@ private:
   enum { kHost, kTwin, kScratch };
   Planes        hostPlanes( const PelStorage& pic );     // the picture in host memory
   Planes        twinPlanes( const PelStorage& pic );     // the picture on the GPU (its memory made when missing)
-  Planes        scratchPlanes( const PelStorage& pic );  // GPU memory laid out as pic's buffers
+  Planes        scratchPlanes( const PelStorage& pic );  // GPU memory laid out as pic's buffers (from the pool)
   void          copyPlanes( const PelStorage& pic, int from, int to );
   void          transferBarrier( bool toTransfer );
 
@@ -191,7 +191,7 @@ private:
   const char*     m_labels[kMaxMarks];
   uint32_t        m_marks   = 0;
   Buffer          m_params;
-  Buffer          m_scratch[MAX_NUM_COMPONENT];     // a picture's worth of GPU memory (SAO's output)
+  Buffer          m_scratch[MAX_NUM_COMPONENT];     // a picture's worth of GPU memory (SAO's or ALF's output), from the pool while its work is recorded
   Buffer          m_lfp;                            // the deblocking parameters
   Buffer          m_dmvr;                           // DMVR's refinements
   Buffer          m_intraJobs;                      // the intra jobs of a picture, wave by wave

@@ -799,10 +799,9 @@ GpuRecon::Planes GpuRecon::scratchPlanes( const PelStorage& pic )
   for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
   {
     const GpuLayout layout = gpuLayout( pic, ComponentID( comp ) );
-    if( m_scratch[comp].size != ( ( layout.size + 255 ) & ~VkDeviceSize( 255 ) ) )
+    if( !m_scratch[comp].valid() )
     {
-      m_ctx->free( m_scratch[comp] );
-      m_scratch[comp] = m_ctx->alloc( size_t( layout.size ), MemKind::Device );
+      m_scratch[comp] = m_ctx->allocPooled( size_t( layout.size ) );
     }
     planes.addr[comp]   = m_scratch[comp].addr + layout.origin;
     planes.stride[comp] = int32_t( pic.bufs[comp].stride );
@@ -1345,8 +1344,8 @@ void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool 
   {
     copyPlanes( refPic->m_bufs[PIC_RECONSTRUCTION], kHost, kTwin );
   }
-  const Planes planes[2] = { twinPlanes( pic ), scratchPlanes( pic ) };
-  int          cur       = 0;
+  Planes planes[2] = { twinPlanes( pic ), Planes{} };   // the scratch planes taken just before SAO and ALF
+  int    cur       = 0;
   if( !jobs.trafo )
   {
     copyPlanes( pic, kHost, kTwin );
@@ -1371,6 +1370,10 @@ void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool 
   if( doDeblock )
   {
     recordDeblock( cs, planes[cur], m_params.addr, *jobs.edges );   // in place
+  }
+  if( doSao || alf )
+  {
+    planes[1] = scratchPlanes( pic );
   }
   if( doSao )
   {
@@ -1401,6 +1404,14 @@ void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool 
     }
   }
   submitPicture( pic, waitFirst );
+  // the scratch planes (after a swap, the picture's former ones) back to the
+  // pool at once: the GPU runs the pictures' work one after the other (each
+  // part begins with a barrier over all the work before it), so the work of
+  // whichever picture takes them next comes after this one's
+  for( Buffer& buf: m_scratch )
+  {
+    m_ctx->recycle( buf );
+  }
   for( const Picture* refPic: uploads )
   {
     refPic->gpuCurrent = true;   // for the work queued after this

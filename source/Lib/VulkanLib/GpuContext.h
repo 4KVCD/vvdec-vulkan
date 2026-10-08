@@ -129,10 +129,12 @@ public:
   Buffer alloc( size_t size, MemKind kind );   // throws on failure
   void   free( Buffer& buf );
   // device-local buffers that come and go with the pictures (their planes on
-  // the GPU): one of the same size given back before, else a new one. Those
-  // given back are all kept for the next ones -- freeing and allocating them
-  // while decoding costs too much time (VideoQ 1080p: -15%) -- until buffers
-  // of another size are wanted (another resolution)
+  // the GPU, and the scratch planes of their filters): one of the same size
+  // given back before, else a new one. Those given back are all kept for the
+  // next ones -- freeing and allocating them while decoding costs too much
+  // time (VideoQ 1080p: -15%) -- until buffers of another size are wanted
+  // (another resolution). A buffer may be given back while work queued still
+  // uses it, when whatever takes it next is queued after that work.
   Buffer allocPooled( size_t size );
   void   recycle( Buffer& buf );
 

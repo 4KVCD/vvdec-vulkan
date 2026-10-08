@@ -375,9 +375,15 @@ Buffer Context::allocPooled( size_t size )
         return buf;
       }
     }
-    // none of the size: those of the sizes not wanted any more go
+    // none of the size: those of the sizes not wanted any more go, once the
+    // work queued is done (the scratch planes come back while their work is
+    // queued)
     if( !m_pool.empty() && m_poolSizes.count( rounded ) == 0 )
     {
+      {
+        std::lock_guard<std::mutex> queueLock( m_queueMutex );
+        m_api.vkQueueWaitIdle( m_queue );
+      }
       for( Buffer& buf: m_pool )
       {
         free( buf );
