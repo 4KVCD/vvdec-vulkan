@@ -241,10 +241,30 @@ bool Context::init()
   enable.features.shaderInt16 = VK_TRUE;
   enable.features.shaderInt64 = VK_TRUE;
 
+  // VVDEC_GPU_PROFILE=1: the GPU time of the passes, and with
+  // VK_AMD_shader_info the registers and memory each shader takes
+  const char* profile = getenv( "VVDEC_GPU_PROFILE" );
+  m_profiling         = profile && atoi( profile ) != 0;
+  const char* shaderInfo = "VK_AMD_shader_info";
+  bool        hasShaderInfo = false;
+  if( m_profiling )
+  {
+    uint32_t extensionCount = 0;
+    m_api.vkEnumerateDeviceExtensionProperties( m_physical, nullptr, &extensionCount, nullptr );
+    std::vector<VkExtensionProperties> extensions( extensionCount );
+    m_api.vkEnumerateDeviceExtensionProperties( m_physical, nullptr, &extensionCount, extensions.data() );
+    for( const VkExtensionProperties& extension: extensions )
+    {
+      hasShaderInfo |= strcmp( extension.extensionName, shaderInfo ) == 0;
+    }
+  }
+
   VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
   deviceInfo.pNext                = &enable;
   deviceInfo.queueCreateInfoCount = 1;
   deviceInfo.pQueueCreateInfos    = &queueInfo;
+  deviceInfo.enabledExtensionCount   = hasShaderInfo ? 1 : 0;
+  deviceInfo.ppEnabledExtensionNames = hasShaderInfo ? &shaderInfo : nullptr;
   if( m_api.vkCreateDevice( m_physical, &deviceInfo, nullptr, &m_device ) != VK_SUCCESS )
   {
     msg( WARNING, "Vulkan: creating the device on %s failed\n", props.deviceName );
@@ -254,6 +274,10 @@ bool Context::init()
 #define VVDEC_VK_LOAD_DEVICE( name ) m_api.name = (PFN_##name) m_api.vkGetDeviceProcAddr( m_device, #name );
   VVDEC_VK_DEVICE_FUNCS( VVDEC_VK_LOAD_DEVICE )
 #undef VVDEC_VK_LOAD_DEVICE
+  if( hasShaderInfo )
+  {
+    m_getShaderInfo = (PFN_vkGetShaderInfoAMD) m_api.vkGetDeviceProcAddr( m_device, "vkGetShaderInfoAMD" );
+  }
 
   m_api.vkGetDeviceQueue( m_device, m_queueFamily, 0, &m_queue );
   m_api.vkGetPhysicalDeviceMemoryProperties( m_physical, &m_memProps );
@@ -272,9 +296,6 @@ bool Context::init()
   {
     m_pipelines[i] = VK_NULL_HANDLE;
   }
-
-  const char* profile = getenv( "VVDEC_GPU_PROFILE" );
-  m_profiling         = profile && atoi( profile ) != 0;
 
   msg( INFO, "Vulkan: %s\n", m_deviceName.c_str() );
   return true;
@@ -496,6 +517,36 @@ VkPipeline Context::pipeline( int shaderId )
     THROW_FATAL( "Vulkan: the pipeline of " << kShaders[shaderId].name << " failed (" << result << ")" );
   }
   m_pipelines[shaderId] = pipe;
+
+  if( m_getShaderInfo )
+  {
+    VkShaderStatisticsInfoAMD stats{};
+    size_t                    size = sizeof( stats );
+    if( m_getShaderInfo( m_device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_STATISTICS_AMD, &size, &stats ) == VK_SUCCESS )
+    {
+      msg( INFO, "GPU shader %-16s VGPRs %3u (of %3u)  SGPRs %3u  shared memory %5zu bytes  scratch %5zu bytes\n", kShaders[shaderId].name,
+           stats.resourceUsage.numUsedVgprs, stats.numAvailableVgprs, stats.resourceUsage.numUsedSgprs, stats.resourceUsage.ldsUsageSizeInBytes,
+           stats.resourceUsage.scratchMemUsageInBytes );
+    }
+    // VVDEC_GPU_ISA=<directory>: the shader's machine code to <directory>/<name>.isa
+    if( const char* dir = getenv( "VVDEC_GPU_ISA" ) )
+    {
+      size_t textSize = 0;
+      if( m_getShaderInfo( m_device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &textSize, nullptr ) == VK_SUCCESS )
+      {
+        std::vector<char> text( textSize );
+        if( m_getShaderInfo( m_device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &textSize, text.data() ) == VK_SUCCESS )
+        {
+          const std::string path = std::string( dir ) + "/" + kShaders[shaderId].name + ".isa";
+          if( FILE* file = fopen( path.c_str(), "wb" ) )
+          {
+            fwrite( text.data(), 1, textSize, file );
+            fclose( file );
+          }
+        }
+      }
+    }
+  }
   return pipe;
 }
 

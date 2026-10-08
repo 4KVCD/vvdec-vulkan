@@ -168,6 +168,7 @@ private:
     long        count;
   };
   bool                             m_profiling = false;
+  PFN_vkGetShaderInfoAMD           m_getShaderInfo = nullptr;   // with VVDEC_GPU_PROFILE, where VK_AMD_shader_info is
   std::vector<Time>                m_times;
   std::mutex                       m_timeMutex;
 
