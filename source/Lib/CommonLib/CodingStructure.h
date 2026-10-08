@@ -54,6 +54,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "Slice.h"
 
 #include <vector>
+#include <mutex>
 
 namespace vvdec
 {
@@ -107,6 +108,45 @@ struct CtuData
 // coding structure
 // ---------------------------------------------------------------------------
 
+// the CU maps of the pictures' coding structures (a CodingUnit pointer a 4x4
+// block, luma and chroma: 8 MB at 4K), kept for the next pictures: a picture
+// gives its map back once reconstructed (deallocTempInternals) and the next
+// one set up takes it (allocTempInternals). Allocated anew, a map came zeroed
+// in fresh pages, on the parser's thread, and was zeroed once more there
+// (initStructData): most of a picture's set-up (4K: 4.4 ms).
+class CuMapCache
+{
+public:
+  std::unique_ptr<CodingUnit*[]> get( ptrdiff_t size )   // not zeroed
+  {
+    {
+      std::lock_guard<std::mutex> lock( m_mutex );
+      if( size == m_size && !m_maps.empty() )
+      {
+        std::unique_ptr<CodingUnit*[]> map = std::move( m_maps.back() );
+        m_maps.pop_back();
+        return map;
+      }
+    }
+    return std::unique_ptr<CodingUnit*[]>( new CodingUnit*[size] );
+  }
+  void put( std::unique_ptr<CodingUnit*[]> map, ptrdiff_t size )
+  {
+    std::lock_guard<std::mutex> lock( m_mutex );
+    if( size != m_size )
+    {
+      m_maps.clear();   // of another picture size
+      m_size = size;
+    }
+    m_maps.push_back( std::move( map ) );
+  }
+
+private:
+  std::mutex                                  m_mutex;
+  ptrdiff_t                                   m_size = 0;
+  std::vector<std::unique_ptr<CodingUnit*[]>> m_maps;
+};
+
 class CodingStructure
 {
 public:
@@ -133,7 +173,7 @@ public:
   Mv*               m_dmvrMvCache;
   // end of partially borrowed data
   
-  CodingStructure( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache );
+  CodingStructure( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache, CuMapCache* cuMapCache = nullptr );
   ~CodingStructure() { destroy(); }
 
   void create(const UnitArea &_unit);
@@ -201,6 +241,7 @@ public:
 
   std::unique_ptr<CodingUnit*[]>         m_cuMap;
   ptrdiff_t                              m_cuMapSize;
+  CuMapCache*                            m_cuMapCache;   // where m_cuMap comes from and goes back to (or null)
   ColocatedMotionInfo*                   m_colMiMap;
   ptrdiff_t                              m_colMiMapSize;
 #if VVDEC_VULKAN

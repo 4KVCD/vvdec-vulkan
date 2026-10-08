@@ -247,7 +247,7 @@ Picture::Picture( bool enableOpt )
   }
 }
 
-void Picture::finalInit( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache, const SPS *sps, const PPS *pps, const std::shared_ptr<PicHeader>& ph, const APS* const alfApss[ALF_CTB_MAX_NUM_APS], const APS* lmcsAps, const APS* scalingListAps, bool phPSupdate )
+void Picture::finalInit( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache, CuMapCache* cuMapCache, const SPS *sps, const PPS *pps, const std::shared_ptr<PicHeader>& ph, const APS* const alfApss[ALF_CTB_MAX_NUM_APS], const APS* lmcsAps, const APS* scalingListAps, bool phPSupdate )
 {
   SEI_internal::deleteSEIs( seiMessageList );
   clearSliceBuffer();
@@ -258,7 +258,7 @@ void Picture::finalInit( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache,
 
   if( !cs )
   {
-    cs = std::make_unique<CodingStructure>( cuChunkCache, tuChunkCache );
+    cs = std::make_unique<CodingStructure>( cuChunkCache, tuChunkCache, cuMapCache );
     cs->create( chromaFormatIDC, Area( 0, 0, iWidth, iHeight ) );
 #if VVDEC_VULKAN
     cs->colMiAllocator = gpuMemory;

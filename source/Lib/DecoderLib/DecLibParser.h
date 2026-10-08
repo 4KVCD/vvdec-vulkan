@@ -130,6 +130,7 @@ private:
 
   CUChunkCache              m_cuChunkCache;
   TUChunkCache              m_tuChunkCache;
+  CuMapCache                m_cuMapCache;
 
 public:
   DecLibParser( DecLib& decLib, PicListManager& picListManager ) : m_decLib( decLib ), m_picListManager( picListManager ) {}

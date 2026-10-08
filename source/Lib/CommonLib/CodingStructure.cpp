@@ -67,7 +67,7 @@ const UnitScale UnitScaleArray[NUM_CHROMA_FORMAT][MAX_NUM_COMPONENT] =
 // coding structure method definitions
 // ---------------------------------------------------------------------------
 
-CodingStructure::CodingStructure( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache )
+CodingStructure::CodingStructure( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache, CuMapCache* cuMapCache )
   : area      ()
   , picture   ( nullptr )
   , m_ctuData ( nullptr )
@@ -77,6 +77,7 @@ CodingStructure::CodingStructure( CUChunkCache* cuChunkCache, TUChunkCache* tuCh
   , m_tuCache ( tuChunkCache )
   , m_cuMap   ( nullptr )
   , m_cuMapSize( 0 )
+  , m_cuMapCache( cuMapCache )
   , m_colMiMap ( nullptr )
   , m_colMiMapSize ( 0 )
   , m_IBCBufferWidth( 0 )
@@ -284,7 +285,7 @@ void CodingStructure::allocTempInternals()
   const ptrdiff_t newCuMapSize = ctuCuMapSize * pcv->sizeInCtus * 2;
   if( m_cuMapSize != newCuMapSize )
   {
-    m_cuMap     = std::make_unique<CodingUnit*[]>( newCuMapSize );
+    m_cuMap     = m_cuMapCache ? m_cuMapCache->get( newCuMapSize ) : std::make_unique<CodingUnit*[]>( newCuMapSize );   // initStructData zeroes it
     m_cuMapSize = newCuMapSize;
   }
 
@@ -342,6 +343,10 @@ void CodingStructure::deallocTempInternals()
   m_cuCache.releaseAll();
   m_tuCache.releaseAll();
 
+  if( m_cuMapCache && m_cuMap )
+  {
+    m_cuMapCache->put( std::move( m_cuMap ), m_cuMapSize );
+  }
   m_cuMap.reset();
   m_cuMapSize = 0;
 }
