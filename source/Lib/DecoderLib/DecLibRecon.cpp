@@ -495,7 +495,32 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     m_pcThreadResource[i]->m_cCuDecoder.init( &m_pcThreadResource[i]->m_cIntraPred, &m_pcThreadResource[i]->m_cInterPred, &m_pcThreadResource[i]->m_cReshaper, &m_pcThreadResource[i]->m_cTrQuant );
   }
 
-  getCompatibleBuffer( *pcPic->cs, pcPic->cs->getRecoBuf(), m_fltBuf, pcPic->getUserAllocator() );
+  const bool isIntra = std::all_of( pcPic->slices.begin(), pcPic->slices.end(), []( const Slice* pcSlice ) { return pcSlice->isIntra(); } );
+#if VVDEC_VULKAN
+  // the GPU applies the in-loop filters to the whole picture once its CTUs are
+  // reconstructed (the finish tasks)
+  m_gpuFilters = m_gpuRecon && gpu::GpuRecon::filtersSupported( cs );
+  // and, before the filters, the intra and IBC blocks, in waves of blocks the
+  // CTU tasks list (TaskGpuCtu)
+  m_gpuIntra   = m_gpuFilters && gpu::GpuRecon::intraSupported( cs );
+  // and, before those, the inter blocks, from the reference pictures on the GPU
+  m_gpuInter   = m_gpuIntra && !isIntra && gpu::GpuRecon::interSupported( cs );
+  // and, first of all, the residuals, when the CPU predicts nothing
+  m_gpuResidual = m_gpuIntra && ( isIntra || m_gpuInter ) && gpu::GpuRecon::residualSupported( cs );
+  pcPic->gpuEarlyRef = false;
+  // the picture-sized buffers of what the CPU does itself, the filters' output
+  // (SAO, ALF) and the prediction, allocated only for that (an instance's: 4K
+  // 28 + 25 MB)
+  const bool cpuFilters  = !m_gpuFilters;
+  const bool cpuPredicts = !m_gpuIntra || ( !isIntra && !m_gpuInter );
+#else
+  const bool cpuFilters  = true;
+  const bool cpuPredicts = true;
+#endif
+  if( cpuFilters )
+  {
+    getCompatibleBuffer( *pcPic->cs, pcPic->cs->getRecoBuf(), m_fltBuf, pcPic->getUserAllocator() );
+  }
 
   const uint32_t  log2SaoOffsetScale = (uint32_t) std::max(0, sps->getBitDepth() - MAX_SAO_TRUNCATED_BITDEPTH);
   const int maxDepth = getLog2(sps->getMaxCUWidth()) - pps->pcv->minCUWidthLog2;
@@ -521,13 +546,13 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   const ptrdiff_t ctuSampleSizeC = isChromaEnabled( pcv->chrFormat ) ? ( ctuSampleSizeL >> ( getChannelTypeScaleX( CH_C, pcv->chrFormat ) + getChannelTypeScaleY( CH_C, pcv->chrFormat ) ) ) : 0;
   const ptrdiff_t ctuSampleSize  = ctuSampleSizeL + 2 * ctuSampleSizeC;
   const size_t    predBufSize    = ctuSampleSize * pcv->sizeInCtus;
-  if( predBufSize != m_predBufSize )
+  if( cpuPredicts && predBufSize != m_predBufSize )
   {
     m_predBuf.reset( ( Pel* ) xMalloc( Pel, predBufSize ) );
     m_predBufSize = predBufSize;
   }
 
-  pcPic->cs->m_predBuf = m_predBuf.get();
+  pcPic->cs->m_predBuf = cpuPredicts ? m_predBuf.get() : nullptr;
 
   // for the worst case of all PUs being 8x8 and using DMVR
   const size_t _maxNumDmvrMvs = pcv->num8x8CtuBlks * pcv->sizeInCtus;
@@ -580,21 +605,6 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 #endif
 
   const int numSubPic = cs.pps->getNumSubPics();
-
-  const bool isIntra = std::all_of( pcPic->slices.begin(), pcPic->slices.end(), []( const Slice* pcSlice ) { return pcSlice->isIntra(); } );
-#if VVDEC_VULKAN
-  // the GPU applies the in-loop filters to the whole picture once its CTUs are
-  // reconstructed (the finish tasks)
-  m_gpuFilters = m_gpuRecon && gpu::GpuRecon::filtersSupported( cs );
-  // and, before the filters, the intra and IBC blocks, in waves of blocks the
-  // CTU tasks list (TaskGpuCtu)
-  m_gpuIntra   = m_gpuFilters && gpu::GpuRecon::intraSupported( cs );
-  // and, before those, the inter blocks, from the reference pictures on the GPU
-  m_gpuInter   = m_gpuIntra && !isIntra && gpu::GpuRecon::interSupported( cs );
-  // and, first of all, the residuals, when the CPU predicts nothing
-  m_gpuResidual = m_gpuIntra && ( isIntra || m_gpuInter ) && gpu::GpuRecon::residualSupported( cs );
-  pcPic->gpuEarlyRef = false;
-#endif
 
   std::vector<Picture*> borderExtRefPics( pcPic->buildAllRefPicsVec() );
   for( Picture* refPic : borderExtRefPics )
