@@ -1120,7 +1120,7 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
 struct InterPush
 {
   VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion;
-  int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth, ctuLog2, widthInCtus, num8x8;
+  int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth, ctuLog2, widthInCtus, num8x8, wide;
 };
 // the colocated motion as shaders/inter.slang writes DMVR's refinements into it
 static_assert( sizeof( ColocatedMotionInfo ) == 20 && offsetof( ColocatedMotionInfo, mv ) == 0 && sizeof( Mv ) == 8,
@@ -1212,6 +1212,21 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   push.picHeight = pcv.lumaHeight;
   push.ctuSize   = pcv.maxCUWidth;
   push.bitDepth  = cs.sps->getBitDepth();
+  // the shader's tile16 loads the planes' rows in aligned pieces of 16 and 8
+  // bytes, up to 7 luma (3 chroma) samples before a window and 9 (5) after it:
+  // the rows must begin 16-byte aligned, the margins be wide enough (the
+  // reference pictures' planes are laid out as this one's)
+  push.wide = 1;
+  for( int comp = 0; comp < (int) cs.picture->m_bufs[PIC_RECONSTRUCTION].bufs.size(); comp++ )
+  {
+    const PelStorage& pic    = cs.picture->m_bufs[PIC_RECONSTRUCTION];
+    const VkDeviceSize left  = gpuLayout( pic, ComponentID( comp ) ).origin / sizeof( Pel );
+    const VkDeviceSize right = VkDeviceSize( pic.bufs[comp].stride ) - left - pic.bufs[comp].width;
+    if( planes.addr[comp] % 16 != 0 || pic.bufs[comp].stride * sizeof( Pel ) % 16 != 0 || left < 16 || right < 16 )
+    {
+      push.wide = 0;
+    }
+  }
 
   const Api& vk = m_ctx->api();
   vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_inter ) );
