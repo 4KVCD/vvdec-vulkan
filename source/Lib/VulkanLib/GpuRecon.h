@@ -120,9 +120,14 @@ public:
 
   // the parameters of the picture's filters (deblocking, SAO, ALF), worked out
   // before its work is recorded -- a task of its own once the picture is
-  // parsed, while its CTU tasks run (else startPicture does it); refs: the
-  // number of its reference pictures, whose table follows them
-  void prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, size_t refs );
+  // parsed, while its CTU tasks run (else startPicture does it)
+  void prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf );
+  // the residuals (jobs.trafo) and the inter blocks (jobs.inter, from the
+  // reference pictures of jobs.refs) of the picture's first ctus CTUs queued
+  // ahead of the rest of its work: once their CTU tasks are done, while the
+  // CPU still makes the jobs of the CTUs below, the GPU starts on them.
+  // startPicture then queues the rest (jobs.bandCtus = ctus).
+  void startBand( CodingStructure& cs, const PictureJobs& jobs, size_t ctus, PelStorage& pic );
   // the rest of the picture in pic, on top of what the CPU reconstructed: the
   // residuals of jobs.trafo, the inter blocks of jobs.inter, from the
   // reference pictures of jobs.refs, the intra and IBC blocks of jobs.intra,
@@ -130,7 +135,8 @@ public:
   // given), ALF with CC-ALF (when alf is given); the result stays on the GPU as
   // a reference (the picture is gpuCurrent then) and comes back to pic.
   // startPicture queues the work, in two parts: the first, the residuals and
-  // the inter blocks, the rest. waitFirst: it returns once the first part is
+  // the inter blocks (those of the CTUs after a band startBand queued), the
+  // rest. waitFirst: it returns once the first part is
   // done, DMVR's refinements in host memory (dmvrMvCache). endPicture waits
   // for the rest, the download of pic included.
   void startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
@@ -138,7 +144,7 @@ public:
   void endPicture();
 
 private:
-  void     beginCommands();
+  void     beginCommands( bool resetPool = true );
   void     computeBarrier();
   void     mark( const char* label );   // with VVDEC_GPU_PROFILE: the GPU time since the last mark counts as label
   void     splitCommands();   // the first part's commands end and go to the GPU, the rest's begin
@@ -147,6 +153,9 @@ private:
   // the rest
   void     submitPicture( const PelStorage& pic, bool waitFirst );
   void     readTimestamps( double waited );
+  // the reference pictures' planes on the GPU into m_refs (laid out as pic's);
+  // uploads: those the CPU reconstructed (or filled in), to copy there first
+  void     writeRefTable( const RefTable& refs, const PelStorage& pic, std::vector<const Picture*>& uploads );
   uint8_t* params( size_t size );   // the host-visible parameter buffer, at least size bytes
 
   // the planes of a picture as the shaders see them
@@ -170,19 +179,24 @@ private:
   bool          prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8_t* params );   // false: no CTU uses SAO
   void          recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params, const std::vector<EdgeLists>& edges );
   void          recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes );
-  void          recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, const Planes& planes, VkDeviceAddress refTable );
+  // the jobs of the CTUs ctuBegin .. ctuEnd - 1, copied into buf
+  void          recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
+                             const Planes& planes );
   // the levels from the planes of levels (the picture in host memory, where the parser left them), the residuals to planes
-  void          recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, const Planes& levels, const Planes& planes );
+  void          recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
+                             const Planes& levels, const Planes& planes );
   void          recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
   void          recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
 
   static constexpr uint32_t kMaxMarks = 64;
+  static constexpr uint32_t kBandMarks = 8;
 
   Context*        m_ctx;
   VkCommandPool   m_pool    = VK_NULL_HANDLE;
-  VkCommandBuffer m_cmd     = VK_NULL_HANDLE;   // the one being recorded: m_cmdFirst or m_cmdRest
+  VkCommandBuffer m_cmd     = VK_NULL_HANDLE;   // the one being recorded: m_cmdBand, m_cmdFirst or m_cmdRest
   VkCommandBuffer m_cmdFirst = VK_NULL_HANDLE;  // a picture's first part
   VkCommandBuffer m_cmdRest  = VK_NULL_HANDLE;  // and the rest
+  VkCommandBuffer m_cmdBand  = VK_NULL_HANDLE;  // its top band, queued ahead (startBand)
   VkFence         m_fenceFirst = VK_NULL_HANDLE;   // the first part done
   VkFence         m_fence   = VK_NULL_HANDLE;   // all done
   std::chrono::steady_clock::time_point m_submitted;
@@ -194,24 +208,30 @@ private:
   const char*     m_labels[kMaxMarks];
   uint32_t        m_marks   = 0;
   uint32_t        m_gapMark = 0;   // the mark that ends the time between the picture's parts (0: none)
+  VkQueryPool     m_bandQueries = VK_NULL_HANDLE;   // the band's profiling timestamps, its marks counted as the rest's
+  const char*     m_bandLabels[kBandMarks];
+  uint32_t        m_bandMarks = 0;
   struct Prepared                  // prepareFilters' results
   {
     const Picture* picture = nullptr;
     bool           deblock = false, sao = false;
-    size_t         dbSize = 0, alfSize = 0, saoSize = 0, refs = 0;
+    size_t         dbSize = 0, alfSize = 0, saoSize = 0;
   } m_prepared;
   // the buffers the CPU only writes, in order, and the shaders read -- the
-  // filters' parameters with the reference table, the jobs, the edges, the
+  // filters' parameters, the reference table, the jobs, the edges, the
   // transform matrices -- are MemKind::Upload: in the GPU's own memory where
   // the BAR allows (VideoQ 4K: the GPU's time a picture -1%; the CPU's
   // write-combined copies of the jobs no slower)
   Buffer          m_params;
+  Buffer          m_refs;                           // the reference table: the reference pictures' planes on the GPU
   Buffer          m_scratch[MAX_NUM_COMPONENT];     // a picture's worth of GPU memory (SAO's or ALF's output), from the pool while its work is recorded
   Buffer          m_dmvr;                           // DMVR's refinements
   Buffer          m_intraJobs;                      // the intra jobs of a picture, wave by wave, then what each waits for
   Buffer          m_intraSync;                      // shaders/intra.slang's counts of the jobs taken and done
   Buffer          m_interJobs;
   Buffer          m_trafoJobs;
+  Buffer          m_bandInterJobs;                  // the top band's
+  Buffer          m_bandTrafoJobs;
   Buffer          m_edges;                          // the edges the deblocking filters
   Buffer          m_matrices;                       // TrQuant's transform matrices
 };

@@ -736,6 +736,15 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   tasksCtu          = std::vector<CtuTaskParam >( heightInCtus * numTasksPerLine, CtuTaskParam{ commonTaskParam, -1, -1, {} } );
 
   pcPic->reconDone.lock();
+#if VVDEC_VULKAN
+  // the top half of the picture's rows of CTUs: their residuals and inter
+  // blocks go to the GPU as soon as their CTU tasks are done (the rows finish
+  // in order, the top half's well before the last row), while the CPU makes
+  // the bottom half's jobs (VideoQ 1080p +3.5 to +5.9%, 4K 0 to +1%; 3 to 5
+  // bands no faster: more submissions)
+  m_gpuBandRows = m_gpuFilters && m_gpuResidual && m_gpuIntra && heightInCtus >= 4 ? heightInCtus / 2 : 0;
+  m_gpuBandDone.store( false, std::memory_order_relaxed );
+#endif
 
 #if 0
   // schedule in raster scan order
@@ -804,6 +813,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       jobs.intra = dec->m_gpuIntra ? &dec->m_gpuIntraJobs : nullptr;
       jobs.refs  = &dec->m_refTable;
       jobs.edges = &dec->m_gpuEdges;
+      jobs.bandCtus = size_t( dec->m_gpuBandRows ) * cs.pcv->widthInCtus;
       // with DMVR, the GPU stores the refined motion for TMVP in the next
       // pictures in the first part (the CTU tasks stored the rest)
       const bool refine = dec->m_gpuInter && cs.picture->stillReferenced;
@@ -834,8 +844,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     {
       FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
       DecLibRecon*        dec   = param->decLib;
-      dec->m_gpuRecon->prepareFilters( *param->pic->cs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr,
-                                       dec->m_gpuInter ? dec->m_refTable.pictures().size() : 0 );
+      dec->m_gpuRecon->prepareFilters( *param->pic->cs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr );
       return true;
     };
 
@@ -848,13 +857,51 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
                                         &pcPic->m_divTasksCounter,
                                         &m_gpuFiltersPrepared,
                                         { &pcPic->parseDone } );
+    CBarrierVec queueBarriers{ pcPic->m_ctuTaskCounter.donePtr(), &m_gpuFiltersPrepared };
+    if( m_gpuBandRows > 0 )
+    {
+      // the top band's jobs to the GPU: a task that waits for the band's CTU
+      // tasks (its ready check: no barrier, so that a CTU task's failure fails
+      // it too rather than leaving it waiting)
+      static auto bandReady = []( int tid, void* task_param )
+      {
+        FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
+        if( param->pic->m_ctuTaskCounter.hasException() )
+        {
+          std::rethrow_exception( param->pic->m_ctuTaskCounter.getException() );
+        }
+        return param->decLib->m_gpuBandDone.load( std::memory_order_acquire );
+      };
+      static auto bandTask = []( int tid, void* task_param )
+      {
+        FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
+        CodingStructure&    cs    = *param->pic->cs;
+        DecLibRecon*        dec   = param->decLib;
+        gpu::PictureJobs    jobs;
+        jobs.trafo = &dec->m_gpuTrafoJobs;
+        jobs.inter = dec->m_gpuInter ? &dec->m_gpuInterJobs : nullptr;
+        jobs.refs  = &dec->m_refTable;
+        dec->m_gpuRecon->startBand( cs, jobs, size_t( dec->m_gpuBandRows ) * cs.pcv->widthInCtus, cs.picture->m_bufs[PIC_RECONSTRUCTION] );
+        return true;
+      };
+      m_gpuBandQueued.clearException();
+      m_gpuBandQueued.lock();
+      m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " bandTask" )
+                                          bandTask,
+                                          &taskFinishPic,
+                                          &pcPic->m_divTasksCounter,
+                                          &m_gpuBandQueued,
+                                          {},
+                                          bandReady );
+      queueBarriers.push_back( &m_gpuBandQueued );
+    }
     pcPic->gpuRefReady.lock();
     m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " queueGpuTask" )
                                         queueGpuTask,
                                         &taskFinishPic,
                                         &pcPic->m_divTasksCounter,
                                         &pcPic->gpuRefReady,
-                                        { pcPic->m_ctuTaskCounter.donePtr(), &m_gpuFiltersPrepared } );
+                                        std::move( queueBarriers ) );
     m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " finishPicTask" )
                                         finishGpuTask,
                                         &taskFinishPic,
@@ -1178,6 +1225,13 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
     // whole lines) would only hold the jobs' recording back
     if( param->common.gpuIntra )
     {
+      if( line == decLib.m_gpuBandRows - 1 && col == tasksPerLine - 1 )
+      {
+        // the band's last task: the others of its line are done (each waited
+        // for the one before), and the lines above (this one waited for the
+        // last task of the line above)
+        decLib.m_gpuBandDone.store( true, std::memory_order_release );
+      }
       thisCtuState = DONE;
       ITT_TASKEND( itt_domain_dec, itt_handle_intra );
       return true;

@@ -185,14 +185,15 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
   VkCommandBufferAllocateInfo cmdInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
   cmdInfo.commandPool        = m_pool;
   cmdInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cmdInfo.commandBufferCount = 2;
-  VkCommandBuffer cmds[2];
+  cmdInfo.commandBufferCount = 3;
+  VkCommandBuffer cmds[3];
   if( vk.vkAllocateCommandBuffers( m_ctx->device(), &cmdInfo, cmds ) != VK_SUCCESS )
   {
     THROW_FATAL( "Vulkan: vkAllocateCommandBuffers failed" );
   }
   m_cmdFirst = m_cmd = cmds[0];
   m_cmdRest  = cmds[1];
+  m_cmdBand  = cmds[2];
 
   VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
   if( vk.vkCreateFence( m_ctx->device(), &fenceInfo, nullptr, &m_fence ) != VK_SUCCESS
@@ -248,6 +249,12 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
     VkQueryPoolCreateInfo queryInfo{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
     queryInfo.queryType  = VK_QUERY_TYPE_TIMESTAMP;
     queryInfo.queryCount = kMaxMarks;
+    queryInfo.queryCount = kBandMarks;
+    if( vk.vkCreateQueryPool( m_ctx->device(), &queryInfo, nullptr, &m_bandQueries ) != VK_SUCCESS )
+    {
+      THROW_FATAL( "Vulkan: vkCreateQueryPool failed" );
+    }
+    queryInfo.queryCount = kMaxMarks;
     if( vk.vkCreateQueryPool( m_ctx->device(), &queryInfo, nullptr, &m_queries ) != VK_SUCCESS )
     {
       THROW_FATAL( "Vulkan: vkCreateQueryPool failed" );
@@ -274,6 +281,10 @@ GpuRecon::~GpuRecon()
   {
     vk.vkDestroyQueryPool( m_ctx->device(), m_transferQueries, nullptr );
   }
+  if( m_bandQueries )
+  {
+    vk.vkDestroyQueryPool( m_ctx->device(), m_bandQueries, nullptr );
+  }
   if( m_semaphore )
   {
     vk.vkDestroySemaphore( m_ctx->device(), m_semaphore, nullptr );
@@ -296,6 +307,9 @@ GpuRecon::~GpuRecon()
   }
   m_ctx->free( m_params );
   m_ctx->free( m_dmvr );
+  m_ctx->free( m_refs );
+  m_ctx->free( m_bandInterJobs );
+  m_ctx->free( m_bandTrafoJobs );
   m_ctx->free( m_intraJobs );
   m_ctx->free( m_intraSync );
   m_ctx->free( m_interJobs );
@@ -318,10 +332,13 @@ uint8_t* GpuRecon::params( size_t size )
   return m_params.mapped;
 }
 
-void GpuRecon::beginCommands()
+void GpuRecon::beginCommands( bool resetPool )
 {
   const Api& vk = m_ctx->api();
-  vk.vkResetCommandPool( m_ctx->device(), m_pool, 0 );
+  if( resetPool )
+  {
+    vk.vkResetCommandPool( m_ctx->device(), m_pool, 0 );
+  }
   VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vk.vkBeginCommandBuffer( m_cmd, &begin );
@@ -343,6 +360,15 @@ void GpuRecon::beginCommands()
 
 void GpuRecon::mark( const char* label )
 {
+  if( m_cmd == m_cmdBand )
+  {
+    if( m_bandQueries && m_bandMarks < kBandMarks )
+    {
+      m_bandLabels[m_bandMarks] = label;
+      m_ctx->api().vkCmdWriteTimestamp( m_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_bandQueries, m_bandMarks++ );
+    }
+    return;
+  }
   if( m_queries && m_marks < kMaxMarks )
   {
     m_labels[m_marks] = label;
@@ -479,12 +505,43 @@ void GpuRecon::readTimestamps( double waited )
     vk.vkGetQueryPoolResults( m_ctx->device(), m_queries, 0, m_marks, sizeof( stamps ), stamps, sizeof( uint64_t ),
                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT );
     const double toMs = m_ctx->timestampPeriod() * 1e-6;
+    // the band's passes, counted with the rest's of the same name (a picture's
+    // trafo or inter time is its band's and its rest's)
+    double   band[kBandMarks] = {};
+    uint64_t bandSpan         = 0;
+    if( m_bandQueries && m_bandMarks > 1 )
+    {
+      uint64_t bandStamps[kBandMarks];
+      vk.vkGetQueryPoolResults( m_ctx->device(), m_bandQueries, 0, m_bandMarks, sizeof( bandStamps ), bandStamps, sizeof( uint64_t ),
+                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT );
+      for( uint32_t j = 1; j < m_bandMarks; j++ )
+      {
+        band[j] = double( bandStamps[j] - bandStamps[j - 1] ) * toMs;
+      }
+      bandSpan = bandStamps[m_bandMarks - 1] - bandStamps[0];
+    }
     for( uint32_t i = 1; i < m_marks; i++ )
     {
-      m_ctx->addTime( m_labels[i], double( stamps[i] - stamps[i - 1] ) * toMs );
+      double time = double( stamps[i] - stamps[i - 1] ) * toMs;
+      for( uint32_t j = 1; j < m_bandMarks; j++ )
+      {
+        if( band[j] > 0 && strcmp( m_bandLabels[j], m_labels[i] ) == 0 )
+        {
+          time += band[j];
+          band[j] = 0;
+        }
+      }
+      m_ctx->addTime( m_labels[i], time );
+    }
+    for( uint32_t j = 1; j < m_bandMarks; j++ )
+    {
+      if( band[j] > 0 )
+      {
+        m_ctx->addTime( m_bandLabels[j], band[j] );
+      }
     }
     const uint64_t between = m_gapMark > 0 ? stamps[m_gapMark] - stamps[m_gapMark - 1] : 0;
-    m_ctx->addTime( "submission (GPU)", double( stamps[m_marks - 1] - stamps[0] - between ) * toMs );
+    m_ctx->addTime( "submission (GPU)", double( stamps[m_marks - 1] - stamps[0] - between + bandSpan ) * toMs );
   }
 }
 
@@ -1207,34 +1264,35 @@ Mv* GpuRecon::dmvrMvCache( size_t count )
   return reinterpret_cast<Mv*>( m_dmvr.mapped );
 }
 
-void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, const Planes& planes, VkDeviceAddress refTable )
+void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
+                            const Planes& planes )
 {
   size_t total = 0;
-  for( const auto& ctu: jobs )
+  for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
   {
-    total += ctu.size();
+    total += jobs[ctu].size();
   }
   if( total == 0 )
   {
     return;
   }
   const size_t size = total * sizeof( InterJob );
-  if( m_interJobs.size < size )
+  if( buf.size < size )
   {
-    m_ctx->free( m_interJobs );
-    m_interJobs = m_ctx->alloc( size * 2, MemKind::Upload );
+    m_ctx->free( buf );
+    buf = m_ctx->alloc( size * 2, MemKind::Upload );
   }
-  InterJob* all = reinterpret_cast<InterJob*>( m_interJobs.mapped );
-  for( const auto& ctu: jobs )
+  InterJob* all = reinterpret_cast<InterJob*>( buf.mapped );
+  for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
   {
-    memcpy( all, ctu.data(), ctu.size() * sizeof( InterJob ) );
-    all += ctu.size();
+    memcpy( all, jobs[ctu].data(), jobs[ctu].size() * sizeof( InterJob ) );
+    all += jobs[ctu].size();
   }
 
   const PreCalcValues& pcv = *cs.pcv;
   InterPush            push{};
-  push.jobs      = m_interJobs.addr;
-  push.refs      = refTable;
+  push.jobs      = buf.addr;
+  push.refs      = m_refs.addr;
   push.dst0      = planes.addr[COMPONENT_Y];
   push.dst1      = planes.addr[COMPONENT_Cb];
   push.dst2      = planes.addr[COMPONENT_Cr];
@@ -1300,32 +1358,33 @@ bool GpuRecon::residualSupported( const CodingStructure& cs )
   return true;
 }
 
-void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, const Planes& levels, const Planes& planes )
+void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
+                            const Planes& levels, const Planes& planes )
 {
   size_t total = 0;
-  for( const auto& ctu: jobs )
+  for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
   {
-    total += ctu.size();
+    total += jobs[ctu].size();
   }
   if( total == 0 )
   {
     return;
   }
   const size_t size = total * sizeof( TrafoJob );
-  if( m_trafoJobs.size < size )
+  if( buf.size < size )
   {
-    m_ctx->free( m_trafoJobs );
-    m_trafoJobs = m_ctx->alloc( size * 2, MemKind::Upload );
+    m_ctx->free( buf );
+    buf = m_ctx->alloc( size * 2, MemKind::Upload );
   }
-  TrafoJob* all = reinterpret_cast<TrafoJob*>( m_trafoJobs.mapped );
-  for( const auto& ctu: jobs )
+  TrafoJob* all = reinterpret_cast<TrafoJob*>( buf.mapped );
+  for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
   {
-    memcpy( all, ctu.data(), ctu.size() * sizeof( TrafoJob ) );
-    all += ctu.size();
+    memcpy( all, jobs[ctu].data(), jobs[ctu].size() * sizeof( TrafoJob ) );
+    all += jobs[ctu].size();
   }
 
   TrafoPush push{};
-  push.jobs     = m_trafoJobs.addr;
+  push.jobs     = buf.addr;
   push.plane0   = planes.addr[COMPONENT_Y];
   push.plane1   = planes.addr[COMPONENT_Cb];
   push.plane2   = planes.addr[COMPONENT_Cr];
@@ -1349,14 +1408,12 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   mark( "trafo" );
 }
 
-void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, size_t refs )
+void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf )
 {
   m_prepared.dbSize  = deblockParamSize( cs );
   m_prepared.alfSize = alf ? alfParamSize( cs ) : 0;
   m_prepared.saoSize = sao ? saoParamSize( cs ) : 0;
-  m_prepared.refs    = refs;
-  const size_t refSize = ( refs * 4 * sizeof( VkDeviceAddress ) + 255 ) & ~size_t( 255 );
-  uint8_t*     base    = params( m_prepared.dbSize + m_prepared.alfSize + m_prepared.saoSize + refSize );
+  uint8_t* base      = params( m_prepared.dbSize + m_prepared.alfSize + m_prepared.saoSize );
   m_prepared.deblock = deblock && prepareDeblock( cs, base );
   m_prepared.sao     = sao && prepareSao( cs, *sao, base + m_prepared.dbSize + m_prepared.alfSize );
   if( alf )
@@ -1366,44 +1423,103 @@ void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptive
   m_prepared.picture = cs.picture;
 }
 
-void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
-                             PelStorage& pic, bool waitFirst )
+void GpuRecon::writeRefTable( const RefTable& refs, const PelStorage& pic, std::vector<const Picture*>& uploads )
 {
-  const size_t refs = jobs.inter ? jobs.refs->pictures().size() : 0;
-  if( m_prepared.picture != cs.picture )
+  const size_t size = std::max<size_t>( refs.pictures().size(), 1 ) * 4 * sizeof( VkDeviceAddress );
+  if( m_refs.size < size )
   {
-    prepareFilters( cs, deblock, sao, alf, refs );
+    m_ctx->free( m_refs );
+    m_refs = m_ctx->alloc( std::max<size_t>( size, 1024 ), MemKind::Upload );
   }
-  m_prepared.picture   = nullptr;   // the next picture's anew
-  CHECK_FATAL( m_prepared.refs != refs, "Vulkan: the filters' parameters prepared for another reference table" );
-  const size_t dbSize  = m_prepared.dbSize;
-  const size_t alfSize = m_prepared.alfSize;
-  const size_t saoSize = m_prepared.saoSize;
-  uint8_t*     base    = m_params.mapped;
-  const size_t refAt   = dbSize + alfSize + saoSize;
+  VkDeviceAddress* table = reinterpret_cast<VkDeviceAddress*>( m_refs.mapped );
+  for( const void* ref: refs.pictures() )
+  {
+    const Picture* refPic = static_cast<const Picture*>( ref );
+    const Planes   planes = twinPlanes( refPic->m_bufs[PIC_RECONSTRUCTION] );
+    table[0]              = planes.addr[COMPONENT_Y];
+    table[1]              = planes.addr[COMPONENT_Cb];
+    table[2]              = planes.addr[COMPONENT_Cr];
+    table[3]              = 0;
+    CHECK( planes.stride[COMPONENT_Y] != pic.bufs[COMPONENT_Y].stride || planes.stride[COMPONENT_Cb] != pic.bufs[COMPONENT_Cb].stride,
+           "Vulkan: a reference picture laid out differently" );
+    table += 4;
+    if( !refPic->gpuCurrent )
+    {
+      uploads.push_back( refPic );
+    }
+  }
+}
 
-  // the reference pictures: their planes on the GPU, where a picture the CPU
-  // reconstructed alone (or filled in) goes first
+void GpuRecon::startBand( CodingStructure& cs, const PictureJobs& jobs, size_t ctus, PelStorage& pic )
+{
+  const Api&                  vk = m_ctx->api();
   std::vector<const Picture*> uploads;
   if( jobs.inter )
   {
-    VkDeviceAddress* table = reinterpret_cast<VkDeviceAddress*>( base + refAt );
-    for( const void* ref: jobs.refs->pictures() )
-    {
-      const Picture* refPic = static_cast<const Picture*>( ref );
-      const Planes   planes = twinPlanes( refPic->m_bufs[PIC_RECONSTRUCTION] );
-      table[0]              = planes.addr[COMPONENT_Y];
-      table[1]              = planes.addr[COMPONENT_Cb];
-      table[2]              = planes.addr[COMPONENT_Cr];
-      table[3]              = 0;
-      CHECK( planes.stride[COMPONENT_Y] != pic.bufs[COMPONENT_Y].stride || planes.stride[COMPONENT_Cb] != pic.bufs[COMPONENT_Cb].stride,
-             "Vulkan: a reference picture laid out differently" );
-      table += 4;
-      if( !refPic->gpuCurrent )
-      {
-        uploads.push_back( refPic );
-      }
-    }
+    writeRefTable( *jobs.refs, pic, uploads );
+  }
+
+  // the band's commands (the pool reset: the instance's previous picture is
+  // done), after what earlier submissions wrote
+  m_cmd = m_cmdBand;
+  vk.vkResetCommandPool( m_ctx->device(), m_pool, 0 );
+  VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vk.vkBeginCommandBuffer( m_cmd, &begin );
+  m_bandMarks = 0;
+  if( m_bandQueries )
+  {
+    vk.vkCmdResetQueryPool( m_cmd, m_bandQueries, 0, kBandMarks );
+    vk.vkCmdWriteTimestamp( m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_bandQueries, m_bandMarks++ );
+  }
+  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+  for( const Picture* refPic: uploads )
+  {
+    copyPlanes( refPic->m_bufs[PIC_RECONSTRUCTION], kHost, kTwin );
+  }
+  transferBarrier( false );
+  const Planes planes = twinPlanes( pic );
+  recordTrafo( cs, *jobs.trafo, 0, ctus, m_bandTrafoJobs, hostPlanes( pic ), planes );
+  if( jobs.inter )
+  {
+    computeBarrier();
+    recordInter( cs, *jobs.inter, 0, ctus, m_bandInterJobs, planes );
+  }
+  vk.vkEndCommandBuffer( m_cmd );
+  // to the GPU now: the first part's commands, queued after these, begin with
+  // a barrier over them
+  m_ctx->submitFirst( m_cmd, VK_NULL_HANDLE );
+  for( const Picture* refPic: uploads )
+  {
+    refPic->gpuCurrent = true;   // for the work queued after this
+  }
+}
+
+void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
+                             PelStorage& pic, bool waitFirst )
+{
+  if( m_prepared.picture != cs.picture )
+  {
+    prepareFilters( cs, deblock, sao, alf );
+  }
+  m_prepared.picture   = nullptr;   // the next picture's anew
+  const size_t dbSize  = m_prepared.dbSize;
+  const size_t alfSize = m_prepared.alfSize;
+
+  // after a band (startBand): the command pool reset, the reference table
+  // written, the references uploaded
+  const bool                  band = jobs.bandCtus > 0;
+  std::vector<const Picture*> uploads;
+  if( jobs.inter && !band )
+  {
+    writeRefTable( *jobs.refs, pic, uploads );
+  }
+  if( !band )
+  {
+    m_bandMarks = 0;
   }
 
   const bool doDeblock = m_prepared.deblock;
@@ -1414,7 +1530,7 @@ void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool 
   // all of it, from the residuals on, nothing goes in: the residual pass reads
   // the levels from the host's picture.
   m_cmd = m_cmdFirst;
-  beginCommands();
+  beginCommands( !band );
   for( const Picture* refPic: uploads )
   {
     copyPlanes( refPic->m_bufs[PIC_RECONSTRUCTION], kHost, kTwin );
@@ -1428,12 +1544,12 @@ void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool 
   transferBarrier( false );
   if( jobs.trafo )
   {
-    recordTrafo( cs, *jobs.trafo, hostPlanes( pic ), planes[cur] );
+    recordTrafo( cs, *jobs.trafo, jobs.bandCtus, jobs.trafo->size(), m_trafoJobs, hostPlanes( pic ), planes[cur] );
     computeBarrier();
   }
   if( jobs.inter )
   {
-    recordInter( cs, *jobs.inter, planes[cur], m_params.addr + refAt );   // in place
+    recordInter( cs, *jobs.inter, jobs.bandCtus, jobs.inter->size(), m_interJobs, planes[cur] );   // in place
     computeBarrier();
   }
   splitCommands();

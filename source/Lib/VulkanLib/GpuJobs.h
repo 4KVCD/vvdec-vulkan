@@ -288,6 +288,9 @@ struct PictureJobs
   const std::vector<std::vector<IntraJob>>* intra = nullptr;
   const RefTable*                           refs  = nullptr;   // with inter
   const std::vector<EdgeLists>*             edges = nullptr;   // per CTU, with deblocking
+  // the first CTUs, bandCtus of them, whose residuals and inter blocks went to
+  // the GPU ahead of the rest (GpuRecon::startBand)
+  size_t                                    bandCtus = 0;
 };
 
 }   // namespace gpu

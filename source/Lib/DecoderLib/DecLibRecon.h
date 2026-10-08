@@ -205,6 +205,11 @@ private:
   FinishPicTaskParam         taskFinishPic;
 #if VVDEC_VULKAN
   Barrier                    m_gpuFiltersPrepared;   // the picture's filter parameters for the GPU worked out (GpuRecon::prepareFilters)
+  // the picture's top rows of CTUs whose residuals and inter blocks go to the
+  // GPU ahead of the rest (0: none), their CTU tasks done, their jobs queued
+  int                        m_gpuBandRows = 0;
+  std::atomic<bool>          m_gpuBandDone{ false };
+  Barrier                    m_gpuBandQueued;
 #endif
   CBarrierVec                picBarriers;
 
