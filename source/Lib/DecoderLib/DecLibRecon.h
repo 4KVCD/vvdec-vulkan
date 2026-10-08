@@ -202,6 +202,9 @@ private:
   std::vector<LineTaskParam> tasksFinishMotion;
   std::vector<CtuTaskParam>  tasksCtu;
   FinishPicTaskParam         taskFinishPic;
+#if VVDEC_VULKAN
+  Barrier                    m_gpuFiltersPrepared;   // the picture's filter parameters for the GPU worked out (GpuRecon::prepareFilters)
+#endif
   CBarrierVec                picBarriers;
 
 public:

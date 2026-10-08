@@ -46,6 +46,10 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "GpuRecon.h"
 
+#ifdef _MSC_VER
+#  include <intrin.h>
+#endif
+
 #include "vvdec_gpu/GpuShaders.h"
 
 #include "CommonLib/AdaptiveLoopFilter.h"
@@ -849,6 +853,18 @@ struct DeblockPush
   int32_t         stride, width, height, ctuLog2, widthInCtus, bitDepth, num4x4, dir, scaleX, scaleY, count;
 };
 
+// the index of the lowest bit set in v (not 0)
+static inline int lowestBit( uint32_t v )
+{
+#ifdef _MSC_VER
+  unsigned long index;
+  _BitScanForward( &index, v );
+  return int( index );
+#else
+  return __builtin_ctz( v );
+#endif
+}
+
 void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& edges )
 {
   edges.clear();
@@ -858,12 +874,14 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
   {
     return;
   }
-  const int  n      = int( pcv.maxCUWidth ) >> 2;   // 4x4 blocks across a CTU
+  const int  n      = int( pcv.maxCUWidth ) >> 2;   // 4x4 blocks across a CTU (32 at most: a row's fit the bits of an int)
   const int  x0     = ( ctuRsAddr % int( pcv.widthInCtus ) ) * int( pcv.maxCUWidth );
   const int  y0     = ( ctuRsAddr / int( pcv.widthInCtus ) ) * int( pcv.maxCUHeight );
   const bool chroma = isChromaEnabled( pcv.chrFormat );
   const int  sx     = chroma ? getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) : 0;
   const int  sy     = chroma ? getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) : 0;
+  const int  cols   = std::min( n, ( int( pcv.lumaWidth ) - x0 + 3 ) >> 2 );
+  const int  rows   = std::min( n, ( int( pcv.lumaHeight ) - y0 + 3 ) >> 2 );
   for( int dir = 0; dir < 2; dir++ )
   {
     const LoopFilterParam* lfp = ctu.lfParam[dir];
@@ -872,22 +890,34 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
     const int across = dir == 0 ? ( ( 8 << sx ) / 4 * ( 4 >> sx ) ) << sx : ( ( 8 << sy ) / 4 * ( 4 >> sy ) ) << sy;
     const int gridX  = dir == 0 ? across : ( 4 >> sx ) << sx;
     const int gridY  = dir == 0 ? ( 4 >> sy ) << sy : across;
-    for( int i = 0; i < (int) pcv.num4x4CtuBlks; i++ )
+    CHECKD( ( gridX & ( gridX - 1 ) ) || ( gridY & ( gridY - 1 ) ), "the chroma grid is a power of 2" );
+    // the 4x4 blocks inside the picture, row by row (no divisions: this runs
+    // for every CTU, between its motion and its jobs)
+    for( int r = 0; r < rows; r++ )
     {
-      const int lx = x0 + ( i % n ) * 4;
-      const int ly = y0 + ( i / n ) * 4;
-      if( lx >= int( pcv.lumaWidth ) || ly >= int( pcv.lumaHeight ) )
+      const LoopFilterParam* row      = lfp + r * n;
+      const int              ly       = y0 + r * 4;
+      const bool             chromaOn = chroma && ( ly & ( gridY - 1 ) ) == 0;
+      // the row's blocks with an edge, as bits (no branch a block: most have none)
+      uint32_t               any      = 0;
+      for( int c = 0; c < cols; c++ )
       {
-        continue;
+        any |= uint32_t( row[c].bs != 0 ) << c;
       }
-      const int bs = lfp[i].bs;
-      if( bs & 3 )
+      while( any )
       {
-        edges.lists[dir].push_back( uint32_t( lx ) | uint32_t( ly ) << 16 );
-      }
-      if( chroma && ( bs & 0x3c ) && lx % gridX == 0 && ly % gridY == 0 )
-      {
-        edges.lists[2 + dir].push_back( uint32_t( lx >> sx ) | uint32_t( ly >> sy ) << 16 );
+        const int c  = lowestBit( any );
+        any         &= any - 1;
+        const int bs = row[c].bs;
+        const int lx = x0 + c * 4;
+        if( bs & 3 )
+        {
+          edges.lists[dir].push_back( uint32_t( lx ) | uint32_t( ly ) << 16 );
+        }
+        if( chromaOn && ( bs & 0x3c ) && ( lx & ( gridX - 1 ) ) == 0 )
+        {
+          edges.lists[2 + dir].push_back( uint32_t( lx >> sx ) | uint32_t( ly >> sy ) << 16 );
+        }
       }
     }
   }
@@ -1317,14 +1347,37 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   mark( "trafo" );
 }
 
+void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, size_t refs )
+{
+  m_prepared.dbSize  = deblockParamSize( cs );
+  m_prepared.alfSize = alf ? alfParamSize( cs ) : 0;
+  m_prepared.saoSize = sao ? saoParamSize( cs ) : 0;
+  m_prepared.refs    = refs;
+  const size_t refSize = ( refs * 4 * sizeof( VkDeviceAddress ) + 255 ) & ~size_t( 255 );
+  uint8_t*     base    = params( m_prepared.dbSize + m_prepared.alfSize + m_prepared.saoSize + refSize );
+  m_prepared.deblock = deblock && prepareDeblock( cs, base );
+  m_prepared.sao     = sao && prepareSao( cs, *sao, base + m_prepared.dbSize + m_prepared.alfSize );
+  if( alf )
+  {
+    prepareAlf( cs, *alf, base + m_prepared.dbSize );
+  }
+  m_prepared.picture = cs.picture;
+}
+
 void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
                              PelStorage& pic, bool waitFirst )
 {
-  const size_t dbSize  = deblockParamSize( cs );
-  const size_t alfSize = alf ? alfParamSize( cs ) : 0;
-  const size_t saoSize = sao ? saoParamSize( cs ) : 0;
-  const size_t refSize = jobs.inter ? ( jobs.refs->pictures().size() * 4 * sizeof( VkDeviceAddress ) + 255 ) & ~size_t( 255 ) : 0;
-  uint8_t*     base    = params( dbSize + alfSize + saoSize + refSize );
+  const size_t refs = jobs.inter ? jobs.refs->pictures().size() : 0;
+  if( m_prepared.picture != cs.picture )
+  {
+    prepareFilters( cs, deblock, sao, alf, refs );
+  }
+  m_prepared.picture   = nullptr;   // the next picture's anew
+  CHECK_FATAL( m_prepared.refs != refs, "Vulkan: the filters' parameters prepared for another reference table" );
+  const size_t dbSize  = m_prepared.dbSize;
+  const size_t alfSize = m_prepared.alfSize;
+  const size_t saoSize = m_prepared.saoSize;
+  uint8_t*     base    = m_params.mapped;
   const size_t refAt   = dbSize + alfSize + saoSize;
 
   // the reference pictures: their planes on the GPU, where a picture the CPU
@@ -1351,12 +1404,8 @@ void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool 
     }
   }
 
-  const bool doDeblock = deblock && prepareDeblock( cs, base );
-  const bool doSao     = sao && prepareSao( cs, *sao, base + dbSize + alfSize );
-  if( alf )
-  {
-    prepareAlf( cs, *alf, base + dbSize );
-  }
+  const bool doDeblock = m_prepared.deblock;
+  const bool doSao     = m_prepared.sao;
   // in the GPU's own memory, which its shaders reach faster than the host's:
   // the picture goes in (what the CPU made of it), is finished there, stays
   // there as a reference, and comes back for the output. When the GPU makes

@@ -815,14 +815,33 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       return true;
     };
 
+    // the parameters of the filters on the GPU, from the parsed picture, while
+    // its CTU tasks run: not on the way from them to the GPU
+    static auto filterParamsTask = []( int tid, void* task_param )
+    {
+      FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
+      DecLibRecon*        dec   = param->decLib;
+      dec->m_gpuRecon->prepareFilters( *param->pic->cs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr,
+                                       dec->m_gpuInter ? dec->m_refTable.pictures().size() : 0 );
+      return true;
+    };
+
     taskFinishPic = FinishPicTaskParam( this, pcPic );
+    m_gpuFiltersPrepared.clearException();
+    m_gpuFiltersPrepared.lock();
+    m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " filterParamsTask" )
+                                        filterParamsTask,
+                                        &taskFinishPic,
+                                        &pcPic->m_divTasksCounter,
+                                        &m_gpuFiltersPrepared,
+                                        { &pcPic->parseDone } );
     pcPic->gpuRefReady.lock();
     m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " queueGpuTask" )
                                         queueGpuTask,
                                         &taskFinishPic,
                                         &pcPic->m_divTasksCounter,
                                         &pcPic->gpuRefReady,
-                                        { pcPic->m_ctuTaskCounter.donePtr() } );
+                                        { pcPic->m_ctuTaskCounter.donePtr(), &m_gpuFiltersPrepared } );
     m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " finishPicTask" )
                                         finishGpuTask,
                                         &taskFinishPic,
@@ -1139,6 +1158,18 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       thisCtuState = INTRA_cont;
     }
 
+#if VVDEC_VULKAN
+    // the GPU reconstructs the picture from these jobs on (intra there: no
+    // reshaper, the filters there): the later stages have nothing to do, and
+    // their waits for the neighbours (RSP's for the line below, PRESAO's for
+    // whole lines) would only hold the jobs' recording back
+    if( param->common.gpuIntra )
+    {
+      thisCtuState = DONE;
+      ITT_TASKEND( itt_domain_dec, itt_handle_intra );
+      return true;
+    }
+#endif
     thisCtuState = RSP;
 
     ITT_TASKEND( itt_domain_dec, itt_handle_intra );

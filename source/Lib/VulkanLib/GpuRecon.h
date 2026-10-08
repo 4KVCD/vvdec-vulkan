@@ -120,6 +120,11 @@ public:
   // vvdec's DMVR MV cache of the current picture, count of them, in host memory the GPU writes
   Mv*              dmvrMvCache( size_t count );
 
+  // the parameters of the picture's filters (deblocking, SAO, ALF), worked out
+  // before its work is recorded -- a task of its own once the picture is
+  // parsed, while its CTU tasks run (else startPicture does it); refs: the
+  // number of its reference pictures, whose table follows them
+  void prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, size_t refs );
   // the rest of the picture in pic, on top of what the CPU reconstructed: the
   // residuals of jobs.trafo, the inter blocks of jobs.inter, from the
   // reference pictures of jobs.refs, the intra and IBC blocks of jobs.intra,
@@ -191,6 +196,12 @@ private:
   const char*     m_labels[kMaxMarks];
   uint32_t        m_marks   = 0;
   uint32_t        m_gapMark = 0;   // the mark that ends the time between the picture's parts (0: none)
+  struct Prepared                  // prepareFilters' results
+  {
+    const Picture* picture = nullptr;
+    bool           deblock = false, sao = false;
+    size_t         dbSize = 0, alfSize = 0, saoSize = 0, refs = 0;
+  } m_prepared;
   Buffer          m_params;
   Buffer          m_scratch[MAX_NUM_COMPONENT];     // a picture's worth of GPU memory (SAO's or ALF's output), from the pool while its work is recorded
   Buffer          m_lfp;                            // the deblocking parameters
