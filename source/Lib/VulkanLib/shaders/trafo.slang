@@ -1,7 +1,7 @@
 // Dequantization and the inverse transforms, as vvdec's Quant::dequant and
-// TrQuant::invTransformNxN and invTransformICT do them: a thread takes one
+// TrQuant::invTransformNxN and invTransformICT do them: a workgroup takes one
 // transform block of one component, reads the levels the parser left in the
-// picture and writes the residual over them, in place.
+// picture and writes the residual over them.
 //
 // A job, 8 uints (VulkanLib/GpuJobs.h, TrafoJob):
 //   0: x | y << 16 (in samples of its component)
@@ -11,9 +11,10 @@
 //   3: scale   4: right shift (negative: a left shift)   5: the levels' maximum
 // flags: 1 transform skip, 2 BDPCM horizontal, 4 BDPCM vertical
 //
-// The transforms run in place: the vertical one column by column (a column's
-// levels read first), the horizontal one row by row; their intermediate values
-// are clipped to 16 bits, so the picture holds them between the two.
+// The threads dequantize the levels into shared memory, run the vertical
+// transform (rounded and clipped to 16 bits) into shared memory, then the
+// horizontal one into the picture; with transform skip, each takes samples
+// (with BDPCM, rows or columns) by itself.
 
 #include "common.slang"
 
@@ -32,12 +33,18 @@ struct Params
 
 [[vk::push_constant]] Params pc;
 
+#define THREADS 64
+
 #define FLAG_TS 1
 #define FLAG_BDPCM_HOR 2
 #define FLAG_BDPCM_VER 4
 
 #define COEFF_MIN ( -32768 )   // maxLog2TrDynamicRange 15
 #define COEFF_MAX 32767
+
+// the levels there are: at most 32 x 32 (64-point transforms keep 32)
+groupshared int s_coef[32 * 32];   // [row][column]
+groupshared int s_mid[64 * 32];    // the vertical transform's output, [row][column]
 
 int16_t* planeOf( int comp )
 {
@@ -74,15 +81,23 @@ int dequant( int level, int scale, int rightShift, int inputMaximum )
   return clip3( COEFF_MIN, COEFF_MAX, value );
 }
 
-[shader( "compute" )]
-[numthreads( 64, 1, 1 )]
-void main( uint3 id : SV_DispatchThreadID )
+// joint Cb-Cr: the other chroma component's residual from this one's (TU::getICTMode)
+int jointResidual( int ict, int v )
 {
-  if( int( id.x ) >= pc.count )
+  return abs( ict ) == 2 ? ( ict > 0 ? v : -v ) : ( ( ict > 0 ? v : -v ) >> 1 );
+}
+
+[shader( "compute" )]
+[numthreads( THREADS, 1, 1 )]
+void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
+{
+  const int index = int( group.x ) + int( group.y ) * 32768;
+  if( index >= pc.count )
   {
-    return;
+    return;   // the whole workgroup
   }
-  uint*     job          = pc.jobs + int( id.x ) * 8;
+  const int tid          = int( local.x );
+  uint*     job          = pc.jobs + index * 8;
   const int x0           = int( job[0] & 0xffff );
   const int y0           = int( job[0] >> 16 );
   const int log2W        = int( job[1] & 15 );
@@ -101,105 +116,108 @@ void main( uint3 id : SV_DispatchThreadID )
   const int height       = 1 << log2H;
   const int stride       = strideOf( comp );
   int16_t*  block        = planeOf( comp ) + y0 * stride + x0;
+  int16_t*  other        = planeOf( comp == 1 ? 2 : 1 ) + y0 * stride + x0;   // joint Cb-Cr's other component
 
   if( ( flags & FLAG_TS ) != 0 )
   {
     // transform skip: the dequantized levels are the residual; BDPCM first
-    // adds them up along its direction (invResDPCM)
+    // adds them up along its direction (invResDPCM), a thread per row or column
     if( ( flags & FLAG_BDPCM_HOR ) != 0 )
     {
-      for( int y = 0; y < height; y++ )
+      for( int y = tid; y < height; y += THREADS )
       {
         int sum = 0;
         for( int x = 0; x < width; x++ )
         {
           const int level = int( block[y * stride + x] );
           sum             = x == 0 ? level : clip3( COEFF_MIN, COEFF_MAX, sum + level );
-          block[y * stride + x] = int16_t( dequant( sum, scale, rightShift, inputMaximum ) );
+          const int r     = dequant( sum, scale, rightShift, inputMaximum );
+          block[y * stride + x] = int16_t( r );
+          if( ict != 0 )
+          {
+            other[y * stride + x] = int16_t( jointResidual( ict, int( int16_t( r ) ) ) );
+          }
         }
       }
     }
     else if( ( flags & FLAG_BDPCM_VER ) != 0 )
     {
-      for( int x = 0; x < width; x++ )
+      for( int x = tid; x < width; x += THREADS )
       {
         int sum = 0;
         for( int y = 0; y < height; y++ )
         {
           const int level = int( block[y * stride + x] );
           sum             = y == 0 ? level : clip3( COEFF_MIN, COEFF_MAX, sum + level );
-          block[y * stride + x] = int16_t( dequant( sum, scale, rightShift, inputMaximum ) );
+          const int r     = dequant( sum, scale, rightShift, inputMaximum );
+          block[y * stride + x] = int16_t( r );
+          if( ict != 0 )
+          {
+            other[y * stride + x] = int16_t( jointResidual( ict, int( int16_t( r ) ) ) );
+          }
         }
       }
     }
     else
     {
-      for( int y = 0; y < height; y++ )
+      for( int s = tid; s < width * height; s += THREADS )
       {
-        for( int x = 0; x < width; x++ )
+        const int x     = s & ( width - 1 );
+        const int y     = s >> log2W;
+        const int level = x <= lastX && y <= lastY ? int( block[y * stride + x] ) : 0;
+        const int r     = dequant( level, scale, rightShift, inputMaximum );
+        block[y * stride + x] = int16_t( r );
+        if( ict != 0 )
         {
-          const int level = x <= lastX && y <= lastY ? int( block[y * stride + x] ) : 0;
-          block[y * stride + x] = int16_t( dequant( level, scale, rightShift, inputMaximum ) );
+          other[y * stride + x] = int16_t( jointResidual( ict, int( int16_t( r ) ) ) );
         }
       }
     }
-  }
-  else
-  {
-    // TrQuant::xIT: the vertical transform, rounded and clipped, then the horizontal one
-    int16_t*  mVer   = pc.matrices + matrixOffset( typeVer, log2H );
-    int16_t*  mHor   = pc.matrices + matrixOffset( typeHor, log2W );
-    const int shift2 = 6 + 15 - 1 - pc.bitDepth;
-    int       line[64];
-
-    for( int x = 0; x <= lastX; x++ )
-    {
-      for( int k = 0; k <= lastY; k++ )
-      {
-        line[k] = dequant( int( block[k * stride + x] ), scale, rightShift, inputMaximum );
-      }
-      for( int y = 0; y < height; y++ )
-      {
-        int sum = 0;
-        for( int k = 0; k <= lastY; k++ )
-        {
-          sum += line[k] * int( mVer[k * height + y] );
-        }
-        block[y * stride + x] = int16_t( clip3( COEFF_MIN, COEFF_MAX, ( sum + 64 ) >> 7 ) );
-      }
-    }
-    // the columns after lastX are zero
-    for( int y = 0; y < height; y++ )
-    {
-      for( int k = 0; k <= lastX; k++ )
-      {
-        line[k] = int( block[y * stride + k] );
-      }
-      for( int x = 0; x < width; x++ )
-      {
-        int sum = 0;
-        for( int k = 0; k <= lastX; k++ )
-        {
-          sum += line[k] * int( mHor[k * width + x] );
-        }
-        block[y * stride + x] = int16_t( clip3( COEFF_MIN, COEFF_MAX, ( sum + ( 1 << ( shift2 - 1 ) ) ) >> shift2 ) );
-      }
-    }
+    return;
   }
 
-  // joint Cb-Cr: the other chroma component's residual from this one (TU::getICTMode)
-  if( ict != 0 )
+  // TrQuant::xIT: the vertical transform, rounded and clipped, then the horizontal one
+  int16_t*  mVer   = pc.matrices + matrixOffset( typeVer, log2H );
+  int16_t*  mHor   = pc.matrices + matrixOffset( typeHor, log2W );
+  const int shift2 = 6 + 15 - 1 - pc.bitDepth;
+  const int nx     = lastX + 1;   // the columns with levels; the others are zero
+  const int ny     = lastY + 1;
+
+  for( int s = tid; s < nx * ny; s += THREADS )
   {
-    int16_t* other = planeOf( comp == 1 ? 2 : 1 ) + y0 * stride + x0;
-    for( int y = 0; y < height; y++ )
+    const int k = s / nx;
+    const int x = s - k * nx;
+    s_coef[k * 32 + x] = dequant( int( block[k * stride + x] ), scale, rightShift, inputMaximum );
+  }
+  GroupMemoryBarrierWithGroupSync();
+
+  for( int s = tid; s < nx * height; s += THREADS )
+  {
+    const int y   = s / nx;
+    const int x   = s - y * nx;
+    int       sum = 0;
+    for( int k = 0; k < ny; k++ )
     {
-      for( int x = 0; x < width; x++ )
-      {
-        const int v = int( block[y * stride + x] );
-        const int a = abs( ict );
-        const int r = a == 2 ? ( ict > 0 ? v : -v ) : ( ( ict > 0 ? v : -v ) >> 1 );
-        other[y * stride + x] = int16_t( r );
-      }
+      sum += s_coef[k * 32 + x] * int( mVer[k * height + y] );
+    }
+    s_mid[y * 32 + x] = clip3( COEFF_MIN, COEFF_MAX, ( sum + 64 ) >> 7 );
+  }
+  GroupMemoryBarrierWithGroupSync();
+
+  for( int s = tid; s < width * height; s += THREADS )
+  {
+    const int x   = s & ( width - 1 );
+    const int y   = s >> log2W;
+    int       sum = 0;
+    for( int k = 0; k < nx; k++ )
+    {
+      sum += s_mid[y * 32 + k] * int( mHor[k * width + x] );
+    }
+    const int r = clip3( COEFF_MIN, COEFF_MAX, ( sum + ( 1 << ( shift2 - 1 ) ) ) >> shift2 );
+    block[y * stride + x] = int16_t( r );
+    if( ict != 0 )
+    {
+      other[y * stride + x] = int16_t( jointResidual( ict, r ) );
     }
   }
 }
