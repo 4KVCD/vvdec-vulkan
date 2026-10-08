@@ -6,6 +6,7 @@
 // CHROMA=0: a thread filters 4 lines across one luma edge of a 4x4 block.
 // CHROMA=1: a thread filters the lines across one chroma edge segment, for Cb
 //           and Cr, at the positions vvdec's xDeblockCtuArea visits.
+// The edges come as a list, those the CPU found to filter (GpuRecon::listEdges).
 //
 // The edge parameters are vvdec's LoopFilterParam (6 bytes: qp[3], bs,
 // sideMaxFiltLength, flags), per 4x4 luma block and direction, CTU by CTU.
@@ -20,6 +21,7 @@ struct Params
   int16_t* pic1;        // Cr
   uint8_t* lfp;
   int8_t*  ctus;
+  uint*    edges;       // x | y << 16 of each edge (samples of the plane)
   int      stride;
   int      width;       // of the plane
   int      height;
@@ -30,6 +32,7 @@ struct Params
   int      dir;         // 0: vertical edges, 1: horizontal
   int      scaleX;      // chroma subsampling
   int      scaleY;
+  int      count;       // of edges
 };
 
 [[vk::push_constant]] Params pc;
@@ -252,15 +255,16 @@ void pelFilterLuma( int base, int off, int tc, bool sw, int thrCut, bool filterS
 }
 
 [shader( "compute" )]
-[numthreads( 8, 8, 1 )]
+[numthreads( 64, 1, 1 )]
 void main( uint3 id : SV_DispatchThreadID )
 {
-  const int x = int( id.x ) * 4;
-  const int y = int( id.y ) * 4;
-  if( x >= pc.width || y >= pc.height )
+  if( int( id.x ) >= pc.count )
   {
     return;
   }
+  const uint edge = pc.edges[id.x];
+  const int  x    = int( edge & 0xffff );
+  const int  y    = int( edge >> 16 );
   const int e  = lfpOffset( x, y );
   const int bs = int( pc.lfp[e + 3] ) & 3;
   if( bs == 0 || ctuParam( x, y, 0 ) != 0 )
@@ -392,19 +396,18 @@ void pelFilterChroma( int16_t* p, int base, int off, int tc, bool sw, int maxVal
 }
 
 [shader( "compute" )]
-[numthreads( 8, 8, 1 )]
+[numthreads( 64, 1, 1 )]
 void main( uint3 id : SV_DispatchThreadID )
 {
   // the segments xDeblockCtuArea visits: along the edge as many lines as a
   // 4x4 luma block has, across it every 8 chroma samples (at the 4:2:0 rate)
-  const int alongLen = pc.dir == 0 ? ( 4 >> pc.scaleY ) : ( 4 >> pc.scaleX );
-  const int acrossStep = pc.dir == 0 ? ( ( 8 << pc.scaleX ) / 4 * ( 4 >> pc.scaleX ) ) : ( ( 8 << pc.scaleY ) / 4 * ( 4 >> pc.scaleY ) );
-  const int x = pc.dir == 0 ? int( id.x ) * acrossStep : int( id.x ) * alongLen;
-  const int y = pc.dir == 0 ? int( id.y ) * alongLen : int( id.y ) * acrossStep;
-  if( x >= pc.width || y >= pc.height )
+  if( int( id.x ) >= pc.count )
   {
     return;
   }
+  const uint edge = pc.edges[id.x];
+  const int  x    = int( edge & 0xffff );
+  const int  y    = int( edge >> 16 );
 
   const int lx = x << pc.scaleX;
   const int ly = y << pc.scaleY;
@@ -422,6 +425,7 @@ void main( uint3 id : SV_DispatchThreadID )
   const int  off               = pc.dir == 0 ? 1 : pc.stride;
   const int  step              = pc.dir == 0 ? pc.stride : 1;
   const int  base0             = y * pc.stride + x;
+  const int  alongLen          = pc.dir == 0 ? ( 4 >> pc.scaleY ) : ( 4 >> pc.scaleX );   // the lines along the edge
   // the second line of the decisions: the next one when subsampled across, else the fourth
   const int  subSamplingShift  = pc.dir == 0 ? pc.scaleY : pc.scaleX;
   const int  base3             = base0 + ( subSamplingShift == 1 ? step : 3 * step );

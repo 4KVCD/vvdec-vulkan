@@ -108,6 +108,9 @@ public:
   // the deblocking parameters of the current picture (vvdec's LF_INIT writes
   // them): count of them, in host memory the GPU reads
   LoopFilterParam* loopFilterParams( size_t count );
+  // the edges of a CTU the deblocking filters, from its deblocking parameters
+  // (after LF_INIT): the GPU's deblocking takes only those
+  static void      listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& edges );
   // vvdec's DMVR MV cache of the current picture, count of them, in host memory the GPU writes
   Mv*              dmvrMvCache( size_t count );
 
@@ -150,7 +153,7 @@ private:
   bool          prepareDeblock( const CodingStructure& cs, uint8_t* params );   // false: no slice deblocks
   void          prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alf, uint8_t* params );
   bool          prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8_t* params );   // false: no CTU uses SAO
-  void          recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params );
+  void          recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params, const std::vector<EdgeLists>& edges );
   void          recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes );
   void          recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, const Planes& planes, VkDeviceAddress refTable );
   // the levels from the planes of levels (the picture in host memory, where the parser left them), the residuals to planes
@@ -178,6 +181,7 @@ private:
   Buffer          m_intraJobs;                      // the intra jobs of a picture, wave by wave
   Buffer          m_interJobs;
   Buffer          m_trafoJobs;
+  Buffer          m_edges;                          // the edges the deblocking filters
   Buffer          m_matrices;                       // TrQuant's transform matrices
 };
 

@@ -654,6 +654,10 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     }
     ( m_gpuResidual ? m_residualPicturesGpu : m_residualPicturesCpu )++;
   }
+  if( m_gpuFilters )
+  {
+    m_gpuEdges.resize( pcv->sizeInCtus );
+  }
   if( m_gpuResidual )
   {
     m_gpuTrafoJobs.resize( pcv->sizeInCtus );
@@ -765,6 +769,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
         jobs.inter = dec->m_gpuInter ? &dec->m_gpuInterJobs : nullptr;
         jobs.intra = dec->m_gpuIntra ? &dec->m_gpuIntraJobs : nullptr;
         jobs.refs  = &dec->m_refTable;
+        jobs.edges = &dec->m_gpuEdges;
         dec->m_gpuRecon->finishPicture( cs, jobs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr,
                                         cs.picture->m_bufs[PIC_RECONSTRUCTION] );
         cs.picture->gpuCurrent = true;
@@ -969,6 +974,12 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       memset( ctuData.lfParam[0], 0, sizeof( LoopFilterParam ) * 2 * cs.pcv->num4x4CtuBlks );
 
       decLib.m_cLoopFilter.calcFilterStrengthsCTU( cs, ctuRsAddr );
+#if VVDEC_VULKAN
+      if( decLib.m_gpuFilters )
+      {
+        gpu::GpuRecon::listEdges( cs, ctuRsAddr, decLib.m_gpuEdges[ctuRsAddr] );
+      }
+#endif
     }
 
     thisCtuState = INTER;

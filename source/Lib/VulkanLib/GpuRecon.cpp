@@ -247,6 +247,7 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_intraJobs );
   m_ctx->free( m_interJobs );
   m_ctx->free( m_trafoJobs );
+  m_ctx->free( m_edges );
   m_ctx->free( m_matrices );
   for( Buffer& buf: m_scratch )
   {
@@ -763,9 +764,53 @@ void GpuRecon::copyPlanes( const PelStorage& pic, int from, int to )
 // the push constants of shaders/deblock.slang
 struct DeblockPush
 {
-  VkDeviceAddress pic0, pic1, lfp, ctus;
-  int32_t         stride, width, height, ctuLog2, widthInCtus, bitDepth, num4x4, dir, scaleX, scaleY;
+  VkDeviceAddress pic0, pic1, lfp, ctus, edges;
+  int32_t         stride, width, height, ctuLog2, widthInCtus, bitDepth, num4x4, dir, scaleX, scaleY, count;
 };
+
+void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& edges )
+{
+  edges.clear();
+  const PreCalcValues& pcv = *cs.pcv;
+  const CtuData&       ctu = cs.getCtuData( ctuRsAddr );
+  if( ctu.slice->getDeblockingFilterDisable() )
+  {
+    return;
+  }
+  const int  n      = int( pcv.maxCUWidth ) >> 2;   // 4x4 blocks across a CTU
+  const int  x0     = ( ctuRsAddr % int( pcv.widthInCtus ) ) * int( pcv.maxCUWidth );
+  const int  y0     = ( ctuRsAddr / int( pcv.widthInCtus ) ) * int( pcv.maxCUHeight );
+  const bool chroma = isChromaEnabled( pcv.chrFormat );
+  const int  sx     = chroma ? getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) : 0;
+  const int  sy     = chroma ? getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) : 0;
+  for( int dir = 0; dir < 2; dir++ )
+  {
+    const LoopFilterParam* lfp = ctu.lfParam[dir];
+    // the luma grid of the chroma segments: across the edge every 8 chroma
+    // samples (at the 4:2:0 rate), along it as many lines as a 4x4 luma block has
+    const int across = dir == 0 ? ( ( 8 << sx ) / 4 * ( 4 >> sx ) ) << sx : ( ( 8 << sy ) / 4 * ( 4 >> sy ) ) << sy;
+    const int gridX  = dir == 0 ? across : ( 4 >> sx ) << sx;
+    const int gridY  = dir == 0 ? ( 4 >> sy ) << sy : across;
+    for( int i = 0; i < (int) pcv.num4x4CtuBlks; i++ )
+    {
+      const int lx = x0 + ( i % n ) * 4;
+      const int ly = y0 + ( i / n ) * 4;
+      if( lx >= int( pcv.lumaWidth ) || ly >= int( pcv.lumaHeight ) )
+      {
+        continue;
+      }
+      const int bs = lfp[i].bs;
+      if( bs & 3 )
+      {
+        edges.lists[dir].push_back( uint32_t( lx ) | uint32_t( ly ) << 16 );
+      }
+      if( chroma && ( bs & 0x3c ) && lx % gridX == 0 && ly % gridY == 0 )
+      {
+        edges.lists[2 + dir].push_back( uint32_t( lx >> sx ) | uint32_t( ly >> sy ) << 16 );
+      }
+    }
+  }
+}
 
 bool GpuRecon::filtersSupported( const CodingStructure& cs )
 {
@@ -808,11 +853,36 @@ bool GpuRecon::prepareDeblock( const CodingStructure& cs, uint8_t* base )
   return any;
 }
 
-void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params )
+void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params, const std::vector<EdgeLists>& edges )
 {
   const PreCalcValues& pcv = *cs.pcv;
   const Api&           vk  = m_ctx->api();
   const bool           chroma = isChromaEnabled( pcv.chrFormat );
+
+  // the edges, list after list
+  size_t first[5] = { 0, 0, 0, 0, 0 };
+  for( int l = 0; l < 4; l++ )
+  {
+    first[l + 1] = first[l];
+    for( const EdgeLists& ctu: edges )
+    {
+      first[l + 1] += ctu.lists[l].size();
+    }
+  }
+  if( m_edges.size < first[4] * sizeof( uint32_t ) )
+  {
+    m_ctx->free( m_edges );
+    m_edges = m_ctx->alloc( std::max<size_t>( first[4], 1024 ) * 2 * sizeof( uint32_t ), MemKind::HostCached );
+  }
+  uint32_t* all = reinterpret_cast<uint32_t*>( m_edges.mapped );
+  for( int l = 0; l < 4; l++ )
+  {
+    for( const EdgeLists& ctu: edges )
+    {
+      memcpy( all, ctu.lists[l].data(), ctu.lists[l].size() * sizeof( uint32_t ) );
+      all += ctu.lists[l].size();
+    }
+  }
 
   DeblockPush push{};
   push.lfp         = m_lfp.addr;
@@ -832,14 +902,20 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
     }
     push.dir = dir;
 
+    // a thread per edge of the list
     push.pic0   = planes.addr[COMPONENT_Y];
     push.pic1   = 0;
     push.stride = planes.stride[COMPONENT_Y];
     push.width  = pcv.lumaWidth;
     push.height = pcv.lumaHeight;
-    vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_deblock_luma ) );
-    vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
-    vk.vkCmdDispatch( m_cmd, ( ( push.width + 3 ) / 4 + 7 ) / 8, ( ( push.height + 3 ) / 4 + 7 ) / 8, 1 );
+    push.edges  = m_edges.addr + first[dir] * sizeof( uint32_t );
+    push.count  = int32_t( first[dir + 1] - first[dir] );
+    if( push.count > 0 )
+    {
+      vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_deblock_luma ) );
+      vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+      vk.vkCmdDispatch( m_cmd, uint32_t( ( push.count + 63 ) / 64 ), 1, 1 );
+    }
 
     if( chroma )
     {
@@ -849,14 +925,14 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
       push.stride = planes.stride[COMPONENT_Cb];
       push.width  = pcv.lumaWidth >> push.scaleX;
       push.height = pcv.lumaHeight >> push.scaleY;
-      // as shaders/deblock.slang walks the segments
-      const int along  = dir == 0 ? ( 4 >> push.scaleY ) : ( 4 >> push.scaleX );
-      const int across = dir == 0 ? ( ( 8 << push.scaleX ) / 4 * ( 4 >> push.scaleX ) ) : ( ( 8 << push.scaleY ) / 4 * ( 4 >> push.scaleY ) );
-      const int threadsX = dir == 0 ? ( push.width + across - 1 ) / across : ( push.width + along - 1 ) / along;
-      const int threadsY = dir == 0 ? ( push.height + along - 1 ) / along : ( push.height + across - 1 ) / across;
-      vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_deblock_chroma ) );
-      vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
-      vk.vkCmdDispatch( m_cmd, ( threadsX + 7 ) / 8, ( threadsY + 7 ) / 8, 1 );
+      push.edges  = m_edges.addr + first[2 + dir] * sizeof( uint32_t );
+      push.count  = int32_t( first[3 + dir] - first[2 + dir] );
+      if( push.count > 0 )
+      {
+        vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_deblock_chroma ) );
+        vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+        vk.vkCmdDispatch( m_cmd, uint32_t( ( push.count + 63 ) / 64 ), 1, 1 );
+      }
     }
     mark( dir == 0 ? "deblock ver" : "deblock hor" );
   }
@@ -1198,7 +1274,7 @@ void GpuRecon::finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool
   }
   if( doDeblock )
   {
-    recordDeblock( cs, planes[cur], m_params.addr );   // in place
+    recordDeblock( cs, planes[cur], m_params.addr, *jobs.edges );   // in place
   }
   if( doSao )
   {

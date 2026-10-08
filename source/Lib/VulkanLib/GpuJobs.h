@@ -235,6 +235,23 @@ private:
   int                   m_shiftY[3] = { 2, 1, 1 };
 };
 
+// the edges of a CTU the deblocking filters (GpuRecon::listEdges), each
+// x | y << 16: luma's vertical and horizontal ones (luma samples, a 4x4
+// block's edge), chroma's (chroma samples, a segment as shaders/deblock.slang
+// visits them)
+struct EdgeLists
+{
+  std::vector<uint32_t> lists[4];
+
+  void clear()
+  {
+    for( auto& list: lists )
+    {
+      list.clear();
+    }
+  }
+};
+
 // where the CTU tasks put a CTU's jobs for the stages of the picture that run
 // on the GPU (null: the CPU runs that stage)
 struct CtuJobs
@@ -253,6 +270,7 @@ struct PictureJobs
   const std::vector<std::vector<InterJob>>* inter = nullptr;
   const std::vector<std::vector<IntraJob>>* intra = nullptr;
   const RefTable*                           refs  = nullptr;   // with inter
+  const std::vector<EdgeLists>*             edges = nullptr;   // per CTU, with deblocking
 };
 
 }   // namespace gpu
