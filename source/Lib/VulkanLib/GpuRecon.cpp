@@ -50,6 +50,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "CommonLib/AdaptiveLoopFilter.h"
 #include "CommonLib/CodingStructure.h"
+#include "CommonLib/Rom.h"
 #include "CommonLib/Picture.h"
 #include "CommonLib/SampleAdaptiveOffset.h"
 #include "CommonLib/Slice.h"
@@ -151,6 +152,31 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
     THROW_FATAL( "Vulkan: vkCreateFence failed" );
   }
 
+  // the transform matrices, in the order of shaders/trafo.slang: DCT-II from 2
+  // to 64 points, DST-VII and DCT-VIII from 4 to 32
+  {
+    const std::pair<const TMatrixCoeff*, int> matrices[] = {
+      { g_trCoreDCT2P2[0], 2 },  { g_trCoreDCT2P4[0], 4 },  { g_trCoreDCT2P8[0], 8 },  { g_trCoreDCT2P16[0], 16 }, { g_trCoreDCT2P32[0], 32 },
+      { g_trCoreDCT2P64[0], 64 }, { g_trCoreDST7P4[0], 4 },  { g_trCoreDST7P8[0], 8 },  { g_trCoreDST7P16[0], 16 }, { g_trCoreDST7P32[0], 32 },
+      { g_trCoreDCT8P4[0], 4 },  { g_trCoreDCT8P8[0], 8 },  { g_trCoreDCT8P16[0], 16 }, { g_trCoreDCT8P32[0], 32 },
+    };
+    size_t count = 0;
+    for( const auto& matrix: matrices )
+    {
+      count += size_t( matrix.second ) * matrix.second;
+    }
+    CHECK_FATAL( count != 8180, "Vulkan: the transform matrices are not those of shaders/trafo.slang" );
+    m_matrices = m_ctx->alloc( count * sizeof( int16_t ), MemKind::HostCached );
+    int16_t* to = reinterpret_cast<int16_t*>( m_matrices.mapped );
+    for( const auto& matrix: matrices )
+    {
+      for( int i = 0; i < matrix.second * matrix.second; i++ )
+      {
+        *to++ = int16_t( matrix.first[i] );
+      }
+    }
+  }
+
   if( m_ctx->profiling() )
   {
     VkQueryPoolCreateInfo queryInfo{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
@@ -183,6 +209,8 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_dmvr );
   m_ctx->free( m_intraJobs );
   m_ctx->free( m_interJobs );
+  m_ctx->free( m_trafoJobs );
+  m_ctx->free( m_matrices );
   for( Buffer& buf: m_scratch )
   {
     m_ctx->free( buf );
@@ -912,24 +940,89 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   mark( "inter" );
 }
 
-void GpuRecon::finishPicture( CodingStructure& cs, const std::vector<std::vector<IntraJob>>* intraJobs,
-                              const std::vector<std::vector<InterJob>>* interJobs, const RefTable& refs, bool deblock, SampleAdaptiveOffset* sao,
-                              const AdaptiveLoopFilter* alf, PelStorage& pic )
+// the push constants of shaders/trafo.slang
+struct TrafoPush
+{
+  VkDeviceAddress jobs, plane0, plane1, plane2, matrices;
+  int32_t         stride0, stride12, count, bitDepth;
+};
+
+bool GpuRecon::residualSupported( const CodingStructure& cs )
+{
+  if( cs.sps->getBitDepth() > 10 || cs.sps->getUseLFNST() )
+  {
+    return false;
+  }
+  for( const Slice* slice: cs.picture->slices )
+  {
+    if( slice->getExplicitScalingListUsed() )
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, const Planes& planes )
+{
+  size_t total = 0;
+  for( const auto& ctu: jobs )
+  {
+    total += ctu.size();
+  }
+  if( total == 0 )
+  {
+    return;
+  }
+  const size_t size = total * sizeof( TrafoJob );
+  if( m_trafoJobs.size < size )
+  {
+    m_ctx->free( m_trafoJobs );
+    m_trafoJobs = m_ctx->alloc( size * 2, MemKind::HostCached );
+  }
+  TrafoJob* all = reinterpret_cast<TrafoJob*>( m_trafoJobs.mapped );
+  for( const auto& ctu: jobs )
+  {
+    memcpy( all, ctu.data(), ctu.size() * sizeof( TrafoJob ) );
+    all += ctu.size();
+  }
+
+  TrafoPush push{};
+  push.jobs     = m_trafoJobs.addr;
+  push.plane0   = planes.addr[COMPONENT_Y];
+  push.plane1   = planes.addr[COMPONENT_Cb];
+  push.plane2   = planes.addr[COMPONENT_Cr];
+  push.matrices = m_matrices.addr;
+  push.stride0  = planes.stride[COMPONENT_Y];
+  push.stride12 = planes.stride[COMPONENT_Cb];
+  push.count    = int32_t( total );
+  push.bitDepth = cs.sps->getBitDepth();
+  CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
+
+  const Api& vk = m_ctx->api();
+  vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_trafo ) );
+  vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+  vk.vkCmdDispatch( m_cmd, uint32_t( ( total + 63 ) / 64 ), 1, 1 );
+  mark( "trafo" );
+}
+
+void GpuRecon::finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
+                              PelStorage& pic )
 {
   const size_t dbSize  = deblockParamSize( cs );
   const size_t alfSize = alf ? alfParamSize( cs ) : 0;
   const size_t saoSize = sao ? saoParamSize( cs ) : 0;
-  const size_t refSize = ( refs.pictures().size() * 4 * sizeof( VkDeviceAddress ) + 255 ) & ~size_t( 255 );
+  const size_t refSize = jobs.inter ? ( jobs.refs->pictures().size() * 4 * sizeof( VkDeviceAddress ) + 255 ) & ~size_t( 255 ) : 0;
   uint8_t*     base    = params( dbSize + alfSize + saoSize + refSize );
   const size_t refAt   = dbSize + alfSize + saoSize;
 
   // the reference pictures: their planes on the GPU, where a picture the CPU
   // reconstructed alone (or filled in) goes first
   std::vector<const Picture*> uploads;
-  if( interJobs )
+  if( jobs.inter )
   {
     VkDeviceAddress* table = reinterpret_cast<VkDeviceAddress*>( base + refAt );
-    for( const void* ref: refs.pictures() )
+    for( const void* ref: jobs.refs->pictures() )
     {
       const Picture* refPic = static_cast<const Picture*>( ref );
       const Planes   planes = twinPlanes( refPic->m_bufs[PIC_RECONSTRUCTION] );
@@ -965,14 +1058,19 @@ void GpuRecon::finishPicture( CodingStructure& cs, const std::vector<std::vector
   int          cur       = 0;
   copyPlanes( pic, kHost, kTwin );
   transferBarrier( false );
-  if( interJobs )
+  if( jobs.trafo )
   {
-    recordInter( cs, *interJobs, planes[cur], m_params.addr + refAt );   // in place
+    recordTrafo( cs, *jobs.trafo, planes[cur] );   // in place
     computeBarrier();
   }
-  if( intraJobs )
+  if( jobs.inter )
   {
-    recordIntra( cs, *intraJobs, planes[cur] );   // in place
+    recordInter( cs, *jobs.inter, planes[cur], m_params.addr + refAt );   // in place
+    computeBarrier();
+  }
+  if( jobs.intra )
+  {
+    recordIntra( cs, *jobs.intra, planes[cur] );   // in place
     computeBarrier();
   }
   if( doDeblock )

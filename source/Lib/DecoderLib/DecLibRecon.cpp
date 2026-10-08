@@ -105,7 +105,7 @@ static int debugNoFiltersPoc()
 }
 
 void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool _doALF, bool _doSAO, bool _doDeblock, bool _gpuIntra,
-                             bool _gpuInter )
+                             bool _gpuInter, bool _gpuResidual )
 {
   this->cs = &cs;
 
@@ -122,6 +122,7 @@ void CommonTaskParam::reset( CodingStructure& cs, TaskType ctuStartState, int ta
   doDeblock     = _doDeblock;
   gpuIntra      = _gpuIntra;
   gpuInter      = _gpuInter;
+  gpuResidual   = _gpuResidual;
 }
 
 DecLibRecon::DecLibRecon()
@@ -639,8 +640,10 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   m_gpuIntra   = m_gpuFilters && gpu::GpuRecon::intraSupported( cs );
   // and, before those, the inter blocks, from the reference pictures on the GPU
   m_gpuInter   = m_gpuIntra && !isIntra && gpu::GpuRecon::interSupported( cs );
+  // and, first of all, the residuals, when the CPU predicts nothing
+  m_gpuResidual = m_gpuIntra && ( isIntra || m_gpuInter ) && gpu::GpuRecon::residualSupported( cs );
   commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuFilters, doSAO && !m_gpuFilters, m_doDeblock && !m_gpuFilters, m_gpuIntra,
-                         m_gpuInter );
+                         m_gpuInter, m_gpuResidual );
   if( m_gpuRecon )
   {
     ( m_gpuFilters ? m_filterPicturesGpu : m_filterPicturesCpu )++;
@@ -648,6 +651,15 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     if( !isIntra )
     {
       ( m_gpuInter ? m_interPicturesGpu : m_interPicturesCpu )++;
+    }
+    ( m_gpuResidual ? m_residualPicturesGpu : m_residualPicturesCpu )++;
+  }
+  if( m_gpuResidual )
+  {
+    m_gpuTrafoJobs.resize( pcv->sizeInCtus );
+    for( auto& jobs: m_gpuTrafoJobs )
+    {
+      jobs.clear();
     }
   }
   if( m_gpuInter )
@@ -683,7 +695,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     }
   }
 #else
-  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF, doSAO, m_doDeblock, false, false );
+  commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF, doSAO, m_doDeblock, false, false, false );
 #endif
 
   tasksFinishMotion = std::vector<LineTaskParam>( heightInCtus, LineTaskParam{ commonTaskParam, -1 } );
@@ -748,8 +760,12 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       DecLibRecon* dec = param->decLib;
       if( dec->m_gpuFilters )
       {
-        dec->m_gpuRecon->finishPicture( cs, dec->m_gpuIntra ? &dec->m_gpuIntraJobs : nullptr, dec->m_gpuInter ? &dec->m_gpuInterJobs : nullptr,
-                                        dec->m_refTable, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr,
+        gpu::PictureJobs jobs;
+        jobs.trafo = dec->m_gpuResidual ? &dec->m_gpuTrafoJobs : nullptr;
+        jobs.inter = dec->m_gpuInter ? &dec->m_gpuInterJobs : nullptr;
+        jobs.intra = dec->m_gpuIntra ? &dec->m_gpuIntraJobs : nullptr;
+        jobs.refs  = &dec->m_refTable;
+        dec->m_gpuRecon->finishPicture( cs, jobs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr,
                                         cs.picture->m_bufs[PIC_RECONSTRUCTION] );
         cs.picture->gpuCurrent = true;
 
@@ -987,6 +1003,9 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       const UnitArea ctuArea = getCtuArea( cs, ctu, line, true );
       const CtuData& ctuData = cs.getCtuData( ctuRsAddr );
 
+#if VVDEC_VULKAN
+      if( !param->common.gpuResidual )   // else its jobs (TaskGpuCtu)
+#endif
       decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskTrafoCtu( cs, ctuRsAddr, ctuArea );
 
 #if VVDEC_VULKAN
@@ -1040,8 +1059,13 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
 #if VVDEC_VULKAN
       if( param->common.gpuIntra )
       {
-        decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskGpuCtu( cs, ctuRsAddr, ctuArea, decLib.m_gpuIntraJobs[ctuRsAddr], decLib.m_waveMap,
-                                                                 param->common.gpuInter ? &decLib.m_gpuInterJobs[ctuRsAddr] : nullptr, decLib.m_refTable );
+        gpu::CtuJobs jobs;
+        jobs.trafo = param->common.gpuResidual ? &decLib.m_gpuTrafoJobs[ctuRsAddr] : nullptr;
+        jobs.inter = param->common.gpuInter ? &decLib.m_gpuInterJobs[ctuRsAddr] : nullptr;
+        jobs.intra = &decLib.m_gpuIntraJobs[ctuRsAddr];
+        jobs.waves = &decLib.m_waveMap;
+        jobs.refs  = &decLib.m_refTable;
+        decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskGpuCtu( cs, ctuRsAddr, ctuArea, jobs );
       }
       else
 #endif

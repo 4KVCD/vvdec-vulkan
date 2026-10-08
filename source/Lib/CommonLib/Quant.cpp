@@ -292,6 +292,52 @@ static inline int getScalingListType( const PredMode predMode, const ComponentID
 }
 
 
+Quant::DequantParam Quant::dequantParam( const TransformUnit& tu, const ComponentID& compID, const QpParam& cQP, const bool enableScalingLists )
+{
+  const SPS*      sps                   = tu.cu->sps;
+  const CompArea& area                  = tu.blocks[compID];
+  const int       maxLog2TrDynamicRange = sps->getMaxLog2TrDynamicRange( toChannelType( compID ) );
+  const bool      isTransformSkip       = ( tu.mtsIdx( compID ) == MTS_SKIP );
+  const int       channelBitDepth       = sps->getBitDepth();
+
+  DequantParam param;
+  param.bdpcm = ( tu.cu->bdpcmMode() && isLuma( compID ) ) || ( tu.cu->bdpcmModeChroma() && isChroma( compID ) );
+  if( param.bdpcm )
+  {
+    param.maxX = area.width - 1;
+    param.maxY = area.height - 1;
+  }
+  else
+  {
+    param.maxX = tu.maxScanPosX[compID];
+    param.maxY = tu.maxScanPosY[compID];
+  }
+
+  // Represents scaling through forward transform
+  const bool bClipTransformShiftTo0 = false;   // tu.mtsIdx[compID] != 1 && sps->getSpsRangeExtension().getExtendedPrecisionProcessingFlag();
+  const int  originalTransformShift = getTransformShift( channelBitDepth, area.size(), maxLog2TrDynamicRange );
+  const bool needSqrtAdjustment     = TU::needsBlockSizeTrafoScale( tu, compID );
+  const int  iTransformShift        = ( bClipTransformShiftTo0 ? std::max<int>( 0, originalTransformShift ) : originalTransformShift )   //
+                                      + ( needSqrtAdjustment ? -1 : 0 );
+  const bool depQuant   = tu.cu->slice->getDepQuantEnabledFlag() && ( tu.mtsIdx( compID ) != MTS_SKIP );
+  const int  QP_per     = depQuant ? ( ( cQP.Qp( isTransformSkip ) + 1 ) / 6 ) : cQP.per( isTransformSkip );
+  const int  QP_rem     = depQuant ? ( cQP.Qp( isTransformSkip ) + 1 - 6 * QP_per ) : cQP.rem( isTransformSkip );
+  param.rightShift      = IQUANT_SHIFT + ( depQuant ? 1 : 0 )                       //
+                         - ( ( isTransformSkip ? 0 : iTransformShift ) + QP_per )   //
+                         + ( enableScalingLists ? LOG2_SCALING_LIST_NEUTRAL_VALUE : 0 );
+
+  param.scale         = g_InvQuantScales[needSqrtAdjustment ? 1 : 0][QP_rem];
+  const int scaleBits = ( IQUANT_SHIFT + 1 );
+
+  // from the dequantisation equation:
+  // iCoeffQ                         = Intermediate_Int((int64_t(clipQCoef) * scale + iAdd) >> rightShift);
+  //(sizeof(Intermediate_Int) * 8)  =                    inputBitDepth   + scaleBits      - rightShift
+  const uint32_t targetInputBitDepth = std::min<uint32_t>( maxLog2TrDynamicRange + 1, (int) sizeof( Intermediate_Int ) * 8 + param.rightShift - scaleBits );
+  CHECK( targetInputBitDepth < 8, "Invalid bit depth" );
+  param.inputMaximum = ( 1 << ( targetInputBitDepth - 1 ) ) - 1;
+  return param;
+}
+
 void Quant::dequant( const TransformUnit& tu, CoeffBuf& dstCoeff, const ComponentID& compID, const QpParam& cQP )
 {
   const SPS*             sps                   = tu.cu->sps;
@@ -309,50 +355,23 @@ void Quant::dequant( const TransformUnit& tu, CoeffBuf& dstCoeff, const Componen
   const bool             disableSMForACT       = tu.cu->sps->getScalingMatrixForAlternativeColourSpaceDisabledFlag() && tu.cu->sps->getScalingMatrixDesignatedColourSpaceFlag() == tu.cu->colorTransform();
   const bool             enableScalingLists    = getUseScalingList( isTransformSkip, isLfnstApplied, disableSMForLFNST, disableSMForACT );
   const int              scalingListType       = getScalingListType( tu.cu->predMode(), compID );
-  const int              channelBitDepth       = sps->getBitDepth();
+  const DequantParam     param                 = dequantParam( tu, compID, cQP, enableScalingLists );
+  const int              maxX                  = param.maxX;
+  const int              maxY                  = param.maxY;
+  const int              rightShift            = param.rightShift;
+  const int              scaleQP               = param.scale;
+  const Intermediate_Int inputMaximum          = param.inputMaximum;
 
-  int maxX, maxY;
-
-  if( ( tu.cu->bdpcmMode() && isLuma(compID) ) || ( tu.cu->bdpcmModeChroma() && isChroma(compID) ) )
+  if( param.bdpcm )
   {
     invResDPCM( tu, compID, dstCoeff );
-    maxX = area.width - 1;
-    maxY = area.height - 1;
-  }
-  else
-  {
-    maxX = tu.maxScanPosX[compID];
-    maxY = tu.maxScanPosY[compID];
   }
 
   CHECK(scalingListType >= SCALING_LIST_NUM, "Invalid scaling list");
 
-  // Represents scaling through forward transform
-  const bool bClipTransformShiftTo0 = false;   // tu.mtsIdx[compID] != 1 && sps->getSpsRangeExtension().getExtendedPrecisionProcessingFlag();
-  const int  originalTransformShift = getTransformShift( channelBitDepth, area.size(), maxLog2TrDynamicRange );
-  const bool needSqrtAdjustment     = TU::needsBlockSizeTrafoScale( tu, compID );
-  const int  iTransformShift        = ( bClipTransformShiftTo0 ? std::max<int>( 0, originalTransformShift ) : originalTransformShift )   //
-                                      + ( needSqrtAdjustment ? -1 : 0 );
-  const bool depQuant   = tu.cu->slice->getDepQuantEnabledFlag() && ( tu.mtsIdx( compID ) != MTS_SKIP );
-  const int  QP_per     = depQuant ? ( ( cQP.Qp( isTransformSkip ) + 1 ) / 6 ) : cQP.per( isTransformSkip );
-  const int  QP_rem     = depQuant ? ( cQP.Qp( isTransformSkip ) + 1 - 6 * QP_per ) : cQP.rem( isTransformSkip );
-  const int  rightShift = IQUANT_SHIFT + ( depQuant ? 1 : 0 )                       //
-                         - ( ( isTransformSkip ? 0 : iTransformShift ) + QP_per )   //
-                         + ( enableScalingLists ? LOG2_SCALING_LIST_NEUTRAL_VALUE : 0 );
-
-  const int scaleQP   = g_InvQuantScales[needSqrtAdjustment ? 1 : 0][QP_rem];
-  const int scaleBits = ( IQUANT_SHIFT + 1 );
-
-  // from the dequantisation equation:
-  // iCoeffQ                         = Intermediate_Int((int64_t(clipQCoef) * scale + iAdd) >> rightShift);
-  //(sizeof(Intermediate_Int) * 8)  =                    inputBitDepth   + scaleBits      - rightShift
-  const uint32_t         targetInputBitDepth = std::min<uint32_t>( maxLog2TrDynamicRange + 1, (int) sizeof( Intermediate_Int ) * 8 + rightShift - scaleBits );
-  CHECK( targetInputBitDepth < 8, "Invalid bit depth" );
-  const Intermediate_Int inputMaximum        = ( 1 << ( targetInputBitDepth - 1 ) ) - 1;
-
   if( !enableScalingLists )
   {
-    if( ( tu.cu->bdpcmMode() && isLuma( compID ) ) || ( tu.cu->bdpcmModeChroma() && isChroma( compID ) ) )
+    if( param.bdpcm )
     {
       TCoeff* dst = &dstCoeff.buf[0];
       DeQuantPCM( area.width, maxX, maxY, scaleQP, dst, dstCoeff.stride, piCoef, rightShift, inputMaximum, transformMaximum );
@@ -367,7 +386,7 @@ void Quant::dequant( const TransformUnit& tu, CoeffBuf& dstCoeff, const Componen
     const uint32_t uiLog2TrWidth  = getLog2( area.width );
     const uint32_t uiLog2TrHeight = getLog2( area.height );
     const int*     piDequantCoef  = getDequantCoeff( scalingListType, uiLog2TrWidth, uiLog2TrHeight );
-    if( ( tu.cu->bdpcmMode() && isLuma( compID ) ) || ( tu.cu->bdpcmModeChroma() && isChroma( compID ) ) )
+    if( param.bdpcm )
     {
       TCoeff* dst = &dstCoeff.buf[0];
       DeQuantScalingPCM( area.width, maxX, maxY, scaleQP, piDequantCoef, dst, dstCoeff.stride, piCoef, rightShift, inputMaximum, transformMaximum );

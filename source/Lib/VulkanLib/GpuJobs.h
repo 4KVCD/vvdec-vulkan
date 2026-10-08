@@ -55,6 +55,35 @@ namespace vvdec
 namespace gpu
 {
 
+// one transform block of one component whose levels the GPU dequantizes and
+// inverse transforms into its residual; the layout of shaders/trafo.slang
+struct TrafoJob
+{
+  enum Flags
+  {
+    kTransformSkip = 1,
+    kBdpcmHor      = 2,
+    kBdpcmVer      = 4,
+  };
+
+  uint32_t w[8];
+
+  // ict: the joint Cb-Cr mode (TU::getICTMode, signed) that derives the other
+  // chroma component's residual from this one's, 0 for none
+  void set( int x, int y, int log2Width, int log2Height, int comp, int typeHor, int typeVer, int flags, int ict, int lastX, int lastY, int scale,
+            int rightShift, int inputMaximum )
+  {
+    w[0] = uint32_t( x ) | uint32_t( y ) << 16;
+    w[1] = uint32_t( log2Width ) | uint32_t( log2Height ) << 4 | uint32_t( comp ) << 8 | uint32_t( typeHor ) << 12 | uint32_t( typeVer ) << 14
+           | uint32_t( flags ) << 16 | uint32_t( ict + 4 ) << 24;
+    w[2] = uint32_t( lastX ) | uint32_t( lastY ) << 8;
+    w[3] = uint32_t( scale );
+    w[4] = uint32_t( rightShift );
+    w[5] = uint32_t( inputMaximum );
+    w[6] = w[7] = 0;
+  }
+};
+
 // one transform block of one component that the GPU predicts and
 // reconstructs; the layout of shaders/intra.slang
 struct IntraJob
@@ -203,6 +232,26 @@ private:
   int                   m_height[3] = { 0, 0, 0 };
   int                   m_shiftX[3] = { 2, 1, 1 };
   int                   m_shiftY[3] = { 2, 1, 1 };
+};
+
+// where the CTU tasks put a CTU's jobs for the stages of the picture that run
+// on the GPU (null: the CPU runs that stage)
+struct CtuJobs
+{
+  std::vector<TrafoJob>* trafo = nullptr;
+  std::vector<InterJob>* inter = nullptr;
+  std::vector<IntraJob>* intra = nullptr;
+  WaveMap*               waves = nullptr;   // with intra
+  const RefTable*        refs  = nullptr;   // with inter
+};
+
+// a picture's jobs, per CTU, for the stages that run on the GPU (null: the CPU ran that stage)
+struct PictureJobs
+{
+  const std::vector<std::vector<TrafoJob>>* trafo = nullptr;
+  const std::vector<std::vector<InterJob>>* inter = nullptr;
+  const std::vector<std::vector<IntraJob>>* intra = nullptr;
+  const RefTable*                           refs  = nullptr;   // with inter
 };
 
 }   // namespace gpu

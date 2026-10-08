@@ -209,7 +209,7 @@ void DecLib::destroy()
 #if VVDEC_VULKAN
   if( m_gpu )
   {
-    int filtersGpu = 0, filtersCpu = 0, intraGpu = 0, intraCpu = 0, interGpu = 0, interCpu = 0;
+    int filtersGpu = 0, filtersCpu = 0, intraGpu = 0, intraCpu = 0, interGpu = 0, interCpu = 0, residualGpu = 0, residualCpu = 0;
     for( auto& dec: m_decLibRecon )
     {
       filtersGpu += dec.filterPicturesGpu();
@@ -218,9 +218,13 @@ void DecLib::destroy()
       intraCpu   += dec.intraPicturesCpu();
       interGpu   += dec.interPicturesGpu();
       interCpu   += dec.interPicturesCpu();
+      residualGpu += dec.residualPicturesGpu();
+      residualCpu += dec.residualPicturesCpu();
     }
-    msg( INFO, "GPU: inter prediction of %d pictures on the GPU, %d on the CPU; intra prediction of %d on the GPU, %d on the CPU; in-loop filters of %d on the GPU, %d on the CPU\n",
-         interGpu, interCpu, intraGpu, intraCpu, filtersGpu, filtersCpu );
+    msg( INFO,
+         "GPU: residuals of %d pictures on the GPU, %d on the CPU; inter prediction of %d on the GPU, %d on the CPU; intra prediction of %d on the GPU, "
+         "%d on the CPU; in-loop filters of %d on the GPU, %d on the CPU\n",
+         residualGpu, residualCpu, interGpu, interCpu, intraGpu, intraCpu, filtersGpu, filtersCpu );
   }
 #endif
   for( auto &dec: m_decLibRecon )

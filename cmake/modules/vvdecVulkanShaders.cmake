@@ -11,6 +11,7 @@ set( VVDEC_GPU_SHADERS
   "deblock_chroma|deblock|CHROMA=1"
   "intra|intra"
   "inter|inter"
+  "trafo|trafo"
 )
 
 if( NOT VVDEC_SLANGC OR NOT EXISTS "${VVDEC_SLANGC}" )

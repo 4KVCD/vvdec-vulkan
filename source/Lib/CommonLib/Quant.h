@@ -116,6 +116,22 @@ public:
   // de-quantization
   void dequant           ( const TransformUnit &tu, CoeffBuf &dstCoeff, const ComponentID &compID, const QpParam &cQP );
 
+  // what dequant does to the levels of a transform block of a component: it
+  // reads them from [0, maxX] x [0, maxY] (BDPCM adds them up first), clips
+  // them to [-inputMaximum - 1, inputMaximum], multiplies them by scale (and
+  // the scaling list's factor, when enableScalingLists) and shifts them right
+  // by rightShift (left, when it is negative)
+  struct DequantParam
+  {
+    int  maxX;
+    int  maxY;
+    int  scale;
+    int  rightShift;
+    int  inputMaximum;
+    bool bdpcm;
+  };
+  static DequantParam dequantParam( const TransformUnit &tu, const ComponentID &compID, const QpParam &cQP, const bool enableScalingLists );
+
   template<class T>
   static void DeQuantCore( const SizeType width,
                            const int      maxX,

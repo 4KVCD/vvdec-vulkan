@@ -101,6 +101,9 @@ public:
   static bool interSupported( const SPS& sps );
   // and of the picture: no weighted prediction, no scaled references
   static bool interSupported( const CodingStructure& cs );
+  // whether the GPU dequantizes and inverse transforms the residuals of the
+  // picture: 10 bits at most, no LFNST, no scaling lists
+  static bool residualSupported( const CodingStructure& cs );
 
   // the deblocking parameters of the current picture (vvdec's LF_INIT writes
   // them): count of them, in host memory the GPU reads
@@ -109,13 +112,13 @@ public:
   Mv*              dmvrMvCache( size_t count );
 
   // the rest of the picture in pic, on top of what the CPU reconstructed: the
-  // inter blocks of interJobs, from the reference pictures of refs, then the
-  // intra and IBC blocks of intraJobs (each one list per CTU), then the
-  // in-loop filters: deblocking (when deblock), SAO (when sao is given), ALF
-  // with CC-ALF (when alf is given); the result stays on the GPU as a
-  // reference (the picture is gpuCurrent then) and comes back to pic
-  void finishPicture( CodingStructure& cs, const std::vector<std::vector<IntraJob>>* intraJobs, const std::vector<std::vector<InterJob>>* interJobs,
-                      const RefTable& refs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf, PelStorage& pic );
+  // residuals of jobs.trafo, the inter blocks of jobs.inter, from the
+  // reference pictures of jobs.refs, the intra and IBC blocks of jobs.intra,
+  // then the in-loop filters: deblocking (when deblock), SAO (when sao is
+  // given), ALF with CC-ALF (when alf is given); the result stays on the GPU as
+  // a reference (the picture is gpuCurrent then) and comes back to pic
+  void finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
+                      PelStorage& pic );
 
 private:
   void     beginCommands();
@@ -145,6 +148,7 @@ private:
   void          recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params );
   void          recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes );
   void          recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, const Planes& planes, VkDeviceAddress refTable );
+  void          recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, const Planes& planes );
   void          recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
   void          recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
 
@@ -163,6 +167,8 @@ private:
   Buffer          m_dmvr;                           // DMVR's refinements
   Buffer          m_intraJobs;                      // the intra jobs of a picture, wave by wave
   Buffer          m_interJobs;
+  Buffer          m_trafoJobs;
+  Buffer          m_matrices;                       // TrQuant's transform matrices
 };
 
 }   // namespace gpu

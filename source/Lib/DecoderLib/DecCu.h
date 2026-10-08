@@ -76,10 +76,10 @@ public:
   void TaskFinishMotionInfo    ( CodingStructure &cs, const int ctuRsAddr, const int col, const int row );
 #if VVDEC_VULKAN
   // instead of TaskCriticalIntraKernel when the GPU predicts: the jobs of the
-  // CTU's intra and IBC blocks, with their waves, and, with interJobs, of its
-  // inter blocks (else they are finished here, as TaskCriticalIntraKernel does)
-  void TaskGpuCtu              ( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, std::vector<gpu::IntraJob>& intraJobs,
-                                 gpu::WaveMap& waves, std::vector<gpu::InterJob>* interJobs, const gpu::RefTable& refs );
+  // CTU's intra and IBC blocks, with their waves, with jobs.inter of its inter
+  // blocks (else they are finished here, as TaskCriticalIntraKernel does), and
+  // with jobs.trafo of its residuals (instead of TaskTrafoCtu)
+  void TaskGpuCtu              ( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, const gpu::CtuJobs& jobs );
 #endif
 
 public:
@@ -103,6 +103,7 @@ protected:
   void xGpuIntraJobs      ( CodingUnit&      cu, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves );
   void xGpuIbcJobs        ( CodingUnit&      cu, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves );
   void xGpuInterJobs      ( CodingUnit&      cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs );
+  void xGpuTrafoJobs      ( CodingUnit&      cu, std::vector<gpu::TrafoJob>& jobs );
 #endif
   void xDeriveCUMV        ( CodingUnit&      cu, MotionHist& hist );
 

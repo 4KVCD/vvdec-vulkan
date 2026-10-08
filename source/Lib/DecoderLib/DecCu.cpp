@@ -235,8 +235,7 @@ void DecCu::TaskFinishMotionInfo( CodingStructure &cs, const int ctuRsAddr, cons
   }
 }
 #if VVDEC_VULKAN
-void DecCu::TaskGpuCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, std::vector<gpu::IntraJob>& intraJobs, gpu::WaveMap& waves,
-                        std::vector<gpu::InterJob>* interJobs, const gpu::RefTable& refs )
+void DecCu::TaskGpuCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, const gpu::CtuJobs& jobs )
 {
   PROFILER_SCOPE_AND_STAGE_EXT( 1, g_timeProfiler, P_CONTROL_PARSE_DERIVE_LL, cs, CH_L );
 
@@ -244,17 +243,22 @@ void DecCu::TaskGpuCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea
   {
     CHECK( !ctuArea.blocks[currCU.chType()].contains( currCU.blocks[currCU.chType()] ), "Should never happen!" );
 
+    if( jobs.trafo && currCU.rootCbf() )
+    {
+      xGpuTrafoJobs( currCU, *jobs.trafo );
+    }
+
     if( CU::isIntra( currCU ) )
     {
-      xGpuIntraJobs( currCU, intraJobs, waves );
+      xGpuIntraJobs( currCU, *jobs.intra, *jobs.waves );
     }
     else if( CU::isIBC( currCU ) )
     {
-      xGpuIbcJobs( currCU, intraJobs, waves );
+      xGpuIbcJobs( currCU, *jobs.intra, *jobs.waves );
     }
-    else if( interJobs )
+    else if( jobs.inter )
     {
-      xGpuInterJobs( currCU, *interJobs, refs );
+      xGpuInterJobs( currCU, *jobs.inter, *jobs.refs );
     }
     else if( currCU.rootCbf() )
     {
@@ -433,6 +437,64 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
       gpu::InterJob job;
       job.set( x, y, tileW, tileH, flags, cu.mv[0][0].hor, cu.mv[0][0].ver, cu.mv[1][0].hor, cu.mv[1][0].ver, cu.lx(), cu.ly(), ref[0], ref[1],
                dmvr ? int( cu.mvdL0SubPuOff ) + num : 0 );
+      jobs.push_back( job );
+    }
+  }
+}
+
+void DecCu::xGpuTrafoJobs( CodingUnit& cu, std::vector<gpu::TrafoJob>& jobs )
+{
+  // the transform blocks reconstructResi takes, with the parameters TrQuant uses
+  for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
+  {
+    for( const auto &area : tu.blocks )
+    {
+      if( !area.valid() )
+      {
+        continue;
+      }
+
+      ComponentID compID = area.compID();
+      int         ict    = 0;
+      if( tu.jointCbCr && isChroma( compID ) )
+      {
+        if( compID != COMPONENT_Cb )
+        {
+          continue;   // with Cb's job
+        }
+        compID = ( tu.jointCbCr >> 1 ) ? COMPONENT_Cb : COMPONENT_Cr;
+        ict    = TU::getICTMode( tu, cu.cs->picHeader->getJointCbCrSignFlag() );
+      }
+      else if( !TU::getCbf( tu, compID ) )
+      {
+        continue;
+      }
+
+      const CompArea&           block = tu.blocks[compID];
+      const QpParam             cQP( tu, compID );
+      const Quant::DequantParam param = Quant::dequantParam( tu, compID, cQP, false );
+      const bool                ts    = tu.mtsIdx( compID ) == MTS_SKIP;
+      CHECK( cu.slice->getExplicitScalingListUsed() || cu.lfnstIdx() || ( param.bdpcm && !ts ), "a residual the GPU cannot reconstruct" );
+
+      int typeHor = DCT2;
+      int typeVer = DCT2;
+      int flags   = 0;
+      if( ts )
+      {
+        flags |= gpu::TrafoJob::kTransformSkip;
+      }
+      else
+      {
+        m_pcTrQuant->getTrTypes( tu, compID, typeHor, typeVer );
+      }
+      if( param.bdpcm )
+      {
+        flags |= ( isLuma( compID ) ? cu.bdpcmMode() : cu.bdpcmModeChroma() ) == 1 ? gpu::TrafoJob::kBdpcmHor : gpu::TrafoJob::kBdpcmVer;
+      }
+
+      gpu::TrafoJob job;
+      job.set( block.x, block.y, getLog2( block.width ), getLog2( block.height ), compID, typeHor, typeVer, flags, ict, param.maxX, param.maxY,
+               param.scale, param.rightShift, param.inputMaximum );
       jobs.push_back( job );
     }
   }
