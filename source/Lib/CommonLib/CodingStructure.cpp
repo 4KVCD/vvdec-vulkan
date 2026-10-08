@@ -97,8 +97,7 @@ void CodingStructure::destroy()
   m_ctuData.reset();
   m_ctuDataSize = 0;
 
-  m_colMiMap.reset();
-  m_colMiMapSize = 0;
+  freeColMiMap();
 
   m_cuMap.reset();
   m_cuMapSize = 0;
@@ -292,8 +291,7 @@ void CodingStructure::allocTempInternals()
   const ptrdiff_t newColMiMapSize = ctuColMiMapSize * pcv->sizeInCtus;
   if( m_colMiMapSize != newColMiMapSize )
   {
-    m_colMiMap     = std::make_unique<ColocatedMotionInfo[]>( newColMiMapSize );
-    m_colMiMapSize = newColMiMapSize;
+    allocColMiMap( newColMiMapSize );
   }
 
   const size_t newCtuDataSize = pcv->sizeInCtus;
@@ -302,6 +300,41 @@ void CodingStructure::allocTempInternals()
     m_ctuData     = std::make_unique<CtuData[]>( newCtuDataSize );
     m_ctuDataSize = newCtuDataSize;
   }
+}
+
+void CodingStructure::allocColMiMap( ptrdiff_t size )
+{
+  freeColMiMap();
+#if VVDEC_VULKAN
+  if( colMiAllocator )
+  {
+    m_colMiMap = static_cast<ColocatedMotionInfo*>( colMiAllocator->create( colMiAllocator->opaque, VVDEC_CT_Y, uint32_t( sizeof( ColocatedMotionInfo ) * size ),
+                                                                           MEMORY_ALIGN_DEF_SIZE, &m_colMiAllocation ) );
+    CHECK( !m_colMiMap, "no memory for the colocated motion" );
+  }
+  else
+#endif
+  {
+    m_colMiMap = new ColocatedMotionInfo[size];
+  }
+  m_colMiMapSize = size;
+}
+
+void CodingStructure::freeColMiMap()
+{
+#if VVDEC_VULKAN
+  if( m_colMiAllocation )
+  {
+    colMiAllocator->unref( colMiAllocator->opaque, m_colMiAllocation );
+    m_colMiAllocation = nullptr;
+  }
+  else
+#endif
+  {
+    delete[] m_colMiMap;
+  }
+  m_colMiMap     = nullptr;
+  m_colMiMapSize = 0;
 }
 
 void CodingStructure::deallocTempInternals()
@@ -328,7 +361,7 @@ void CodingStructure::initStructData()
 
   memset( NO_WARNING_class_memaccess( m_ctuData.get() ),             0, sizeof( CtuData             ) * m_ctuDataSize );
   memset( NO_WARNING_class_memaccess( m_cuMap.get() ),               0, sizeof( CodingUnit*         ) * m_cuMapSize );
-  memset( NO_WARNING_class_memaccess( m_colMiMap.get() ), CO_NOT_VALID, sizeof( ColocatedMotionInfo ) * m_colMiMapSize );
+  memset( NO_WARNING_class_memaccess( m_colMiMap ), CO_NOT_VALID, sizeof( ColocatedMotionInfo ) * m_colMiMapSize );
 
   const ptrdiff_t ctuSampleSizeL  = pcv->maxCUHeight * pcv->maxCUWidth;
   const ptrdiff_t ctuSampleSizeC  = isChromaEnabled( pcv->chrFormat ) ? ( ctuSampleSizeL >> ( getChannelTypeScaleX( CH_C, pcv->chrFormat) + getChannelTypeScaleY( CH_C, pcv->chrFormat ) ) ) : 0;

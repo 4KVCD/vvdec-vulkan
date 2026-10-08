@@ -254,17 +254,6 @@ void DecCu::TaskColMotion( CodingStructure &cs, const int ctuRsAddr )
   storeColMotion( cs, ctuRsAddr );
 }
 
-void DecCu::finishDmvrMotion( CodingStructure &cs, const int ctuRsAddr, const std::vector<const CodingUnit*>& cus )
-{
-  // into the colocated motion only, which TaskColMotion copied: nothing reads
-  // the CTU's motion any more
-  ColocatedMotionInfo* colMotion = cs.getCtuData( ctuRsAddr ).colMotion;
-  for( const CodingUnit* cu: cus )
-  {
-    storeDmvrMotion( cs, *cu, [&]( Position pos ) -> ColocatedMotionInfo& { return colMotion[cs.colMotPos( pos )]; } );
-  }
-}
-
 void DecCu::TaskGpuCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, const gpu::CtuJobs& jobs )
 {
   PROFILER_SCOPE_AND_STAGE_EXT( 1, g_timeProfiler, P_CONTROL_PARSE_DERIVE_LL, cs, CH_L );
@@ -289,10 +278,6 @@ void DecCu::TaskGpuCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea
     else if( jobs.inter )
     {
       xGpuInterJobs( currCU, *jobs.inter, *jobs.refs, jobs.trafo );
-      if( jobs.dmvr && currCU.dmvrCondition() )
-      {
-        jobs.dmvr->push_back( &currCU );
-      }
     }
     else if( currCU.rootCbf() )
     {

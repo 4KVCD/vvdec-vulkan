@@ -155,6 +155,9 @@ Picture* PicListManager::getNewPicBuffer( const SPS& sps, const PPS& pps, const 
                    picMargin,
                    layerId,
                    userAllocator );
+#if VVDEC_VULKAN
+    pcPic->gpuMemory = externAllocator ? nullptr : m_gpuAllocator;
+#endif
     pcPic->createWrapAroundBuf( sps.getUseWrapAround(), sps.getMaxCUWidth() );
     m_cPicList.push_back( pcPic );
 
@@ -178,6 +181,9 @@ Picture* PicListManager::getNewPicBuffer( const SPS& sps, const PPS& pps, const 
                    picMargin,
                    layerId,
                    userAllocator );
+#if VVDEC_VULKAN
+      pic->gpuMemory = externAllocator ? nullptr : m_gpuAllocator;
+#endif
       pic->createWrapAroundBuf( sps.getUseWrapAround(), sps.getMaxCUWidth() );
       pic->resetForUse( layerId );
     }
@@ -205,6 +211,9 @@ Picture* PicListManager::getNewPicBuffer( const SPS& sps, const PPS& pps, const 
                    picMargin,
                    layerId,
                    userAllocator );
+#if VVDEC_VULKAN
+    pcPic->gpuMemory = externAllocator ? nullptr : m_gpuAllocator;
+#endif
     pcPic->createWrapAroundBuf( sps.getUseWrapAround(), sps.getMaxCUWidth() );
     m_cPicList.push_back( pcPic );
 
@@ -225,6 +234,9 @@ Picture* PicListManager::getNewPicBuffer( const SPS& sps, const PPS& pps, const 
                    picMargin,
                    layerId,
                    userAllocator );
+#if VVDEC_VULKAN
+    pcPic->gpuMemory = externAllocator ? nullptr : m_gpuAllocator;
+#endif
     pcPic->createWrapAroundBuf( sps.getUseWrapAround(), sps.getMaxCUWidth() );
   }
 

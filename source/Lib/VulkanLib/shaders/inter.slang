@@ -31,6 +31,7 @@ struct Params
   int16_t*   dst1;
   int16_t*   dst2;
   int*       dmvr;        // vvdec's Mv: hor, ver
+  int*       colMotion;   // the picture's colocated motion: vvdec's ColocatedMotionInfo, 5 ints
   int        stride0;
   int        stride12;
   int        count;
@@ -38,6 +39,9 @@ struct Params
   int        picHeight;
   int        ctuSize;
   int        bitDepth;
+  int        ctuLog2;     // the colocated motion's CTUs
+  int        widthInCtus;
+  int        num8x8;      // its entries a CTU
 };
 
 [[vk::push_constant]] Params pc;
@@ -546,6 +550,23 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       pc.dmvr[index8 * 2]     = delta.x;
       pc.dmvr[index8 * 2 + 1] = delta.y;
       s_delta                = delta;
+      // the refined motion where TMVP takes it, the 8x8 grid, into the
+      // colocated motion the CPU stored (DecCu's storeDmvrMotion)
+      const int2 m0   = mv0 + delta;
+      const int2 m1   = mv1 - delta;
+      const int  mask = ( 1 << ( pc.ctuLog2 - 3 ) ) - 1;
+      for( int y2 = ( ( y - 1 ) & ~7 ) + 8; y2 < y + h; y2 += 8 )
+      {
+        for( int x2 = ( ( x - 1 ) & ~7 ) + 8; x2 < x + w; x2 += 8 )
+        {
+          const int ctu = ( y2 >> pc.ctuLog2 ) * pc.widthInCtus + ( x2 >> pc.ctuLog2 );
+          int*      e   = pc.colMotion + ( ctu * pc.num8x8 + ( ( x2 >> 3 ) & mask ) + ( ( ( y2 >> 3 ) & mask ) << ( pc.ctuLog2 - 3 ) ) ) * 5;
+          e[0] = m0.x;
+          e[1] = m0.y;
+          e[2] = m1.x;
+          e[3] = m1.y;
+        }
+      }
     }
     GroupMemoryBarrierWithGroupSync();
     refined0 = clipStorage( mv0 + s_delta );

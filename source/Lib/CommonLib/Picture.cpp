@@ -260,6 +260,9 @@ void Picture::finalInit( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache,
   {
     cs = std::make_unique<CodingStructure>( cuChunkCache, tuChunkCache );
     cs->create( chromaFormatIDC, Area( 0, 0, iWidth, iHeight ) );
+#if VVDEC_VULKAN
+    cs->colMiAllocator = gpuMemory;
+#endif
   }
 
 #if RECO_WHILE_PARSE

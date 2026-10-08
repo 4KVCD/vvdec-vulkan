@@ -201,8 +201,17 @@ public:
 
   std::unique_ptr<CodingUnit*[]>         m_cuMap;
   ptrdiff_t                              m_cuMapSize;
-  std::unique_ptr<ColocatedMotionInfo[]> m_colMiMap;
+  ColocatedMotionInfo*                   m_colMiMap;
   ptrdiff_t                              m_colMiMapSize;
+#if VVDEC_VULKAN
+  // the colocated motion in memory from colMiAllocator, when it is set before
+  // allocTempInternals: the GPU's, which writes DMVR's refinements there
+  // (gpu::GpuRecon); m_colMiAllocation the allocator's handle of it
+  const UserAllocator*                   colMiAllocator = nullptr;
+  void*                                  m_colMiAllocation = nullptr;
+#endif
+  void                                   allocColMiMap( ptrdiff_t size );
+  void                                   freeColMiMap();
 
 public:
 

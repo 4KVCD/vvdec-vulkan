@@ -214,6 +214,7 @@ public:
   // prediction the GPU makes may reference it before it is done, once
   // gpuRefReady (its motion for TMVP final, its GPU work queued: DecLibRecon)
   bool                     gpuEarlyRef     = false;
+  UserAllocator*           gpuMemory       = nullptr;        // the GPU's allocator of the picture's buffers (PicListManager): its colocated motion too
 #endif
   bool             isReferencePic          = false;          // mainly for setting vvdecPicAttributes::isRefPic for the library output frame
   bool             wasLost                 = false;

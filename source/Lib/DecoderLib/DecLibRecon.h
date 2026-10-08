@@ -185,7 +185,6 @@ private:
   gpu::WaveMap                   m_waveMap;
   std::vector<std::vector<gpu::IntraJob>> m_gpuIntraJobs;   // per CTU
   std::vector<std::vector<gpu::InterJob>> m_gpuInterJobs;   // per CTU
-  std::vector<std::vector<const CodingUnit*>> m_gpuDmvrCus;   // per CTU: the CUs DMVR refines, whose motion for TMVP waits for the GPU
   std::vector<std::vector<gpu::TrafoJob>> m_gpuTrafoJobs;   // per CTU
   std::vector<gpu::EdgeLists>    m_gpuEdges;               // per CTU: the edges the GPU deblocks
   gpu::RefTable                  m_refTable;               // the reference pictures of the current picture

@@ -702,11 +702,6 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     {
       jobs.clear();
     }
-    m_gpuDmvrCus.resize( pcv->sizeInCtus );
-    for( auto& cus: m_gpuDmvrCus )
-    {
-      cus.clear();
-    }
     // DMVR's refinements: the GPU's, in memory it writes
     pcPic->cs->m_dmvrMvCache = m_gpuRecon->dmvrMvCache( m_dmvrMvCacheSize );
   }
@@ -780,10 +775,10 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   if( m_gpuFilters )
   {
     // with the GPU, two tasks. The first queues the picture's work on the GPU,
-    // and when DMVR refines motion there, waits for that part of the work, to
-    // store the refined motion for TMVP; then (gpuRefReady) the pictures whose
-    // inter prediction the GPU makes can reference this one, their work queued
-    // after its. The second waits for the rest, the download included.
+    // and when DMVR refines motion there, waits for that part of the work,
+    // which stores the refined motion for TMVP; then (gpuRefReady) the pictures
+    // whose inter prediction the GPU makes can reference this one, their work
+    // queued after its. The second waits for the rest, the download included.
     static auto queueGpuTask = []( int tid, void* task_param )
     {
       FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
@@ -796,19 +791,12 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       jobs.intra = dec->m_gpuIntra ? &dec->m_gpuIntraJobs : nullptr;
       jobs.refs  = &dec->m_refTable;
       jobs.edges = &dec->m_gpuEdges;
-      // with DMVR's refinements, which the GPU makes, the motion for TMVP in
-      // the next pictures of the CUs DMVR refined (the CTU tasks stored the rest)
+      // with DMVR, the GPU stores the refined motion for TMVP in the next
+      // pictures in the first part (the CTU tasks stored the rest)
       const bool refine = dec->m_gpuInter && cs.picture->stillReferenced;
       dec->m_gpuRecon->startPicture( cs, jobs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr,
                                      cs.picture->m_bufs[PIC_RECONSTRUCTION], refine );
       cs.picture->gpuCurrent = true;   // for the work queued after this
-      if( refine )
-      {
-        for( int ctuRsAddr = 0; ctuRsAddr < (int) cs.pcv->sizeInCtus; ctuRsAddr++ )
-        {
-          DecCu::finishDmvrMotion( cs, ctuRsAddr, dec->m_gpuDmvrCus[ctuRsAddr] );
-        }
-      }
       return true;
     };
     static auto finishGpuTask = []( int tid, void* task_param )
@@ -1139,7 +1127,6 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
         gpu::CtuJobs jobs;
         jobs.trafo = param->common.gpuResidual ? &decLib.m_gpuTrafoJobs[ctuRsAddr] : nullptr;
         jobs.inter = param->common.gpuInter ? &decLib.m_gpuInterJobs[ctuRsAddr] : nullptr;
-        jobs.dmvr  = param->common.gpuInter ? &decLib.m_gpuDmvrCus[ctuRsAddr] : nullptr;
         jobs.intra = &decLib.m_gpuIntraJobs[ctuRsAddr];
         jobs.waves = &decLib.m_waveMap;
         jobs.refs  = &decLib.m_refTable;

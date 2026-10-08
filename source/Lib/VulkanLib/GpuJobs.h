@@ -52,8 +52,6 @@ POSSIBILITY OF SUCH DAMAGE.
 
 namespace vvdec
 {
-struct CodingUnit;
-
 namespace gpu
 {
 
@@ -268,7 +266,6 @@ struct CtuJobs
   std::vector<IntraJob>* intra = nullptr;
   WaveMap*               waves = nullptr;   // with intra
   const RefTable*        refs  = nullptr;   // with inter
-  std::vector<const CodingUnit*>* dmvr = nullptr;   // with inter: the CUs DMVR refines
 };
 
 // a picture's jobs, per CTU, for the stages that run on the GPU (null: the CPU ran that stage)

@@ -1077,9 +1077,12 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
 // the push constants of shaders/inter.slang
 struct InterPush
 {
-  VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr;
-  int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth;
+  VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion;
+  int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth, ctuLog2, widthInCtus, num8x8;
 };
+// the colocated motion as shaders/inter.slang writes DMVR's refinements into it
+static_assert( sizeof( ColocatedMotionInfo ) == 20 && offsetof( ColocatedMotionInfo, mv ) == 0 && sizeof( Mv ) == 8,
+               "the colocated motion is not laid out as shaders/inter.slang writes it" );
 
 bool GpuRecon::interSupported( const SPS& sps )
 {
@@ -1153,6 +1156,13 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   push.dst1      = planes.addr[COMPONENT_Cb];
   push.dst2      = planes.addr[COMPONENT_Cr];
   push.dmvr      = m_dmvr.addr;
+  // DMVR's refinements into the picture's colocated motion (TMVP), in the
+  // memory of the GPU's picture allocator (Picture::gpuMemory)
+  CHECK_FATAL( !cs.m_colMiAllocation, "Vulkan: the colocated motion out of the GPU's reach" );
+  push.colMotion   = static_cast<HostPlane*>( cs.m_colMiAllocation )->host.addr;
+  push.ctuLog2     = getLog2( pcv.maxCUWidth );
+  push.widthInCtus = pcv.widthInCtus;
+  push.num8x8      = int32_t( pcv.num8x8CtuBlks );
   push.stride0   = planes.stride[COMPONENT_Y];
   push.stride12  = planes.stride[COMPONENT_Cb];
   push.count     = int32_t( total );

@@ -80,12 +80,10 @@ public:
   // blocks (else they are finished here, as TaskCriticalIntraKernel does), and
   // with jobs.trafo of its residuals (instead of TaskTrafoCtu)
   void TaskGpuCtu              ( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, const gpu::CtuJobs& jobs );
-  // TaskFinishMotionInfo in two with the inter prediction on the GPU: the
-  // motion for TMVP in the next pictures as the CTU tasks derived it, then,
-  // once the GPU has refined it, that of the CUs DMVR refines (TaskGpuCtu
-  // lists them in jobs.dmvr)
+  // TaskFinishMotionInfo with the inter prediction on the GPU: the motion for
+  // TMVP in the next pictures as the CTU tasks derived it; the GPU stores
+  // that of the CUs DMVR refines into it (shaders/inter.slang)
   void TaskColMotion           ( CodingStructure& cs, const int ctuRsAddr );
-  static void finishDmvrMotion ( CodingStructure& cs, const int ctuRsAddr, const std::vector<const CodingUnit*>& cus );
 #endif
 
 public:
