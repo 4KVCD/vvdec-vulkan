@@ -79,10 +79,11 @@ static const int kChroma[128] = {
 };
 static const int kBilinear[32] = { 16, 0, 15, 1, 14, 2, 13, 3, 12, 4, 11, 5, 10, 6, 9, 7, 8, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
 
-// shared by the workgroup: the horizontal pass of a 2-D filter, per list;
-// DMVR's bilinear predictions, its SADs and its result
-#define TMP_SIZE ( ( 16 + 7 ) * 16 )
-groupshared int  s_tmp[2 * TMP_SIZE];
+// shared by the workgroup: the reference samples a block's filter reads, the
+// horizontal pass of a 2-D filter; DMVR's bilinear predictions, its SADs and
+// its result
+groupshared int  s_ref[( 16 + 7 ) * ( 16 + 7 )];
+groupshared int  s_tmp[( 16 + 7 ) * 16];
 groupshared int  s_bil0[20 * 20];
 groupshared int  s_bil1[20 * 20];
 groupshared int  s_sad[25];
@@ -137,13 +138,14 @@ int coeff( int comp, int frac, bool hpel, int k )
   return kChroma[frac * 4 + k];
 }
 
-// xPredInterBlk of a w x h block of a component, the thread's samples
-// s = tid + THREADS * k into out[k]: the sample (i, j) filters the reference
-// around (baseX + i, baseY + j) with the fractions of mv; bi: the 14-bit
-// intermediate for averaging, else the final, clipped value. The workgroup
-// calls it together (it may wait for the others).
-void predictBlock( int tid, int list, int slot, int comp, int bx, int by, int w, int h, int2 mv, bool bi, bool hpel, bool windowed, int4 window,
-                   int2 base, inout int out[PER_THREAD] )
+// xPredInterBlk of a w x h block of a component with an N-tap filter, the
+// thread's samples s = tid + THREADS * k into out[k]: the sample (i, j)
+// filters the reference around (baseX + i, baseY + j) with the fractions of
+// mv; bi: the 14-bit intermediate for averaging, else the final, clipped
+// value. The workgroup calls it together: the reference samples the filter
+// reads go to shared memory first, clamped (and windowed) once each.
+void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int w, int h, int2 mv, bool bi, bool hpel, bool windowed,
+                                int4 window, int2 base, inout int out[PER_THREAD] )
 {
   int16_t*  ref      = refPlane( slot, comp );
   const int shift    = comp == 0 ? 4 : 5;
@@ -151,28 +153,48 @@ void predictBlock( int tid, int list, int slot, int comp, int bx, int by, int w,
   const int yFrac    = mv.y & ( ( 1 << shift ) - 1 );
   const int baseX    = windowed ? base.x : bx + ( mv.x >> shift );
   const int baseY    = windowed ? base.y : by + ( mv.y >> shift );
-  const int n        = comp == 0 ? 8 : 4;
-  const int half     = n / 2 - 1;
+  const int half     = N / 2 - 1;
   const int headRoom = max( 2, 14 - pc.bitDepth );
   const int maxVal   = ( 1 << pc.bitDepth ) - 1;
   const int log2W    = log2Int( w );
+
+  int cx[N], cy[N];
+  [unroll]
+  for( int k = 0; k < N; k++ )
+  {
+    cx[k] = coeff( comp, xFrac, hpel, k );
+    cy[k] = coeff( comp, yFrac, hpel, k );
+  }
+
+  // the samples the filter reads: rw x rh from (baseX - ox, baseY - oy)
+  const int ox = xFrac != 0 ? half : 0;
+  const int oy = yFrac != 0 ? half : 0;
+  const int rw = w + ( xFrac != 0 ? N - 1 : 0 );
+  const int rh = h + ( yFrac != 0 ? N - 1 : 0 );
+  for( int s = tid; s < rw * rh; s += THREADS )
+  {
+    const int r = s / rw;
+    const int c = s - r * rw;
+    s_ref[s] = refSample( ref, comp, baseX - ox + c, baseY - oy + r, windowed, window );
+  }
+  GroupMemoryBarrierWithGroupSync();
 
   if( xFrac != 0 && yFrac != 0 )
   {
     // the horizontal pass over the rows the vertical one reads
     const int shift1  = 6 - headRoom;
     const int offset1 = -IF_INTERNAL_OFFS * ( 1 << shift1 );
-    const int at      = list * TMP_SIZE;
-    for( int s = tid; s < ( h + n - 1 ) * w; s += THREADS )
+    for( int s = tid; s < rh * w; s += THREADS )
     {
       const int r   = s >> log2W;
       const int i   = s & ( w - 1 );
       int       sum = 0;
-      for( int k = 0; k < n; k++ )
+      [unroll]
+      for( int k = 0; k < N; k++ )
       {
-        sum += coeff( comp, xFrac, hpel, k ) * refSample( ref, comp, baseX + i + k - half, baseY + r - half, windowed, window );
+        sum += cx[k] * s_ref[r * rw + i + k];
       }
-      s_tmp[at + s] = ( sum + offset1 ) >> shift1;
+      s_tmp[s] = ( sum + offset1 ) >> shift1;
     }
     GroupMemoryBarrierWithGroupSync();
     for( int k = 0; k < PER_THREAD; k++ )
@@ -183,48 +205,57 @@ void predictBlock( int tid, int list, int slot, int comp, int bx, int by, int w,
         const int j   = s >> log2W;
         const int i   = s & ( w - 1 );
         int       sum = 0;
-        for( int t = 0; t < n; t++ )
+        [unroll]
+        for( int t = 0; t < N; t++ )
         {
-          sum += coeff( comp, yFrac, hpel, t ) * s_tmp[at + ( j + t ) * w + i];
+          sum += cy[t] * s_tmp[( j + t ) * w + i];
         }
         out[k] = bi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
       }
     }
-    GroupMemoryBarrierWithGroupSync();   // before the next pass writes the shared memory
-    return;
   }
-
-  for( int k = 0; k < PER_THREAD; k++ )
+  else
   {
-    const int s = tid + THREADS * k;
-    if( s >= w * h )
+    const int shiftV = bi ? 6 - headRoom : 6;
+    const int offset = bi ? -IF_INTERNAL_OFFS * ( 1 << shiftV ) : 32;
+    for( int k = 0; k < PER_THREAD; k++ )
     {
-      break;
-    }
-    const int j = s >> log2W;
-    const int i = s & ( w - 1 );
-    if( xFrac == 0 && yFrac == 0 )
-    {
-      const int v = refSample( ref, comp, baseX + i, baseY + j, windowed, window );
-      out[k]      = bi ? v * ( 1 << headRoom ) - IF_INTERNAL_OFFS : v;
-    }
-    else
-    {
-      const bool vertical = yFrac != 0;
-      const int  frac     = vertical ? yFrac : xFrac;
-      const int  shiftV   = bi ? 6 - headRoom : 6;
-      const int  offset   = bi ? -IF_INTERNAL_OFFS * ( 1 << shiftV ) : 32;
-      int        sum      = 0;
-      for( int t = 0; t < n; t++ )
+      const int s = tid + THREADS * k;
+      if( s < w * h )
       {
-        sum += coeff( comp, frac, hpel, t )
-               * ( vertical ? refSample( ref, comp, baseX + i, baseY + j + t - half, windowed, window )
-                            : refSample( ref, comp, baseX + i + t - half, baseY + j, windowed, window ) );
+        const int j = s >> log2W;
+        const int i = s & ( w - 1 );
+        if( xFrac == 0 && yFrac == 0 )
+        {
+          const int v = s_ref[j * rw + i];
+          out[k]      = bi ? v * ( 1 << headRoom ) - IF_INTERNAL_OFFS : v;
+        }
+        else
+        {
+          int sum = 0;
+          if( yFrac != 0 )
+          {
+            [unroll]
+            for( int t = 0; t < N; t++ )
+            {
+              sum += cy[t] * s_ref[( j + t ) * rw + i];
+            }
+          }
+          else
+          {
+            [unroll]
+            for( int t = 0; t < N; t++ )
+            {
+              sum += cx[t] * s_ref[j * rw + i + t];
+            }
+          }
+          const int v = ( sum + offset ) >> shiftV;
+          out[k]      = bi ? v : clip3( 0, maxVal, v );
+        }
       }
-      const int v = ( sum + offset ) >> shiftV;
-      out[k]      = bi ? v : clip3( 0, maxVal, v );
     }
   }
+  GroupMemoryBarrierWithGroupSync();   // before the next block writes the shared memory
 }
 
 // --------------------------------------------------------------------------------------------------------------------
@@ -459,13 +490,22 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       {
         clipped = clipMv( mv, cuX, cuY );
       }
-      if( list == 0 || ( flags & FLAG_L0 ) == 0 )
+      const bool first = list == 0 || ( flags & FLAG_L0 ) == 0;
+      if( comp == 0 && first )
       {
-        predictBlock( tid, list, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred0 );
+        predictBlock<8>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred0 );
+      }
+      else if( comp == 0 )
+      {
+        predictBlock<8>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred1 );
+      }
+      else if( first )
+      {
+        predictBlock<4>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred0 );
       }
       else
       {
-        predictBlock( tid, list, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred1 );
+        predictBlock<4>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred1 );
       }
     }
 
