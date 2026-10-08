@@ -3,7 +3,14 @@
 // workgroup predicts one transform block of one component, adds its residual
 // (already in the picture, where vvdec's TrQuant left it) and writes the
 // result. The blocks come in waves: a block's wave is above the waves of
-// every block whose samples it reads, so a dispatch per wave keeps the order.
+// every block whose samples it reads. One dispatch makes all the blocks of a
+// picture: a workgroup takes the next block in the order of the waves (a
+// count of the blocks taken) and waits until the blocks of the waves before
+// its block's are done (a count of the blocks done). Taken in order, those
+// are all with workgroups already running, which wait only for blocks before
+// them: nothing waits for a workgroup that cannot run. (A dispatch a wave,
+// each after a barrier, took 6.5 us a wave, and a picture coded intra has a
+// thousand waves.)
 //
 // A wave lasts as long as its slowest workgroup, which mostly waits for
 // memory: so a workgroup makes 256 samples at most (GpuRecon::recordIntra
@@ -26,19 +33,20 @@
 
 struct Params
 {
-  int16_t* plane0;
-  int16_t* plane1;
-  int16_t* plane2;
-  uint*    jobs;
-  int      stride0;
-  int      stride12;
-  int      first;       // the jobs of this wave: jobs[first .. first + count)
-  int      count;
-  int      bitDepth;
-  int      ctuLog2;     // luma
-  int      scaleX;      // chroma subsampling
-  int      scaleY;
-  int      collocated;  // sps CCLM collocated chroma
+  int16_t*      plane0;
+  int16_t*      plane1;
+  int16_t*      plane2;
+  uint*         jobs;        // the picture's, wave by wave
+  uint*         waits;       // a job's: the jobs of the waves before its, which it waits for
+  Atomic<uint>* sync;        // the jobs taken, the jobs done (zeroed before the dispatch)
+  int           stride0;
+  int           stride12;
+  int           count;       // the jobs
+  int           bitDepth;
+  int           ctuLog2;     // luma
+  int           scaleX;      // chroma subsampling
+  int           scaleY;
+  int           collocated;  // sps CCLM collocated chroma
 };
 
 [[vk::push_constant]] Params pc;
@@ -594,19 +602,11 @@ int3 cclmParameters( uint lm, uint lm2 )
   return int3( a, minC - ( ( a * minY ) >> shift ), shift );
 }
 
-// a workgroup per job (a block of a component): the threads read what the
-// block needs of the picture together, then share out the block's samples
-[shader( "compute" )]
-[numthreads( 64, 1, 1 )]
-void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
+// a job (a block of a component, or a band of its rows): the workgroup's
+// threads read what the block needs of the picture together, then share out
+// the block's samples
+void make( int tid, uint job[8] )
 {
-  const int index = int( group.x ) + int( group.y ) * 32768;
-  if( index >= pc.count )
-  {
-    return;   // the whole workgroup
-  }
-  const int   tid    = int( local.x );
-  uint*       job    = pc.jobs + ( pc.first + index ) * 8;
   const int   x0     = int( job[0] & 0xffff );
   const int   y0     = int( job[0] >> 16 );
   const int   w      = int( job[1] & 255 );
@@ -765,5 +765,45 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     }
     const int at = ( y0 + y ) * stride + x0 + x;
     dst[at]      = int16_t( residual ? clip3( 0, maxVal, v + int( s_res[i] ) ) : v );
+  }
+}
+
+groupshared uint s_job;   // the job the workgroup took
+
+// a workgroup a job: the next one, in the order of the waves
+[shader( "compute" )]
+[numthreads( 64, 1, 1 )]
+void main( uint3 local : SV_GroupThreadID )
+{
+  const int tid = int( local.x );
+  if( tid == 0 )
+  {
+    s_job = pc.sync[0].add( 1u );
+  }
+  GroupMemoryBarrierWithGroupSync();
+  const uint index = WaveReadLaneFirst( s_job );
+  if( index >= uint( pc.count ) )
+  {
+    return;   // the whole workgroup (the dispatch, in rows of 32768 workgroups, has more than the jobs)
+  }
+  // the job on its way while the workgroup waits for the jobs before
+  const uint4 a = *(uint4*)( pc.jobs + index * 8 );
+  const uint4 b = *(uint4*)( pc.jobs + index * 8 + 4 );
+  if( tid == 0 )
+  {
+    const uint before = pc.waits[index];
+    while( pc.sync[1].load( MemoryOrder.Relaxed ) < before )
+    {
+    }
+  }
+  // the barrier's acquire: what those jobs wrote, visible to all the threads
+  AllMemoryBarrierWithGroupSync();
+  uint job[8] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w };
+  make( tid, job );
+  // the barrier's release: the threads' writes done before the job counts as done
+  AllMemoryBarrierWithGroupSync();
+  if( tid == 0 )
+  {
+    pc.sync[1].add( 1u, MemoryOrder.Release );
   }
 }

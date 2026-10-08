@@ -206,7 +206,8 @@ private:
   Buffer          m_scratch[MAX_NUM_COMPONENT];     // a picture's worth of GPU memory (SAO's or ALF's output), from the pool while its work is recorded
   Buffer          m_lfp;                            // the deblocking parameters
   Buffer          m_dmvr;                           // DMVR's refinements
-  Buffer          m_intraJobs;                      // the intra jobs of a picture, wave by wave
+  Buffer          m_intraJobs;                      // the intra jobs of a picture, wave by wave, then what each waits for
+  Buffer          m_intraSync;                      // shaders/intra.slang's counts of the jobs taken and done
   Buffer          m_interJobs;
   Buffer          m_trafoJobs;
   Buffer          m_edges;                          // the edges the deblocking filters

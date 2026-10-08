@@ -298,6 +298,7 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_lfp );
   m_ctx->free( m_dmvr );
   m_ctx->free( m_intraJobs );
+  m_ctx->free( m_intraSync );
   m_ctx->free( m_interJobs );
   m_ctx->free( m_trafoJobs );
   m_ctx->free( m_edges );
@@ -1052,8 +1053,8 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
 // the push constants of shaders/intra.slang
 struct IntraPush
 {
-  VkDeviceAddress plane0, plane1, plane2, jobs;
-  int32_t         stride0, stride12, first, count, bitDepth, ctuLog2, scaleX, scaleY, collocated;
+  VkDeviceAddress plane0, plane1, plane2, jobs, waits, sync;
+  int32_t         stride0, stride12, count, bitDepth, ctuLog2, scaleX, scaleY, collocated;
 };
 
 bool GpuRecon::intraSupported( const CodingStructure& cs )
@@ -1101,13 +1102,16 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   {
     first[wave] += first[wave - 1];
   }
-  const size_t size = total * sizeof( IntraJob );
+  // the jobs, then each one's count of the jobs of the waves before its, which
+  // it waits for (shaders/intra.slang)
+  const size_t size = total * ( sizeof( IntraJob ) + sizeof( uint32_t ) );
   if( m_intraJobs.size < size )
   {
     m_ctx->free( m_intraJobs );
     m_intraJobs = m_ctx->alloc( size * 2, MemKind::HostCached );
   }
   IntraJob*             sorted = reinterpret_cast<IntraJob*>( m_intraJobs.mapped );
+  uint32_t*             waits  = reinterpret_cast<uint32_t*>( sorted + total );
   std::vector<uint32_t> next( first.begin(), first.end() - 1 );
   for( const auto& ctu: jobs )
   {
@@ -1116,11 +1120,16 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
       const int rows = bandRows( job );
       for( int row = 0; row < job.height(); row += rows )
       {
-        IntraJob& band = sorted[next[job.wave()]++];
-        band           = job;
-        band.setRows( row, std::min( rows, job.height() - row ) );
+        const uint32_t at = next[job.wave()]++;
+        sorted[at]        = job;
+        sorted[at].setRows( row, std::min( rows, job.height() - row ) );
+        waits[at] = first[job.wave()];
       }
     }
+  }
+  if( !m_intraSync.valid() )
+  {
+    m_intraSync = m_ctx->alloc( 256, MemKind::Device );
   }
 
   const PreCalcValues& pcv = *cs.pcv;
@@ -1130,6 +1139,9 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   push.plane1     = planes.addr[COMPONENT_Cb];
   push.plane2     = planes.addr[COMPONENT_Cr];
   push.jobs       = m_intraJobs.addr;
+  push.waits      = m_intraJobs.addr + total * sizeof( IntraJob );
+  push.sync       = m_intraSync.addr;
+  push.count      = int32_t( total );
   push.stride0    = planes.stride[COMPONENT_Y];
   push.stride12   = planes.stride[COMPONENT_Cb];
   push.bitDepth   = cs.sps->getBitDepth();
@@ -1138,20 +1150,18 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   push.scaleY     = getComponentScaleY( COMPONENT_Cb, pcv.chrFormat );
   push.collocated = cs.sps->getCclmCollocatedChromaFlag() ? 1 : 0;
   CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
+  // the counts of the jobs taken and done from zero; they and what the work
+  // before wrote (the residuals, inter's predictions) visible to the jobs
+  vk.vkCmdFillBuffer( m_cmd, m_intraSync.buffer, 0, 2 * sizeof( uint32_t ), 0 );
+  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                           &barrier, 0, nullptr, 0, nullptr );
   vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_intra ) );
-  for( int wave = 1; wave <= maxWave; wave++ )
-  {
-    push.first = int32_t( first[wave] );
-    push.count = int32_t( first[wave + 1] - first[wave] );
-    if( push.count == 0 )
-    {
-      continue;
-    }
-    computeBarrier();   // the waves before
-    vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
-    // a workgroup per job, in rows of 32768 (shaders/intra.slang)
-    vk.vkCmdDispatch( m_cmd, uint32_t( std::min( push.count, 32768 ) ), uint32_t( ( push.count + 32767 ) / 32768 ), 1 );
-  }
+  vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+  // all the waves: a workgroup a job, in rows of 32768 (shaders/intra.slang)
+  vk.vkCmdDispatch( m_cmd, uint32_t( std::min<size_t>( total, 32768 ) ), uint32_t( ( total + 32767 ) / 32768 ), 1 );
   mark( "intra" );
 }
 
