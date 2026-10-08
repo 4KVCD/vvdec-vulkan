@@ -53,9 +53,11 @@ POSSIBILITY OF SUCH DAMAGE.
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -107,6 +109,7 @@ struct Buffer
   uint8_t*        mapped = nullptr;   // null for MemKind::Device
   VkDeviceAddress addr   = 0;
   MemKind         kind   = MemKind::Device;
+  VkDeviceSize    memory_size = 0;   // the memory bound to it
 
   bool valid() const { return buffer != VK_NULL_HANDLE; }
 };
@@ -124,6 +127,13 @@ public:
 
   Buffer alloc( size_t size, MemKind kind );   // throws on failure
   void   free( Buffer& buf );
+  // device-local buffers that come and go with the pictures (their planes on
+  // the GPU): one of the same size given back before, else a new one. Those
+  // given back are all kept for the next ones -- freeing and allocating them
+  // while decoding costs too much time (VideoQ 1080p: -15%) -- until buffers
+  // of another size are wanted (another resolution)
+  Buffer allocPooled( size_t size );
+  void   recycle( Buffer& buf );
 
   VkPipeline       pipeline( int shaderId );   // created on first use
   VkPipelineLayout layout() const { return m_layout; }
@@ -148,6 +158,11 @@ public:
   // VVDEC_GPU_PROFILE=1: the decoders add up the time of their passes, printed
   // when the context goes
   bool profiling() const { return m_profiling; }
+  // the memory of the buffers alive: now and at most, in bytes, the
+  // device-local (heap 0: the GPU's own) and the host-visible (heap 1); the
+  // GPU profile prints it
+  int64_t memoryNow( int heap ) const { return m_memoryNow[heap]; }
+  int64_t memoryPeak( int heap ) const { return m_memoryPeak[heap]; }
   void addTime( const char* label, double milliseconds );
 
 private:
@@ -182,6 +197,12 @@ private:
     long        count;
   };
   bool                             m_profiling = false;
+  std::mutex                       m_poolMutex;
+  std::vector<Buffer>              m_pool;
+  std::set<VkDeviceSize>           m_poolSizes;   // the sizes asked for since the last change of size
+  std::atomic<int64_t>             m_memoryNow[2]  = { { 0 }, { 0 } };
+  std::atomic<int64_t>             m_memoryPeak[2] = { { 0 }, { 0 } };
+  void                             countMemory( MemKind kind, int64_t bytes );
   PFN_vkGetShaderInfoAMD           m_getShaderInfo = nullptr;   // with VVDEC_GPU_PROFILE, where VK_AMD_shader_info is
   bool                             m_wave32 = false;            // the shaders may ask for waves of 32 threads
   std::vector<Time>                m_times;

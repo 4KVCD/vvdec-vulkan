@@ -270,6 +270,22 @@ void PicListManager::markUnusedPicturesReusable()
     }
   }
 
+#if VVDEC_VULKAN
+  // the GPU's copy of a picture: given back once the picture is reconstructed,
+  // no picture in progress references it, and none to come can (it is no
+  // longer marked as a reference)
+  if( m_releaseGpuCopy )
+  {
+    for( auto& pic: m_cPicList )
+    {
+      if( pic->gpuCurrent && pic->progress >= Picture::reconstructed && !pic->dpbReferenceMark && m_allRefPics.count( pic ) == 0 )
+      {
+        m_releaseGpuCopy( *pic );
+      }
+    }
+  }
+#endif
+
   // remove stillReferenced flag from all others
   for( auto& pic: m_cPicList )
   {

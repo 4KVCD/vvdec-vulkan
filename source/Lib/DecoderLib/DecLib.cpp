@@ -174,6 +174,12 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
 #endif
   bool upscalingEnabled = false;
   m_picListManager.create( m_parseFrameDelay, (int) m_decLibRecon.size(), userAllocator, gpuAllocator );
+#if VVDEC_VULKAN
+  if( gpuAllocator )
+  {
+    m_picListManager.setReleaseGpuCopy( gpu::releaseTwins );
+  }
+#endif
   m_decLibParser.create  ( m_decodeThreadPool.get(), m_parseFrameDelay, (int) m_decLibRecon.size(), numDecThreads, errHandlingFlags );
 
   int id=0;

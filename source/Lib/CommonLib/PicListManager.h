@@ -65,6 +65,9 @@ private:
   int                                m_parallelDecInst = 1;
   UserAllocator                      m_userAllocator;
   UserAllocator*                     m_gpuAllocator   = nullptr;   // the decoder's own, for pictures the GPU reaches
+#if VVDEC_VULKAN
+  void ( *m_releaseGpuCopy )( Picture& ) = nullptr;
+#endif
   int                                m_tuneInDelay    = 0;
   bool                               m_firstOutputPic = true;
   std::unordered_set<const Picture*> m_allRefPics;
@@ -74,6 +77,11 @@ public:
   ~PicListManager() { deleteBuffers(); }
 
   void create( int frameDelay, int decInstances, const UserAllocator& userAllocator, UserAllocator* gpuAllocator = nullptr );
+#if VVDEC_VULKAN
+  // gives back the GPU's copy of a reconstructed picture nothing will
+  // reference any more (markUnusedPicturesReusable)
+  void setReleaseGpuCopy( void ( *release )( Picture& ) ) { m_releaseGpuCopy = release; }
+#endif
   void restart()
   {
     m_firstOutputPic = true;

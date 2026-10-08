@@ -66,6 +66,7 @@ class AdaptiveLoopFilter;
 class SampleAdaptiveOffset;
 class Mv;
 class SPS;
+struct Picture;
 
 namespace gpu
 {
@@ -73,6 +74,9 @@ namespace gpu
 // UserAllocator callbacks putting the planes of the pictures in host memory
 // the GPU reaches; each plane's allocator handle is its HostPlane (GpuRecon.cpp)
 UserAllocator hostPictureAllocator( Context* context );
+// a reconstructed picture no picture will reference any more gives back its
+// planes on the GPU (to Context's pool); not gpuCurrent then
+void releaseTwins( Picture& pic );
 
 class GpuRecon
 {

@@ -348,6 +348,56 @@ void Context::addTime( const char* label, double milliseconds )
   m_times.push_back( Time{ label, milliseconds, 1 } );
 }
 
+Buffer Context::allocPooled( size_t size )
+{
+  const VkDeviceSize rounded = ( size + 255 ) & ~size_t( 255 );
+  {
+    std::lock_guard<std::mutex> lock( m_poolMutex );
+    for( auto it = m_pool.begin(); it != m_pool.end(); ++it )
+    {
+      if( it->size == rounded )
+      {
+        const Buffer buf = *it;
+        m_pool.erase( it );
+        return buf;
+      }
+    }
+    // none of the size: those of the sizes not wanted any more go
+    if( !m_pool.empty() && m_poolSizes.count( rounded ) == 0 )
+    {
+      for( Buffer& buf: m_pool )
+      {
+        free( buf );
+      }
+      m_pool.clear();
+      m_poolSizes.clear();
+    }
+    m_poolSizes.insert( rounded );
+  }
+  return alloc( size, MemKind::Device );
+}
+
+void Context::recycle( Buffer& buf )
+{
+  if( !buf.valid() )
+  {
+    return;
+  }
+  std::lock_guard<std::mutex> lock( m_poolMutex );
+  m_pool.push_back( buf );
+  buf = Buffer();
+}
+
+void Context::countMemory( MemKind kind, int64_t bytes )
+{
+  const int     heap = kind == MemKind::Device ? 0 : 1;
+  const int64_t now  = m_memoryNow[heap] += bytes;
+  int64_t       peak = m_memoryPeak[heap];
+  while( now > peak && !m_memoryPeak[heap].compare_exchange_weak( peak, now ) )
+  {
+  }
+}
+
 Context::~Context()
 {
   if( m_profiling && !m_times.empty() )
@@ -363,6 +413,16 @@ Context::~Context()
   if( m_device )
   {
     m_api.vkDeviceWaitIdle( m_device );
+    for( Buffer& buf: m_pool )
+    {
+      free( buf );
+    }
+    m_pool.clear();
+    if( m_profiling )
+    {
+      msg( INFO, "GPU memory (MB): device-local peak %.1f, at the end %.1f; host-visible peak %.1f, at the end %.1f\n", m_memoryPeak[0] / 1048576.0,
+           m_memoryNow[0] / 1048576.0, m_memoryPeak[1] / 1048576.0, m_memoryNow[1] / 1048576.0 );
+    }
     if( m_pipelines )
     {
       for( int i = 0; i < kShaderCount; i++ )
@@ -498,6 +558,8 @@ Buffer Context::alloc( size_t size, MemKind kind )
     THROW_FATAL( "Vulkan: vkAllocateMemory failed for " << size << " bytes (" << result << ")" );
   }
   m_api.vkBindBufferMemory( m_device, buf.buffer, buf.memory, 0 );
+  buf.memory_size = req.size;
+  countMemory( buf.kind, int64_t( req.size ) );
 
   if( m_memProps.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT )
   {
@@ -521,6 +583,7 @@ void Context::free( Buffer& buf )
   if( buf.memory )
   {
     m_api.vkFreeMemory( m_device, buf.memory, nullptr );
+    countMemory( buf.kind, -int64_t( buf.memory_size ) );
   }
   buf = Buffer();
 }

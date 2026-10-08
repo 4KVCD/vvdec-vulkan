@@ -112,6 +112,25 @@ UserAllocator hostPictureAllocator( Context* context )
   return UserAllocator( createHostPlane, unrefHostPlane, context );
 }
 
+void releaseTwins( Picture& pic )
+{
+  if( !pic.gpuMemory )
+  {
+    return;
+  }
+  pic.gpuCurrent              = false;   // were it referenced after all: uploaded again
+  Context*          context   = static_cast<Context*>( pic.gpuMemory->opaque );
+  const PelStorage& planes    = pic.m_bufs[PIC_RECONSTRUCTION];
+  for( int comp = 0; comp < (int) planes.bufs.size(); comp++ )
+  {
+    HostPlane* plane = static_cast<HostPlane*>( planes.getBufAllocator( ComponentID( comp ) ) );
+    if( plane )
+    {
+      context->recycle( plane->twin );
+    }
+  }
+}
+
 // where a plane's sample (0, 0) is in its buffer
 static VkDeviceSize planeOffset( const PelStorage& storage, ComponentID comp )
 {
@@ -743,7 +762,7 @@ GpuRecon::Planes GpuRecon::twinPlanes( const PelStorage& pic )
     HostPlane* plane = hostPlane( pic, ComponentID( comp ) );
     if( !plane->twin.valid() )
     {
-      plane->twin = m_ctx->alloc( size_t( plane->host.size ), MemKind::Device );
+      plane->twin = m_ctx->allocPooled( size_t( plane->host.size ) );
     }
     planes.addr[comp]   = plane->twin.addr + planeOffset( pic, ComponentID( comp ) );
     planes.stride[comp] = int32_t( pic.bufs[comp].stride );
