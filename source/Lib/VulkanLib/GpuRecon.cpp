@@ -152,6 +152,23 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
     THROW_FATAL( "Vulkan: vkCreateFence failed" );
   }
 
+  if( m_ctx->transferQueue() )
+  {
+    VkCommandPoolCreateInfo transferPoolInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    transferPoolInfo.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    transferPoolInfo.queueFamilyIndex = m_ctx->transferFamily();
+    VkCommandBufferAllocateInfo transferCmdInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    transferCmdInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    transferCmdInfo.commandBufferCount = 1;
+    VkSemaphoreCreateInfo semaphoreInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    if( vk.vkCreateCommandPool( m_ctx->device(), &transferPoolInfo, nullptr, &m_transferPool ) != VK_SUCCESS
+        || ( transferCmdInfo.commandPool = m_transferPool, vk.vkAllocateCommandBuffers( m_ctx->device(), &transferCmdInfo, &m_transferCmd ) ) != VK_SUCCESS
+        || vk.vkCreateSemaphore( m_ctx->device(), &semaphoreInfo, nullptr, &m_semaphore ) != VK_SUCCESS )
+    {
+      THROW_FATAL( "Vulkan: making the copy engine's commands failed" );
+    }
+  }
+
   // the transform matrices, in the order of shaders/trafo.slang: DCT-II from 2
   // to 64 points, DST-VII and DCT-VIII from 4 to 32
   {
@@ -186,6 +203,14 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
     {
       THROW_FATAL( "Vulkan: vkCreateQueryPool failed" );
     }
+    if( m_ctx->transferQueue() && m_ctx->transferTimestamps() )
+    {
+      queryInfo.queryCount = 2;
+      if( vk.vkCreateQueryPool( m_ctx->device(), &queryInfo, nullptr, &m_transferQueries ) != VK_SUCCESS )
+      {
+        THROW_FATAL( "Vulkan: vkCreateQueryPool failed" );
+      }
+    }
   }
 }
 
@@ -195,6 +220,18 @@ GpuRecon::~GpuRecon()
   if( m_queries )
   {
     vk.vkDestroyQueryPool( m_ctx->device(), m_queries, nullptr );
+  }
+  if( m_transferQueries )
+  {
+    vk.vkDestroyQueryPool( m_ctx->device(), m_transferQueries, nullptr );
+  }
+  if( m_semaphore )
+  {
+    vk.vkDestroySemaphore( m_ctx->device(), m_semaphore, nullptr );
+  }
+  if( m_transferPool )
+  {
+    vk.vkDestroyCommandPool( m_ctx->device(), m_transferPool, nullptr );
   }
   if( m_fence )
   {
@@ -287,10 +324,72 @@ void GpuRecon::submitAndWait()
   {
     THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
   }
+  readTimestamps( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - start ).count() );
+}
 
+void GpuRecon::submitDownloadAndWait( const PelStorage& pic )
+{
+  const Api& vk = m_ctx->api();
+
+  // the compute commands: their writes (the DMVR refinements in host memory
+  // among them) visible to the CPU, the copies wait for them
+  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0,
+                           nullptr, 0, nullptr );
+  vk.vkEndCommandBuffer( m_cmd );
+  const auto start = std::chrono::steady_clock::now();
+  m_ctx->submit( m_cmd, VK_NULL_HANDLE, m_semaphore );
+
+  // the copies: the picture's planes on the GPU to host memory
+  vk.vkResetCommandPool( m_ctx->device(), m_transferPool, 0 );
+  VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vk.vkBeginCommandBuffer( m_transferCmd, &begin );
+  if( m_transferQueries )
+  {
+    vk.vkCmdResetQueryPool( m_transferCmd, m_transferQueries, 0, 2 );
+    vk.vkCmdWriteTimestamp( m_transferCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_transferQueries, 0 );
+  }
+  for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
+  {
+    const HostPlane* plane = hostPlane( pic, ComponentID( comp ) );
+    VkBufferCopy     region{ 0, 0, plane->host.size };
+    vk.vkCmdCopyBuffer( m_transferCmd, plane->twin.buffer, plane->host.buffer, 1, &region );
+  }
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  vk.vkCmdPipelineBarrier( m_transferCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+  if( m_transferQueries )
+  {
+    vk.vkCmdWriteTimestamp( m_transferCmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_transferQueries, 1 );
+  }
+  vk.vkEndCommandBuffer( m_transferCmd );
+
+  vk.vkResetFences( m_ctx->device(), 1, &m_fence );
+  m_ctx->submitTransfer( m_transferCmd, m_semaphore, m_fence );
+  const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_fence, VK_TRUE, UINT64_MAX );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
+  }
+  readTimestamps( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - start ).count() );
+  if( m_transferQueries )
+  {
+    uint64_t stamps[2];
+    vk.vkGetQueryPoolResults( m_ctx->device(), m_transferQueries, 0, 2, sizeof( stamps ), stamps, sizeof( uint64_t ),
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT );
+    m_ctx->addTime( "download (copies)", double( stamps[1] - stamps[0] ) * m_ctx->timestampPeriod() * 1e-6 );
+  }
+}
+
+void GpuRecon::readTimestamps( double waited )
+{
+  const Api& vk = m_ctx->api();
   if( m_queries && m_marks > 1 )
   {
-    m_ctx->addTime( "wait (CPU)", std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - start ).count() );
+    m_ctx->addTime( "wait (CPU)", waited );
     uint64_t stamps[kMaxMarks];
     vk.vkGetQueryPoolResults( m_ctx->device(), m_queries, 0, m_marks, sizeof( stamps ), stamps, sizeof( uint64_t ),
                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT );
@@ -1129,8 +1228,15 @@ void GpuRecon::finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool
       std::swap( hostPlane( pic, ComponentID( comp ) )->twin, m_scratch[comp] );
     }
   }
-  copyPlanes( pic, kTwin, kHost );
-  submitAndWait();
+  if( m_ctx->transferQueue() )
+  {
+    submitDownloadAndWait( pic );
+  }
+  else
+  {
+    copyPlanes( pic, kTwin, kHost );
+    submitAndWait();
+  }
   for( const Picture* refPic: uploads )
   {
     refPic->gpuCurrent = true;

@@ -80,7 +80,7 @@ namespace gpu
   X( vkCmdDispatchIndirect ) X( vkCmdPipelineBarrier ) X( vkCmdCopyBuffer ) X( vkCmdFillBuffer ) X( vkCreateFence )     \
   X( vkDestroyFence ) X( vkWaitForFences ) X( vkResetFences ) X( vkGetFenceStatus ) X( vkQueueSubmit )                  \
   X( vkQueueWaitIdle ) X( vkDeviceWaitIdle ) X( vkCreateQueryPool ) X( vkDestroyQueryPool ) X( vkCmdResetQueryPool )    \
-  X( vkCmdWriteTimestamp ) X( vkGetQueryPoolResults )
+  X( vkCmdWriteTimestamp ) X( vkGetQueryPoolResults ) X( vkCreateSemaphore ) X( vkDestroySemaphore )
 
 struct Api
 {
@@ -128,10 +128,18 @@ public:
   VkPipeline       pipeline( int shaderId );   // created on first use
   VkPipelineLayout layout() const { return m_layout; }
 
-  // the queue is shared by the decoder instances of the process
-  void submit( VkCommandBuffer cmd, VkFence fence );
+  // the queue is shared by the decoder instances of the process; signal (when
+  // given) is signalled once the commands are done
+  void submit( VkCommandBuffer cmd, VkFence fence, VkSemaphore signal = VK_NULL_HANDLE );
+  // a queue for copies only (the GPU's copy engine), when the device has one:
+  // its copies run alongside the compute queue's work; the commands wait for
+  // wait first. The buffers are shared by both queues' families.
+  bool transferQueue() const { return m_transferFamily != UINT32_MAX; }
+  void submitTransfer( VkCommandBuffer cmd, VkSemaphore wait, VkFence fence );
 
   uint32_t           queueFamily()     const { return m_queueFamily; }
+  uint32_t           transferFamily()  const { return m_transferFamily; }
+  bool               transferTimestamps() const { return m_transferTimestamps; }
   double             timestampPeriod() const { return m_timestampPeriod; }
   const std::string& deviceName()      const { return m_deviceName; }
 
@@ -153,6 +161,10 @@ private:
   VkDevice                         m_device   = VK_NULL_HANDLE;
   VkQueue                          m_queue    = VK_NULL_HANDLE;
   uint32_t                         m_queueFamily = 0;
+  VkQueue                          m_transferQueue  = VK_NULL_HANDLE;
+  uint32_t                         m_transferFamily = UINT32_MAX;
+  bool                             m_transferTimestamps = false;
+  std::mutex                       m_transferMutex;
   VkPhysicalDeviceMemoryProperties m_memProps{};
   VkPipelineLayout                 m_layout = VK_NULL_HANDLE;
   VkPipeline*                      m_pipelines = nullptr;

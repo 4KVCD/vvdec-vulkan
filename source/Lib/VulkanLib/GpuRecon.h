@@ -125,6 +125,10 @@ private:
   void     computeBarrier();
   void     mark( const char* label );   // with VVDEC_GPU_PROFILE: the GPU time since the last mark counts as label
   void     submitAndWait();
+  // the download of pic on the copy engine (Context::transferQueue): the
+  // compute commands go first, signalling m_semaphore, the copies wait for it
+  void     submitDownloadAndWait( const PelStorage& pic );
+  void     readTimestamps( double waited );
   uint8_t* params( size_t size );   // the host-visible parameter buffer, at least size bytes
 
   // the planes of a picture as the shaders see them
@@ -161,6 +165,10 @@ private:
   VkCommandBuffer m_cmd     = VK_NULL_HANDLE;
   VkFence         m_fence   = VK_NULL_HANDLE;
   VkQueryPool     m_queries = VK_NULL_HANDLE;   // the profiling timestamps
+  VkCommandPool   m_transferPool    = VK_NULL_HANDLE;   // the copy engine's commands
+  VkCommandBuffer m_transferCmd     = VK_NULL_HANDLE;
+  VkSemaphore     m_semaphore       = VK_NULL_HANDLE;   // the compute commands done, for the copies
+  VkQueryPool     m_transferQueries = VK_NULL_HANDLE;
   const char*     m_labels[kMaxMarks];
   uint32_t        m_marks   = 0;
   Buffer          m_params;

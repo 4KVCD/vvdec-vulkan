@@ -223,11 +223,25 @@ bool Context::init()
     return false;
   }
 
+  // and a family for copies only (the copy engine), the pictures' downloads
+  // there run alongside the compute queue's work
+  for( uint32_t i = 0; i < count && m_transferFamily == UINT32_MAX; i++ )
+  {
+    if( ( families[i].queueFlags & VK_QUEUE_TRANSFER_BIT ) && !( families[i].queueFlags & ( VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT ) ) )
+    {
+      m_transferFamily     = i;
+      m_transferTimestamps = families[i].timestampValidBits != 0;
+    }
+  }
+
   const float priority = 1.0f;
-  VkDeviceQueueCreateInfo queueInfo{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
-  queueInfo.queueFamilyIndex = m_queueFamily;
-  queueInfo.queueCount       = 1;
-  queueInfo.pQueuePriorities = &priority;
+  VkDeviceQueueCreateInfo queueInfos[2] = { { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO }, { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO } };
+  queueInfos[0].queueFamilyIndex = m_queueFamily;
+  queueInfos[0].queueCount       = 1;
+  queueInfos[0].pQueuePriorities = &priority;
+  queueInfos[1].queueFamilyIndex = m_transferFamily;
+  queueInfos[1].queueCount       = 1;
+  queueInfos[1].pQueuePriorities = &priority;
 
   VkPhysicalDeviceVulkan12Features enable12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
   VkPhysicalDeviceVulkan11Features enable11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
@@ -261,8 +275,8 @@ bool Context::init()
 
   VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
   deviceInfo.pNext                = &enable;
-  deviceInfo.queueCreateInfoCount = 1;
-  deviceInfo.pQueueCreateInfos    = &queueInfo;
+  deviceInfo.queueCreateInfoCount = transferQueue() ? 2 : 1;
+  deviceInfo.pQueueCreateInfos    = queueInfos;
   deviceInfo.enabledExtensionCount   = hasShaderInfo ? 1 : 0;
   deviceInfo.ppEnabledExtensionNames = hasShaderInfo ? &shaderInfo : nullptr;
   if( m_api.vkCreateDevice( m_physical, &deviceInfo, nullptr, &m_device ) != VK_SUCCESS )
@@ -280,6 +294,10 @@ bool Context::init()
   }
 
   m_api.vkGetDeviceQueue( m_device, m_queueFamily, 0, &m_queue );
+  if( transferQueue() )
+  {
+    m_api.vkGetDeviceQueue( m_device, m_transferFamily, 0, &m_transferQueue );
+  }
   m_api.vkGetPhysicalDeviceMemoryProperties( m_physical, &m_memProps );
 
   VkPushConstantRange range{ VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushConstantSize };
@@ -426,6 +444,13 @@ Buffer Context::alloc( size_t size, MemKind kind )
   info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  const uint32_t families[2] = { m_queueFamily, m_transferFamily };
+  if( transferQueue() )
+  {
+    info.sharingMode           = VK_SHARING_MODE_CONCURRENT;   // the compute queue's and the copy engine's
+    info.queueFamilyIndexCount = 2;
+    info.pQueueFamilyIndices   = families;
+  }
   if( m_api.vkCreateBuffer( m_device, &info, nullptr, &buf.buffer ) != VK_SUCCESS )
   {
     THROW_FATAL( "Vulkan: vkCreateBuffer failed for " << size << " bytes" );
@@ -550,16 +575,35 @@ VkPipeline Context::pipeline( int shaderId )
   return pipe;
 }
 
-void Context::submit( VkCommandBuffer cmd, VkFence fence )
+void Context::submit( VkCommandBuffer cmd, VkFence fence, VkSemaphore signal )
 {
   VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-  info.commandBufferCount = 1;
-  info.pCommandBuffers    = &cmd;
+  info.commandBufferCount   = 1;
+  info.pCommandBuffers      = &cmd;
+  info.signalSemaphoreCount = signal ? 1 : 0;
+  info.pSignalSemaphores    = &signal;
   std::lock_guard<std::mutex> lock( m_queueMutex );
   const VkResult result = m_api.vkQueueSubmit( m_queue, 1, &info, fence );
   if( result != VK_SUCCESS )
   {
     THROW_FATAL( "Vulkan: vkQueueSubmit failed (" << result << ")" );
+  }
+}
+
+void Context::submitTransfer( VkCommandBuffer cmd, VkSemaphore wait, VkFence fence )
+{
+  const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  VkSubmitInfo               info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+  info.commandBufferCount = 1;
+  info.pCommandBuffers    = &cmd;
+  info.waitSemaphoreCount = 1;
+  info.pWaitSemaphores    = &wait;
+  info.pWaitDstStageMask  = &stage;
+  std::lock_guard<std::mutex> lock( m_transferMutex );
+  const VkResult result = m_api.vkQueueSubmit( m_transferQueue, 1, &info, fence );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkQueueSubmit (copies) failed (" << result << ")" );
   }
 }
 
