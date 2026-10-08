@@ -937,7 +937,8 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   const Api& vk = m_ctx->api();
   vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_inter ) );
   vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
-  vk.vkCmdDispatch( m_cmd, uint32_t( ( total + 63 ) / 64 ), 1, 1 );
+  // a workgroup per job, in rows of 32768 (shaders/inter.slang)
+  vk.vkCmdDispatch( m_cmd, uint32_t( std::min<size_t>( total, 32768 ) ), uint32_t( ( total + 32767 ) / 32768 ), 1 );
   mark( "inter" );
 }
 
