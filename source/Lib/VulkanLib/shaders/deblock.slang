@@ -6,10 +6,9 @@
 // CHROMA=0: a thread filters 4 lines across one luma edge of a 4x4 block.
 // CHROMA=1: a thread filters the lines across one chroma edge segment, for Cb
 //           and Cr, at the positions vvdec's xDeblockCtuArea visits.
-// The edges come as a list, those the CPU found to filter (GpuRecon::listEdges).
-//
-// The edge parameters are vvdec's LoopFilterParam (6 bytes: qp[3], bs,
-// sideMaxFiltLength, flags), per 4x4 luma block and direction, CTU by CTU.
+// The edges come as a list, those the CPU found to filter, each with the
+// bytes of vvdec's LoopFilterParam (qp[3], bs, sideMaxFiltLength, flags) its
+// filter needs (GpuRecon::listEdges, GpuJobs.h Edge).
 // Per CTU, 8 bytes: deblocking disabled, then the beta and tc offsets (div 2)
 // of Y, Cb, Cr.
 
@@ -19,16 +18,14 @@ struct Params
 {
   int16_t* pic0;        // luma, or Cb
   int16_t* pic1;        // Cr
-  uint8_t* lfp;
   int8_t*  ctus;
-  uint*    edges;       // x | y << 16 of each edge (samples of the plane)
+  uint2*   edges;       // x | y << 16 of each edge (samples of the plane), and its parameters
   int      stride;
   int      width;       // of the plane
   int      height;
   int      ctuLog2;     // luma
   int      widthInCtus;
   int      bitDepth;
-  int      num4x4;      // LoopFilterParams per CTU and direction
   int      dir;         // 0: vertical edges, 1: horizontal
   int      scaleX;      // chroma subsampling
   int      scaleY;
@@ -47,15 +44,6 @@ static const int kBetaTable[64] = {
 };
 
 #define MAX_QP 63
-
-// the LoopFilterParam of the 4x4 luma block at (x, y) (luma samples)
-int lfpOffset( int x, int y )
-{
-  const int ctu    = ( y >> pc.ctuLog2 ) * pc.widthInCtus + ( x >> pc.ctuLog2 );
-  const int n      = 1 << ( pc.ctuLog2 - 2 );
-  const int within = ( ( y >> 2 ) & ( n - 1 ) ) * n + ( ( x >> 2 ) & ( n - 1 ) );
-  return ( pc.num4x4 * ( 2 * ctu + pc.dir ) + within ) * 6;
-}
 
 int ctuParam( int x, int y, int i )
 {
@@ -262,18 +250,17 @@ void main( uint3 id : SV_DispatchThreadID )
   {
     return;
   }
-  const uint edge = pc.edges[id.x];
-  const int  x    = int( edge & 0xffff );
-  const int  y    = int( edge >> 16 );
-  const int e  = lfpOffset( x, y );
-  const int bs = int( pc.lfp[e + 3] ) & 3;
+  const uint2 edge = pc.edges[id.x];   // qp | bs << 8 | sideMaxFiltLength << 16
+  const int   x    = int( edge.x & 0xffff );
+  const int   y    = int( edge.x >> 16 );
+  const int   bs   = int( edge.y >> 8 ) & 3;
   if( bs == 0 || ctuParam( x, y, 0 ) != 0 )
   {
     return;
   }
 
-  const int qp               = int( int8_t( pc.lfp[e] ) );
-  const int sideMax          = int( pc.lfp[e + 4] );
+  const int qp               = int( int8_t( edge.y & 255 ) );
+  const int sideMax          = int( ( edge.y >> 16 ) & 255 );
   const int maxFilterLengthP = ( sideMax >> 4 ) & 7;
   const int maxFilterLengthQ = sideMax & 7;
   bool      largeP           = maxFilterLengthP > 3;
@@ -405,21 +392,20 @@ void main( uint3 id : SV_DispatchThreadID )
   {
     return;
   }
-  const uint edge = pc.edges[id.x];
-  const int  x    = int( edge & 0xffff );
-  const int  y    = int( edge >> 16 );
+  const uint2 edge = pc.edges[id.x];   // Cb's qp | Cr's qp << 8 | bs << 16 | flags << 24
+  const int   x    = int( edge.x & 0xffff );
+  const int   y    = int( edge.x >> 16 );
 
   const int lx = x << pc.scaleX;
   const int ly = y << pc.scaleY;
-  const int e  = lfpOffset( lx, ly );
-  const int bs = int( pc.lfp[e + 3] );
+  const int bs = int( edge.y >> 16 ) & 255;
   const int bsC[2] = { ( bs >> 2 ) & 3, ( bs >> 4 ) & 3 };
   if( ( bsC[0] == 0 && bsC[1] == 0 ) || ctuParam( lx, ly, 0 ) != 0 )
   {
     return;
   }
 
-  const bool largeBoundary     = ( ( int( pc.lfp[e + 5] ) >> 5 ) & 1 ) != 0;
+  const bool largeBoundary     = ( ( edge.y >> 29 ) & 1 ) != 0;   // flags bit 5
   const bool chromaCtbBoundary = pc.dir == 1 && ( y & ( ( ( 1 << pc.ctuLog2 ) - 1 ) >> pc.scaleY ) ) == 0;
   const int  maxVal            = ( 1 << pc.bitDepth ) - 1;
   const int  off               = pc.dir == 0 ? 1 : pc.stride;
@@ -437,7 +423,7 @@ void main( uint3 id : SV_DispatchThreadID )
       continue;
     }
     int16_t*  p       = c == 0 ? pc.pic0 : pc.pic1;
-    const int qp      = int( int8_t( pc.lfp[e + 1 + c] ) );
+    const int qp      = int( int8_t( ( edge.y >> ( 8 * c ) ) & 255 ) );
     const int indexTc = clip3( 0, MAX_QP + 2, qp + 2 * ( bsC[c] - 1 ) + ctuParam( lx, ly, 4 + 2 * c ) * 2 );
     const int tc      = tcFromTable( indexTc );
     bool      sw      = false;

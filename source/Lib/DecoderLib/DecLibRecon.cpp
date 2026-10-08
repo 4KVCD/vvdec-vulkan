@@ -204,9 +204,6 @@ void DecLibRecon::destroy()
 
   if( m_loopFilterParam )
   {
-#if VVDEC_VULKAN
-    if( !m_gpuRecon )   // else the GPU's buffer
-#endif
     free( m_loopFilterParam );
     m_loopFilterParam = nullptr;
   }
@@ -581,22 +578,14 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 
   if( m_num4x4Elements != cs.pcv->num4x4CtuBlks * cs.pcv->sizeInCtus )
   {
-#if VVDEC_VULKAN
-    if( m_loopFilterParam && !m_gpuRecon ) free( m_loopFilterParam );
-#else
     if( m_loopFilterParam ) free( m_loopFilterParam );
-#endif
     if( m_motionInfo      ) free( m_motionInfo );
 
     m_num4x4Elements = cs.pcv->num4x4CtuBlks * cs.pcv->sizeInCtus;
 
-#if VVDEC_VULKAN
-    // with the GPU, in host memory it reads: the deblocking shaders take them from there
-    m_loopFilterParam = m_gpuRecon ? m_gpuRecon->loopFilterParams( m_num4x4Elements * 2 )
-                                   : ( LoopFilterParam* ) malloc( sizeof( LoopFilterParam ) * m_num4x4Elements * 2 );
-#else
+    // (with the GPU too: its deblocking takes the parameters it needs from the
+    // edge lists, GpuRecon::listEdges)
     m_loopFilterParam = ( LoopFilterParam* ) malloc( sizeof( LoopFilterParam ) * m_num4x4Elements * 2 );
-#endif
     m_motionInfo      = ( MotionInfo* )      malloc( sizeof( MotionInfo      ) * m_num4x4Elements );
   }
   // finished

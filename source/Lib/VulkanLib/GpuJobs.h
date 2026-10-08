@@ -240,13 +240,25 @@ private:
   int                   m_shiftY[3] = { 2, 1, 1 };
 };
 
-// the edges of a CTU the deblocking filters (GpuRecon::listEdges), each
-// x | y << 16: luma's vertical and horizontal ones (luma samples, a 4x4
-// block's edge), chroma's (chroma samples, a segment as shaders/deblock.slang
-// visits them)
+// an edge the deblocking filters, as shaders/deblock.slang takes it: where
+// (x | y << 16), and the bytes of its LoopFilterParam the shader needs
+// (luma: qp | bs << 8 | sideMaxFiltLength << 16; chroma: Cb's qp | Cr's qp
+// << 8 | bs << 16 | flags << 24) -- else the shader read them from the
+// parameters of all the 4x4 blocks in host memory (at 4K, 3 MB a direction
+// for the vertical edges: 0.47 ms a picture, 0.12 for the horizontal ones,
+// which read half the cache lines)
+struct Edge
+{
+  uint32_t xy;
+  uint32_t params;
+};
+
+// the edges of a CTU the deblocking filters (GpuRecon::listEdges): luma's
+// vertical and horizontal ones (luma samples, a 4x4 block's edge), chroma's
+// (chroma samples, a segment as shaders/deblock.slang visits them)
 struct EdgeLists
 {
-  std::vector<uint32_t> lists[4];
+  std::vector<Edge> lists[4];
 
   void clear()
   {

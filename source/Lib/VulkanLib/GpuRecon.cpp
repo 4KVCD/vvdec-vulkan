@@ -295,7 +295,6 @@ GpuRecon::~GpuRecon()
     vk.vkDestroyCommandPool( m_ctx->device(), m_pool, nullptr );
   }
   m_ctx->free( m_params );
-  m_ctx->free( m_lfp );
   m_ctx->free( m_dmvr );
   m_ctx->free( m_intraJobs );
   m_ctx->free( m_intraSync );
@@ -850,8 +849,8 @@ void GpuRecon::copyPlanes( const PelStorage& pic, int from, int to )
 // the push constants of shaders/deblock.slang
 struct DeblockPush
 {
-  VkDeviceAddress pic0, pic1, lfp, ctus, edges;
-  int32_t         stride, width, height, ctuLog2, widthInCtus, bitDepth, num4x4, dir, scaleX, scaleY, count;
+  VkDeviceAddress pic0, pic1, ctus, edges;
+  int32_t         stride, width, height, ctuLog2, widthInCtus, bitDepth, dir, scaleX, scaleY, count;
 };
 
 // the index of the lowest bit set in v (not 0)
@@ -907,17 +906,20 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
       }
       while( any )
       {
-        const int c  = lowestBit( any );
-        any         &= any - 1;
-        const int bs = row[c].bs;
-        const int lx = x0 + c * 4;
-        if( bs & 3 )
+        const int              c  = lowestBit( any );
+        any                      &= any - 1;
+        const LoopFilterParam& p  = row[c];
+        const int              lx = x0 + c * 4;
+        if( p.bs & 3 )
         {
-          edges.lists[dir].push_back( uint32_t( lx ) | uint32_t( ly ) << 16 );
+          edges.lists[dir].push_back(
+            { uint32_t( lx ) | uint32_t( ly ) << 16, uint32_t( uint8_t( p.qp[0] ) ) | uint32_t( p.bs ) << 8 | uint32_t( p.sideMaxFiltLength ) << 16 } );
         }
-        if( chromaOn && ( bs & 0x3c ) && ( lx & ( gridX - 1 ) ) == 0 )
+        if( chromaOn && ( p.bs & 0x3c ) && ( lx & ( gridX - 1 ) ) == 0 )
         {
-          edges.lists[2 + dir].push_back( uint32_t( lx >> sx ) | uint32_t( ly >> sy ) << 16 );
+          edges.lists[2 + dir].push_back( { uint32_t( lx >> sx ) | uint32_t( ly >> sy ) << 16,
+                                            uint32_t( uint8_t( p.qp[1] ) ) | uint32_t( uint8_t( p.qp[2] ) ) << 8 | uint32_t( p.bs ) << 16
+                                              | uint32_t( p.flags ) << 24 } );
         }
       }
     }
@@ -927,17 +929,6 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
 bool GpuRecon::filtersSupported( const CodingStructure& cs )
 {
   return alfSupported( cs ) && saoSupported( cs ) && !cs.sps->getLadfEnabled();
-}
-
-LoopFilterParam* GpuRecon::loopFilterParams( size_t count )
-{
-  const size_t size = count * sizeof( LoopFilterParam );
-  if( m_lfp.size < size )
-  {
-    m_ctx->free( m_lfp );
-    m_lfp = m_ctx->alloc( size, MemKind::HostCached );
-  }
-  return reinterpret_cast<LoopFilterParam*>( m_lfp.mapped );
 }
 
 size_t GpuRecon::deblockParamSize( const CodingStructure& cs )
@@ -981,28 +972,26 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
       first[l + 1] += ctu.lists[l].size();
     }
   }
-  if( m_edges.size < first[4] * sizeof( uint32_t ) )
+  if( m_edges.size < first[4] * sizeof( Edge ) )
   {
     m_ctx->free( m_edges );
-    m_edges = m_ctx->alloc( std::max<size_t>( first[4], 1024 ) * 2 * sizeof( uint32_t ), MemKind::HostCached );
+    m_edges = m_ctx->alloc( std::max<size_t>( first[4], 1024 ) * 2 * sizeof( Edge ), MemKind::HostCached );
   }
-  uint32_t* all = reinterpret_cast<uint32_t*>( m_edges.mapped );
+  Edge* all = reinterpret_cast<Edge*>( m_edges.mapped );
   for( int l = 0; l < 4; l++ )
   {
     for( const EdgeLists& ctu: edges )
     {
-      memcpy( all, ctu.lists[l].data(), ctu.lists[l].size() * sizeof( uint32_t ) );
+      memcpy( all, ctu.lists[l].data(), ctu.lists[l].size() * sizeof( Edge ) );
       all += ctu.lists[l].size();
     }
   }
 
   DeblockPush push{};
-  push.lfp         = m_lfp.addr;
   push.ctus        = params;
   push.ctuLog2     = getLog2( pcv.maxCUWidth );
   push.widthInCtus = pcv.widthInCtus;
   push.bitDepth    = cs.sps->getBitDepth();
-  push.num4x4      = int32_t( pcv.num4x4CtuBlks );
   push.scaleX      = chroma ? getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) : 0;
   push.scaleY      = chroma ? getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) : 0;
 
@@ -1020,7 +1009,7 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
     push.stride = planes.stride[COMPONENT_Y];
     push.width  = pcv.lumaWidth;
     push.height = pcv.lumaHeight;
-    push.edges  = m_edges.addr + first[dir] * sizeof( uint32_t );
+    push.edges  = m_edges.addr + first[dir] * sizeof( Edge );
     push.count  = int32_t( first[dir + 1] - first[dir] );
     if( push.count > 0 )
     {
@@ -1037,7 +1026,7 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
       push.stride = planes.stride[COMPONENT_Cb];
       push.width  = pcv.lumaWidth >> push.scaleX;
       push.height = pcv.lumaHeight >> push.scaleY;
-      push.edges  = m_edges.addr + first[2 + dir] * sizeof( uint32_t );
+      push.edges  = m_edges.addr + first[2 + dir] * sizeof( Edge );
       push.count  = int32_t( first[3 + dir] - first[2 + dir] );
       if( push.count > 0 )
       {

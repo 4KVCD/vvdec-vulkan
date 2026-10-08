@@ -111,11 +111,9 @@ public:
   // picture: 10 bits at most, no LFNST, no scaling lists
   static bool residualSupported( const CodingStructure& cs );
 
-  // the deblocking parameters of the current picture (vvdec's LF_INIT writes
-  // them): count of them, in host memory the GPU reads
-  LoopFilterParam* loopFilterParams( size_t count );
-  // the edges of a CTU the deblocking filters, from its deblocking parameters
-  // (after LF_INIT): the GPU's deblocking takes only those
+  // the edges of a CTU the deblocking filters, with the bytes of their
+  // deblocking parameters the shaders need (after LF_INIT): the GPU's
+  // deblocking takes only those
   static void      listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& edges );
   // vvdec's DMVR MV cache of the current picture, count of them, in host memory the GPU writes
   Mv*              dmvrMvCache( size_t count );
@@ -204,7 +202,6 @@ private:
   } m_prepared;
   Buffer          m_params;
   Buffer          m_scratch[MAX_NUM_COMPONENT];     // a picture's worth of GPU memory (SAO's or ALF's output), from the pool while its work is recorded
-  Buffer          m_lfp;                            // the deblocking parameters
   Buffer          m_dmvr;                           // DMVR's refinements
   Buffer          m_intraJobs;                      // the intra jobs of a picture, wave by wave, then what each waits for
   Buffer          m_intraSync;                      // shaders/intra.slang's counts of the jobs taken and done
