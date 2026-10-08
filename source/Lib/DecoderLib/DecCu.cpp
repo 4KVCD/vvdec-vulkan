@@ -258,7 +258,7 @@ void DecCu::TaskGpuCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea
     }
     else if( jobs.inter )
     {
-      xGpuInterJobs( currCU, *jobs.inter, *jobs.refs );
+      xGpuInterJobs( currCU, *jobs.inter, *jobs.refs, jobs.trafo );
     }
     else if( currCU.rootCbf() )
     {
@@ -372,7 +372,7 @@ void DecCu::xGpuIbcJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::
   }
 }
 
-void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs )
+void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs, std::vector<gpu::TrafoJob>* trafoJobs )
 {
   CHECK( cu.affineFlag() || cu.geoFlag() || cu.ciipFlag() || cu.mergeType() == MRG_TYPE_SUBPU_ATMVP, "an inter tool the GPU lacks" );
 
@@ -406,7 +406,8 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
   }
 
   // the residual: the GPU adds it where a component has one; inside such a
-  // component, the transform blocks without one are cleared here
+  // component, the transform blocks without one are cleared, by the GPU when
+  // it makes the residuals (trafoJobs), else here
   if( cu.rootCbf() )
   {
     for( int c = 0; c < getNumberValidComponents( cu.chromaFormat ); c++ )
@@ -421,7 +422,17 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
       {
         if( tu.blocks[compID].valid() && !TU::getCbf( tu, compID ) && !( isChroma( compID ) && tu.jointCbCr ) )
         {
-          cu.cs->getRecoBuf( tu.blocks[compID] ).fill( 0 );
+          const CompArea& block = tu.blocks[compID];
+          if( trafoJobs )
+          {
+            gpu::TrafoJob job;
+            job.set( block.x, block.y, getLog2( block.width ), getLog2( block.height ), compID, 0, 0, gpu::TrafoJob::kZero, 0, 0, 0, 0, 0, 0 );
+            trafoJobs->push_back( job );
+          }
+          else
+          {
+            cu.cs->getRecoBuf( block ).fill( 0 );
+          }
         }
       }
     }

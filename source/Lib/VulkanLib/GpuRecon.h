@@ -134,6 +134,7 @@ private:
     int32_t         stride[MAX_NUM_COMPONENT];
   };
   enum { kHost, kTwin, kScratch };
+  Planes        hostPlanes( const PelStorage& pic );     // the picture in host memory
   Planes        twinPlanes( const PelStorage& pic );     // the picture on the GPU (its memory made when missing)
   Planes        scratchPlanes( const PelStorage& pic );  // GPU memory laid out as pic's buffers
   void          copyPlanes( const PelStorage& pic, int from, int to );
@@ -148,7 +149,8 @@ private:
   void          recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params );
   void          recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes );
   void          recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, const Planes& planes, VkDeviceAddress refTable );
-  void          recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, const Planes& planes );
+  // the levels from the planes of levels (the picture in host memory, where the parser left them), the residuals to planes
+  void          recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, const Planes& levels, const Planes& planes );
   void          recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
   void          recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
 

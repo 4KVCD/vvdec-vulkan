@@ -64,6 +64,7 @@ struct TrafoJob
     kTransformSkip = 1,
     kBdpcmHor      = 2,
     kBdpcmVer      = 4,
+    kZero          = 8,   // no residual: zeros (a block of an inter CU whose component has residuals elsewhere)
   };
 
   uint32_t w[8];

@@ -102,7 +102,7 @@ protected:
 #if VVDEC_VULKAN
   void xGpuIntraJobs      ( CodingUnit&      cu, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves );
   void xGpuIbcJobs        ( CodingUnit&      cu, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves );
-  void xGpuInterJobs      ( CodingUnit&      cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs );
+  void xGpuInterJobs      ( CodingUnit&      cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs, std::vector<gpu::TrafoJob>* trafoJobs );
   void xGpuTrafoJobs      ( CodingUnit&      cu, std::vector<gpu::TrafoJob>& jobs );
 #endif
   void xDeriveCUMV        ( CodingUnit&      cu, MotionHist& hist );

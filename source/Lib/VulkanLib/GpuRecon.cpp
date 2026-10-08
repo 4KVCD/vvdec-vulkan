@@ -594,6 +594,17 @@ void GpuRecon::recordSao( const CodingStructure& cs, const Planes& src, const Pl
   mark( "sao" );
 }
 
+GpuRecon::Planes GpuRecon::hostPlanes( const PelStorage& pic )
+{
+  Planes planes{};
+  for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
+  {
+    planes.addr[comp]   = hostPlane( pic, ComponentID( comp ) )->host.addr + planeOffset( pic, ComponentID( comp ) );
+    planes.stride[comp] = int32_t( pic.bufs[comp].stride );
+  }
+  return planes;
+}
+
 GpuRecon::Planes GpuRecon::twinPlanes( const PelStorage& pic )
 {
   Planes planes{};
@@ -945,7 +956,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
 // the push constants of shaders/trafo.slang
 struct TrafoPush
 {
-  VkDeviceAddress jobs, plane0, plane1, plane2, matrices;
+  VkDeviceAddress jobs, plane0, plane1, plane2, levels0, levels1, levels2, matrices;
   int32_t         stride0, stride12, count, bitDepth;
 };
 
@@ -965,7 +976,7 @@ bool GpuRecon::residualSupported( const CodingStructure& cs )
   return true;
 }
 
-void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, const Planes& planes )
+void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, const Planes& levels, const Planes& planes )
 {
   size_t total = 0;
   for( const auto& ctu: jobs )
@@ -994,12 +1005,17 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   push.plane0   = planes.addr[COMPONENT_Y];
   push.plane1   = planes.addr[COMPONENT_Cb];
   push.plane2   = planes.addr[COMPONENT_Cr];
+  push.levels0  = levels.addr[COMPONENT_Y];
+  push.levels1  = levels.addr[COMPONENT_Cb];
+  push.levels2  = levels.addr[COMPONENT_Cr];
   push.matrices = m_matrices.addr;
   push.stride0  = planes.stride[COMPONENT_Y];
   push.stride12 = planes.stride[COMPONENT_Cb];
   push.count    = int32_t( total );
   push.bitDepth = cs.sps->getBitDepth();
   CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
+  CHECK( levels.stride[COMPONENT_Y] != planes.stride[COMPONENT_Y] || levels.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cb],
+         "the levels laid out differently" );
 
   const Api& vk = m_ctx->api();
   vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_trafo ) );
@@ -1051,7 +1067,9 @@ void GpuRecon::finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool
   }
   // in the GPU's own memory, which its shaders reach faster than the host's:
   // the picture goes in (what the CPU made of it), is finished there, stays
-  // there as a reference, and comes back for the output
+  // there as a reference, and comes back for the output. When the GPU makes
+  // all of it, from the residuals on, nothing goes in: the residual pass reads
+  // the levels from the host's picture.
   beginCommands();
   for( const Picture* refPic: uploads )
   {
@@ -1059,11 +1077,14 @@ void GpuRecon::finishPicture( CodingStructure& cs, const PictureJobs& jobs, bool
   }
   const Planes planes[2] = { twinPlanes( pic ), scratchPlanes( pic ) };
   int          cur       = 0;
-  copyPlanes( pic, kHost, kTwin );
+  if( !jobs.trafo )
+  {
+    copyPlanes( pic, kHost, kTwin );
+  }
   transferBarrier( false );
   if( jobs.trafo )
   {
-    recordTrafo( cs, *jobs.trafo, planes[cur] );   // in place
+    recordTrafo( cs, *jobs.trafo, hostPlanes( pic ), planes[cur] );
     computeBarrier();
   }
   if( jobs.inter )
