@@ -180,11 +180,38 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
   const int oy = yFrac != 0 ? half : 0;
   const int rw = w + ( xFrac != 0 ? N - 1 : 0 );
   const int rh = h + ( yFrac != 0 ? N - 1 : 0 );
-  for( int s = tid; s < rw * rh; s += THREADS )
+  const int picW = comp == 0 ? pc.picWidth : pc.picWidth >> 1;
+  const int picH = comp == 0 ? pc.picHeight : pc.picHeight >> 1;
+  if( !windowed && baseX - ox >= 0 && baseX - ox + rw <= picW && baseY - oy >= 0 && baseY - oy + rh <= picH )
   {
-    const int r = s / rw;
-    const int c = s - r * rw;
-    s_pool[REF_AT + s] = int16_t( refSample( ref, comp, baseX - ox + c, baseY - oy + r, windowed, window ) );
+    // inside the picture (most blocks): the samples as they are, no clamping
+    const int stride = comp == 0 ? pc.stride0 : pc.stride12;
+    int16_t*  src    = ref + ( baseY - oy ) * stride + baseX - ox;
+    // the thread's sample (c, r), THREADS samples on each step
+    const int stepR  = THREADS / rw;
+    const int stepC  = THREADS - stepR * rw;
+    int       r      = tid / rw;
+    int       c      = tid - r * rw;
+    for( int s = tid; s < rw * rh; s += THREADS )
+    {
+      s_pool[REF_AT + s] = src[r * stride + c];
+      c += stepC;
+      r += stepR;
+      if( c >= rw )
+      {
+        c -= rw;
+        r++;
+      }
+    }
+  }
+  else
+  {
+    for( int s = tid; s < rw * rh; s += THREADS )
+    {
+      const int r = s / rw;
+      const int c = s - r * rw;
+      s_pool[REF_AT + s] = int16_t( refSample( ref, comp, baseX - ox + c, baseY - oy + r, windowed, window ) );
+    }
   }
   GroupMemoryBarrierWithGroupSync();
 
@@ -296,6 +323,29 @@ int bilinearAt( int slot, int cuX, int cuY, int2 mvStart, int u, int v )
   }
   const int t0 = ( kBilinear[xFrac * 2] * refAt( ref, 0, x, y ) + kBilinear[xFrac * 2 + 1] * refAt( ref, 0, x + 1, y ) + ( 1 << ( shift - 1 ) ) ) >> shift;
   const int t1 = ( kBilinear[xFrac * 2] * refAt( ref, 0, x, y + 1 ) + kBilinear[xFrac * 2 + 1] * refAt( ref, 0, x + 1, y + 1 ) + ( 1 << ( shift - 1 ) ) ) >> shift;
+  return ( kBilinear[yFrac * 2] * t0 + kBilinear[yFrac * 2 + 1] * t1 + 8 ) >> 4;
+}
+
+// bilinearAt where its reads stay inside the picture: src the sample of (u, v)
+// = (0, 0), no clamping
+int bilinearInside( int16_t* src, int xFrac, int yFrac, int u, int v )
+{
+  int16_t*  p     = src + v * pc.stride0 + u;
+  const int      shift = 4 - ( 10 - pc.bitDepth );
+  if( xFrac == 0 && yFrac == 0 )
+  {
+    return int( p[0] ) * ( 1 << ( 10 - pc.bitDepth ) );
+  }
+  if( yFrac == 0 )
+  {
+    return ( kBilinear[xFrac * 2] * int( p[0] ) + kBilinear[xFrac * 2 + 1] * int( p[1] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
+  }
+  if( xFrac == 0 )
+  {
+    return ( kBilinear[yFrac * 2] * int( p[0] ) + kBilinear[yFrac * 2 + 1] * int( p[pc.stride0] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
+  }
+  const int t0 = ( kBilinear[xFrac * 2] * int( p[0] ) + kBilinear[xFrac * 2 + 1] * int( p[1] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
+  const int t1 = ( kBilinear[xFrac * 2] * int( p[pc.stride0] ) + kBilinear[xFrac * 2 + 1] * int( p[pc.stride0 + 1] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
   return ( kBilinear[yFrac * 2] * t0 + kBilinear[yFrac * 2 + 1] * t1 + 8 ) >> 4;
 }
 
@@ -428,12 +478,42 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     const int2 start0 = clipMv( mv0, cuX, cuY ) - int2( 32, 32 );
     const int2 start1 = clipMv( mv1, cuX, cuY ) - int2( 32, 32 );
     const int  bw     = w + 4;
-    for( int s = tid; s < bw * ( h + 4 ); s += THREADS )
+    // the samples the bilinear filters read: (w + 5) x (h + 5) from x0, y0
+    const int x00 = x + ( start0.x >> 4 ), y00 = y + ( start0.y >> 4 );
+    const int x01 = x + ( start1.x >> 4 ), y01 = y + ( start1.y >> 4 );
+    if( x00 >= 0 && x00 + w + 5 <= pc.picWidth && y00 >= 0 && y00 + h + 5 <= pc.picHeight && x01 >= 0 && x01 + w + 5 <= pc.picWidth && y01 >= 0
+        && y01 + h + 5 <= pc.picHeight )
     {
-      const int v = s / bw;
-      const int u = s - v * bw;
-      s_pool[BIL0_AT + v * 20 + u] = int16_t( bilinearAt( ref0, cuX, cuY, start0, x - cuX + u, y - cuY + v ) );
-      s_pool[BIL1_AT + v * 20 + u] = int16_t( bilinearAt( ref1, cuX, cuY, start1, x - cuX + u, y - cuY + v ) );
+      // inside the picture (most subblocks): no clamping
+      int16_t*  src0  = refPlane( ref0, 0 ) + y00 * pc.stride0 + x00;
+      int16_t*  src1  = refPlane( ref1, 0 ) + y01 * pc.stride0 + x01;
+      // the thread's sample (u, v), THREADS samples on each step
+      const int stepV = THREADS / bw;
+      const int stepU = THREADS - stepV * bw;
+      int       v     = tid / bw;
+      int       u     = tid - v * bw;
+      for( int s = tid; s < bw * ( h + 4 ); s += THREADS )
+      {
+        s_pool[BIL0_AT + v * 20 + u] = int16_t( bilinearInside( src0, start0.x & 15, start0.y & 15, u, v ) );
+        s_pool[BIL1_AT + v * 20 + u] = int16_t( bilinearInside( src1, start1.x & 15, start1.y & 15, u, v ) );
+        u += stepU;
+        v += stepV;
+        if( u >= bw )
+        {
+          u -= bw;
+          v++;
+        }
+      }
+    }
+    else
+    {
+      for( int s = tid; s < bw * ( h + 4 ); s += THREADS )
+      {
+        const int v = s / bw;
+        const int u = s - v * bw;
+        s_pool[BIL0_AT + v * 20 + u] = int16_t( bilinearAt( ref0, cuX, cuY, start0, x - cuX + u, y - cuY + v ) );
+        s_pool[BIL1_AT + v * 20 + u] = int16_t( bilinearAt( ref1, cuX, cuY, start1, x - cuX + u, y - cuY + v ) );
+      }
     }
     if( tid < 25 )
     {
