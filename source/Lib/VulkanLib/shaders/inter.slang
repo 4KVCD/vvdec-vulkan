@@ -655,6 +655,56 @@ int hi16( uint v )
   return int( v ) >> 16;
 }
 
+// dmvrDelta from the SADs in s_sad, the centre's (reduced by a quarter) given: the threads each work it out
+int sadOr( int i, int centre )
+{
+  return i == 12 ? centre : s_sad[i];
+}
+
+int2 dmvrDeltaFrom( int centre )
+{
+  int minCost = centre;
+  int best    = 12;
+  for( int i = 0; i < 25; i++ )
+  {
+    const int cost = sadOr( i, centre );
+    if( cost < minCost )
+    {
+      minCost = cost;
+      best    = i;
+    }
+  }
+  const int bestH = best % 5 - 2, bestV = best / 5 - 2;
+  int2      delta = int2( bestH * 16, bestV * 16 );
+  if( abs( delta.x ) != 32 && abs( delta.y ) != 32 )
+  {
+    delta.x += subPel( sadOr( best, centre ), sadOr( best - 1, centre ), sadOr( best + 1, centre ), 0 );
+    delta.y += subPel( sadOr( best, centre ), sadOr( best - 5, centre ), sadOr( best + 5, centre ), 0 );
+  }
+  return delta;
+}
+
+// DMVR's bilinear prediction (xinitMC, as bilinearInside) of the window's sample at p in shared memory (rows of YS)
+int bilinearW( int p, int xFrac, int yFrac, int shift )
+{
+  const int16_t c0x = int16_t( 16 - xFrac ), c1x = int16_t( xFrac ), c0y = int16_t( 16 - yFrac ), c1y = int16_t( yFrac );
+  if( xFrac == 0 && yFrac == 0 )
+  {
+    return int( s_pool[p] ) * ( 1 << ( 10 - pc.bitDepth ) );
+  }
+  if( yFrac == 0 )
+  {
+    return ( int( c0x ) * int( s_pool[p] ) + int( c1x ) * int( s_pool[p + 1] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
+  }
+  if( xFrac == 0 )
+  {
+    return ( int( c0y ) * int( s_pool[p] ) + int( c1y ) * int( s_pool[p + YS] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
+  }
+  const int16_t t0 = int16_t( ( int( c0x ) * int( s_pool[p] ) + int( c1x ) * int( s_pool[p + 1] ) + ( 1 << ( shift - 1 ) ) ) >> shift );
+  const int16_t t1 = int16_t( ( int( c0x ) * int( s_pool[p + YS] ) + int( c1x ) * int( s_pool[p + YS + 1] ) + ( 1 << ( shift - 1 ) ) ) >> shift );
+  return ( int( c0y ) * int( t0 ) + int( c1y ) * int( t1 ) + 8 ) >> 4;
+}
+
 // whether tile16 may take the tile: each list's windows inside the picture
 bool tile16Inside( int x, int y, int flags, int2 mv0, int2 mv1 )
 {
@@ -783,82 +833,77 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   }
   GroupMemoryBarrierWithGroupSync();
 
-  // DMVR
+  // DMVR, as xProcessDMVR: the centre's SAD first -- when it is small enough (83% of VideoQ's subblocks) there is no
+  // refinement, and neither the other 24 SADs nor most bilinear predictions are needed
   int2 mvR[2] = { mvs[0], mvs[1] };
   if( dmvr )
   {
-    // the bilinear predictions of the 20 x 20 samples from the merge motion minus 2 samples: the window's from (1, 1)
+    const int shift = 4 - ( 10 - pc.bitDepth );
+    // rows 2, 4 .. 16 and columns 2 .. 17 of the bilinear predictions (the windows' samples from (3, 3)), 2 a thread
+    int part = 0;
     [unroll]
-    for( int s = 0; s < 2; s++ )
+    for( int k = 0; k < 2; k++ )
     {
-      const int     at    = WY_AT( s ) + leadY[s] + YS + 1;
-      const int     xFrac = mvs[s].x & 15;
-      const int     yFrac = mvs[s].y & 15;
-      const int     shift = 4 - ( 10 - pc.bitDepth );
-      const int16_t c0x = int16_t( 16 - xFrac ), c1x = int16_t( xFrac ), c0y = int16_t( 16 - yFrac ), c1y = int16_t( yFrac );
-      for( int o = tid; o < 400; o += THREADS )
-      {
-        const int v = o / 20;
-        const int p = at + v * YS + o - 20 * v;
-        int       b;
-        if( xFrac == 0 && yFrac == 0 )
-        {
-          b = int( s_pool[p] ) * ( 1 << ( 10 - pc.bitDepth ) );
-        }
-        else if( yFrac == 0 )
-        {
-          b = ( int( c0x ) * int( s_pool[p] ) + int( c1x ) * int( s_pool[p + 1] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
-        }
-        else if( xFrac == 0 )
-        {
-          b = ( int( c0y ) * int( s_pool[p] ) + int( c1y ) * int( s_pool[p + YS] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
-        }
-        else
-        {
-          const int16_t t0 = int16_t( ( int( c0x ) * int( s_pool[p] ) + int( c1x ) * int( s_pool[p + 1] ) + ( 1 << ( shift - 1 ) ) ) >> shift );
-          const int16_t t1 = int16_t( ( int( c0x ) * int( s_pool[p + YS] ) + int( c1x ) * int( s_pool[p + YS + 1] ) + ( 1 << ( shift - 1 ) ) ) >> shift );
-          b                = ( int( c0y ) * int( t0 ) + int( c1y ) * int( t1 ) + 8 ) >> 4;
-        }
-        s_pool[WORK_AT + 400 * s + o] = int16_t( b );
-      }
+      const int e  = tid + THREADS * k;
+      const int rc = ( 3 + 2 * ( e >> 4 ) ) * YS + 3 + ( e & 15 );
+      part += abs( bilinearW( WY_AT( 0 ) + leadY[0] + rc, mvs[0].x & 15, mvs[0].y & 15, shift )
+                   - bilinearW( WY_AT( 1 ) + leadY[1] + rc, mvs[1].x & 15, mvs[1].y & 15, shift ) );
+    }
+    const int waveSum = WaveActiveSum( part );
+    if( WaveIsFirstLane() )
+    {
+      InterlockedAdd( s_sad[12], waveSum );
     }
     GroupMemoryBarrierWithGroupSync();
-    // the SADs of the 25 offsets on every other row
-    for( int p = tid; p < 25 * 8; p += THREADS )
+    const bool search = s_sad[12] - ( s_sad[12] >> 2 ) >= 16 * 16;
+    if( search )
     {
-      const int pos = p % 25;
-      InterlockedAdd( s_sad[pos], sadRowAt( WORK_AT, WORK_AT + 400, 2 * ( p / 25 ), pos % 5 - 2, pos / 5 - 2 ) );
-    }
-    GroupMemoryBarrierWithGroupSync();
-    if( tid == 0 )
-    {
-      s_sad[12] -= s_sad[12] >> 2;
-      const int2 delta       = dmvrDelta( 16, 16 );
-      const int  index8      = int( job[8] );
-      pc.dmvr[index8 * 2]     = delta.x;
-      pc.dmvr[index8 * 2 + 1] = delta.y;
-      s_delta                = delta;
-      // the refined motion where TMVP takes it, the 8x8 grid, into the colocated motion the CPU stored (DecCu's
-      // storeDmvrMotion)
-      const int2 m0   = mv0 + delta;
-      const int2 m1   = mv1 - delta;
-      const int  mask = ( 1 << ( pc.ctuLog2 - 3 ) ) - 1;
-      for( int y2 = ( ( y - 1 ) & ~7 ) + 8; y2 < y + 16; y2 += 8 )
+      // all the bilinear predictions of the 20 x 20 samples from the merge motion minus 2 samples (the windows'
+      // from (1, 1)), the other 24 SADs on every other row
+      [unroll]
+      for( int s = 0; s < 2; s++ )
       {
-        for( int x2 = ( ( x - 1 ) & ~7 ) + 8; x2 < x + 16; x2 += 8 )
+        const int at = WY_AT( s ) + leadY[s] + YS + 1;
+        for( int o = tid; o < 400; o += THREADS )
         {
-          const int ctu = ( y2 >> pc.ctuLog2 ) * pc.widthInCtus + ( x2 >> pc.ctuLog2 );
-          int*      e   = pc.colMotion + ( ctu * pc.num8x8 + ( ( x2 >> 3 ) & mask ) + ( ( ( y2 >> 3 ) & mask ) << ( pc.ctuLog2 - 3 ) ) ) * 5;
-          e[0] = m0.x;
-          e[1] = m0.y;
-          e[2] = m1.x;
-          e[3] = m1.y;
+          const int v = o / 20;
+          s_pool[WORK_AT + 400 * s + o] = int16_t( bilinearW( at + v * YS + o - 20 * v, mvs[s].x & 15, mvs[s].y & 15, shift ) );
         }
       }
+      GroupMemoryBarrierWithGroupSync();
+      for( int p = tid; p < 25 * 8; p += THREADS )
+      {
+        const int pos = p % 25;
+        if( pos != 12 )
+        {
+          InterlockedAdd( s_sad[pos], sadRowAt( WORK_AT, WORK_AT + 400, 2 * ( p / 25 ), pos % 5 - 2, pos / 5 - 2 ) );
+        }
+      }
+      GroupMemoryBarrierWithGroupSync();
     }
-    GroupMemoryBarrierWithGroupSync();
-    mvR[0] = clipStorage( mv0 + s_delta );
-    mvR[1] = clipStorage( mv1 - s_delta );
+    // the refinement, worked out by every thread (no waiting for one), from the SADs with the centre's reduced by a
+    // quarter
+    const int2 delta = search ? dmvrDeltaFrom( s_sad[12] - ( s_sad[12] >> 2 ) ) : int2( 0, 0 );
+    // threads 0 .. 15: the refined motion where TMVP takes it, the 8x8 grid, into the colocated motion the CPU stored
+    // (DecCu's storeDmvrMotion), an int each; 16, 17: vvdec's DMVR MV cache
+    if( tid < 16 )
+    {
+      const int x2 = ( ( x - 1 ) & ~7 ) + 8 + 8 * ( ( tid >> 2 ) & 1 );
+      const int y2 = ( ( y - 1 ) & ~7 ) + 8 + 8 * ( tid >> 3 );
+      if( x2 < x + 16 && y2 < y + 16 )
+      {
+        const int  mask = ( 1 << ( pc.ctuLog2 - 3 ) ) - 1;
+        const int  ctu  = ( y2 >> pc.ctuLog2 ) * pc.widthInCtus + ( x2 >> pc.ctuLog2 );
+        const int2 m    = ( tid & 2 ) == 0 ? mv0 + delta : mv1 - delta;
+        pc.colMotion[( ctu * pc.num8x8 + ( ( x2 >> 3 ) & mask ) + ( ( ( y2 >> 3 ) & mask ) << ( pc.ctuLog2 - 3 ) ) ) * 5 + ( tid & 3 )] = ( tid & 1 ) == 0 ? m.x : m.y;
+      }
+    }
+    else if( tid < 18 )
+    {
+      pc.dmvr[int( job[8] ) * 2 + tid - 16] = tid == 16 ? delta.x : delta.y;
+    }
+    mvR[0] = clipStorage( mv0 + delta );
+    mvR[1] = clipStorage( mv1 - delta );
   }
 
   // luma: the horizontal passes of the 2-D filters, 23 rows of 16 in groups of 4
