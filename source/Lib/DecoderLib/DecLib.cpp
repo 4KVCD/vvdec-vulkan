@@ -123,7 +123,8 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
     numDecThreads = std::thread::hardware_concurrency();
   }
 
-  if( parserFrameDelay < 0 )
+  const bool defaultParseDelay = parserFrameDelay < 0;
+  if( defaultParseDelay )
   {
     CHECK_FATAL( numDecThreads < 0, "invalid number of threads" );
     parserFrameDelay = std::min<int>( ( numDecThreads * DEFAULT_PARSE_DELAY_FACTOR ) >> 4, DEFAULT_PARSE_DELAY_MAX );
@@ -152,6 +153,20 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
   if( useGpu )
   {
     msg( WARNING, "GPU reconstruction off: this vvdec is built without Vulkan\n" );
+  }
+#endif
+
+#if VVDEC_VULKAN
+  // with the GPU, 12 pictures parsed ahead at most by default (the CPU's
+  // default, 1.5 a thread, is 24 at 16 threads): as fast (VideoQ, 16 threads:
+  // 1080p 642.4 -> 653.1 fps, 4K 177.7 -> 179.4), and each picture parsed
+  // ahead holds its buffers (1080p 13 MB, 4K 44 MB): peak commit 1080p 793 ->
+  // 633 MB, 4K 2546 -> 2014 MB. 8 saves 60 MB more at 1080p but is slower
+  // there (634 vs 657 fps).
+  if( m_gpu && defaultParseDelay )
+  {
+    parserFrameDelay  = std::min( parserFrameDelay, 12 );
+    m_parseFrameDelay = parserFrameDelay;
   }
 #endif
 
