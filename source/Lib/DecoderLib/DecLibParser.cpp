@@ -986,6 +986,10 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
     try
     {
       pic->startProcessingTimer();
+      if( slice->parseTaskParams.clearColMotion )
+      {
+        pic->cs->clearColMotion();
+      }
 
       //  Decode a picture
       ITT_TASKSTART( itt_domain_prs, itt_handle_parse );
@@ -1006,6 +1010,7 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
   };
 
   pcSlice->parseTaskParams.init( this, std::move( nalu.getBitstream() ) );
+  pcSlice->parseTaskParams.clearColMotion = m_uiSliceSegmentIdx == 0;
   pcSlice->parseDone.lock();
 
   auto expected = Picture::init;
@@ -1081,7 +1086,8 @@ void DecLibParser::xActivateParameterSets( const int layerId )
     // assign these fields already, because they are needed by PicListManager::getPicListRange() and Slice::applyReferencePictureSet()
     m_pcParsePic->poc          = m_apcSlicePilot->getPOC();
     m_pcParsePic->eNalUnitType = m_apcSlicePilot->getNalUnitType();
-    m_pcParsePic->finalInit( &m_cuChunkCache, &m_tuChunkCache, &m_cuMapCache, sps, pps, m_picHeader, alfApss, lmcsAPS, scalingListAPS );
+    // the colocated motion cleared by the first parse task, off this thread
+    m_pcParsePic->finalInit( &m_cuChunkCache, &m_tuChunkCache, &m_cuMapCache, sps, pps, m_picHeader, alfApss, lmcsAPS, scalingListAPS, true, false );
 
 #if !DISABLE_CONFROMANCE_CHECK
     m_apcSlicePilot->checkLeadingPictureRestrictions( m_dpbReferencePics );

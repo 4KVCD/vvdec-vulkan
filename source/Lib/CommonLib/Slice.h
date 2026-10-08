@@ -2815,6 +2815,7 @@ public:
 
     class DecLibParser* decLibParser = nullptr;
     InputBitstream      bitstream;
+    bool                clearColMotion = false;   // the picture's first slice: its task clears the colocated motion first
   } parseTaskParams;
 
   Barrier parseDone;

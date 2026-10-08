@@ -110,14 +110,15 @@ struct CtuData
 
 // the CU maps of the pictures' coding structures (a CodingUnit pointer a 4x4
 // block, luma and chroma: 8 MB at 4K), kept for the next pictures: a picture
-// gives its map back once reconstructed (deallocTempInternals) and the next
-// one set up takes it (allocTempInternals). Allocated anew, a map came zeroed
-// in fresh pages, on the parser's thread, and was zeroed once more there
-// (initStructData): most of a picture's set-up (4K: 4.4 ms).
+// gives its map back once reconstructed, zeroed (deallocTempInternals, on a
+// worker thread), and the next one set up takes it (allocTempInternals).
+// Allocated anew, a map came zeroed in fresh pages, on the parser's thread,
+// and was zeroed once more there (initStructData): most of a picture's
+// set-up (4K: 4.4 ms).
 class CuMapCache
 {
 public:
-  std::unique_ptr<CodingUnit*[]> get( ptrdiff_t size )   // not zeroed
+  std::unique_ptr<CodingUnit*[]> get( ptrdiff_t size )   // zeroed
   {
     {
       std::lock_guard<std::mutex> lock( m_mutex );
@@ -128,9 +129,9 @@ public:
         return map;
       }
     }
-    return std::unique_ptr<CodingUnit*[]>( new CodingUnit*[size] );
+    return std::make_unique<CodingUnit*[]>( size );
   }
-  void put( std::unique_ptr<CodingUnit*[]> map, ptrdiff_t size )
+  void put( std::unique_ptr<CodingUnit*[]> map, ptrdiff_t size )   // zeroed
   {
     std::lock_guard<std::mutex> lock( m_mutex );
     if( size != m_size )
@@ -222,7 +223,10 @@ public:
   void            addEmptyTUs(Partitioner &partitioner, CodingUnit& cu);
   CUTraverser     traverseCUs(const int ctuRsAddr);
 
-  void initStructData();
+  // clearColMotion: the colocated motion too, else the picture's first parse
+  // task clears it (clearColMotion(), off the parser's thread)
+  void initStructData( bool clearColMotion = true );
+  void clearColMotion();
 
   void allocTempInternals();
   void deallocTempInternals();
@@ -242,6 +246,7 @@ public:
   std::unique_ptr<CodingUnit*[]>         m_cuMap;
   ptrdiff_t                              m_cuMapSize;
   CuMapCache*                            m_cuMapCache;   // where m_cuMap comes from and goes back to (or null)
+  bool                                   m_cuMapZero = false;   // m_cuMap zeroed (from the cache or new): initStructData need not
   ColocatedMotionInfo*                   m_colMiMap;
   ptrdiff_t                              m_colMiMapSize;
 #if VVDEC_VULKAN

@@ -285,8 +285,9 @@ void CodingStructure::allocTempInternals()
   const ptrdiff_t newCuMapSize = ctuCuMapSize * pcv->sizeInCtus * 2;
   if( m_cuMapSize != newCuMapSize )
   {
-    m_cuMap     = m_cuMapCache ? m_cuMapCache->get( newCuMapSize ) : std::make_unique<CodingUnit*[]>( newCuMapSize );   // initStructData zeroes it
+    m_cuMap     = m_cuMapCache ? m_cuMapCache->get( newCuMapSize ) : std::make_unique<CodingUnit*[]>( newCuMapSize );
     m_cuMapSize = newCuMapSize;
+    m_cuMapZero = true;
   }
 
   const ptrdiff_t newColMiMapSize = ctuColMiMapSize * pcv->sizeInCtus;
@@ -345,13 +346,19 @@ void CodingStructure::deallocTempInternals()
 
   if( m_cuMapCache && m_cuMap )
   {
+    memset( NO_WARNING_class_memaccess( m_cuMap.get() ), 0, sizeof( CodingUnit* ) * m_cuMapSize );
     m_cuMapCache->put( std::move( m_cuMap ), m_cuMapSize );
   }
   m_cuMap.reset();
   m_cuMapSize = 0;
 }
 
-void CodingStructure::initStructData()
+void CodingStructure::clearColMotion()
+{
+  memset( NO_WARNING_class_memaccess( m_colMiMap ), CO_NOT_VALID, sizeof( ColocatedMotionInfo ) * m_colMiMapSize );
+}
+
+void CodingStructure::initStructData( bool clearColMotion )
 {
   m_cuCache.releaseAll();
   m_tuCache.releaseAll();
@@ -365,8 +372,15 @@ void CodingStructure::initStructData()
   m_ctuWidthLog2[1] = m_ctuWidthLog2[0]; // same for luma and chroma, because of the 2x2 blocks
 
   memset( NO_WARNING_class_memaccess( m_ctuData.get() ),             0, sizeof( CtuData             ) * m_ctuDataSize );
-  memset( NO_WARNING_class_memaccess( m_cuMap.get() ),               0, sizeof( CodingUnit*         ) * m_cuMapSize );
-  memset( NO_WARNING_class_memaccess( m_colMiMap ), CO_NOT_VALID, sizeof( ColocatedMotionInfo ) * m_colMiMapSize );
+  if( !m_cuMapZero )
+  {
+    memset( NO_WARNING_class_memaccess( m_cuMap.get() ),             0, sizeof( CodingUnit*         ) * m_cuMapSize );
+  }
+  m_cuMapZero = false;
+  if( clearColMotion )
+  {
+    this->clearColMotion();
+  }
 
   const ptrdiff_t ctuSampleSizeL  = pcv->maxCUHeight * pcv->maxCUWidth;
   const ptrdiff_t ctuSampleSizeC  = isChromaEnabled( pcv->chrFormat ) ? ( ctuSampleSizeL >> ( getChannelTypeScaleX( CH_C, pcv->chrFormat) + getChannelTypeScaleY( CH_C, pcv->chrFormat ) ) ) : 0;
