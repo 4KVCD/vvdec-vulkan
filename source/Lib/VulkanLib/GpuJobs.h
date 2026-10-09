@@ -95,11 +95,13 @@ struct IntraJob
     kBdpcm   = 1,
     kCclm    = 2,
     kIbc     = 3,
+    kMip     = 4,   // matrix-based intra prediction (the mode: the MIP mode)
   };
   enum Flags
   {
-    kResidual = 1,   // the picture holds the block's residual
-    kFiltered = 2,   // the [1 2 1]-filtered references
+    kResidual      = 1,   // the picture holds the block's residual
+    kFiltered      = 2,   // the [1 2 1]-filtered references
+    kMipTransposed = 4,
   };
 
   uint32_t w[8];

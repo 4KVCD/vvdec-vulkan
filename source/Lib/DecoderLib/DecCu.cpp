@@ -304,10 +304,20 @@ void DecCu::xGpuIntraJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu
       const uint32_t    mode   = PU::getFinalIntraMode( cu, chType );
       const int         bdpcm  = isLuma( compID ) ? cu.bdpcmMode() : cu.bdpcmModeChroma();
 
-      int kind = gpu::IntraJob::kAngular;
+      int kind   = gpu::IntraJob::kAngular;
+      int flags  = 0;
+      int jobMode = int( mode );
       if( bdpcm )
       {
         kind = gpu::IntraJob::kBdpcm;
+      }
+      else if( CU::isMIP( cu, chType ) )
+      {
+        // MIP: luma's mode, or (4:4:4 chroma in DM) the co-located luma's
+        kind                    = gpu::IntraJob::kMip;
+        const CodingUnit& luma  = isLuma( compID ) ? cu : PU::getCoLocatedLumaPU( cu );
+        jobMode                 = luma.intraDir[CHANNEL_TYPE_LUMA];
+        flags                  |= luma.mipTransposedFlag() ? gpu::IntraJob::kMipTransposed : 0;
       }
       else if( !isLuma( compID ) && PU::isLMCMode( mode ) )
       {
@@ -317,7 +327,6 @@ void DecCu::xGpuIntraJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu
       int units[3];
       m_pcIntraPred->getNeighborUnits( tu, area, units );
 
-      int flags = 0;
       if( TU::getCbf( tu, compID ) || ( isChroma( compID ) && tu.jointCbCr ) )
       {
         flags |= gpu::IntraJob::kResidual;
@@ -331,7 +340,8 @@ void DecCu::xGpuIntraJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu
       const int refLine = isLuma( compID ) ? cu.multiRefIdx() : 0;
 
       gpu::IntraJob job;
-      job.set( area.x, area.y, area.width, area.height, compID, kind, kind == gpu::IntraJob::kAngular ? int( mode ) : 0, flags, bdpcm, refLine );
+      job.set( area.x, area.y, area.width, area.height, compID, kind,
+               kind == gpu::IntraJob::kAngular || kind == gpu::IntraJob::kMip ? jobMode : 0, flags, bdpcm, refLine );
       job.setNeighbors( units[0], units[1], units[2] );
 
       // what the block reads: its references (the row above with the

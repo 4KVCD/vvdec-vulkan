@@ -20,9 +20,10 @@
 //
 // A job, 8 uints (VulkanLib/GpuRecon.h, GpuIntraJob):
 //   0: x | y << 16                (in samples of its component)
-//   1: width | height << 8 | component << 16 | kind << 24   (kind: 0 planar/DC/angular, 1 BDPCM, 2 CCLM, 3 IBC)
-//   2: mode | flags << 8 | bdpcm direction << 16 | reference line << 24   (flags: 1 residual, 2 filtered references;
-//      the reference line: MRL's, 0 .. 2)
+//   1: width | height << 8 | component << 16 | kind << 24   (kind: 0 planar/DC/angular, 1 BDPCM, 2 CCLM, 3 IBC,
+//      4 MIP)
+//   2: mode | flags << 8 | bdpcm direction << 16 | reference line << 24   (flags: 1 residual, 2 filtered references,
+//      4 MIP transposed; the reference line: MRL's, 0 .. 2)
 //   3: top-left units | above units << 8 | left units << 16  (the reference samples available)
 //   4: CCLM: luma above units | luma left units << 8 | bAbove << 16 | bLeft << 17 | aboveAvail << 18 | leftAvail << 19 | lm mode << 24
 //   5: CCLM: actual top template samples | actual left << 16
@@ -40,6 +41,7 @@ struct Params
   uint*         jobs;        // the picture's, wave by wave
   uint*         waits;       // a job's: the jobs of the waves before its, which it waits for
   Atomic<uint>* sync;        // the jobs taken, the jobs done (zeroed before the dispatch)
+  uint8_t*      mip;         // MIP's matrices: vvdec's mipMatrix4x4, mipMatrix8x8, mipMatrix16x16 in a row
   int           stride0;
   int           stride12;
   int           count;       // the jobs
@@ -435,6 +437,113 @@ int pdpcPlanarDc( bool filtered, int w, int h, int x, int y, int val )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
+// MIP (Mip::PredictorMIP): the block's top and left references averaged down to 2 or 4 samples each, a matrix
+// times them (the reduced prediction, 4x4 or 8x8), upsampled linearly to the block (horizontally, then vertically,
+// from the references at the block's edges). The reduced boundary and prediction live in s_luma (CCLM's), from
+// MIP_BDRY and 0
+// --------------------------------------------------------------------------------------------------------------------
+
+#define MIP_BDRY 64
+
+int mipSizeId( int w, int h )
+{
+  return ( w == 4 && h == 4 ) ? 0 : ( ( w == 4 || h == 4 || ( w == 8 && h == 8 ) ) ? 1 : 2 );
+}
+
+// boundaryDownsampling1D: element b of the reduced boundary, top's (b < bdry) then left's, from t and l
+int mipBoundary( int b, int bdry, int w, int h )
+{
+  const bool top    = b < bdry;
+  const int  len    = top ? w : h;
+  const int  idx    = top ? b : b - bdry;
+  const int  factor = len / bdry;
+  if( factor == 1 )
+  {
+    return top ? t[1 + idx] : l[1 + idx];
+  }
+  int sum = 0;
+  for( int k = 0; k < factor; k++ )
+  {
+    sum += top ? t[1 + idx * factor + k] : l[1 + idx * factor + k];
+  }
+  const int log2F = log2Int( factor );
+  return ( sum + ( 1 << ( log2F - 1 ) ) ) >> log2F;
+}
+
+// computeReducedPred: output o (in the order of the matrix's rows) of mode `mode`, from the reduced boundary in
+// s_luma[MIP_BDRY ..]; written where the (transposed) reduced prediction has it
+void mipReducedPred( int o, int sizeId, int mode, bool transposed )
+{
+  const int bdry    = sizeId == 0 ? 2 : 4;
+  const int pred    = sizeId < 2 ? 4 : 8;
+  const int inSize  = 2 * bdry;
+  const int skip    = sizeId == 2 ? 1 : 0;   // the matrix's first column, unused for the large blocks
+  const int perOut  = inSize - skip;
+  const int base    = sizeId == 0 ? 0 : ( sizeId == 1 ? 1024 : 2048 );
+  const int modeLen = ( sizeId == 0 ? 16 : ( sizeId == 1 ? 16 : 64 ) ) * perOut;
+  // the input: the boundary, left's first when transposed, rebased on its first sample
+  int in[8];
+  [unroll]
+  for( int i = 0; i < 8; i++ )
+  {
+    const int src = transposed ? ( i < bdry ? bdry + i : i - bdry ) : i;
+    in[i]         = i < inSize ? int( s_luma[MIP_BDRY + src] ) : 0;
+  }
+  const int inputOffset = in[0];
+  in[0] = sizeId < 2 ? ( 1 << ( pc.bitDepth - 1 ) ) - inputOffset : 0;
+  int sum = in[0];
+  [unroll]
+  for( int i = 1; i < 8; i++ )
+  {
+    in[i] = i < inSize ? in[i] - inputOffset : 0;
+    sum += in[i];
+  }
+  const int offset = 32 - 32 * sum;   // ( 1 << ( MIP_SHIFT_MATRIX - 1 ) ) - MIP_OFFSET_MATRIX * sum
+  const int at     = base + mode * modeLen + o * perOut;
+  int       acc    = 0;
+  for( int i = skip; i < inSize; i++ )
+  {
+    acc += in[i] * int( pc.mip[at + i - skip] );
+  }
+  const int v = clip3( 0, ( 1 << pc.bitDepth ) - 1, ( ( acc + offset ) >> 6 ) + inputOffset );
+  s_luma[transposed ? ( o % pred ) * pred + o / pred : o] = int16_t( v );
+}
+
+// predictionUpsampling: the horizontally upsampled row k of the reduced prediction at column x (the left references
+// at the rows the reduced prediction's lands on)
+int mipRow( int k, int x, int w, int h, int pred )
+{
+  const int upH = w / pred;
+  if( upH == 1 )
+  {
+    return int( s_luma[k * pred + x] );
+  }
+  const int upV    = h / pred;
+  const int log2H  = log2Int( upH );
+  const int j      = x >> log2H;
+  const int i      = x & ( upH - 1 );
+  const int before = j == 0 ? l[1 + ( upV - 1 ) + k * upV] : int( s_luma[k * pred + j - 1] );
+  const int behind = int( s_luma[k * pred + j] );
+  return ( ( before << log2H ) + ( upH >> 1 ) + ( i + 1 ) * ( behind - before ) ) >> log2H;
+}
+
+// the prediction at (x, y): the rows upsampled vertically (the top references above the first)
+int mipSample( int x, int y, int w, int h, int pred )
+{
+  const int upV = h / pred;
+  if( upV == 1 )
+  {
+    return mipRow( y, x, w, h, pred );
+  }
+  const int log2V  = log2Int( upV );
+  const int k      = y >> log2V;
+  const int i      = y & ( upV - 1 );
+  const int before = k == 0 ? t[1 + x] : mipRow( k - 1, x, w, h, pred );
+  const int behind = mipRow( k, x, w, h, pred );
+  return ( ( before << log2V ) + ( upV >> 1 ) + ( i + 1 ) * ( behind - before ) ) >> log2V;
+}
+
+// --------------------------------------------------------------------------------------------------------------------
 // CCLM (xGetLumaRecPixels, xGetLMParameters, linearTransform), 4:2:0
 // --------------------------------------------------------------------------------------------------------------------
 
@@ -745,6 +854,23 @@ void make( int tid, uint job[8] )
   {
     ang = setupAngular( comp, w, h, mode, refLine );
   }
+  const int mipPred = mipSizeId( w, h ) < 2 ? 4 : 8;
+  if( kind == 4 )
+  {
+    // MIP: the reduced boundary, then the reduced prediction (a thread an element)
+    const int sizeId = mipSizeId( w, h );
+    const int bdry   = sizeId == 0 ? 2 : 4;
+    if( tid < 2 * bdry )
+    {
+      s_luma[MIP_BDRY + tid] = int16_t( mipBoundary( tid, bdry, w, h ) );
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if( tid < mipPred * mipPred )
+    {
+      mipReducedPred( tid, sizeId, mode, ( flags & 4 ) != 0 );
+    }
+    GroupMemoryBarrierWithGroupSync();
+  }
   const int  dc    = s_dc;
   const int3 model = s_model;
 
@@ -764,6 +890,10 @@ void make( int tid, uint job[8] )
     else if( kind == 1 )
     {
       v = bdpcmDir == 1 ? refL( false, y + 1 ) : refT( false, x + 1 );
+    }
+    else if( kind == 4 )
+    {
+      v = mipSample( x, y, w, h, mipPred );
     }
     else if( mode == PLANAR_IDX || mode == DC_IDX )
     {

@@ -53,6 +53,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "vvdec_gpu/GpuShaders.h"
 
 #include "CommonLib/AdaptiveLoopFilter.h"
+#include "CommonLib/MipData.h"
 #include "CommonLib/CodingStructure.h"
 #include "CommonLib/Rom.h"
 #include "CommonLib/Picture.h"
@@ -248,6 +249,16 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
     }
   }
 
+  // MIP's matrices, in the order of shaders/intra.slang: 4x4, 8x8, 16x16
+  {
+    static_assert( sizeof( mipMatrix4x4 ) == 1024 && sizeof( mipMatrix8x8 ) == 1024 && sizeof( mipMatrix16x16 ) == 2688,
+                   "MIP's matrices are not those of shaders/intra.slang" );
+    m_mip = m_ctx->alloc( sizeof( mipMatrix4x4 ) + sizeof( mipMatrix8x8 ) + sizeof( mipMatrix16x16 ), MemKind::Upload );
+    memcpy( m_mip.mapped, mipMatrix4x4, sizeof( mipMatrix4x4 ) );
+    memcpy( m_mip.mapped + sizeof( mipMatrix4x4 ), mipMatrix8x8, sizeof( mipMatrix8x8 ) );
+    memcpy( m_mip.mapped + sizeof( mipMatrix4x4 ) + sizeof( mipMatrix8x8 ), mipMatrix16x16, sizeof( mipMatrix16x16 ) );
+  }
+
   if( m_ctx->profiling() )
   {
     VkQueryPoolCreateInfo queryInfo{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
@@ -330,6 +341,7 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_trafoJobs );
   m_ctx->free( m_edges );
   m_ctx->free( m_matrices );
+  m_ctx->free( m_mip );
   for( Buffer& buf: m_scratch )
   {
     m_ctx->free( buf );
@@ -1153,7 +1165,7 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
 // the push constants of shaders/intra.slang
 struct IntraPush
 {
-  VkDeviceAddress plane0, plane1, plane2, jobs, waits, sync;
+  VkDeviceAddress plane0, plane1, plane2, jobs, waits, sync, mip;
   int32_t         stride0, stride12, count, bitDepth, ctuLog2, scaleX, scaleY, collocated;
 };
 
@@ -1164,8 +1176,8 @@ bool GpuRecon::intraSupported( const CodingStructure& cs )
 
 bool GpuRecon::intraSupported( const SPS& sps )
 {
-  return sps.getChromaFormatIdc() == CHROMA_420 && !sps.getUseMIP() && !sps.getUseISP() && !sps.getUseCiip() && !sps.getUseColorTrans()
-         && !sps.getUseReshaper() && !sps.getUseWrapAround();
+  return sps.getChromaFormatIdc() == CHROMA_420 && !sps.getUseISP() && !sps.getUseCiip() && !sps.getUseColorTrans() && !sps.getUseReshaper()
+         && !sps.getUseWrapAround();
 }
 
 void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes )
@@ -1242,6 +1254,7 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   push.jobs       = m_intraJobs.addr;
   push.waits      = m_intraJobs.addr + total * sizeof( IntraJob );
   push.sync       = m_intraSync.addr;
+  push.mip        = m_mip.addr;
   push.count      = int32_t( total );
   push.stride0    = planes.stride[COMPONENT_Y];
   push.stride12   = planes.stride[COMPONENT_Cb];
