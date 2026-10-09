@@ -75,6 +75,12 @@ int clipAlf( int c, int cur, int a, int b )
 #define TILE_H ( TILE + 2 * MARGIN )
 groupshared uint2 s_tile[TILE_H * GROUPS];
 static int        s_x0, s_y0;
+// the classification's Laplacians, a cell of 2x2 samples at a time (the
+// block's window has 4x4 cells, each cell is in the windows of up to 4
+// blocks): V | H << 16, D0 | D1 << 16 of the cells ( s_x0 - 2 + 2 * cx,
+// s_y0 - 2 + 2 * cy )
+#define CELLS 18
+groupshared uint2 s_cls[CELLS * CELLS];
 
 // the samples ( bx - 4 .. bx + 7, y ) of the 4x4 block at bx (its group G of
 // the tile, the one before, the one after)
@@ -90,6 +96,28 @@ struct Row
     return int( ( j & 1 ) == 0 ? ( w & 0xffffu ) : ( w >> 16 ) );
   }
 };
+
+// the samples ( s_x0 - 4 + 4 * m .. + 7, y ): the tile's groups m, m + 1
+struct Row2
+{
+  uint2 g0, g1;
+
+  int at( int j )
+  {
+    const uint2 g = j < 4 ? g0 : g1;
+    const uint  w = ( j & 2 ) == 0 ? g.x : g.y;
+    return int( ( j & 1 ) == 0 ? ( w & 0xffffu ) : ( w >> 16 ) );
+  }
+};
+
+Row2 tileRow2( int y, int m )
+{
+  const int at = ( y - s_y0 + MARGIN ) * GROUPS + m;
+  Row2      r;
+  r.g0 = s_tile[at];
+  r.g1 = s_tile[at + 1];
+  return r;
+}
 
 Row tileRow( int y, int G )
 {
@@ -132,6 +160,45 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
   }
   GroupMemoryBarrierWithGroupSync();
 
+  const int vbH   = 1 << pc.ctuLog2;
+  const int vbPos = vbH - 4;
+
+  // the cells' Laplacians, two neighbours at a time (their samples are 2
+  // groups of the tile's rows)
+  for( int t = int( local.y * 8 + local.x ); t < CELLS * CELLS / 2; t += 64 )
+  {
+    const int cy  = t / ( CELLS / 2 );
+    const int m   = t - cy * ( CELLS / 2 );   // the cells 2 * m, 2 * m + 1 of the row
+    const int y0  = s_y0 - 2 + 2 * cy;
+    int       ym1 = y0 - 1;
+    int       yp2 = y0 + 2;
+    if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos - 2 )
+    {
+      yp2 = y0 + 1;
+    }
+    else if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos )
+    {
+      ym1 = y0;
+    }
+    const Row2 am = tileRow2( ym1, m );
+    const Row2 a0 = tileRow2( y0, m );
+    const Row2 a1 = tileRow2( y0 + 1, m );
+    const Row2 ap = tileRow2( yp2, m );
+    [unroll]
+    for( int e = 0; e < 2; e++ )
+    {
+      const int j0 = 2 + 2 * e;   // x0 = s_x0 - 2 + 2 * ( 2 * m + e )
+      const int a  = a0.at( j0 ) << 1;       // ( x0, y0 )
+      const int b  = a1.at( j0 + 1 ) << 1;   // ( x0 + 1, y0 + 1 )
+      const int v  = abs( a - am.at( j0 ) - a1.at( j0 ) ) + abs( b - a0.at( j0 + 1 ) - ap.at( j0 + 1 ) );
+      const int h  = abs( a - a0.at( j0 + 1 ) - a0.at( j0 - 1 ) ) + abs( b - a1.at( j0 + 2 ) - a1.at( j0 ) );
+      const int d0 = abs( a - am.at( j0 - 1 ) - a1.at( j0 + 1 ) ) + abs( b - a0.at( j0 ) - ap.at( j0 + 2 ) );
+      const int d1 = abs( a - a1.at( j0 - 1 ) - am.at( j0 + 1 ) ) + abs( b - ap.at( j0 ) - a0.at( j0 + 2 ) );
+      s_cls[cy * CELLS + 2 * m + e] = uint2( uint( v ) | uint( h ) << 16, uint( d0 ) | uint( d1 ) << 16 );
+    }
+  }
+  GroupMemoryBarrierWithGroupSync();
+
   const int bx = int( id.x ) * 4;
   const int by = int( id.y ) * 4;
   if( bx >= pc.width || by >= pc.height )
@@ -153,45 +220,27 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
     return;
   }
 
-  const int vbH   = 1 << pc.ctuLog2;
-  const int vbPos = vbH - 4;
-  const int byVb  = by & ( vbH - 1 );
+  const int byVb = by & ( vbH - 1 );
 
-  // classification: Laplacians at every other sample of the 8x8 window around
-  // the block (the rows' samples bx - 4 + j)
+  // classification: the Laplacians of the cells of the block's window, the
+  // 4x4 cells from ( bx - 2, by - 2 ), but the rows the virtual boundary hides
   int sumV = 0, sumH = 0, sumD0 = 0, sumD1 = 0;
   const int rFirst = byVb == vbPos ? 1 : 0;
   const int rLast  = byVb == vbPos - 4 ? 2 : 3;
+  const int cell0  = ( by - s_y0 ) / 2 * CELLS + ( bx - s_x0 ) / 2;
   [unroll]
   for( int r = 0; r < 4; r++ )
   {
     if( r >= rFirst && r <= rLast )
     {
-      const int y0  = by - 2 + 2 * r;
-      int       ym1 = y0 - 1;
-      int       yp2 = y0 + 2;
-      if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos - 2 )
-      {
-        yp2 = y0 + 1;
-      }
-      else if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos )
-      {
-        ym1 = y0;
-      }
-      const Row am = tileRow( ym1, G );
-      const Row a0 = tileRow( y0, G );
-      const Row a1 = tileRow( y0 + 1, G );
-      const Row ap = tileRow( yp2, G );
       [unroll]
       for( int c = 0; c < 4; c++ )
       {
-        const int j0 = 2 + 2 * c;   // x0 = bx - 2 + 2 * c
-        const int a  = a0.at( j0 ) << 1;       // ( x0, y0 )
-        const int b  = a1.at( j0 + 1 ) << 1;   // ( x0 + 1, y0 + 1 )
-        sumV  += abs( a - am.at( j0 ) - a1.at( j0 ) ) + abs( b - a0.at( j0 + 1 ) - ap.at( j0 + 1 ) );
-        sumH  += abs( a - a0.at( j0 + 1 ) - a0.at( j0 - 1 ) ) + abs( b - a1.at( j0 + 2 ) - a1.at( j0 ) );
-        sumD0 += abs( a - am.at( j0 - 1 ) - a1.at( j0 + 1 ) ) + abs( b - a0.at( j0 ) - ap.at( j0 + 2 ) );
-        sumD1 += abs( a - a1.at( j0 - 1 ) - am.at( j0 + 1 ) ) + abs( b - ap.at( j0 ) - a0.at( j0 + 2 ) );
+        const uint2 cell = s_cls[cell0 + r * CELLS + c];
+        sumV  += int( cell.x & 0xffffu );
+        sumH  += int( cell.x >> 16 );
+        sumD0 += int( cell.y & 0xffffu );
+        sumD1 += int( cell.y >> 16 );
       }
     }
   }
