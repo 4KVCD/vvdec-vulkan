@@ -611,7 +611,7 @@ Buffer Context::alloc( size_t size, MemKind kind )
     THROW_FATAL( "Vulkan: vkAllocateMemory failed for " << size << " bytes (" << result << ")" );
   }
   m_api.vkBindBufferMemory( m_device, buf.buffer, buf.memory, 0 );
-  buf.memory_size = req.size;
+  buf.memorySize = req.size;
   countMemory( buf.kind, int64_t( req.size ) );
 
   if( m_memProps.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT )
@@ -636,7 +636,7 @@ void Context::free( Buffer& buf )
   if( buf.memory )
   {
     m_api.vkFreeMemory( m_device, buf.memory, nullptr );
-    countMemory( buf.kind, -int64_t( buf.memory_size ) );
+    countMemory( buf.kind, -int64_t( buf.memorySize ) );
   }
   buf = Buffer();
 }

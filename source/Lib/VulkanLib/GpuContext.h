@@ -41,11 +41,12 @@ POSSIBILITY OF SUCH DAMAGE.
 ------------------------------------------------------------------------------------------- */
 
 /** \file     GpuContext.h
-    \brief    the Vulkan device shared by all decoder instances of a process
+    \brief    The Vulkan device that all decoder instances of a process share
 
-    Every buffer the shaders use is reached through its device address (push
-    constants carry the addresses), so there are no descriptor sets: one
-    pipeline layout with 256 bytes of push constants serves every shader.
+    The context owns the device, its queues, the memory allocation and the shaders' pipelines. Shaders reach every
+    buffer through its device address, which the push constants carry, so there are no descriptor sets: one
+    pipeline layout with 256 bytes of push constants serves every shader. See README.md for an overview of the GPU
+    path.
 */
 
 #pragma once
@@ -66,6 +67,7 @@ namespace vvdec
 namespace gpu
 {
 
+// The Vulkan functions the decoder uses, loaded at run time from vulkan-1.dll (or libvulkan.so).
 #define VVDEC_VK_INSTANCE_FUNCS( X )                                                                                    \
   X( vkDestroyInstance ) X( vkEnumeratePhysicalDevices ) X( vkGetPhysicalDeviceProperties )                              \
   X( vkGetPhysicalDeviceProperties2 ) X( vkGetPhysicalDeviceFeatures2 ) X( vkGetPhysicalDeviceMemoryProperties )         \
@@ -93,12 +95,12 @@ struct Api
 #undef VVDEC_VK_DECLARE
 };
 
-// where a buffer lives
+// Where a buffer's memory lives.
 enum class MemKind
 {
-  Device,       // GPU memory, not visible to the CPU
-  HostCached,   // CPU memory the CPU reads and writes at full speed and the GPU reaches through the bus
-  Upload,       // memory the CPU writes in order and the GPU reads (device local if the BAR allows)
+  Device,       // GPU memory that the CPU cannot see
+  HostCached,   // CPU memory that the CPU reads and writes at full speed; the GPU reaches it over the bus
+  Upload,       // memory the CPU writes once, in order, and the GPU reads (GPU memory when the BAR allows it)
 };
 
 struct Buffer
@@ -106,10 +108,10 @@ struct Buffer
   VkBuffer        buffer = VK_NULL_HANDLE;
   VkDeviceMemory  memory = VK_NULL_HANDLE;
   VkDeviceSize    size   = 0;
-  uint8_t*        mapped = nullptr;   // null for MemKind::Device
-  VkDeviceAddress addr   = 0;
+  uint8_t*        mapped = nullptr;   // the CPU's view of the buffer; null for MemKind::Device
+  VkDeviceAddress addr   = 0;         // the address the shaders use
   MemKind         kind   = MemKind::Device;
-  VkDeviceSize    memory_size = 0;   // the memory bound to it
+  VkDeviceSize    memorySize = 0;     // the size of the memory allocated for the buffer (at least size)
 
   bool valid() const { return buffer != VK_NULL_HANDLE; }
 };
@@ -117,51 +119,55 @@ struct Buffer
 class Context
 {
 public:
-  // the process-wide context: created by the first acquire(), destroyed with
-  // the last release() -- but for the Vulkan instance, which stays
-  // (s_instance); acquire() returns null when no usable Vulkan device exists
+  // The process-wide context. The first acquire() creates it and the last release() destroys it, except for the
+  // Vulkan instance, which stays for the rest of the process (see s_instance). acquire() returns null when no
+  // usable Vulkan device exists.
   static Context* acquire();
   static void     release();
 
   const Api& api() const { return m_api; }
   VkDevice   device() const { return m_device; }
 
-  Buffer alloc( size_t size, MemKind kind );   // throws on failure
+  // Allocates a buffer (throws on failure) and frees one.
+  Buffer alloc( size_t size, MemKind kind );
   void   free( Buffer& buf );
-  // device-local buffers that come and go with the pictures (their planes on
-  // the GPU, and the scratch planes of their filters): one of the same size
-  // given back before, else a new one. Those given back are all kept for the
-  // next ones -- freeing and allocating them while decoding costs too much
-  // time (VideoQ 1080p: -15%) -- until buffers of another size are wanted
-  // (another resolution). A buffer may be given back while work queued still
-  // uses it, when whatever takes it next is queued after that work.
+
+  // A pool for the device-local buffers that come and go with the pictures: their planes on the GPU and the scratch
+  // planes of their filters. allocPooled() returns a buffer of the same size given back earlier, or a new one.
+  // Returned buffers stay in the pool for later pictures, because freeing and allocating them during decoding costs
+  // too much time (VideoQ 1080p: -15%), until buffers of another size are requested (a new resolution). A buffer
+  // may be returned while queued work still uses it, as long as whatever takes it next is queued after that work.
   Buffer allocPooled( size_t size );
   void   recycle( Buffer& buf );
 
-  VkPipeline       pipeline( int shaderId );   // created on first use
+  // The compute pipeline of a shader (kShader_...), created on first use, and the layout they all share.
+  VkPipeline       pipeline( int shaderId );
   VkPipelineLayout layout() const { return m_layout; }
 
-  // a picture's work on the compute queue, which the decoder instances of the
-  // process share: the first part, which signals firstDone, then the rest,
-  // which signals restDone, then (with transfer) the picture's download on the
-  // copy queue, which waits for the rest's semaphore and signals transferDone
-  // (and with the async queue, the first part waits for waitFront, the front end's semaphore, and signals the
-  // timeline semaphore: the value returned)
+  // --- The compute queue, which all decoder instances of the process share ---
+  // A picture's work is submitted in two parts. submitFirst() submits the first part, which signals firstDone.
+  // With the async queues, the first part also waits for waitFront (the semaphore of the picture's front end) and
+  // signals the timeline semaphore; the value it signals is returned (0 without the async queues).
   uint64_t submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemaphore waitFront = VK_NULL_HANDLE );
+  // submitRest() submits the rest, which waits for waitFront (the front end's second submission) when given and
+  // signals restDone. With a copy queue it also submits the picture's download (transfer), which waits for the
+  // rest's semaphore and signals transferDone.
   void submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore semaphore, VkCommandBuffer transfer, VkFence transferDone,
                    VkSemaphore waitFront = VK_NULL_HANDLE );
-  // other work on the compute queue (the output frames' film grain), which
-  // signals done
+  // Other work on the compute queue (film grain on the output frames), which signals done.
   void submit( VkCommandBuffer cmd, VkFence done ) { submitFirst( cmd, done ); }
-  // a queue for copies only (the GPU's copy engine), when the device has one:
-  // its copies run alongside the compute queue's work. The buffers are shared
-  // by both queues' families.
+
+  // --- The copy queue ---
+  // A queue for copies only (the GPU's copy engine), when the device has one. Its copies run alongside the compute
+  // queue's work. Buffers are shared by both queues' families.
   bool transferQueue() const { return m_transferFamily != UINT32_MAX; }
-  // a second compute queue, in a family for compute only (an async compute engine), when the device has one
-  // (VVDEC_GPU_ASYNC=0: not used): the pictures' front ends there run alongside the compute queue's work. A front
-  // end waits for the compute queue's timeline semaphore to reach waitFirst (submitFirst's value: the first parts
-  // of its colocated pictures) and signals done.
-  // (a queue a decoder instance, takeAsyncQueue's: their front ends run alongside each other too)
+
+  // --- The async compute queues ---
+  // Compute-only queues (async compute engines), when the device has them and VVDEC_GPU_ASYNC is not 0. The
+  // pictures' front ends run there, alongside the compute queue's work. Each decoder instance takes its own queue
+  // (takeAsyncQueue), so the front ends of different instances also run at the same time. submitFront() submits a
+  // front end's commands: they wait until the compute queue's timeline semaphore reaches waitFirst (the first parts
+  // of the picture's colocated pictures) and then signal done.
   bool     asyncQueue() const { return m_asyncFamily != UINT32_MAX; }
   uint32_t asyncFamily() const { return m_asyncFamily; }
   int      takeAsyncQueue() { return int( m_asyncNext++ % uint32_t( m_asyncCount ) ); }
@@ -173,48 +179,63 @@ public:
   double             timestampPeriod() const { return m_timestampPeriod; }
   const std::string& deviceName()      const { return m_deviceName; }
 
-  // VVDEC_GPU_PROFILE=1: the decoders add up the time of their passes, printed
-  // when the context goes
-  bool profiling() const { return m_profiling; }
-  // the memory of the buffers alive: now and at most, in bytes, the
-  // device-local (heap 0: the GPU's own) and the host-visible (heap 1); the
-  // GPU profile prints it
+  // --- Profiling (VVDEC_GPU_PROFILE=1) ---
+  // The decoder instances add up the GPU time of their passes (addTime); the totals are printed when the context
+  // is destroyed, with the memory in use now and at its peak: heap 0 is the GPU's own memory, heap 1 the
+  // host-visible memory, in bytes.
+  bool    profiling() const { return m_profiling; }
   int64_t memoryNow( int heap ) const { return m_memoryNow[heap]; }
   int64_t memoryPeak( int heap ) const { return m_memoryPeak[heap]; }
-  void addTime( const char* label, double milliseconds );
+  void    addTime( const char* label, double milliseconds );
 
 private:
   Context() = default;
   ~Context();
   bool init();
   int  memoryType( uint32_t typeBits, MemKind kind ) const;
+  void countMemory( MemKind kind, int64_t bytes );
 
   Api                              m_api;
   VkInstance                       m_instance = VK_NULL_HANDLE;   // s_instance
   VkPhysicalDevice                 m_physical = VK_NULL_HANDLE;
   VkDevice                         m_device   = VK_NULL_HANDLE;
-  VkQueue                          m_queue    = VK_NULL_HANDLE;
+  VkPhysicalDeviceMemoryProperties m_memProps{};
+  double                           m_timestampPeriod = 1.0;
+  std::string                      m_deviceName;
+  bool                             m_wave32 = false;   // the shaders may ask for waves of 32 threads
+
+  // the compute queue
+  VkQueue                          m_queue       = VK_NULL_HANDLE;
   uint32_t                         m_queueFamily = 0;
-  VkQueue                          m_transferQueue  = VK_NULL_HANDLE;
-  uint32_t                         m_transferFamily = UINT32_MAX;
+  std::mutex                       m_queueMutex;
+  VkSemaphore                      m_timeline      = VK_NULL_HANDLE;   // signalled by the pictures' first parts
+  uint64_t                         m_timelineValue = 0;                // the last value signalled (guarded by m_queueMutex)
+
+  // the copy queue
+  VkQueue                          m_transferQueue      = VK_NULL_HANDLE;
+  uint32_t                         m_transferFamily     = UINT32_MAX;
   bool                             m_transferTimestamps = false;
   std::mutex                       m_transferMutex;
+
+  // the async compute queues
   static constexpr int             kMaxAsync = 4;
   VkQueue                          m_asyncQueues[kMaxAsync] = {};
   std::mutex                       m_asyncMutexes[kMaxAsync];
   int                              m_asyncCount  = 0;
   std::atomic<uint32_t>            m_asyncNext{ 0 };
   uint32_t                         m_asyncFamily = UINT32_MAX;
-  VkSemaphore                      m_timeline      = VK_NULL_HANDLE;   // the compute queue's first parts
-  uint64_t                         m_timelineValue = 0;                // (with m_queueMutex)
-  VkPhysicalDeviceMemoryProperties m_memProps{};
-  VkPipelineLayout                 m_layout = VK_NULL_HANDLE;
+
+  // the pipelines
+  VkPipelineLayout                 m_layout    = VK_NULL_HANDLE;
   VkPipeline*                      m_pipelines = nullptr;
-  double                           m_timestampPeriod = 1.0;
-  std::string                      m_deviceName;
-  std::mutex                       m_queueMutex;
   std::mutex                       m_pipelineMutex;
 
+  // the buffer pool (allocPooled, recycle)
+  std::mutex                       m_poolMutex;
+  std::vector<Buffer>              m_pool;
+  std::set<VkDeviceSize>           m_poolSizes;   // the sizes requested since the size last changed
+
+  // profiling
   struct Time
   {
     std::string label;
@@ -222,25 +243,19 @@ private:
     long        count;
   };
   bool                             m_profiling = false;
-  std::mutex                       m_poolMutex;
-  std::vector<Buffer>              m_pool;
-  std::set<VkDeviceSize>           m_poolSizes;   // the sizes asked for since the last change of size
-  std::atomic<int64_t>             m_memoryNow[2]  = { { 0 }, { 0 } };
-  std::atomic<int64_t>             m_memoryPeak[2] = { { 0 }, { 0 } };
-  void                             countMemory( MemKind kind, int64_t bytes );
-  PFN_vkGetShaderInfoAMD           m_getShaderInfo = nullptr;   // with VVDEC_GPU_PROFILE, where VK_AMD_shader_info is
-  bool                             m_wave32 = false;            // the shaders may ask for waves of 32 threads
   std::vector<Time>                m_times;
   std::mutex                       m_timeMutex;
+  std::atomic<int64_t>             m_memoryNow[2]  = { { 0 }, { 0 } };
+  std::atomic<int64_t>             m_memoryPeak[2] = { { 0 }, { 0 } };
+  PFN_vkGetShaderInfoAMD           m_getShaderInfo = nullptr;   // VK_AMD_shader_info, when profiling on AMD
 
   static std::mutex s_mutex;
   static Context*   s_context;
   static int        s_refs;
-  // the Vulkan library and instance: made by the first init(), kept for the
-  // process (never destroyed: not at its exit either, where the driver may
-  // already be going). The loader unloads the driver with the last instance,
-  // and AMD's (32.0.31041) leaks 1.5 MB each time it is loaded again: 200
-  // decoders opened and closed one after the other, a process grew by 300 MB.
+  // The Vulkan library and instance are created by the first init() and kept for the rest of the process (not
+  // destroyed at exit either, when the driver may already be unloading). The loader unloads the driver together
+  // with the last instance, and AMD's driver (32.0.31041) leaks 1.5 MB every time it is loaded again: a process that
+  // opened and closed 200 decoders one after another grew by 300 MB.
   static void*      s_library;
   static VkInstance s_instance;
 };

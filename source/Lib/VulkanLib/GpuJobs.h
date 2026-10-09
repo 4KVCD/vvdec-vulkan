@@ -41,7 +41,10 @@ POSSIBILITY OF SUCH DAMAGE.
 ------------------------------------------------------------------------------------------- */
 
 /** \file     GpuJobs.h
-    \brief    what the CPU hands the GPU's reconstruction of a picture, block by block
+    \brief    The jobs: the work items of the GPU's reconstruction passes, one per block, in the layouts the shaders read
+
+    The CTU tasks (CPU front end) or jobs.slang (GPU front end) fill these lists. Each job type's set functions are
+    the reference for its layout; the shaders read the same words.
 */
 
 #pragma once
@@ -55,8 +58,8 @@ namespace vvdec
 namespace gpu
 {
 
-// one transform block of one component whose levels the GPU dequantizes and
-// inverse transforms into its residual; the layout of shaders/trafo.slang
+// A transform block of one component. trafo.slang dequantizes its coefficients and inverse-transforms them into
+// the residual. 8 words.
 struct TrafoJob
 {
   enum Flags
@@ -64,13 +67,15 @@ struct TrafoJob
     kTransformSkip = 1,
     kBdpcmHor      = 2,
     kBdpcmVer      = 4,
-    kZero          = 8,   // no residual: zeros (a block of an inter CU whose component has residuals elsewhere)
+    kZero          = 8,   // no coefficients: the job writes zeros, for an inter CU with a residual elsewhere in the component
   };
 
   uint32_t w[8];
 
-  // ict: the joint Cb-Cr mode (TU::getICTMode, signed) that derives the other
-  // chroma component's residual from this one's, 0 for none
+  // (x, y), log2Width, log2Height: the block, in samples of component comp. typeHor, typeVer: the transform types.
+  // ict: the joint Cb-Cr mode (TU::getICTMode, signed) that derives the other chroma component's residual from this
+  // one's; 0 for none. lastX, lastY: the largest x and y of a nonzero coefficient. scale, rightShift, inputMaximum:
+  // the dequantization's scale and shift, and the limit the coefficient levels are clipped to.
   void set( int x, int y, int log2Width, int log2Height, int comp, int typeHor, int typeVer, int flags, int ict, int lastX, int lastY, int scale,
             int rightShift, int inputMaximum )
   {
@@ -83,22 +88,20 @@ struct TrafoJob
     w[5] = uint32_t( inputMaximum );
     w[6] = w[7] = 0;
   }
-  // LFNST (TrQuant::xInvLfnst): the CU's index (1, 2), the set of the block's
-  // intra mode (g_lfnstLut), whether its output is transposed, whether it
-  // makes the top-left 8x8 (the blocks at least 8x8) and whether it takes 8
-  // inputs (the blocks of 4x4 and 8x8) rather than 16
+  // LFNST (TrQuant::xInvLfnst): the CU's LFNST index (1 or 2); the transform set chosen by the block's intra mode
+  // (g_lfnstLut); whether the output is transposed; whether the output covers the top-left 8x8 (blocks of at least
+  // 8x8); and whether it takes 8 inputs (4x4 and 8x8 blocks) rather than 16.
   void setLfnst( int index, int set, bool transposed, bool block8, bool inputs8 )
   {
     w[6] = uint32_t( index ) | uint32_t( set ) << 2 | uint32_t( transposed ) << 4 | uint32_t( block8 ) << 5 | uint32_t( inputs8 ) << 6;
   }
-  // an explicit scaling list (Quant's DeQuantScaling): where the block's
-  // matrix (Quant::getDequantCoeff) begins in the picture's matrices, its
-  // factor of the coefficient (x, y) at y * width + x
+  // An explicit scaling list (Quant's DeQuantScaling): offset is where the block's matrix (Quant::getDequantCoeff)
+  // starts in the picture's matrices; the factor of coefficient (x, y) is at offset + y * width + x. Stored plus one,
+  // so that 0 means no scaling list.
   void setScalingList( int offset ) { w[7] = uint32_t( offset + 1 ); }
 };
 
-// one transform block of one component that the GPU predicts and
-// reconstructs; the layout of shaders/intra.slang
+// A transform block of one component that intra.slang predicts and reconstructs. 12 words.
 struct IntraJob
 {
   enum Kind
@@ -107,22 +110,21 @@ struct IntraJob
     kBdpcm   = 1,
     kCclm    = 2,
     kIbc     = 3,
-    kMip     = 4,   // matrix-based intra prediction (the mode: the MIP mode)
-    kLmcs    = 5,   // an inter CU's chroma under LMCS: its prediction (kept aside) plus its residual, scaled
-    kCiip    = 6,   // a CIIP CU's component: inter's prediction (kept aside) blended with planar's, plus the residual
+    kMip     = 4,   // matrix-based intra prediction (the job's mode is the MIP mode)
+    kLmcs    = 5,   // an inter CU's chroma under LMCS: its prediction (kept aside by inter.slang) plus its scaled residual
+    kCiip    = 6,   // a CIIP CU's component: the inter prediction (kept aside) blended with planar's, plus the residual
   };
   enum Flags
   {
     kResidual      = 1,   // the picture holds the block's residual
-    kFiltered      = 2,   // the [1 2 1]-filtered references
+    kFiltered      = 2,   // predict from the [1 2 1]-filtered reference samples
     kMipTransposed = 4,
     kIsp           = 8,   // a luma sub-partition of an ISP CU (setIsp)
   };
 
   uint32_t w[12];
 
-  // refLine: the reference line the block predicts from (MRL: luma's
-  // cu.multiRefIdx(), 0 .. 2)
+  // refLine: the reference line the block predicts from (MRL: luma's cu.multiRefIdx(), 0 .. 2).
   void set( int x, int y, int width, int height, int comp, int kind, int mode, int flags, int bdpcmDir, int refLine = 0 )
   {
     w[0] = uint32_t( x ) | uint32_t( y ) << 16;
@@ -130,44 +132,47 @@ struct IntraJob
     w[2] = uint32_t( mode ) | uint32_t( flags ) << 8 | uint32_t( bdpcmDir ) << 16 | uint32_t( refLine ) << 24;
     w[3] = w[4] = w[5] = w[6] = w[7] = w[8] = w[9] = w[10] = w[11] = 0;
   }
+  // How many units of reference samples are available top-left, above (with above-right) and left (with
+  // below-left), as IntraPrediction's xDeriveNeighborSize counts them.
   void setNeighbors( int topLeft, int above, int left ) { w[3] = uint32_t( topLeft ) | uint32_t( above ) << 8 | uint32_t( left ) << 16; }
+  // CCLM: whether the luma template and the chroma block have neighbours above and left, and how many neighbouring
+  // samples are available above and left (IntraPrediction::getLmAvailability).
   void setCclm( bool lumaAbove, bool lumaLeft, bool above, bool left, int actualTop, int actualLeft )
   {
     w[4] = uint32_t( lumaAbove ) << 16 | uint32_t( lumaLeft ) << 17 | uint32_t( above ) << 18 | uint32_t( left ) << 19;
     w[5] = uint32_t( actualTop ) | uint32_t( actualLeft ) << 16;
   }
+  // IBC: the block vector.
   void setBlockVector( int x, int y ) { w[6] = uint32_t( uint16_t( int16_t( x ) ) ) | uint32_t( uint16_t( int16_t( y ) ) ) << 16; }
-  // CIIP: planar's weight in the blend (predBlendIntraCiip's wIntra, 1 .. 3;
-  // 0: inter's prediction as it is)
+  // CIIP: planar's weight in the blend (predBlendIntraCiip's wIntra, 1 .. 3); 0 leaves the inter prediction as it is.
   void setCiip( int intraWeight ) { w[6] = uint32_t( intraWeight ); }
-  // ISP: the CU (luma samples), its split (vvdec's ISPType: 1 horizontal, 2
-  // vertical) and whether the neighbours left of and above the sub-partition's
-  // prediction block are there (initIntraPatternChTypeISP's isLeftAvail and
-  // isAboveAvail); the neighbours' units (setNeighbors) are the CU's
+  // ISP: the CU (in luma samples), its split (vvdec's ISPType: 1 horizontal, 2 vertical), and whether the
+  // neighbours left of and above the sub-partition's prediction block are available (initIntraPatternChTypeISP's
+  // isLeftAvail and isAboveAvail). The neighbour counts (setNeighbors) are the CU's.
   void setIsp( int cuX, int cuY, int cuWidth, int cuHeight, int split, bool leftAvail, bool aboveAvail )
   {
     w[4] = uint32_t( cuX ) | uint32_t( cuY ) << 16;
     w[5] = uint32_t( cuWidth ) | uint32_t( cuHeight ) << 8 | uint32_t( split ) << 16 | uint32_t( leftAvail ) << 18 | uint32_t( aboveAvail ) << 19;
   }
-  // LMCS's chroma residual scaling (Reshape::calculateChromaAdjVpduNei): the
-  // luma of the CU at (x, y) its average comes from, left of it and above
-  // it (where there), 1 << log2Count samples a side
+  // LMCS's chroma residual scaling (Reshape::calculateChromaAdjVpduNei): the scale comes from the average of the luma
+  // samples left of and above the CU at (x, y), where available, 1 << log2Count samples on each side.
   void setLmcs( int x, int y, bool left, bool above, int log2Count )
   {
     w[8] = uint32_t( x ) | uint32_t( y ) << 16;
     w[9] = 1u | uint32_t( left ) << 1 | uint32_t( above ) << 2 | uint32_t( log2Count ) << 4;
   }
+  // The job's wave (see WaveMap).
   void setWave( int wave ) { w[7] = uint32_t( wave ); }
   int  wave() const { return int( w[7] ); }
   int  width() const { return int( w[1] & 255 ); }
   int  height() const { return int( ( w[1] >> 8 ) & 255 ); }
-  // on the GPU, in place of the wave: the rows of the block one workgroup
-  // makes (GpuRecon::recordIntra cuts the big blocks into bands)
+  // On the GPU the wave's word holds the rows of the block that one workgroup makes instead: GpuRecon::recordIntra
+  // cuts big blocks into bands.
   void setRows( int first, int count ) { w[7] = uint32_t( first ) | uint32_t( count ) << 16; }
 };
 
-// a tile of up to 16x16 luma samples of an inter CU (DMVR's subblock when it
-// refines) with its chroma; the layout of shaders/inter.slang
+// A tile of up to 16x16 luma samples of an inter CU, with its chroma, that inter.slang predicts (with DMVR, the tile
+// is DMVR's subblock). 12 words.
 struct InterJob
 {
   enum Flags
@@ -176,21 +181,25 @@ struct InterJob
     kL1        = 2,
     kDmvr      = 4,
     kHalfPel   = 8,    // AMVR's half-sample luma filter
-    kResidualY = 16,   // and kResidualY << 1, << 2 for Cb, Cr: the picture holds the residual
-    kLumaMap   = 128,  // LMCS: the luma prediction forward-mapped
-    kDeferCb   = 256,  // and kDeferCb << 1 for Cr, under LMCS's chroma scaling: the prediction kept aside, the
-                       // residual left in the picture, for an intra job of kind IntraJob::kLmcs
-    kDeferY    = 1024, // CIIP: so for the luma too (with kDeferCb and Cr), for kind IntraJob::kCiip
-    kBcw       = 2048, // BCW: the bi-prediction weighted (setBcw)
-    kBdof      = 4096, // BDOF (with DMVR: where its cost leaves it on), in the dispatch of the inter_bdof variant
-    kAffine    = 8192, // an affine CU's tile: this job and the next make an affine job (setAffine), for the inter_affine
-                       // variant
-    kGeo       = 16384, // GPM: the "L0" and "L1" predictions are the partitions', blended (setGeo)
+    kResidualY = 16,   // (and kResidualY << 1, << 2 for Cb, Cr) the picture holds a residual to add
+    kLumaMap   = 128,  // LMCS: forward-map the luma prediction
+    kDeferCb   = 256,  // (and kDeferCb << 1 for Cr) LMCS's chroma scaling: keep the prediction aside and leave the
+                       // residual in the picture, for an intra job of kind IntraJob::kLmcs
+    kDeferY    = 1024, // CIIP: the same for luma (with kDeferCb and its Cr flag), for an intra job of kind IntraJob::kCiip
+    kBcw       = 2048, // BCW: weighted bi-prediction (setBcw)
+    kBdof      = 4096, // BDOF (with DMVR: where DMVR's cost leaves it on), run by the inter_bdof variant
+    kAffine    = 8192, // an affine CU's tile: this job and the next make one affine job (setAffine), run by the
+                       // inter_affine variant
+    kGeo       = 16384, // GPM: the "L0" and "L1" predictions are the two partitions', blended (setGeo)
     kWp        = 32768, // weighted prediction (setWp)
   };
 
   uint32_t w[12];
 
+  // mv0, mv1: the motion of list 0 and list 1. (cuX, cuY): the CU's position, which clips the motion with the width
+  // setClipWidth gives. ref0, ref1: the reference pictures' slots in the picture's RefTable. dmvrIndex: with DMVR,
+  // where the tile's refinement goes in the picture's refinements (CodingUnit::mvdL0SubPuOff plus the subblock's
+  // index).
   void set( int x, int y, int width, int height, int flags, int mv0x, int mv0y, int mv1x, int mv1y, int cuX, int cuY, int ref0, int ref1,
             int dmvrIndex )
   {
@@ -205,19 +214,18 @@ struct InterJob
     w[8]  = uint32_t( dmvrIndex );
     w[9]  = w[10] = w[11] = 0;
   }
-  // the width of the block whose position (cuX, cuY) and size clip the motion
-  // (clipMv, wrapClipMv): the CU's, or SbTMVP's joined sub-PUs'
+  // The width of the block that clips the motion (clipMv, wrapClipMv): the CU's, or with SbTMVP the joined sub-PUs'.
   void setClipWidth( int width ) { w[7] |= uint32_t( width ) << 20; }
-  // BCW: L1's weight, of 8 (addWeightedAvg's w1; L0's: 8 - w1)
+  // BCW: list 1's weight out of 8 (addWeightedAvg's w1; list 0's is 8 - w1). Stored plus 2, as the weights go down
+  // to -2.
   void setBcw( int weight1 )
   {
     w[1] |= uint32_t( kBcw ) << 16;
     w[7] |= uint32_t( weight1 + 2 ) << 16;
   }
 
-  // weighted prediction: per component its weights, offsets (at 8 bits) and
-  // denominator, of the first list's prediction (uni-prediction: the list's
-  // whose prediction it is) and, with bi, the second's
+  // Weighted prediction: per component, the weight, offset (at 8 bits) and log2 denominator of the first prediction
+  // (for uni-prediction, of the list it predicts from) and, with bi, the second prediction's weight and offset.
   void setWp( const int weight[2][3], const int offset[2][3], const int log2Denom[3], bool bi )
   {
     w[1] |= uint32_t( kWp ) << 16;
@@ -229,20 +237,18 @@ struct InterJob
     w[11] = ( uint32_t( offset[1][0] ) & 255 ) | ( uint32_t( offset[1][1] ) & 255 ) << 8 | ( uint32_t( offset[1][2] ) & 255 ) << 16 | uint32_t( bi ) << 24;
   }
 
-  // GPM: the weights' mask (g_globalGeoWeights), its mirroring and the CU's
-  // offsets into it (xWeightedGeoBlk)
+  // GPM: the weight mask (g_globalGeoWeights), whether it is mirrored, and the CU's offsets into it (xWeightedGeoBlk).
   void setGeo( int mask, int mirror, int offsetX, int offsetY )
   {
     w[1] |= uint32_t( kGeo ) << 16;
     w[9] = uint32_t( mask ) | uint32_t( mirror ) << 8 | uint32_t( offsetX ) << 16 | uint32_t( offsetY ) << 24;
   }
 
-  // an affine tile, as two jobs (shaders/inter.slang's AFFINE variant reads
-  // them as one of 24 words): this one the tile (set, kAffine, the CU at
-  // w[6]) and, at w[2..5], each list's base motion; the next one the CU's
-  // size, whether PROF refines each list and whether its motion spreads too
-  // far (one motion for all then), and each list's steps across and down:
-  // the subblocks' motion as setAllAffineMv works it out (all << 7)
+  // An affine tile takes two jobs, which inter.slang's affine variant reads as one job of 24 words. The first is the
+  // tile (set with kAffine and the CU's position in w[6]) with each list's base motion in w[2..5]. The second holds
+  // the CU's size; whether PROF refines each list; whether each list's motion spreads too far (then every subblock
+  // takes the same motion); and each list's motion steps across and down. Together they give the subblocks' motion
+  // as setAllAffineMv works it out (all << 7).
   static void setAffine( InterJob& job, InterJob& next, int cuWidth, int cuHeight, const bool prof[2], const bool spread[2], const int params[2][6] )
   {
     job.w[2]  = uint32_t( params[0][0] );
@@ -259,12 +265,12 @@ struct InterJob
   }
 };
 
-// the reference pictures of a picture's inter jobs: a slot each
+// The reference pictures of a picture's inter jobs, one slot each.
 class RefTable
 {
 public:
   void clear() { m_pictures.clear(); }
-  // during the picture's set-up, before the CTU tasks look slots up
+  // During the picture's set-up, before the CTU tasks look slots up.
   void add( const void* picture )
   {
     if( std::find( m_pictures.begin(), m_pictures.end(), picture ) == m_pictures.end() )
@@ -279,9 +285,8 @@ private:
   std::vector<const void*> m_pictures;
 };
 
-// the wave of every block of a picture's planes, at the granularity of the
-// smallest block: a block's wave is one above the highest wave of the samples
-// it reads; inter blocks are wave 0, there before the waves begin
+// The wave of every 4x4 luma area of a picture's planes (2x2 chroma samples in 4:2:0). A block's wave is one more
+// than the highest wave of the samples it reads. Inter blocks are wave 0: they are done before the waves start.
 class WaveMap
 {
 public:
@@ -298,7 +303,7 @@ public:
     }
   }
 
-  // the highest wave in the rectangle (in samples of component c), clipped to the picture
+  // The highest wave in the rectangle (in samples of component c), clipped to the picture.
   int maxIn( int c, int x, int y, int width, int height ) const
   {
     const int x0 = std::max( x, 0 ) >> m_shiftX[c];
@@ -341,22 +346,20 @@ private:
   int                   m_shiftY[3] = { 2, 1, 1 };
 };
 
-// an edge the deblocking filters, as shaders/deblock.slang takes it: where
-// (x | y << 16), and the bytes of its LoopFilterParam the shader needs
-// (luma: qp | bs << 8 | sideMaxFiltLength << 16; chroma: Cb's qp | Cr's qp
-// << 8 | bs << 16 | flags << 24) -- else the shader read them from the
-// parameters of all the 4x4 blocks in host memory (at 4K, 3 MB a direction
-// for the vertical edges: 0.47 ms a picture, 0.12 for the horizontal ones,
-// which read half the cache lines)
+// An edge the deblocking filters, as deblock.slang reads it: its position (x | y << 16) and the bytes of its
+// LoopFilterParam the shader needs (luma: qp | bs << 8 | sideMaxFiltLength << 16; chroma: Cb's qp | Cr's qp << 8 |
+// bs << 16 | flags << 24). Carrying them here spares the shader reading the parameters of every 4x4 block from host
+// memory (at 4K, 3 MB per direction: 0.47 ms per picture for the vertical edges, 0.12 ms for the horizontal ones,
+// which read half the cache lines).
 struct Edge
 {
   uint32_t xy;
   uint32_t params;
 };
 
-// the edges of a CTU the deblocking filters (GpuRecon::listEdges): luma's
-// vertical and horizontal ones (luma samples, a 4x4 block's edge), chroma's
-// (chroma samples, a segment as shaders/deblock.slang visits them)
+// The edges of a CTU that the deblocking filters (GpuRecon::listEdges). lists[0] and lists[1]: luma's vertical and
+// horizontal edges, in luma samples, one per edge of a 4x4 block. lists[2] and lists[3]: chroma's, in chroma
+// samples, one per segment as deblock.slang visits them.
 struct EdgeLists
 {
   std::vector<Edge> lists[4];
@@ -370,8 +373,7 @@ struct EdgeLists
   }
 };
 
-// where the CTU tasks put a CTU's jobs for the stages of the picture that run
-// on the GPU (null: the CPU runs that stage)
+// Where the CTU tasks put a CTU's jobs for the passes that run on the GPU (null: the CPU runs that pass).
 struct CtuJobs
 {
   std::vector<TrafoJob>* trafo = nullptr;
@@ -381,20 +383,19 @@ struct CtuJobs
   const RefTable*        refs  = nullptr;   // with inter
 };
 
-// a picture's LMCS for the GPU (Reshape::gpuTables): the tables of the 1 <<
-// bit depth luma values
+// A picture's LMCS tables for the GPU (Reshape::gpuTables), one entry per luma value (1 << bit depth of them).
 struct LmcsTables
 {
   std::vector<int16_t> fwd;           // the forward luma mapping
-  std::vector<int16_t> inv;           // the inverse one
-  std::vector<int32_t> chromaScale;   // the chroma residual scale of an average luma
+  std::vector<int16_t> inv;           // the inverse luma mapping
+  std::vector<int32_t> chromaScale;   // the chroma residual scale for an average luma value
   bool                 chroma = false;   // the picture scales its chroma residuals
 };
 
 struct CuRecord;
 struct TuRecord;
 
-// a picture's jobs, per CTU, for the stages that run on the GPU (null: the CPU ran that stage)
+// A picture's jobs, per CTU, for the passes that run on the GPU (null: the CPU ran that pass).
 struct PictureJobs
 {
   const std::vector<std::vector<TrafoJob>>* trafo = nullptr;
@@ -402,16 +403,17 @@ struct PictureJobs
   const std::vector<std::vector<IntraJob>>* intra = nullptr;
   const RefTable*                           refs  = nullptr;   // with inter
   const std::vector<EdgeLists>*             edges = nullptr;   // per CTU, with deblocking
-  // the first CTUs, bandCtus of them, whose residuals and inter blocks went to
-  // the GPU ahead of the rest (GpuRecon::startBand)
+  // The early rows (CPU front end): the first bandCtus CTUs, whose residuals and inter blocks went to the GPU ahead
+  // of the rest (GpuRecon::startBand).
   size_t                                    bandCtus = 0;
-  // the CUs of the parse, per CTU: the GPU derives their motion too, for the
-  // comparison with the CPU's (VVDEC_GPU_MIDER; GpuRecon::compareMider)
+  // The parse's CU and TU records, per CTU (GpuFrontEnd.h). The GPU front end works from them: it drives the picture
+  // with front, and without it runs beside the CPU front end for the comparison (VVDEC_GPU_MIDER=1;
+  // GpuRecon::compareMider).
   const std::vector<std::vector<CuRecord>>* cus = nullptr;
-  const std::vector<std::vector<TuRecord>>* tus = nullptr;   // with cus: their TUs, per CTU
-  // the GPU's front end drives the picture (VVDEC_GPU_FRONT): from cus and tus it derives the motion, the deblocking's
-  // parameters and edges, the jobs (the residuals' with frontTrafo, inter's with frontInter) -- trafo, inter, intra and
-  // edges unused
+  const std::vector<std::vector<TuRecord>>* tus = nullptr;
+  // The GPU front end drives the picture: from cus and tus it derives the motion, the deblocking parameters and
+  // edges, and the jobs (the residuals' with frontTrafo, inter's with frontInter). trafo, inter, intra and edges are
+  // then unused.
   bool                                      front      = false;
   bool                                      frontTrafo = false;
   bool                                      frontInter = false;

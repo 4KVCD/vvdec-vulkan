@@ -94,10 +94,6 @@ public:
   GpuRecon( const GpuRecon& )            = delete;
   GpuRecon& operator=( const GpuRecon& ) = delete;
 
-  // whether the GPU covers all the in-loop filters of the picture: deblocking,
-  // SAO and ALF (every picture)
-  static bool filtersSupported( const CodingStructure& cs );
-
   // whether the GPU predicts the intra and IBC blocks of the picture: not with
   // ACT
   static bool intraSupported( const CodingStructure& cs );

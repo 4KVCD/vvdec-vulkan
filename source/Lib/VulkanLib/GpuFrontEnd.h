@@ -41,7 +41,12 @@ POSSIBILITY OF SUCH DAMAGE.
 ------------------------------------------------------------------------------------------- */
 
 /** \file     GpuFrontEnd.h
-    \brief    the parse's CUs as the GPU's front end takes them (motion derivation, shaders/mider.slang)
+    \brief    The records the CPU's parse writes for the GPU's front end, and the checks of the front end's results
+
+    With the GPU front end, the CPU's CTU tasks only parse. For every CU, TU and CTU they write a fixed-size record
+    of words that the front end's shaders read (mider.slang, dbparams.slang, jobs.slang). The records hold what the
+    parse produced and nothing derived from it: a CU's motion vector differences, for example, not its motion
+    vectors, which the GPU derives. See README.md for the overall flow.
 */
 
 #pragma once
@@ -61,9 +66,7 @@ struct LoopFilterParam;
 namespace gpu
 {
 
-// a CU as the parse leaves it -- before the motion derivation, which turns
-// the motion vector differences into motion vectors -- for the front end's
-// shaders (shaders/mider.slang, dbparams.slang): 32 words
+// A CU as the parse leaves it: 32 words. Fields packed into a word are listed from the lowest bit up.
 struct CuRecord
 {
   enum Flags : uint32_t
@@ -74,116 +77,125 @@ struct CuRecord
     kAffine  = 8,
     kGeo     = 16,
     kCiip    = 32,
-    kChroma  = 64,    // a CU of the chroma tree
-    kAffine6 = 128,   // the 6-parameter model
+    kChroma  = 64,    // the CU belongs to the chroma tree (dual tree)
+    kAffine6 = 128,   // the affine model has 6 parameters
   };
 
-  // w0: the luma position, x | y << 16
-  // w1: the luma size, width | height << 8; the prediction mode << 16 (vvdec's PredMode); the flags << 18
-  // w2: merge index | MMVD index << 3 | GPM split << 9 | GPM indices << 15, << 18 | imv << 21 | BCW index << 23 |
-  //     inter direction << 26 | MVP indices << 28, << 29
-  // w3: reference indices (int8_t) | << 8; QP << 16 (int8_t); chroma QP adjustment << 24 (int8_t)
-  // w4..w15: the motion vector differences as parsed: list l's k-th at w[4 + 6 * l + 2 * k], (hor, ver)
-  // w16: its first TU (in its CTU's) | their count << 16
-  // w17: chType | treeType << 1 | modeType << 3 | ISP << 5 | LFNST index << 7 | MIP << 9 | MIP transposed << 10 |
-  //      MRL index << 11 | colour transform << 13 | BDPCM luma << 14 | chroma << 16 | root CBF << 18 | SBT info
-  //      << 19 (8 bits) | the planes' CBFs << 27
-  // w18: intra direction luma (uint8_t) | chroma << 8 | QT depth << 16 | depth << 20
-  // w19: the chroma block (chroma samples), x | y << 16; w20: its width | height << 8 | chroma there << 16 |
-  //      luma there << 17
-  // w21: DMVR's refinements' place (CodingUnit::mvdL0SubPuOff, in its CTU's) | left neighbour there << 16 | above
-  //      << 17 (CodingUnit::left, above) | SMVD << 18
+  // w0:  luma position: x (16 bits), y (16 bits)
+  // w1:  luma size: width (8 bits), height (8 bits); prediction mode (2 bits, vvdec's PredMode); flags (Flags)
+  // w2:  merge index (3 bits), MMVD index (6 bits), GPM split direction (6 bits), GPM merge indices (3 + 3 bits),
+  //      AMVR index imv (2 bits), BCW index (3 bits), inter direction (2 bits), MVP index of list 0 and list 1
+  // w3:  reference index of list 0 and list 1 (int8_t each), QP (int8_t), chroma QP adjustment (int8_t)
+  // w4..w15: motion vector differences as parsed: list l's k-th (k = 0..2 for the affine control points) at
+  //      w[4 + 6 * l + 2 * k] (horizontal) and the next word (vertical)
+  // w16: index of the CU's first TU within its CTU (16 bits), number of TUs (16 bits)
+  // w17: channel type (1 bit), tree type (2), mode type (2), ISP mode (2), LFNST index (2), MIP (1),
+  //      MIP transposed (1), MRL index (2), colour transform (1), BDPCM luma (2), BDPCM chroma (2), root CBF (1),
+  //      SBT info (8), CBFs of the planes (from bit 27)
+  // w18: intra luma direction (8 bits), intra chroma direction (8 bits), QT depth (4 bits), depth (from bit 20)
+  // w19: chroma block position in chroma samples: x (16 bits), y (16 bits)
+  // w20: chroma block width (8 bits), height (8 bits); bit 16: the CU has a chroma block; bit 17: a luma block
+  // w21: where the CU's DMVR refinements start in its CTU's share of the picture's refinements
+  //      (CodingUnit::mvdL0SubPuOff minus the CTU's start, 16 bits); bit 16: the left neighbour is available; bit 17:
+  //      the above neighbour is available (CodingUnit::left, above); bit 18: SMVD
   // w22..w31: reserved
   uint32_t w[32];
 };
 
-// a TU of the parse: 16 words
-// w0, w1: its luma block x | y << 16, width | height << 8 | there << 16
-// w2, w3: its chroma block (chroma samples), the same
-// w4: CBFs (3 bits) | joint Cb-Cr << 3 | MTS index luma << 5 (3 bits) | Cb << 8 | Cr << 9 | chType << 10
-// w5: the chroma QPs (int8_t) | << 8
-// w6, w7: the highest scan positions, x and y, per component (a byte each)
-// w8: its CU (in its CTU's)
+// A TU as the parse leaves it: 16 words.
+// w0:  luma block position: x (16 bits), y (16 bits)
+// w1:  luma block width (8 bits), height (8 bits); bit 16: the TU has a luma block
+// w2, w3: the chroma block, the same in chroma samples
+// w4:  CBFs (3 bits), joint Cb-Cr (2 bits), luma's MTS index (3 bits), Cb's and Cr's transform skip (1 bit each),
+//      channel type (1 bit)
+// w5:  chroma QPs of Cb and Cr (int8_t each)
+// w6, w7: per component, the largest x (w6) and y (w7) of a nonzero coefficient, one byte per component
+//      (vvdec's maxScanPosX, maxScanPosY)
+// w8:  index of the TU's CU within its CTU
 // w9..w15: reserved
 struct TuRecord
 {
   uint32_t w[16];
 };
 
-// a CTU's: its first CU (the picture's CUs CTU by CTU, each CTU's in decoding
-// order), their count, its slice (the index in the picture's slices), its
-// tile and whether it begins a tile's row (the history of motion begins
-// anew), its first TU: 4 words
+// A CTU: 4 words.
+// w0: index of the CTU's first CU (the picture's CUs are stored CTU by CTU, each CTU's in decoding order)
+// w1: number of CUs (16 bits), index of the CTU's slice in the picture's slices (16 bits)
+// w2: bit 0: the CTU starts a row of its tile (the history of motion candidates starts anew); the tile's index
+//     (from bit 16)
+// w3: index of the CTU's first TU
 struct CtuRecord
 {
   uint32_t w[4];
 };
 
-// the CU and TU records of a CTU, in decoding order, appended to cus and tus
+// Appends the CU and TU records of a CTU, in decoding order, to cus and tus.
 void writeCuRecords( CodingStructure& cs, int ctuRsAddr, std::vector<CuRecord>& cus, std::vector<TuRecord>& tus );
-// the CTU records of a picture whose CUs' and TUs' records are cus and tus, CTU by CTU
+// Writes the CTU records of a picture, given its CU and TU records CTU by CTU.
 void writeCtuRecords( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus,
                       CtuRecord* out );
 
-// a picture's slice table: per CTU its slice's index, then the slices'
-// records (64 words each: their POC, reference lists, colocated picture --
-// its motion and slice table, for TMVP in the motion derivation, which reads
-// the slice table of the colocated picture's CTUs): its words
+// A picture's slice table: one word per CTU with the index of its slice, then one record of 64 words per slice
+// (its POC, reference lists and colocated picture). For TMVP, a slice record points to the colocated picture's
+// motion and slice table. sliceTableWords() returns the table's size in words.
 size_t sliceTableWords( const CodingStructure& cs );
 void   writeSliceTable( const CodingStructure& cs, uint32_t* table );
 
-// the comparison of the GPU's motion derivation with the CPU's (VVDEC_GPU_MIDER=1)
-struct MiderStats
-{
-  int64_t pictures   = 0;
-  int64_t compared   = 0;   // 4x4 blocks
-  int64_t mismatched = 0;
-  int64_t skipped    = 0;   // of the CUs the GPU doesn't derive yet
-  int64_t lfpCompared   = 0;   // the deblocking's parameters (4x4 blocks and directions)
-  int64_t lfpMismatched = 0;
-  int64_t lfpEdges      = 0;   // of them with a boundary strength (the CPU's)
-  int     lfpReported   = 0;
-  int     reported   = 0;
-  int64_t jobsCompared[3]   = { 0, 0, 0 };   // the jobs (DecCu's xGpu*Jobs; shaders/jobs.slang): residuals', inter's, intra's
-  int64_t jobsMismatched[3] = { 0, 0, 0 };
-  int     jobsReported      = 0;
-  int64_t sortedCompared    = 0;   // intra's bands in the order of the waves (GpuRecon::recordIntra; shaders/intrasort.slang)
-  int64_t sortedMismatched  = 0;
-  int64_t edgesCompared     = 0;   // the deblocking's edges (GpuRecon::listEdges; shaders/edges.slang)
-  int64_t edgesMismatched   = 0;
-  int     edgesReported     = 0;
-};
-// gpu: the motion of each 4x4 block as the GPU wrote it (shaders/mider.slang's), cpu: as vvdec keeps it
-void compareMotion( const CodingStructure& cs, const int32_t* gpu, const MotionInfo* cpu, MiderStats& stats );
-// gpu: the deblocking's parameters as the GPU wrote them (shaders/dbparams.slang's, 2 words each), cpu: vvdec's
-void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const LoopFilterParam* cpu, MiderStats& stats );
-
-// the room the front end's lists of a picture need at most (in jobs, bands, edges), from its records
+// The most room each of the front end's lists of a picture can need (in jobs, intra bands and deblocking edges),
+// worked out from its records.
 struct FrontCapacities
 {
   size_t trafo = 0, inter = 0, intra = 0, bands = 0, edges = 0;
 };
 FrontCapacities frontCapacities( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus );
 
-// the jobs' tables (shaders/jobs.slang's T_*): vvdec's, kJobTableWords words
+// The constant tables that jobs.slang reads (its T_* tables, taken from vvdec): kJobTableWords words.
 static constexpr size_t kJobTableWords = 2048;
 void writeJobTables( uint32_t* out );
-// per slice of the picture 256 words for its jobs (shaders/jobs.slang's JobSlice): w0: the slice type | LMCS << 2 |
-// dependent quantisation << 3 | explicit scaling lists << 4; w32 + 16 * list + refIdx: the reference's slot in refs |
-// scaled (RPR) << 8 | of the picture's size << 9 | weights present (Y, Cb, Cr) << 10; w64 + ( 16 * list + refIdx ) *
-// 3 + component: its weight (int16_t) | offset << 16 (int8_t) | log2 denominator << 24
+// The per-slice words that jobs.slang reads (its JobSlice), 256 words per slice of the picture:
+// w0: slice type (2 bits); bit 2: LMCS; bit 3: dependent quantisation; bit 4: explicit scaling lists
+// w[32 + 16 * list + refIdx]: the reference picture's slot in refs (8 bits); bit 8: scaled (RPR); bit 9: the same
+//     size as the picture; bits 10..12: weights present for Y, Cb, Cr
+// w[64 + 3 * (16 * list + refIdx) + component]: weighted prediction's weight (int16_t), offset (int8_t, bits 16..23)
+//     and log2 denominator (from bit 24)
 void writeJobSlices( const CodingStructure& cs, const RefTable& refs, uint32_t* out );
-// gpu: the lists the GPU made (count jobs each, words a job), cpu: the CTU tasks' (list 0 residuals', 1 inter's, 2
-// intra's)
-// gpu: intra's bands in the order of the waves as the GPU made them (12 words each) and each one's wait, count of them;
-// cpu: the CTU tasks' jobs, which recordIntra puts in that order
-void compareSorted( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* waits, size_t count, const std::vector<std::vector<IntraJob>>& cpu,
-                    MiderStats& stats );
-// gpu: the edges the GPU listed (2 words each) and its lists' firsts and counts (2 words each), cpu: the CTU tasks'
-void compareEdges( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* lists, size_t capacity, const std::vector<EdgeLists>& cpu,
-                   MiderStats& stats );
+
+// --- Checks of the GPU's front end against the CPU's results (VVDEC_GPU_MIDER=1) ---
+
+struct MiderStats
+{
+  int64_t pictures   = 0;
+  int64_t compared   = 0;   // motion: 4x4 blocks compared
+  int64_t mismatched = 0;
+  int64_t lfpCompared   = 0;   // deblocking parameters: 4x4 blocks and directions compared
+  int64_t lfpMismatched = 0;
+  int64_t lfpEdges      = 0;   // the compared ones the CPU gave a boundary strength
+  int     lfpReported   = 0;
+  int     reported   = 0;
+  int64_t jobsCompared[3]   = { 0, 0, 0 };   // jobs (DecCu's xGpu*Jobs vs jobs.slang): residual, inter, intra
+  int64_t jobsMismatched[3] = { 0, 0, 0 };
+  int     jobsReported      = 0;
+  int64_t sortedCompared    = 0;   // intra bands in wave order (GpuRecon::recordIntra vs intrasort.slang)
+  int64_t sortedMismatched  = 0;
+  int64_t edgesCompared     = 0;   // deblocking edges (GpuRecon::listEdges vs edges.slang)
+  int64_t edgesMismatched   = 0;
+  int     edgesReported     = 0;
+};
+// Compares the motion of each 4x4 block as the GPU wrote it (mider.slang's layout) with vvdec's MotionInfo.
+void compareMotion( const CodingStructure& cs, const int32_t* gpu, const MotionInfo* cpu, MiderStats& stats );
+// Compares the deblocking parameters as the GPU wrote them (dbparams.slang's, 2 words each) with vvdec's.
+void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const LoopFilterParam* cpu, MiderStats& stats );
+// Compares one of the GPU's job lists (count jobs) with the CTU tasks' (list 0: residual, 1: inter, 2: intra).
 template<typename Job>
 void compareJobs( const CodingStructure& cs, int list, const uint32_t* gpu, size_t count, const std::vector<std::vector<Job>>& cpu, MiderStats& stats );
+// Compares the intra bands in wave order as the GPU made them (12 words each, with each band's wait; count bands)
+// with the CTU tasks' jobs, which recordIntra puts into that order.
+void compareSorted( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* waits, size_t count, const std::vector<std::vector<IntraJob>>& cpu,
+                    MiderStats& stats );
+// Compares the deblocking edges the GPU listed (2 words each; lists: each list's first edge and count) with the
+// CTU tasks' lists.
+void compareEdges( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* lists, size_t capacity, const std::vector<EdgeLists>& cpu,
+                   MiderStats& stats );
 
 }   // namespace gpu
 }   // namespace vvdec

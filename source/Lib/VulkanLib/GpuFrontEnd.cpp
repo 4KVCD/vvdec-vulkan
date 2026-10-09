@@ -41,7 +41,8 @@ POSSIBILITY OF SUCH DAMAGE.
 ------------------------------------------------------------------------------------------- */
 
 /** \file     GpuFrontEnd.cpp
-    \brief    the parse's CUs as the GPU's front end takes them (motion derivation, shaders/mider.slang)
+    \brief    The records the CPU's parse writes for the GPU's front end, and the checks of the front end's results
+              (see GpuFrontEnd.h)
 */
 
 #include "GpuFrontEnd.h"

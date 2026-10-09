@@ -271,7 +271,6 @@ void DecLib::destroy()
         mider.pictures += s->pictures;
         mider.compared += s->compared;
         mider.mismatched += s->mismatched;
-        mider.skipped += s->skipped;
         mider.lfpCompared += s->lfpCompared;
         mider.lfpMismatched += s->lfpMismatched;
         mider.lfpEdges += s->lfpEdges;
@@ -288,8 +287,8 @@ void DecLib::destroy()
     }
     if( miderOn )
     {
-      msg( INFO, "GPU: motion derivation (VVDEC_GPU_MIDER) of %lld pictures: %lld 4x4 blocks compared with the CPU's, %lld differ, %lld skipped\n",
-           (long long) mider.pictures, (long long) mider.compared, (long long) mider.mismatched, (long long) mider.skipped );
+      msg( INFO, "GPU: motion derivation (VVDEC_GPU_MIDER) of %lld pictures: %lld 4x4 blocks compared with the CPU's, %lld differ\n",
+           (long long) mider.pictures, (long long) mider.compared, (long long) mider.mismatched );
       msg( INFO, "GPU: deblocking parameters (VVDEC_GPU_MIDER): %lld compared with the CPU's (%lld with a boundary strength), %lld differ\n",
            (long long) mider.lfpCompared, (long long) mider.lfpEdges, (long long) mider.lfpMismatched );
       msg( INFO, "GPU: jobs (VVDEC_GPU_MIDER): residuals' %lld compared with the CPU's, %lld differ; inter's %lld, %lld; intra's %lld, %lld\n",

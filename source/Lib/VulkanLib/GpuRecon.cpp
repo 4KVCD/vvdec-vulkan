@@ -301,7 +301,6 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
   {
     VkQueryPoolCreateInfo queryInfo{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
     queryInfo.queryType  = VK_QUERY_TYPE_TIMESTAMP;
-    queryInfo.queryCount = kMaxMarks;
     queryInfo.queryCount = kBandMarks;
     if( vk.vkCreateQueryPool( m_ctx->device(), &queryInfo, nullptr, &m_bandQueries ) != VK_SUCCESS )
     {
@@ -1182,11 +1181,6 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
       }
     }
   }
-}
-
-bool GpuRecon::filtersSupported( const CodingStructure& cs )
-{
-  return true;
 }
 
 size_t GpuRecon::deblockParamSize( const CodingStructure& cs )

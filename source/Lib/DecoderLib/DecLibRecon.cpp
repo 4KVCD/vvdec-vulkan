@@ -524,9 +524,9 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 
   const bool isIntra = std::all_of( pcPic->slices.begin(), pcPic->slices.end(), []( const Slice* pcSlice ) { return pcSlice->isIntra(); } );
 #if VVDEC_VULKAN
-  // the GPU applies the in-loop filters to the whole picture once its CTUs are
-  // reconstructed (the finish tasks)
-  m_gpuFilters = m_gpuRecon && gpu::GpuRecon::filtersSupported( cs );
+  // the GPU applies the in-loop filters (deblocking, SAO, ALF, CC-ALF) to every
+  // picture, after its reconstruction
+  m_gpuFilters = m_gpuRecon != nullptr;
   // and, before the filters, the intra and IBC blocks, in waves of blocks the
   // CTU tasks list (TaskGpuCtu). With LMCS's chroma residual scaling or
   // CIIP, the inter blocks too: the CPU's finishLMCSAndReco would read the

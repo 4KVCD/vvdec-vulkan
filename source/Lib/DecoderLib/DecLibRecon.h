@@ -193,7 +193,7 @@ private:
   std::vector<std::vector<gpu::TrafoJob>> m_gpuTrafoJobs;   // per CTU
   std::vector<gpu::EdgeLists>    m_gpuEdges;               // per CTU: the edges the GPU deblocks
   gpu::RefTable                  m_refTable;               // the reference pictures of the current picture
-  gpu::LmcsTables                m_lmcsTables;             // the current picture's LMCS (GpuRecon::setLmcs)
+  gpu::LmcsTables                m_lmcsTables;             // the current picture's LMCS (Reshape::gpuTables)
   int                            m_filterPicturesGpu = 0;
   int                            m_filterPicturesCpu = 0;
   int                            m_intraPicturesGpu  = 0;

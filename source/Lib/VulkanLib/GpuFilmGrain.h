@@ -41,7 +41,7 @@ POSSIBILITY OF SUCH DAMAGE.
 ------------------------------------------------------------------------------------------- */
 
 /** \file     GpuFilmGrain.h
-    \brief    film grain synthesis of the output frames on the GPU
+    \brief    Film grain synthesis on the output frames, on the GPU
 */
 
 #pragma once
@@ -55,9 +55,9 @@ class FilmGrain;
 namespace gpu
 {
 
-// film grain synthesis of output frames on the GPU (shaders/filmgrain.slang),
-// as vvdec's FilmGrain adds it on the CPU (VVDecImpl::xAddGrain): the frames
-// in host memory the GPU reaches (the pictures', or the output's copies)
+// Adds film grain to output frames on the GPU (filmgrain.slang), bit-exact with vvdec's FilmGrain on the CPU
+// (VVDecImpl::xAddGrain). The frames are in host memory the GPU can reach: the pictures' planes, or the output's
+// copies of them.
 class GpuFilmGrain
 {
 public:
@@ -66,24 +66,24 @@ public:
   GpuFilmGrain( const GpuFilmGrain& )            = delete;
   GpuFilmGrain& operator=( const GpuFilmGrain& ) = delete;
 
-  // a plane of the frame: its sample (0, 0) and its stride
+  // A plane of a frame: the address of its sample (0, 0) and its stride.
   struct Plane
   {
     VkDeviceAddress addr      = 0;
-    int             stride    = 0;   // src: samples (16 bits each); dst: bytes
-    int             readWidth = 0;   // src: the samples a row has from (0, 0) on (past the frame's width: the picture's)
+    int             stride    = 0;   // source: in samples (16 bits each); destination: in bytes
+    int             readWidth = 0;   // source: the samples a row has from x = 0 on (can be wider than the frame: the picture's)
   };
 
-  // where the frame's block seeds go (FilmGrain::prepareBlockSeeds): count of them
+  // Where the next frame's block seeds go (FilmGrain::prepareBlockSeeds): room for count seeds.
   uint32_t* seeds( size_t count );
-  // the grain of a frame of luma lumaWidth x lumaHeight -- its planes' subsampling, bit depth and models as grain has
-  // them, its block seeds already written -- from src (16 bits a sample) into dst (dstBytes a sample; may be src).
-  // Returns when the GPU is done.
+  // Adds the grain to a frame of lumaWidth x lumaHeight luma samples, reading src (16 bits per sample) and writing
+  // dst (dstBytes per sample; dst may be src). The planes' subsampling, the bit depth and the grain models come from
+  // grain; the block seeds must already be written (seeds()). Returns when the GPU is done.
   void apply( const FilmGrain& grain, int numPlanes, const Plane src[3], const Plane dst[3], int dstBytes, int lumaWidth, int lumaHeight );
 
 private:
   Context*        m_ctx;
-  Buffer          m_tables;   // the patterns, then sLUT and pLUT
+  Buffer          m_tables;   // the grain patterns, then per component the scale table (sLUT), then the pattern tables (pLUT)
   Buffer          m_seeds;
   VkCommandPool   m_pool  = VK_NULL_HANDLE;
   VkCommandBuffer m_cmd   = VK_NULL_HANDLE;
