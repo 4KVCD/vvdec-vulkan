@@ -205,6 +205,9 @@ struct InterJob
     w[8]  = uint32_t( dmvrIndex );
     w[9]  = w[10] = w[11] = 0;
   }
+  // the width of the block whose position (cuX, cuY) and size clip the motion
+  // (clipMv, wrapClipMv): the CU's, or SbTMVP's joined sub-PUs'
+  void setClipWidth( int width ) { w[7] |= uint32_t( width ) << 20; }
   // BCW: L1's weight, of 8 (addWeightedAvg's w1; L0's: 8 - w1)
   void setBcw( int weight1 )
   {

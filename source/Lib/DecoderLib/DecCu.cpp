@@ -678,6 +678,7 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
         gpu::InterJob job;
         job.set( x, y, tileW, tileH, bflags, mv[0].hor, mv[0].ver, mv[1].hor, mv[1].ver, bx, by, ref[0], ref[1],
                  dmvr ? int( cu.mvdL0SubPuOff ) + num : 0 );
+        job.setClipWidth( bw );
         if( bcw )
         {
           job.setBcw( getBcwWeight( g_BcwInternBcw[cu.BcwIdx()], REF_PIC_LIST_1 ) );
@@ -710,6 +711,7 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
         gpu::InterJob job;
         job.set( x, y, std::min<int>( 16, cu.lwidth() ), std::min<int>( 16, cu.lheight() ), flags | gpu::InterJob::kL0 | gpu::InterJob::kL1,
                  mv0.hor, mv0.ver, mv1.hor, mv1.ver, cu.lx(), cu.ly(), ref0, ref1, 0 );
+        job.setClipWidth( cu.lwidth() );
         job.setGeo( g_angle2mask[angle], g_angle2mirror[angle], g_weightOffset[split][hIdx][wIdx][0], g_weightOffset[split][hIdx][wIdx][1] );
         jobs.push_back( job );
       }
