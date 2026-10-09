@@ -1324,8 +1324,7 @@ bool GpuRecon::interSupported( const SPS& sps )
 
 bool GpuRecon::interSupported( const CodingStructure& cs )
 {
-  const PPS& pps = *cs.pps;
-  if( !interSupported( *cs.sps ) || pps.getUseWP() || pps.getWPBiPred() )
+  if( !interSupported( *cs.sps ) )
   {
     return false;
   }
@@ -1335,7 +1334,7 @@ bool GpuRecon::interSupported( const CodingStructure& cs )
     {
       for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ); refIdx++ )
       {
-        if( slice->getRefPic( RefPicList( list ), refIdx )->isRefScaled( &pps ) )
+        if( slice->getRefPic( RefPicList( list ), refIdx )->isRefScaled( cs.pps.get() ) )
         {
           return false;
         }

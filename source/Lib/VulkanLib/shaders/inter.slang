@@ -17,7 +17,7 @@
 // left in the picture for intra.slang's kind 5 or 6, 1024 (CIIP) so the luma's too (defer0), 2048 BCW's weights,
 // 4096 BDOF (the variant built with BDOF=1 takes those tiles), 8192 an affine tile (the variant built with AFFINE=1
 // takes those, two jobs each: see affineMain), 16384 GPM (the partitions' predictions as L0's and L1's, blended by the
-// weights of word 9: mask | mirror << 8 | offset x << 16 | offset y << 24)
+// weights of word 9: mask | mirror << 8 | offset x << 16 | offset y << 24), 32768 weighted prediction (see wpSample)
 
 #include "common.slang"
 
@@ -69,6 +69,30 @@ struct Params
 #define FLAG_BCW 2048
 #define FLAG_BDOF 4096
 #define FLAG_GEO 16384
+#define FLAG_WP 32768
+
+// weighted prediction (addWeightUni, addWeightBi) of a component's 14-bit predictions: word 8 + comp holds
+// w0 | w1 << 10 | log2 denominator << 20 | o0 << 24, word 11 o1 of Y, Cb and Cr, 8 bits each, | bi << 24 (the offsets
+// at 8 bits; with a uni-prediction, its list's in w0, o0)
+int wpSample( uint params, uint offsets1, int comp, int p0, int p1, int maxVal )
+{
+  const int w0    = int( params << 22 ) >> 22;
+  const int w1    = int( ( params >> 10 ) << 22 ) >> 22;
+  const int denom = int( ( params >> 20 ) & 15 );
+  const int scale = 1 << ( pc.bitDepth - 8 );
+  const int o0    = ( int( params ) >> 24 ) * scale;
+  const int head  = max( 2, 14 - pc.bitDepth );
+  if( ( offsets1 >> 24 ) != 0 )
+  {
+    const int o1    = ( int( ( offsets1 >> ( 8 * comp ) ) << 24 ) >> 24 ) * scale;
+    const int shift = denom + 1 + head;
+    const int add   = ( 1 << ( shift - 1 ) ) + ( o0 + o1 ) * ( 1 << ( shift - 1 ) ) + ( w0 + w1 ) * 8192;   // IF_INTERNAL_OFFS
+    return clip3( 0, maxVal, ( w0 * p0 + w1 * p1 + add ) >> shift );
+  }
+  const int shift = denom + head;
+  const int round = shift > 0 ? 1 << ( shift - 1 ) : 0;
+  return clip3( 0, maxVal, ( ( w0 * ( p0 + 8192 ) + round ) >> shift ) + o0 );
+}
 
 // GPM (xWeightedGeoBlk): the weight (of 8) of the first partition at the CU's
 // luma sample (lx, ly), from the mask, mirrored, at the CU's offsets
@@ -1607,8 +1631,10 @@ void affineMain( int tid, int index )
     const bool spread = ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
     int        p[PER_THREAD];
     int        c[2];
-    affineLuma( tid, job, list, x, y, w, h, cuX, cuY, cw, ch, spread, prof, bi, p );
-    affineChroma( tid, job, list, x, y, w, h, cuX, cuY, cw, ch, spread, bi, c );
+    // (weighted prediction: from the 14-bit predictions, a uni-prediction's too)
+    const bool hi = bi || ( flags & FLAG_WP ) != 0;
+    affineLuma( tid, job, list, x, y, w, h, cuX, cuY, cw, ch, spread, prof, hi, p );
+    affineChroma( tid, job, list, x, y, w, h, cuX, cuY, cw, ch, spread, hi, c );
     if( list == 0 || ( flags & FLAG_L0 ) == 0 )
     {
       pred0  = p;
@@ -1631,7 +1657,8 @@ void affineMain( int tid, int index )
     if( t < w * h )
     {
       const int at = ( y + ( t >> log2W ) ) * pc.stride0 + x + ( t & ( w - 1 ) );
-      int       v  = bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k];
+      int       v  = ( flags & FLAG_WP ) != 0 ? wpSample( job[8], job[11], 0, pred0[k], pred1[k], maxVal )
+                     : ( bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k] );
       if( ( flags & FLAG_LUMA_MAP ) != 0 )
       {
         v = int( pc.lmcsFwd[v] );
@@ -1650,7 +1677,8 @@ void affineMain( int tid, int index )
     {
       int16_t*  dst = comp == 1 ? pc.dst1 : pc.dst2;
       const int at  = ( ( y >> 1 ) + tid / cw2 ) * pc.stride12 + ( x >> 1 ) + tid % cw2;
-      int       v   = bi ? biAverage( predC0[comp - 1], predC1[comp - 1], flags, bcwW1, shiftNum, offset, maxVal ) : predC0[comp - 1];
+      int       v   = ( flags & FLAG_WP ) != 0 ? wpSample( job[8 + comp], job[11], comp, predC0[comp - 1], predC1[comp - 1], maxVal )
+                      : ( bi ? biAverage( predC0[comp - 1], predC1[comp - 1], flags, bcwW1, shiftNum, offset, maxVal ) : predC0[comp - 1] );
       if( ( flags & ( FLAG_RES_Y << comp ) ) != 0 )
       {
         v = clip3( 0, maxVal, v + int( dst[at] ) );
@@ -1693,7 +1721,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const bool dmvr  = ( flags & FLAG_DMVR ) != 0;
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
-  if( !BDOF && ( flags & FLAG_GEO ) == 0 && pc.wide != 0 && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
+  if( !BDOF && ( flags & ( FLAG_GEO | FLAG_WP ) ) == 0 && pc.wide != 0 && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
   {
     tile16( tid, index, job, x, y, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel );
     return;
@@ -1864,14 +1892,16 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       }
       // one call a filter length: the shader's code stays small (it ran slower
       // when it outgrew the instruction cache)
-      int pred[PER_THREAD];
+      // (weighted prediction: from the 14-bit predictions, a uni-prediction's too)
+      const bool hi = bi || ( flags & FLAG_WP ) != 0;
+      int        pred[PER_THREAD];
       if( comp == 0 )
       {
-        predictBlock<8>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred );
+        predictBlock<8>( tid, slot, comp, bx, by, bw, bh, clipped, hi, hpel, windowed, window, base, pred );
       }
       else
       {
-        predictBlock<4>( tid, slot, comp, bx, by, bw, bh, clipped, bi, hpel, windowed, window, base, pred );
+        predictBlock<4>( tid, slot, comp, bx, by, bw, bh, clipped, hi, hpel, windowed, window, base, pred );
       }
       if( list == 0 || ( flags & FLAG_L0 ) == 0 )
       {
@@ -1917,7 +1947,11 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       const int i  = t & ( bw - 1 );
       const int j  = t >> log2W;
       int       v;
-      if( ( flags & FLAG_GEO ) != 0 )
+      if( ( flags & FLAG_WP ) != 0 )
+      {
+        v = wpSample( job[8 + comp], job[11], comp, pred0[k], pred1[k], maxVal );
+      }
+      else if( ( flags & FLAG_GEO ) != 0 )
       {
         // (the CU's luma sample under this one)
         v = geoBlend( pred0[k], pred1[k], geoWeight( job[9], ( bx + i - ( comp == 0 ? cuX : cuX >> 1 ) ) << s, ( by + j - ( comp == 0 ? cuY : cuY >> 1 ) ) << s ),

@@ -182,6 +182,7 @@ struct InterJob
     kAffine    = 8192, // an affine CU's tile: this job and the next make an affine job (setAffine), for the inter_affine
                        // variant
     kGeo       = 16384, // GPM: the "L0" and "L1" predictions are the partitions', blended (setGeo)
+    kWp        = 32768, // weighted prediction (setWp)
   };
 
   uint32_t w[12];
@@ -205,6 +206,20 @@ struct InterJob
   {
     w[1] |= uint32_t( kBcw ) << 16;
     w[7] |= uint32_t( weight1 + 2 ) << 16;
+  }
+
+  // weighted prediction: per component its weights, offsets (at 8 bits) and
+  // denominator, of the first list's prediction (uni-prediction: the list's
+  // whose prediction it is) and, with bi, the second's
+  void setWp( const int weight[2][3], const int offset[2][3], const int log2Denom[3], bool bi )
+  {
+    w[1] |= uint32_t( kWp ) << 16;
+    for( int c = 0; c < 3; c++ )
+    {
+      w[8 + c] = ( uint32_t( weight[0][c] ) & 1023 ) | ( uint32_t( weight[1][c] ) & 1023 ) << 10 | uint32_t( log2Denom[c] ) << 20
+                 | ( uint32_t( offset[0][c] ) & 255 ) << 24;
+    }
+    w[11] = ( uint32_t( offset[1][0] ) & 255 ) | ( uint32_t( offset[1][1] ) & 255 ) << 8 | ( uint32_t( offset[1][2] ) & 255 ) << 16 | uint32_t( bi ) << 24;
   }
 
   // GPM: the weights' mask (g_globalGeoWeights), its mirroring and the CU's

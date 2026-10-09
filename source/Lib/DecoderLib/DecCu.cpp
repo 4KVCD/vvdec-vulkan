@@ -494,6 +494,42 @@ void DecCu::xGpuIbcJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::
   }
 }
 
+// weighted prediction (xPredInterBi): P slices under the PPS's weighted
+// prediction, B slices under its bi-prediction one (BCW's weights left at
+// their default), not GPM, nor DMVR or BDOF (whose references have no
+// weights: xProcessDMVR, xSubPuBio average without them): the lists'
+// weights, offsets and denominators (getWpScaling), for the job (flags: the
+// lists the job predicts from, DMVR, BDOF)
+static void gpuWp( const CodingUnit& cu, const int8_t refIdx[2], int flags, gpu::InterJob& job )
+{
+  const Slice& slice = *cu.slice;
+  const PPS&   pps   = *cu.pps;
+  if( cu.geoFlag() || ( flags & ( gpu::InterJob::kDmvr | gpu::InterJob::kBdof ) )
+      || !( ( pps.getWPBiPred() && slice.getSliceType() == B_SLICE && cu.BcwIdx() == BCW_DEFAULT ) || ( pps.getUseWP() && slice.getSliceType() == P_SLICE ) ) )
+  {
+    return;
+  }
+  int weight[2][3] = {}, offset[2][3] = {}, log2Denom[3] = {};
+  int n = 0;
+  for( int list = 0; list < 2; list++ )
+  {
+    if( !( flags & ( list == 0 ? gpu::InterJob::kL0 : gpu::InterJob::kL1 ) ) )
+    {
+      continue;
+    }
+    const WPScalingParam* wp = nullptr;
+    slice.getWpScaling( RefPicList( list ), refIdx[list], wp );
+    for( int c = 0; c < getNumberValidComponents( cu.chromaFormat ); c++ )
+    {
+      weight[n][c] = wp[c].iWeight;
+      offset[n][c] = wp[c].iOffset;
+      log2Denom[c] = int( wp[c].uiLog2WeightDenom );
+    }
+    n++;
+  }
+  job.setWp( weight, offset, log2Denom, n == 2 );
+}
+
 // motionCompensation's bioApplied: whether BDOF refines the CU's bi-prediction
 static bool gpuBdof( const CodingUnit& cu )
 {
@@ -646,6 +682,7 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
         {
           job.setBcw( getBcwWeight( g_BcwInternBcw[cu.BcwIdx()], REF_PIC_LIST_1 ) );
         }
+        gpuWp( cu, refIdx, bflags, job );
         jobs.push_back( job );
       }
     }
@@ -737,6 +774,8 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
         {
           job.setBcw( getBcwWeight( g_BcwInternBcw[cu.BcwIdx()], REF_PIC_LIST_1 ) );
         }
+        const int8_t refIdx[2] = { int8_t( cu.refIdx[0] ), int8_t( cu.refIdx[1] ) };
+        gpuWp( cu, refIdx, aflags, job );
         next.set( 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 );
         gpu::InterJob::setAffine( job, next, cu.lwidth(), cu.lheight(), prof, spread, params );
         jobs.push_back( job );
