@@ -391,6 +391,8 @@ struct LmcsTables
   bool                 chroma = false;   // the picture scales its chroma residuals
 };
 
+struct CuRecord;
+
 // a picture's jobs, per CTU, for the stages that run on the GPU (null: the CPU ran that stage)
 struct PictureJobs
 {
@@ -402,6 +404,9 @@ struct PictureJobs
   // the first CTUs, bandCtus of them, whose residuals and inter blocks went to
   // the GPU ahead of the rest (GpuRecon::startBand)
   size_t                                    bandCtus = 0;
+  // the CUs of the parse, per CTU: the GPU derives their motion too, for the
+  // comparison with the CPU's (VVDEC_GPU_MIDER; GpuRecon::compareMider)
+  const std::vector<std::vector<CuRecord>>* cus = nullptr;
 };
 
 }   // namespace gpu

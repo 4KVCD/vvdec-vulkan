@@ -482,6 +482,8 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   if( m_gpu && !m_gpuRecon )
   {
     m_gpuRecon = std::make_unique<gpu::GpuRecon>( m_gpu );
+    const char* mider = getenv( "VVDEC_GPU_MIDER" );
+    m_gpuMider        = mider && atoi( mider ) != 0;
   }
 #endif
   if( !m_pcThreadResource )
@@ -720,6 +722,14 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   {
     m_gpuEdges.resize( pcv->sizeInCtus );
   }
+  if( m_gpuMider )
+  {
+    m_gpuCuRecords.resize( pcv->sizeInCtus );
+    for( auto& cus: m_gpuCuRecords )
+    {
+      cus.clear();
+    }
+  }
   if( m_gpuResidual )
   {
     m_gpuTrafoJobs.resize( pcv->sizeInCtus );
@@ -842,6 +852,13 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       CodingStructure&    cs    = *param->pic->cs;
       DecLibRecon*        dec   = param->decLib;
 
+      // the picture's slice table (its CTUs parsed: their slices known), for
+      // the GPU's motion derivation of this picture and of those it is the
+      // colocated picture of
+      if( dec->m_gpuMider && cs.colMiAllocator )
+      {
+        gpu::writeSliceTable( cs, cs.gpuSliceTable( gpu::sliceTableWords( cs ) ) );
+      }
       gpu::PictureJobs jobs;
       jobs.trafo = dec->m_gpuResidual ? &dec->m_gpuTrafoJobs : nullptr;
       jobs.inter = dec->m_gpuInter ? &dec->m_gpuInterJobs : nullptr;
@@ -849,6 +866,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       jobs.refs  = &dec->m_refTable;
       jobs.edges = &dec->m_gpuEdges;
       jobs.bandCtus = size_t( dec->m_gpuBandRows ) * cs.pcv->widthInCtus;
+      jobs.cus      = dec->m_gpuMider && dec->m_gpuIntra ? &dec->m_gpuCuRecords : nullptr;
       // with DMVR, the GPU stores the refined motion for TMVP in the next
       // pictures in the first part (the CTU tasks stored the rest)
       const bool refine = dec->m_gpuInter && cs.picture->stillReferenced;
@@ -861,6 +879,10 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     {
       FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
       param->decLib->m_gpuRecon->endCompute();
+      if( param->decLib->m_gpuMider && param->decLib->m_gpuIntra )
+      {
+        param->decLib->m_gpuRecon->compareMider( *param->pic->cs, param->decLib->m_motionInfo );
+      }
       return true;
     };
     static auto finishGpuTask = []( int tid, void* task_param )
@@ -1165,6 +1187,14 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       const int ctuRsAddr = ctu + line * cs.pcv->widthInCtus;
       CtuData& ctuData    = cs.getCtuData( ctuRsAddr );
       ctuData.motion      = &decLib.m_motionInfo[cs.pcv->num4x4CtuBlks * ctuRsAddr];
+#if VVDEC_VULKAN
+      if( decLib.m_gpuMider && param->common.gpuIntra )
+      {
+        // the parse's CUs, before the derivation turns their motion vector
+        // differences into motion vectors
+        gpu::writeCuRecords( cs, ctuRsAddr, decLib.m_gpuCuRecords[ctuRsAddr] );
+      }
+#endif
 
       if( !ctuData.slice->isIntra() || cs.sps->getIBCFlag() )
       {

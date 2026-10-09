@@ -99,6 +99,9 @@ void CodingStructure::destroy()
   m_ctuDataSize = 0;
 
   freeColMiMap();
+#if VVDEC_VULKAN
+  freeGpuSliceTable();
+#endif
 
   m_cuMap.reset();
   m_cuMapSize = 0;
@@ -339,6 +342,33 @@ void CodingStructure::freeColMiMap()
   m_colMiMapSize = 0;
 }
 
+#if VVDEC_VULKAN
+uint32_t* CodingStructure::gpuSliceTable( size_t words )
+{
+  if( !m_gpuSliceAllocation || words > m_gpuSliceTableWords )
+  {
+    freeGpuSliceTable();
+    CHECK( !colMiAllocator, "the GPU's slice table out of the GPU's reach" );
+    m_gpuSliceTable = static_cast<uint32_t*>( colMiAllocator->create( colMiAllocator->opaque, VVDEC_CT_Y, uint32_t( words * sizeof( uint32_t ) ),
+                                                                      MEMORY_ALIGN_DEF_SIZE, &m_gpuSliceAllocation ) );
+    CHECK( !m_gpuSliceTable, "no memory for the GPU's slice table" );
+    m_gpuSliceTableWords = words;
+  }
+  return m_gpuSliceTable;
+}
+
+void CodingStructure::freeGpuSliceTable()
+{
+  if( m_gpuSliceAllocation )
+  {
+    colMiAllocator->unref( colMiAllocator->opaque, m_gpuSliceAllocation );
+    m_gpuSliceAllocation = nullptr;
+  }
+  m_gpuSliceTable      = nullptr;
+  m_gpuSliceTableWords = 0;
+}
+
+#endif
 void CodingStructure::deallocTempInternals()
 {
   m_cuCache.releaseAll();

@@ -19,6 +19,8 @@ set( VVDEC_GPU_SHADERS
   "trafo|trafo"
   "lmcs|lmcs"
   "filmgrain|filmgrain"
+  "mider|mider"
+  "mider_cumap|mider|CUMAP=1"
 )
 
 if( NOT VVDEC_SLANGC OR NOT EXISTS "${VVDEC_SLANGC}" )

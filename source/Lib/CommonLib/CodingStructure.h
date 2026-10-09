@@ -255,6 +255,14 @@ public:
   // (gpu::GpuRecon); m_colMiAllocation the allocator's handle of it
   const UserAllocator*                   colMiAllocator = nullptr;
   void*                                  m_colMiAllocation = nullptr;
+  // the picture's slice table for the GPU's motion derivation
+  // (gpu::writeSliceTable), in memory from colMiAllocator: its own, then as
+  // the colocated picture's
+  void*                                  m_gpuSliceAllocation = nullptr;
+  uint32_t*                              m_gpuSliceTable      = nullptr;
+  size_t                                 m_gpuSliceTableWords = 0;
+  uint32_t*                              gpuSliceTable( size_t words );   // room for words of it
+  void                                   freeGpuSliceTable();
 #endif
   void                                   allocColMiMap( ptrdiff_t size );
   void                                   freeColMiMap();

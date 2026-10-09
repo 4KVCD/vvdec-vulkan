@@ -201,6 +201,10 @@ private:
   int                            m_interPicturesCpu  = 0;
   int                            m_residualPicturesGpu = 0;
   int                            m_residualPicturesCpu = 0;
+  // VVDEC_GPU_MIDER=1: the GPU derives the motion too, from the parse's CUs,
+  // and its motion is compared with the CPU's (GpuRecon::compareMider)
+  bool                           m_gpuMider = false;
+  std::vector<std::vector<gpu::CuRecord>> m_gpuCuRecords;   // per CTU
 #endif
 
   CommonTaskParam            commonTaskParam{ this };
@@ -253,6 +257,7 @@ public:
   int      interPicturesCpu()  const { return m_interPicturesCpu; }
   int      residualPicturesGpu() const { return m_residualPicturesGpu; }
   int      residualPicturesCpu() const { return m_residualPicturesCpu; }
+  const gpu::MiderStats* miderStats() const { return m_gpuMider && m_gpuRecon ? &m_gpuRecon->miderStats() : nullptr; }
 #endif
 
 

@@ -55,6 +55,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "GpuContext.h"
 #include "GpuJobs.h"
+#include "GpuFrontEnd.h"
 
 #include "CommonLib/Common.h"
 #include "CommonLib/Buffer.h"
@@ -79,6 +80,8 @@ UserAllocator hostPictureAllocator( Context* context );
 // buffers), and then (addr, stride not null) where each plane's sample (0, 0)
 // is and its stride in samples
 bool hostPictureAddresses( const PelStorage& pic, VkDeviceAddress addr[MAX_NUM_COMPONENT], int stride[MAX_NUM_COMPONENT] );
+// where the GPU reaches memory from hostPictureAllocator's create (its allocator handle)
+VkDeviceAddress hostAllocationAddress( void* allocation );
 // a reconstructed picture no picture will reference any more gives back its
 // planes on the GPU (to Context's pool); not gpuCurrent then
 void releaseTwins( Picture& pic );
@@ -157,6 +160,11 @@ public:
   void endCompute();
   void endDownload( int download );
 
+  // after endCompute: the GPU's motion derivation (PictureJobs::cus) against
+  // the CPU's, cpu the picture's motion as vvdec keeps it
+  void              compareMider( const CodingStructure& cs, const MotionInfo* cpu );
+  const MiderStats& miderStats() const { return m_miderStats; }
+
 private:
   void     beginCommands( bool resetPool = true );
   void     computeBarrier();
@@ -184,6 +192,11 @@ private:
   Planes        scratchPlanes( const PelStorage& pic );  // GPU memory laid out as pic's buffers (from the pool)
   void          copyPlanes( const PelStorage& pic, int from, int to );
   void          transferBarrier( bool toTransfer );
+  // the motion derivation of the picture's CUs (cus, per CTU), for the comparison with the CPU's
+  void          recordMider( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus );
+  // with subpictures treated as pictures: each CTU's rectangle (its subpicture's
+  // or the picture's) in m_subpics, its address returned; else 0
+  VkDeviceAddress subpicRects( const CodingStructure& cs );
 
   static size_t deblockParamSize( const CodingStructure& cs );
   static size_t alfParamSize( const CodingStructure& cs );
@@ -271,6 +284,16 @@ private:
   bool            m_scalingOn = false;
   Buffer          m_scaling;
   Buffer          m_subpics;   // subpictures treated as pictures: each CTU's rectangle (recordInter)
+  // the motion derivation's (recordMider): the records in upload memory; the CU map, the CUs' and the 4x4
+  // blocks' motion, the rows' progress in the GPU's; the 4x4 blocks' motion copied to host memory for the comparison
+  Buffer          m_miderCus;
+  Buffer          m_miderCtus;
+  Buffer          m_miderCuMap;
+  Buffer          m_miderCuMotion;
+  Buffer          m_miderMotion;
+  Buffer          m_miderMotionHost;   // its copy, for the comparison
+  Buffer          m_miderProgress;
+  MiderStats      m_miderStats;
 };
 
 }   // namespace gpu

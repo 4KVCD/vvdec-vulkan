@@ -261,6 +261,24 @@ void DecLib::destroy()
          "GPU: residuals of %d pictures on the GPU, %d on the CPU; inter prediction of %d on the GPU, %d on the CPU; intra prediction of %d on the GPU, "
          "%d on the CPU; in-loop filters of %d on the GPU, %d on the CPU\n",
          residualGpu, residualCpu, interGpu, interCpu, intraGpu, intraCpu, filtersGpu, filtersCpu );
+    gpu::MiderStats mider;
+    bool            miderOn = false;
+    for( auto& dec: m_decLibRecon )
+    {
+      if( const gpu::MiderStats* s = dec.miderStats() )
+      {
+        miderOn = true;
+        mider.pictures += s->pictures;
+        mider.compared += s->compared;
+        mider.mismatched += s->mismatched;
+        mider.skipped += s->skipped;
+      }
+    }
+    if( miderOn )
+    {
+      msg( INFO, "GPU: motion derivation (VVDEC_GPU_MIDER) of %lld pictures: %lld 4x4 blocks compared with the CPU's, %lld differ, %lld skipped\n",
+           (long long) mider.pictures, (long long) mider.compared, (long long) mider.mismatched, (long long) mider.skipped );
+    }
   }
 #endif
   for( auto &dec: m_decLibRecon )

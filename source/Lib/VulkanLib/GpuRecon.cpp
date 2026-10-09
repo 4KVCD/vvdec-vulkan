@@ -358,6 +358,13 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_edges );
   m_ctx->free( m_matrices );
   m_ctx->free( m_mip );
+  m_ctx->free( m_miderCus );
+  m_ctx->free( m_miderCtus );
+  m_ctx->free( m_miderCuMap );
+  m_ctx->free( m_miderCuMotion );
+  m_ctx->free( m_miderMotion );
+  m_ctx->free( m_miderMotionHost );
+  m_ctx->free( m_miderProgress );
   m_ctx->free( m_lfnst );
   m_ctx->free( m_geo );
   m_ctx->free( m_lmcs );
@@ -947,6 +954,11 @@ bool hostPictureAddresses( const PelStorage& pic, VkDeviceAddress addr[MAX_NUM_C
   return true;
 }
 
+VkDeviceAddress hostAllocationAddress( void* allocation )
+{
+  return static_cast<HostPlane*>( allocation )->host.addr;
+}
+
 GpuRecon::Planes GpuRecon::hostPlanes( const PelStorage& pic )
 {
   Planes planes{};
@@ -1490,27 +1502,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   }
   if( push.subpicOn )
   {
-    const size_t size = ( size_t( pcv.sizeInCtus ) * 4 * sizeof( uint16_t ) + 255 ) & ~size_t( 255 );
-    if( ctuBegin == 0 )
-    {
-      if( m_subpics.size < size )
-      {
-        m_ctx->free( m_subpics );
-        m_subpics = m_ctx->alloc( size, MemKind::Upload );
-      }
-      uint16_t* rects = reinterpret_cast<uint16_t*>( m_subpics.mapped );
-      for( unsigned ctu = 0; ctu < pcv.sizeInCtus; ctu++ )
-      {
-        const Position pos( ( ctu % pcv.widthInCtus ) * pcv.maxCUWidth, ( ctu / pcv.widthInCtus ) * pcv.maxCUHeight );
-        const SubPic&  sub     = pps.getSubPicFromPos( pos );
-        const bool     asPic   = sub.getTreatedAsPicFlag();
-        rects[ctu * 4]         = uint16_t( asPic ? sub.getSubPicLeft() : 0 );
-        rects[ctu * 4 + 1]     = uint16_t( asPic ? sub.getSubPicTop() : 0 );
-        rects[ctu * 4 + 2]     = uint16_t( asPic ? sub.getSubPicRight() : pcv.lumaWidth - 1 );
-        rects[ctu * 4 + 3]     = uint16_t( asPic ? sub.getSubPicBottom() : pcv.lumaHeight - 1 );
-      }
-    }
-    push.subpics = m_subpics.addr;
+    push.subpics = ctuBegin == 0 ? subpicRects( cs ) : m_subpics.addr;
   }
   // RPR: the picture's scaling window, its chroma's siting; a scaled
   // reference anywhere
@@ -1850,6 +1842,149 @@ void GpuRecon::startBand( CodingStructure& cs, const PictureJobs& jobs, size_t c
   }
 }
 
+// shaders/mider.slang's push constants
+struct MiderPush
+{
+  VkDeviceAddress cus, ctus, slices, cuMap, cuMotion, motion, progress, subpics;
+  int32_t         numCus, widthInCtus, heightInCtus, log2Ctu, width, height, widthIn4, plevel, wpp, maxNumMergeCand, subpicOn, sps;
+};
+static_assert( sizeof( MiderPush ) == 112, "MiderPush: the layout of mider.slang's Params" );
+
+// a buffer of kind of at least size bytes
+static void ensureBuffer( Context* ctx, Buffer& buf, size_t size, MemKind kind )
+{
+  if( buf.size < size )
+  {
+    ctx->free( buf );
+    buf = ctx->alloc( ( size + 65535 ) & ~size_t( 65535 ), kind );
+  }
+}
+
+VkDeviceAddress GpuRecon::subpicRects( const CodingStructure& cs )
+{
+  const PPS&           pps = *cs.pps;
+  const PreCalcValues& pcv = *cs.pcv;
+  bool                 on  = false;
+  for( int i = 0; pps.getNumSubPics() > 1 && i < pps.getNumSubPics(); i++ )
+  {
+    on |= pps.getSubPic( i ).getTreatedAsPicFlag();
+  }
+  if( !on )
+  {
+    return 0;
+  }
+  const size_t size = ( size_t( pcv.sizeInCtus ) * 4 * sizeof( uint16_t ) + 255 ) & ~size_t( 255 );
+  if( m_subpics.size < size )
+  {
+    m_ctx->free( m_subpics );
+    m_subpics = m_ctx->alloc( size, MemKind::Upload );
+  }
+  uint16_t* rects = reinterpret_cast<uint16_t*>( m_subpics.mapped );
+  for( unsigned ctu = 0; ctu < pcv.sizeInCtus; ctu++ )
+  {
+    const Position pos( ( ctu % pcv.widthInCtus ) * pcv.maxCUWidth, ( ctu / pcv.widthInCtus ) * pcv.maxCUHeight );
+    const SubPic&  sub   = pps.getSubPicFromPos( pos );
+    const bool     asPic = sub.getTreatedAsPicFlag();
+    rects[ctu * 4]       = uint16_t( asPic ? sub.getSubPicLeft() : 0 );
+    rects[ctu * 4 + 1]   = uint16_t( asPic ? sub.getSubPicTop() : 0 );
+    rects[ctu * 4 + 2]   = uint16_t( asPic ? sub.getSubPicRight() : pcv.lumaWidth - 1 );
+    rects[ctu * 4 + 3]   = uint16_t( asPic ? sub.getSubPicBottom() : pcv.lumaHeight - 1 );
+  }
+  return m_subpics.addr;
+}
+
+void GpuRecon::recordMider( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus )
+{
+  const PreCalcValues& pcv    = *cs.pcv;
+  size_t               numCus = 0;
+  for( const auto& ctu: cus )
+  {
+    numCus += ctu.size();
+  }
+  CHECK( !cs.m_gpuSliceAllocation, "the GPU's motion derivation without the picture's slice table" );
+  const int widthIn4  = int( ( pcv.lumaWidth + 3 ) >> 2 );
+  const int heightIn4 = int( ( pcv.lumaHeight + 3 ) >> 2 );
+  // the records written in order by the CPU; what only the GPU reads and
+  // writes (the CU map, the CUs' motion, the rows' progress) in its own
+  // memory, where its one lane a row waits far less for each read (host
+  // memory: VideoQ 1080p 0.6 s a picture); the motion of the 4x4 blocks, for
+  // the comparison, in host memory
+  ensureBuffer( m_ctx, m_miderCus, std::max<size_t>( numCus, 1 ) * sizeof( CuRecord ), MemKind::Upload );
+  ensureBuffer( m_ctx, m_miderCtus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::Upload );
+  ensureBuffer( m_ctx, m_miderCuMap, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
+  const size_t motionSize = size_t( pcv.sizeInCtus ) * pcv.num4x4CtuBlks * 5 * sizeof( int32_t );
+  ensureBuffer( m_ctx, m_miderCuMotion, std::max<size_t>( numCus, 1 ) * 16 * sizeof( int32_t ), MemKind::Device );
+  ensureBuffer( m_ctx, m_miderMotion, motionSize, MemKind::Device );
+  ensureBuffer( m_ctx, m_miderMotionHost, motionSize, MemKind::HostCached );
+  ensureBuffer( m_ctx, m_miderProgress, ( pcv.heightInCtus + 1 ) * sizeof( uint32_t ), MemKind::Device );
+  CuRecord* dst = reinterpret_cast<CuRecord*>( m_miderCus.mapped );
+  for( const auto& ctu: cus )
+  {
+    if( !ctu.empty() )
+    {
+      memcpy( dst, ctu.data(), ctu.size() * sizeof( CuRecord ) );
+      dst += ctu.size();
+    }
+  }
+  writeCtuRecords( cs, cus, reinterpret_cast<CtuRecord*>( m_miderCtus.mapped ) );
+
+  MiderPush push{};
+  push.cus             = m_miderCus.addr;
+  push.ctus            = m_miderCtus.addr;
+  push.slices          = hostAllocationAddress( cs.m_gpuSliceAllocation );
+  push.cuMap           = m_miderCuMap.addr;
+  push.cuMotion        = m_miderCuMotion.addr;
+  push.motion          = m_miderMotion.addr;
+  push.progress        = m_miderProgress.addr;
+  push.numCus          = int32_t( numCus );
+  push.widthInCtus     = int32_t( pcv.widthInCtus );
+  push.heightInCtus    = int32_t( pcv.heightInCtus );
+  push.log2Ctu         = int32_t( pcv.maxCUWidthLog2 );
+  push.width           = int32_t( pcv.lumaWidth );
+  push.height          = int32_t( pcv.lumaHeight );
+  push.widthIn4        = widthIn4;
+  push.plevel          = int32_t( cs.sps->getLog2ParallelMergeLevelMinus2() + 2 );
+  push.wpp             = cs.sps->getEntropyCodingSyncEnabledFlag() ? 1 : 0;
+  push.maxNumMergeCand = int32_t( cs.sps->getMaxNumMergeCand() );
+  push.subpics         = subpicRects( cs );
+  push.subpicOn        = push.subpics != 0 ? 1 : 0;
+  push.sps             = ( cs.sps->getSBTMVPEnabledFlag() ? 1 : 0 ) | ( cs.sps->getUseAffine() ? 2 : 0 ) | ( cs.sps->getUseAffineType() ? 4 : 0 );
+
+  const Api& vk = m_ctx->api();
+  if( numCus > 0 )
+  {
+    vk.vkCmdFillBuffer( m_cmd, m_miderProgress.buffer, 0, VK_WHOLE_SIZE, 0 );
+    VkMemoryBarrier filled{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    filled.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    filled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &filled, 0, nullptr, 0, nullptr );
+    vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_mider_cumap ) );
+    vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+    vk.vkCmdDispatch( m_cmd, uint32_t( std::min<size_t>( numCus, 32768 ) ), uint32_t( ( numCus + 32767 ) / 32768 ), 1 );
+    computeBarrier();
+    vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_mider ) );
+    vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+    vk.vkCmdDispatch( m_cmd, uint32_t( pcv.heightInCtus ), 1, 1 );
+    // the motion of the 4x4 blocks to host memory, for the comparison
+    VkMemoryBarrier derived{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    derived.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    derived.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &derived, 0, nullptr, 0, nullptr );
+    VkBufferCopy region{ 0, 0, motionSize };
+    vk.vkCmdCopyBuffer( m_cmd, m_miderMotion.buffer, m_miderMotionHost.buffer, 1, &region );
+    VkMemoryBarrier copied{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &copied, 0, nullptr, 0, nullptr );
+  }
+  mark( "mider" );
+}
+
+void GpuRecon::compareMider( const CodingStructure& cs, const MotionInfo* cpu )
+{
+  compareMotion( cs, reinterpret_cast<const int32_t*>( m_miderMotionHost.mapped ), cpu, m_miderStats );
+}
+
 int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
                             PelStorage& pic, bool waitFirst )
 {
@@ -1895,6 +2030,10 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
     copyPlanes( pic, kHost, kTwin );
   }
   transferBarrier( false );
+  if( jobs.cus )
+  {
+    recordMider( cs, *jobs.cus );
+  }
   if( jobs.trafo )
   {
     recordTrafo( cs, *jobs.trafo, jobs.bandCtus, jobs.trafo->size(), m_trafoJobs, hostPlanes( pic ), planes[cur] );
