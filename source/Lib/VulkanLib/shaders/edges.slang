@@ -139,9 +139,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int  n    = 1 << ( pc.log2Ctu - 2 );
   const int  x0   = ( ctu % pc.widthInCtus ) << pc.log2Ctu;
   const int  y0   = ( ctu / pc.widthInCtus ) << pc.log2Ctu;
-  const int  cols = min( n, ( pc.width - x0 + 3 ) >> 2 );
-  const int  rows = min( n, ( pc.height - y0 + 3 ) >> 2 );
-  const bool off  = deblockingOff( sliceOfCtu( ctu ) );
+  const int   cols    = min( n, ( pc.width - x0 + 3 ) >> 2 );
+  const int   rows    = min( n, ( pc.height - y0 + 3 ) >> 2 );
+  const bool  off     = deblockingOff( sliceOfCtu( ctu ) );
+  const float rcpCols = 1.0f / float( max( cols, 1 ) );
   for( int dir = 0; dir < 2; dir++ )
   {
     // a thread four blocks in a row's order
@@ -158,7 +159,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       if( i < blocks )
       {
         uint2 lumaEdge, chromaEdge;
-        which[k] = blockEdges( ctu, dir, i / cols, i % cols, lumaEdge, chromaEdge );
+        const int row = int( ( float( i ) + 0.5f ) * rcpCols );   // (i / cols exactly: i, cols small)
+        which[k]      = blockEdges( ctu, dir, row, i - row * cols, lumaEdge, chromaEdge );
         e[k][0]  = lumaEdge;
         e[k][1]  = chromaEdge;
         cl += which[k] & 1;

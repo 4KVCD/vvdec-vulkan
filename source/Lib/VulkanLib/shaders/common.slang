@@ -23,3 +23,11 @@ int loadClamped( int16_t* p, int stride, int x, int y, int w, int h )
 {
   return int( p[clamp( y, 0, h - 1 ) * stride + clamp( x, 0, w - 1 )] );
 }
+
+// the workgroup's threads synchronized, their writes to global (and shared) memory visible to each other: a
+// workgroup-scope barrier, for a workgroup's own data (AllMemoryBarrierWithGroupSync's device scope, which other
+// workgroups' data needs, also invalidates the CU's caches on AMD's GPUs)
+void workgroupBarrierAll()
+{
+  spirv_asm { OpControlBarrier Workgroup Workgroup AcquireRelease|UniformMemory|WorkgroupMemory };
+}

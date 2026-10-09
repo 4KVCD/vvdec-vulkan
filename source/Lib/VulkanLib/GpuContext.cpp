@@ -249,14 +249,34 @@ bool Context::init()
     }
   }
 
+  // and a family for compute only (an async compute engine), with timestamps: the GPU's front end there runs
+  // alongside the compute queue's work (VVDEC_GPU_ASYNC=0: not)
+  const char* async = getenv( "VVDEC_GPU_ASYNC" );
+  for( uint32_t i = 0; i < count && m_asyncFamily == UINT32_MAX && features12.timelineSemaphore && !( async && atoi( async ) == 0 ); i++ )
+  {
+    if( i != m_queueFamily && ( families[i].queueFlags & VK_QUEUE_COMPUTE_BIT ) && !( families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT )
+        && families[i].timestampValidBits )
+    {
+      m_asyncFamily = i;
+    }
+  }
+
   const float priority = 1.0f;
-  VkDeviceQueueCreateInfo queueInfos[2] = { { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO }, { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO } };
-  queueInfos[0].queueFamilyIndex = m_queueFamily;
-  queueInfos[0].queueCount       = 1;
-  queueInfos[0].pQueuePriorities = &priority;
-  queueInfos[1].queueFamilyIndex = m_transferFamily;
-  queueInfos[1].queueCount       = 1;
-  queueInfos[1].pQueuePriorities = &priority;
+  const float asyncPriorities[kMaxAsync] = { 1.0f, 1.0f, 1.0f, 1.0f };
+  m_asyncCount = m_asyncFamily != UINT32_MAX ? int( std::min<uint32_t>( families[m_asyncFamily].queueCount, uint32_t( kMaxAsync ) ) ) : 0;
+  VkDeviceQueueCreateInfo queueInfos[3] = { { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO }, { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO },
+                                            { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO } };
+  uint32_t numQueueInfos = 0;
+  for( const uint32_t family: { m_queueFamily, m_transferFamily, m_asyncFamily } )
+  {
+    if( family != UINT32_MAX )
+    {
+      queueInfos[numQueueInfos].queueFamilyIndex = family;
+      queueInfos[numQueueInfos].queueCount       = family == m_asyncFamily ? uint32_t( m_asyncCount ) : 1;
+      queueInfos[numQueueInfos].pQueuePriorities = family == m_asyncFamily ? asyncPriorities : &priority;
+      numQueueInfos++;
+    }
+  }
 
   // waves of 32 threads where the shaders run better so (GPUs with both
   // sizes, AMD's): the size, subgroup size control
@@ -276,6 +296,7 @@ bool Context::init()
   enable12.bufferDeviceAddress      = VK_TRUE;
   enable12.storageBuffer8BitAccess  = VK_TRUE;
   enable12.shaderInt8               = VK_TRUE;
+  enable12.timelineSemaphore        = asyncQueue() ? VK_TRUE : VK_FALSE;
   enable11.storageBuffer16BitAccess = VK_TRUE;
   VkPhysicalDeviceFeatures2 enable{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
   enable.pNext                = &enable12;
@@ -302,7 +323,7 @@ bool Context::init()
 
   VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
   deviceInfo.pNext                = &enable;
-  deviceInfo.queueCreateInfoCount = transferQueue() ? 2 : 1;
+  deviceInfo.queueCreateInfoCount = numQueueInfos;
   deviceInfo.pQueueCreateInfos    = queueInfos;
   deviceInfo.enabledExtensionCount   = hasShaderInfo ? 1 : 0;
   deviceInfo.ppEnabledExtensionNames = hasShaderInfo ? &shaderInfo : nullptr;
@@ -324,6 +345,21 @@ bool Context::init()
   if( transferQueue() )
   {
     m_api.vkGetDeviceQueue( m_device, m_transferFamily, 0, &m_transferQueue );
+  }
+  if( asyncQueue() )
+  {
+    for( int i = 0; i < m_asyncCount; i++ )
+    {
+      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, uint32_t( i ), &m_asyncQueues[i] );
+    }
+    VkSemaphoreTypeCreateInfo timelineType{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+    timelineType.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo timelineInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    timelineInfo.pNext = &timelineType;
+    if( m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_timeline ) != VK_SUCCESS )
+    {
+      THROW_FATAL( "Vulkan: vkCreateSemaphore failed (the timeline semaphore)" );
+    }
   }
   m_api.vkGetPhysicalDeviceMemoryProperties( m_physical, &m_memProps );
 
@@ -456,6 +492,10 @@ Context::~Context()
     {
       m_api.vkDestroyPipelineLayout( m_device, m_layout, nullptr );
     }
+    if( m_timeline )
+    {
+      m_api.vkDestroySemaphore( m_device, m_timeline, nullptr );
+    }
     m_api.vkDestroyDevice( m_device, nullptr );
   }
   delete[] m_pipelines;
@@ -523,11 +563,19 @@ Buffer Context::alloc( size_t size, MemKind kind )
   info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  const uint32_t families[2] = { m_queueFamily, m_transferFamily };
-  if( transferQueue() )
+  uint32_t families[3]  = { m_queueFamily };
+  uint32_t numFamilies  = 1;
+  for( const uint32_t family: { m_transferFamily, m_asyncFamily } )
   {
-    info.sharingMode           = VK_SHARING_MODE_CONCURRENT;   // the compute queue's and the copy engine's
-    info.queueFamilyIndexCount = 2;
+    if( family != UINT32_MAX )
+    {
+      families[numFamilies++] = family;
+    }
+  }
+  if( numFamilies > 1 )
+  {
+    info.sharingMode           = VK_SHARING_MODE_CONCURRENT;   // the compute queue's, the copy engine's, the async compute queue's
+    info.queueFamilyIndexCount = numFamilies;
     info.pQueueFamilyIndices   = families;
   }
   if( m_api.vkCreateBuffer( m_device, &info, nullptr, &buf.buffer ) != VK_SUCCESS )
@@ -666,20 +714,73 @@ VkPipeline Context::pipeline( int shaderId )
   return pipe;
 }
 
-void Context::submitFirst( VkCommandBuffer first, VkFence firstDone )
+uint64_t Context::submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemaphore waitFront )
 {
   VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
   info.commandBufferCount = 1;
   info.pCommandBuffers    = &first;
+  // (the front end's results: its buffers, the indirect dispatches' arguments)
+  const VkPipelineStageFlags    stage       = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+  const uint64_t                waitValue   = 0;   // (a binary semaphore's)
+  uint64_t                      signalValue = 0;
+  VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+  if( waitFront )
+  {
+    info.waitSemaphoreCount          = 1;
+    info.pWaitSemaphores             = &waitFront;
+    info.pWaitDstStageMask           = &stage;
+    timeline.waitSemaphoreValueCount = 1;
+    timeline.pWaitSemaphoreValues    = &waitValue;
+  }
   std::lock_guard<std::mutex> lock( m_queueMutex );
+  if( m_timeline )
+  {
+    signalValue                        = ++m_timelineValue;
+    info.signalSemaphoreCount          = 1;
+    info.pSignalSemaphores             = &m_timeline;
+    timeline.signalSemaphoreValueCount = 1;
+    timeline.pSignalSemaphoreValues    = &signalValue;
+    info.pNext                         = &timeline;
+  }
   const VkResult result = m_api.vkQueueSubmit( m_queue, 1, &info, firstDone );
   if( result != VK_SUCCESS )
   {
     THROW_FATAL( "Vulkan: vkQueueSubmit failed (" << result << ")" );
   }
+  return signalValue;
 }
 
-void Context::submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore semaphore, VkCommandBuffer transfer, VkFence transferDone )
+void Context::submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, VkSemaphore done )
+{
+  VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+  info.commandBufferCount   = 1;
+  info.pCommandBuffers      = &cmd;
+  info.signalSemaphoreCount = 1;
+  info.pSignalSemaphores    = &done;
+  const VkPipelineStageFlags    stage       = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  const uint64_t                signalValue = 0;   // (a binary semaphore's)
+  VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+  timeline.signalSemaphoreValueCount = 1;
+  timeline.pSignalSemaphoreValues    = &signalValue;
+  if( waitFirst > 0 )
+  {
+    info.waitSemaphoreCount          = 1;
+    info.pWaitSemaphores             = &m_timeline;
+    info.pWaitDstStageMask           = &stage;
+    timeline.waitSemaphoreValueCount = 1;
+    timeline.pWaitSemaphoreValues    = &waitFirst;
+  }
+  info.pNext = &timeline;
+  std::lock_guard<std::mutex> lock( m_asyncMutexes[queue] );
+  const VkResult result = m_api.vkQueueSubmit( m_asyncQueues[queue], 1, &info, VK_NULL_HANDLE );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkQueueSubmit failed on the async compute queue (" << result << ")" );
+  }
+}
+
+void Context::submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore semaphore, VkCommandBuffer transfer, VkFence transferDone,
+                          VkSemaphore waitFront )
 {
   {
     VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -687,6 +788,14 @@ void Context::submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore se
     info.pCommandBuffers      = &rest;
     info.signalSemaphoreCount = transfer ? 1 : 0;
     info.pSignalSemaphores    = &semaphore;
+    // (the front end's second part: intra's waves and order, the deblocking's parameters and edges, their arguments)
+    const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    if( waitFront )
+    {
+      info.waitSemaphoreCount = 1;
+      info.pWaitSemaphores    = &waitFront;
+      info.pWaitDstStageMask  = &stage;
+    }
     std::lock_guard<std::mutex> lock( m_queueMutex );
     const VkResult result = m_api.vkQueueSubmit( m_queue, 1, &info, restDone );
     if( result != VK_SUCCESS )

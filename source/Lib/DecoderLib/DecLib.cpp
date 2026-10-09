@@ -760,12 +760,16 @@ void DecLib::reconPicture( Picture* pcPic )
   // last of those in turn
   size_t inTurn = m_decLibRecon.size();
 #if VVDEC_VULKAN
-  // with the GPU, the pictures up to 1080p take the first two only: as fast as
-  // with four (VideoQ 1080p 685 vs 675 fps; two films' 1080p within 0.5%),
-  // with two pictures fewer in reconstruction and two instances' buffers not
-  // allocated (VideoQ 1080p: peak commit 580 -> 477 MB). Larger pictures take
-  // all four (3840x1608 and 4K: 1.3% and 2.0% faster than with two).
-  if( m_gpu && pcPic->lumaSize().area() <= 1920 * 1088 )
+  // with the GPU and the CPU's front end, the pictures up to 1080p take the
+  // first two only: as fast as with four (VideoQ 1080p 685 vs 675 fps; two
+  // films' 1080p within 0.5%), with two pictures fewer in reconstruction and
+  // two instances' buffers not allocated (VideoQ 1080p: peak commit 580 -> 477
+  // MB). Larger pictures take all four (3840x1608 and 4K: 1.3% and 2.0% faster
+  // than with two), and with the GPU's front end all pictures do: a picture's
+  // front end waits for its colocated picture's first part, more pictures in
+  // flight keep the GPU busy (VideoQ 1080p +9%, peak commit +140 MB).
+  static const bool gpuFront = DecLibRecon::gpuFrontRequested();
+  if( m_gpu && pcPic->lumaSize().area() <= 1920 * 1088 && !gpuFront )
   {
     inTurn = std::min<size_t>( inTurn, 2 );
   }

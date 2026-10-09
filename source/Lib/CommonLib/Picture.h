@@ -214,6 +214,11 @@ public:
   // prediction the GPU makes may reference it before it is done, once
   // gpuRefReady (its motion for TMVP final, its GPU work queued: DecLibRecon)
   bool                     gpuEarlyRef     = false;
+  uint64_t                 gpuFirstValue   = 0;              // its first part's on the GPU: the timeline value it signals (gpu::Context)
+  // with the GPU's front end gpuRefReady comes before its motion for TMVP is final (DMVR's refinements, the GPU's
+  // colocated motion): the next pictures' front ends on the GPU read it after its work, in the queue; a picture whose
+  // motion the CPU derives waits for gpuComputeDone
+  bool                     gpuMotionLater  = false;
   UserAllocator*           gpuMemory       = nullptr;        // the GPU's allocator of the picture's buffers (PicListManager): its colocated motion too
 #endif
   bool             isReferencePic          = false;          // mainly for setting vvdecPicAttributes::isRefPic for the library output frame

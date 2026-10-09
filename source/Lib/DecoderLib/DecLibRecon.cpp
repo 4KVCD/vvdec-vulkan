@@ -144,6 +144,15 @@ DecLibRecon::DecLibRecon()
 }
 
 #if VVDEC_VULKAN
+bool DecLibRecon::gpuFrontRequested()
+{
+  const char* front = getenv( "VVDEC_GPU_FRONT" );
+  const char* mider = getenv( "VVDEC_GPU_MIDER" );
+  return !( front && atoi( front ) == 0 ) && !( mider && atoi( mider ) != 0 );
+}
+#endif
+
+#if VVDEC_VULKAN
 void DecLibRecon::create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled, gpu::Context* gpu )
 #else
 void DecLibRecon::create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled )
@@ -476,16 +485,15 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   const PPS * pps = cs.pps.get();
 
   // the threads' resources and the GPU's commands, made with the instance's
-  // first picture: an instance left idle (with the GPU, the pictures up to
-  // 1080p take two of the four) goes without them
+  // first picture: an instance left idle (with the GPU and the CPU's front
+  // end, the pictures up to 1080p take two of the four) goes without them
 #if VVDEC_VULKAN
   if( m_gpu && !m_gpuRecon )
   {
     m_gpuRecon = std::make_unique<gpu::GpuRecon>( m_gpu );
     const char* mider = getenv( "VVDEC_GPU_MIDER" );
     m_gpuMider        = mider && atoi( mider ) != 0;
-    const char* front = getenv( "VVDEC_GPU_FRONT" );
-    m_gpuFrontOn      = !( front && atoi( front ) == 0 ) && !m_gpuMider;
+    m_gpuFrontOn      = gpuFrontRequested();
   }
 #endif
   if( !m_pcThreadResource )
@@ -532,7 +540,8 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   m_gpuInter   = m_gpuIntra && !isIntra && gpu::GpuRecon::interSupported( cs );
   // and, first of all, the residuals, when the CPU predicts nothing
   m_gpuResidual = m_gpuIntra && ( isIntra || m_gpuInter ) && gpu::GpuRecon::residualSupported( cs );
-  pcPic->gpuEarlyRef = false;
+  pcPic->gpuEarlyRef    = false;
+  pcPic->gpuMotionLater = false;
   // LMCS's tables for the GPU, when it makes the intra blocks (else the CPU's
   // CTU tasks map the luma back themselves); the dequantisation matrices of an
   // explicit scaling list (TrQuant::init made them for the picture), when it
@@ -664,6 +673,10 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   const int numSubPic = cs.pps->getNumSubPics();
 
   std::vector<Picture*> borderExtRefPics( pcPic->buildAllRefPicsVec() );
+#if VVDEC_VULKAN
+  // (m_gpuFront's, below)
+  const bool gpuFront = m_gpuFrontOn && m_gpuFilters && m_gpuIntra && m_gpuResidual && ( isIntra || m_gpuInter ) && cs.colMiAllocator;
+#endif
   for( Picture* refPic : borderExtRefPics )
   {
 #if VVDEC_VULKAN
@@ -676,6 +689,12 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       if( refPic->gpuRefReady.isBlocked() && std::find( picBarriers.cbegin(), picBarriers.cend(), &refPic->gpuRefReady ) == picBarriers.cend() )
       {
         picBarriers.push_back( &refPic->gpuRefReady );
+      }
+      // its motion for TMVP final only with its GPU work (the GPU's front end): for the CPU's motion derivation
+      if( !gpuFront && refPic->gpuMotionLater && refPic->gpuComputeDone.isBlocked()
+          && std::find( picBarriers.cbegin(), picBarriers.cend(), &refPic->gpuComputeDone ) == picBarriers.cend() )
+      {
+        picBarriers.push_back( &refPic->gpuComputeDone );
       }
       continue;
     }
@@ -727,7 +746,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   m_doDeblock                  = !noFilters;
 #if VVDEC_VULKAN
   // the GPU's front end drives the picture: every stage on the GPU
-  m_gpuFront = m_gpuFrontOn && m_gpuFilters && m_gpuIntra && m_gpuResidual && ( isIntra || m_gpuInter ) && cs.colMiAllocator;
+  m_gpuFront = gpuFront;
   commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuFilters, doSAO && !m_gpuFilters, m_doDeblock && !m_gpuFilters, m_gpuIntra,
                          m_gpuInter, m_gpuResidual );
   commonTaskParam.gpuFront = m_gpuFront;
@@ -867,10 +886,11 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   if( m_gpuFilters )
   {
     // with the GPU, three tasks. The first queues the picture's work on the
-    // GPU, and when DMVR refines motion there, waits for that part of the work,
-    // which stores the refined motion for TMVP; then (gpuRefReady) the pictures
-    // whose inter prediction the GPU makes can reference this one, their work
-    // queued after its. The second waits for the rest of the work on the
+    // GPU, and when DMVR refines motion there (and the CPU derives the next
+    // pictures' motion: not with the GPU's front end, gpuMotionLater), waits
+    // for that part of the work, which stores the refined motion for TMVP;
+    // then (gpuRefReady) the pictures whose inter prediction the GPU makes can
+    // reference this one, their work queued after its. The second waits for the rest of the work on the
     // compute queue: then (gpuComputeDone) the instance may take the next
     // picture while this one downloads (releasePrevDecompressedPic: VideoQ
     // 1080p +1.4%). The third waits for the download.
@@ -908,7 +928,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       jobs.tus      = &dec->m_gpuTuRecords;
       // with DMVR, the GPU stores the refined motion for TMVP in the next
       // pictures in the first part (the CTU tasks stored the rest)
-      const bool refine = dec->m_gpuInter && cs.picture->stillReferenced;
+      const bool refine = dec->m_gpuInter && cs.picture->stillReferenced && !dec->m_gpuFront;
       param->download   = dec->m_gpuRecon->startPicture( cs, jobs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr,
                                                          dec->m_doALF ? &dec->m_cALF : nullptr, cs.picture->m_bufs[PIC_RECONSTRUCTION], refine );
       cs.picture->gpuCurrent = true;   // for the work queued after this
@@ -1025,6 +1045,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
                                         &pcPic->reconDone,
                                         { &pcPic->gpuComputeDone } );
     // from now on, the next pictures may reference this one early
+    pcPic->gpuMotionLater  = m_gpuInter && m_gpuFront;
     pcPic->gpuEarlyRef     = true;
     m_currDecompReleasable = true;
   }

@@ -145,8 +145,11 @@ public:
   // process share: the first part, which signals firstDone, then the rest,
   // which signals restDone, then (with transfer) the picture's download on the
   // copy queue, which waits for the rest's semaphore and signals transferDone
-  void submitFirst( VkCommandBuffer first, VkFence firstDone );
-  void submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore semaphore, VkCommandBuffer transfer, VkFence transferDone );
+  // (and with the async queue, the first part waits for waitFront, the front end's semaphore, and signals the
+  // timeline semaphore: the value returned)
+  uint64_t submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemaphore waitFront = VK_NULL_HANDLE );
+  void submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore semaphore, VkCommandBuffer transfer, VkFence transferDone,
+                   VkSemaphore waitFront = VK_NULL_HANDLE );
   // other work on the compute queue (the output frames' film grain), which
   // signals done
   void submit( VkCommandBuffer cmd, VkFence done ) { submitFirst( cmd, done ); }
@@ -154,6 +157,15 @@ public:
   // its copies run alongside the compute queue's work. The buffers are shared
   // by both queues' families.
   bool transferQueue() const { return m_transferFamily != UINT32_MAX; }
+  // a second compute queue, in a family for compute only (an async compute engine), when the device has one
+  // (VVDEC_GPU_ASYNC=0: not used): the pictures' front ends there run alongside the compute queue's work. A front
+  // end waits for the compute queue's timeline semaphore to reach waitFirst (submitFirst's value: the first parts
+  // of its colocated pictures) and signals done.
+  // (a queue a decoder instance, takeAsyncQueue's: their front ends run alongside each other too)
+  bool     asyncQueue() const { return m_asyncFamily != UINT32_MAX; }
+  uint32_t asyncFamily() const { return m_asyncFamily; }
+  int      takeAsyncQueue() { return int( m_asyncNext++ % uint32_t( m_asyncCount ) ); }
+  void     submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, VkSemaphore done );
 
   uint32_t           queueFamily()     const { return m_queueFamily; }
   uint32_t           transferFamily()  const { return m_transferFamily; }
@@ -187,6 +199,14 @@ private:
   uint32_t                         m_transferFamily = UINT32_MAX;
   bool                             m_transferTimestamps = false;
   std::mutex                       m_transferMutex;
+  static constexpr int             kMaxAsync = 4;
+  VkQueue                          m_asyncQueues[kMaxAsync] = {};
+  std::mutex                       m_asyncMutexes[kMaxAsync];
+  int                              m_asyncCount  = 0;
+  std::atomic<uint32_t>            m_asyncNext{ 0 };
+  uint32_t                         m_asyncFamily = UINT32_MAX;
+  VkSemaphore                      m_timeline      = VK_NULL_HANDLE;   // the compute queue's first parts
+  uint64_t                         m_timelineValue = 0;                // (with m_queueMutex)
   VkPhysicalDeviceMemoryProperties m_memProps{};
   VkPipelineLayout                 m_layout = VK_NULL_HANDLE;
   VkPipeline*                      m_pipelines = nullptr;

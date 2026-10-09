@@ -196,6 +196,28 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
   m_cmdRest  = cmds[1];
   m_cmdBand  = cmds[2];
 
+  if( m_ctx->asyncQueue() )
+  {
+    VkCommandPoolCreateInfo frontPoolInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    frontPoolInfo.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    frontPoolInfo.queueFamilyIndex = m_ctx->asyncFamily();
+    VkCommandBufferAllocateInfo frontCmdInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    frontCmdInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    frontCmdInfo.commandBufferCount = 2;
+    VkCommandBuffer       frontCmds[2] = {};
+    VkSemaphoreCreateInfo frontSemaphoreInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    if( vk.vkCreateCommandPool( m_ctx->device(), &frontPoolInfo, nullptr, &m_poolFront ) != VK_SUCCESS
+        || ( frontCmdInfo.commandPool = m_poolFront, vk.vkAllocateCommandBuffers( m_ctx->device(), &frontCmdInfo, frontCmds ) ) != VK_SUCCESS
+        || vk.vkCreateSemaphore( m_ctx->device(), &frontSemaphoreInfo, nullptr, &m_frontDone ) != VK_SUCCESS
+        || vk.vkCreateSemaphore( m_ctx->device(), &frontSemaphoreInfo, nullptr, &m_frontDone2 ) != VK_SUCCESS )
+    {
+      THROW_FATAL( "Vulkan: the front end's commands on the async compute queue failed" );
+    }
+    m_cmdFront   = frontCmds[0];
+    m_cmdFront2  = frontCmds[1];
+    m_asyncQueue = m_ctx->takeAsyncQueue();
+  }
+
   VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
   if( vk.vkCreateFence( m_ctx->device(), &fenceInfo, nullptr, &m_fence ) != VK_SUCCESS
       || vk.vkCreateFence( m_ctx->device(), &fenceInfo, nullptr, &m_fenceFirst ) != VK_SUCCESS )
@@ -342,6 +364,18 @@ GpuRecon::~GpuRecon()
   {
     vk.vkDestroyFence( m_ctx->device(), m_fenceFirst, nullptr );
   }
+  if( m_frontDone )
+  {
+    vk.vkDestroySemaphore( m_ctx->device(), m_frontDone, nullptr );
+  }
+  if( m_frontDone2 )
+  {
+    vk.vkDestroySemaphore( m_ctx->device(), m_frontDone2, nullptr );
+  }
+  if( m_poolFront )
+  {
+    vk.vkDestroyCommandPool( m_ctx->device(), m_poolFront, nullptr );
+  }
   if( m_pool )
   {
     vk.vkDestroyCommandPool( m_ctx->device(), m_pool, nullptr );
@@ -458,6 +492,10 @@ void GpuRecon::beginCommands( bool resetPool )
 
 void GpuRecon::mark( const char* label )
 {
+  if( m_cmd == m_cmdFront || m_cmd == m_cmdFront2 )
+  {
+    return;   // (on the async queue: its time not apart)
+  }
   if( m_cmd == m_cmdBand )
   {
     if( m_bandQueries && m_bandMarks < kBandMarks )
@@ -497,8 +535,9 @@ void GpuRecon::splitCommands()
   vk.vkEndCommandBuffer( m_cmd );
   // to the GPU at once: the rest is recorded while it runs
   vk.vkResetFences( m_ctx->device(), 1, &m_fenceFirst );
-  m_submitted = std::chrono::steady_clock::now();
-  m_ctx->submitFirst( m_cmdFirst, m_fenceFirst );
+  m_submitted  = std::chrono::steady_clock::now();
+  m_firstValue = m_ctx->submitFirst( m_cmdFirst, m_fenceFirst, m_waitFront );
+  m_waitFront  = VK_NULL_HANDLE;
 
   // the rest, after what the first part wrote
   m_cmd = m_cmdRest;
@@ -574,7 +613,8 @@ int GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
 
   vk.vkResetFences( m_ctx->device(), 1, &m_fence );
   m_ctx->submitRest( m_cmdRest, m_fence, download ? download->semaphore : VK_NULL_HANDLE, download ? download->cmd : VK_NULL_HANDLE,
-                     download ? download->fence : VK_NULL_HANDLE );
+                     download ? download->fence : VK_NULL_HANDLE, m_waitFront2 );
+  m_waitFront2 = VK_NULL_HANDLE;
   if( waitFirst )
   {
     const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_fenceFirst, VK_TRUE, UINT64_MAX );
@@ -2194,6 +2234,9 @@ void GpuRecon::recordMider( const CodingStructure& cs, const PictureJobs& jobs )
       vk.vkCmdCopyBuffer( m_cmd, m_miderMotion.buffer, m_miderMotionHost.buffer, 1, &region );
     }
 
+    // the jobs (with the async queue: then the front end's second submission, splitFront)
+    recordJobs( cs, jobs, push.slices );
+
     // the deblocking's parameters: zeroed (as the CTU tasks' LF_INIT has
     // them), the luma tree's CUs, then the chroma tree's
     const size_t lfpSize = size_t( pcv.sizeInCtus ) * 2 * pcv.num4x4CtuBlks * 2 * sizeof( uint32_t );
@@ -2274,7 +2317,6 @@ void GpuRecon::recordMider( const CodingStructure& cs, const PictureJobs& jobs )
       m_dbRecorded = true;
     }
 
-    recordJobs( cs, jobs, push.slices );
     recordEdges( cs, jobs, push.slices );
 
     VkMemoryBarrier copied{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
@@ -2283,6 +2325,68 @@ void GpuRecon::recordMider( const CodingStructure& cs, const PictureJobs& jobs )
     vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &copied, 0, nullptr, 0, nullptr );
   }
   mark( "front end" );
+}
+
+void GpuRecon::recordFront( const CodingStructure& cs, const PictureJobs& jobs )
+{
+  const Api& vk = m_ctx->api();
+  vk.vkResetCommandPool( m_ctx->device(), m_poolFront, 0 );
+  VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  m_cmd       = m_cmdFront;
+  vk.vkBeginCommandBuffer( m_cmd, &begin );
+  // what the front ends before wrote (the colocated pictures' motion), visible
+  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+  // after the first parts of the colocated pictures (their inter prediction writes DMVR's refined motion into their
+  // colocated motion, which TMVP reads)
+  uint64_t wait = 0;
+  for( const Slice* s: cs.picture->slices )
+  {
+    if( !s->isIntra() )
+    {
+      const RefPicList colList = RefPicList( s->isInterB() ? 1 - s->getColFromL0Flag() : 0 );
+      if( int( s->getColRefIdx() ) < s->getNumRefIdx( colList ) )
+      {
+        if( const Picture* col = s->getRefPic( colList, int( s->getColRefIdx() ) ) )
+        {
+          wait = std::max( wait, col->gpuFirstValue );
+        }
+      }
+    }
+  }
+  // two submissions: the first (the motion, the jobs) ends after the jobs (splitFront), which the picture's first
+  // part waits for; the second, which the rest waits for
+  m_frontWait  = wait;
+  m_frontSplit = true;
+  recordMider( cs, jobs );
+  m_frontSplit = false;
+  if( m_cmd == m_cmdFront )
+  {
+    splitFront();   // (no jobs recorded: the second submission empty)
+  }
+  vk.vkEndCommandBuffer( m_cmd );
+  m_ctx->submitFront( m_asyncQueue, m_cmdFront2, 0, m_frontDone2 );
+  m_waitFront  = m_frontDone;
+  m_waitFront2 = m_frontDone2;
+}
+
+void GpuRecon::splitFront()
+{
+  const Api& vk = m_ctx->api();
+  vk.vkEndCommandBuffer( m_cmdFront );
+  m_ctx->submitFront( m_asyncQueue, m_cmdFront, m_frontWait, m_frontDone );
+  VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  m_cmd       = m_cmdFront2;
+  vk.vkBeginCommandBuffer( m_cmd, &begin );
+  // what the first submission wrote, visible
+  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
 }
 
 void GpuRecon::indirectBarrier()
@@ -2438,6 +2542,10 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, V
     computeBarrier();
   }
   mark( "jobs" );
+  if( m_frontSplit )
+  {
+    splitFront();
+  }
   push.pass = 3;
   vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_jobs_waves ) );
   vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
@@ -2709,6 +2817,12 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
 
   const bool doDeblock = m_prepared.deblock;
   const bool doSao     = m_prepared.sao;
+  // the GPU's front end on the async compute queue (recordFront), alongside the work queued before
+  const bool async = jobs.front && jobs.cus && m_cmdFront != VK_NULL_HANDLE;
+  if( async )
+  {
+    recordFront( cs, jobs );
+  }
   // in the GPU's own memory, which its shaders reach faster than the host's:
   // the picture goes in (what the CPU made of it), is finished there, stays
   // there as a reference, and comes back for the output. When the GPU makes
@@ -2727,7 +2841,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
     copyPlanes( pic, kHost, kTwin );
   }
   transferBarrier( false );
-  if( jobs.cus )
+  if( jobs.cus && !async )
   {
     recordMider( cs, jobs );
   }
@@ -2749,6 +2863,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
     computeBarrier();
   }
   splitCommands();
+  cs.picture->gpuFirstValue = m_firstValue;   // (for the front ends of the pictures it is the colocated picture of)
   if( jobs.intra || jobs.front )
   {
     recordIntra( cs, jobs.front ? noIntra : *jobs.intra, planes[cur] );   // in place

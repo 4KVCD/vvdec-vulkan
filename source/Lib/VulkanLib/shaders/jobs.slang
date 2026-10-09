@@ -1782,10 +1782,11 @@ int waveMaxInP( int c, int x, int y, int width, int height, int lane )
   const int y1   = min( ( y + height - 1 ) >> waveShiftY( c ), waveHeight( c ) - 1 );
   const int cols = x1 - x0 + 1;
   const int n    = cols > 0 && y1 >= y0 ? cols * ( y1 - y0 + 1 ) : 0;
-  int       wave = 0;
+  int         wave = 0;
+  const float rcp  = 1.0f / float( max( cols, 1 ) );   // (u / cols exactly: u, cols small)
   for( int u = lane; u < n; u += 32 )
   {
-    const int j = y0 + u / cols;
+    const int j = y0 + int( ( float( u ) + 0.5f ) * rcp );
     wave        = max( wave, int( waveRow( c, j )[x0 + u - ( j - y0 ) * cols] ) );
   }
   return WaveActiveMax( wave );
@@ -1799,9 +1800,10 @@ void waveSetP( int c, int x, int y, int width, int height, int wave, int lane )
   const int y1   = min( ( y + height - 1 ) >> waveShiftY( c ), waveHeight( c ) - 1 );
   const int cols = x1 - x0 + 1;
   const int n    = cols > 0 && y1 >= y0 ? cols * ( y1 - y0 + 1 ) : 0;
+  const float rcp = 1.0f / float( max( cols, 1 ) );   // (u / cols exactly: u, cols small)
   for( int u = lane; u < n; u += 32 )
   {
-    const int j                                       = y0 + u / cols;
+    const int j                                 = y0 + int( ( float( u ) + 0.5f ) * rcp );
     waveRow( c, j )[x0 + u - ( j - y0 ) * cols] = uint( wave );
   }
 }
@@ -2005,7 +2007,7 @@ void main( uint3 local : SV_GroupThreadID )
       {
         jobWaveP( pc.intra + j * 12, lane );
         // (the job's units written before the next job's reads)
-        AllMemoryBarrierWithGroupSync();
+        workgroupBarrierAll();
       }
     }
     AllMemoryBarrierWithGroupSync();

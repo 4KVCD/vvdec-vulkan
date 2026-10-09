@@ -91,20 +91,63 @@ struct Cu
   int  index;
 };
 
+// the CTU's CU records' first words (loadCu's), read at the CTU's start: its first CU, how many there
+static const int kCachedCus = 512;
+groupshared uint s_cuRec[4 * kCachedCus];
+static int g_cachedFirst = 0;
+static int g_cachedCount = 0;
+
 Cu loadCu( int index )
 {
-  uint* r = pc.cus + index * 32;
-  Cu    cu;
-  cu.x        = int( r[0] & 0xffff );
-  cu.y        = int( r[0] >> 16 );
-  cu.w        = int( r[1] & 0xff );
-  cu.h        = int( ( r[1] >> 8 ) & 0xff );
-  cu.predMode = int( ( r[1] >> 16 ) & 3 );
-  cu.flags    = r[1] >> 18;
-  cu.w2       = r[2];
-  cu.w3       = r[3];
+  uint4 r;
+  if( uint( index - g_cachedFirst ) < uint( g_cachedCount ) )
+  {
+    const int at = ( index - g_cachedFirst ) * 4;
+    r            = uint4( s_cuRec[at], s_cuRec[at + 1], s_cuRec[at + 2], s_cuRec[at + 3] );
+  }
+  else
+  {
+    uint* g = pc.cus + index * 32;
+    r       = uint4( g[0], g[1], g[2], g[3] );
+  }
+  Cu cu;
+  cu.x        = int( r.x & 0xffff );
+  cu.y        = int( r.x >> 16 );
+  cu.w        = int( r.y & 0xff );
+  cu.h        = int( ( r.y >> 8 ) & 0xff );
+  cu.predMode = int( ( r.y >> 16 ) & 3 );
+  cu.flags    = r.y >> 18;
+  cu.w2       = r.z;
+  cu.w3       = r.w;
   cu.index    = index;
   return cu;
+}
+
+// the CTU's CU records into shared memory (all threads)
+void cacheCtuCus( int first, int count )
+{
+  g_cachedFirst = first;
+  g_cachedCount = min( count, kCachedCus );
+  const int n   = g_cachedCount * 4;
+  for( int base = 0; base < n; base += 128 )
+  {
+    // (a thread's four loads issued together)
+    uint v[4];
+    for( int j = 0; j < 4; j++ )
+    {
+      const int i = base + j * 32 + g_lane;
+      v[j]        = i < n ? pc.cus[( first + ( i >> 2 ) ) * 32 + ( i & 3 )] : 0u;
+    }
+    for( int j = 0; j < 4; j++ )
+    {
+      const int i = base + j * 32 + g_lane;
+      if( i < n )
+      {
+        s_cuRec[i] = v[j];
+      }
+    }
+  }
+  GroupMemoryBarrierWithGroupSync();
 }
 
 int  mergeIdx( Cu cu ) { return int( cu.w2 & 7 ); }
@@ -469,6 +512,48 @@ int cuAt( Cur cur, int x, int y )
   return -1;
 }
 
+// the CTUs left (0), above left (1), above (2) and above right (3) of the CU's: whether getCURestricted lets the CU
+// use them (in its slice and tile, above right not with WPP), their independent slices (setNeighbourCtus, a CTU)
+static uint g_nbAvail;
+static uint g_nbSlice[4];
+
+int nbCtu( int xdiff, int ydiff )
+{
+  return ydiff == 0 ? ( xdiff == -1 ? 0 : -1 ) : ydiff == -1 ? ( xdiff + 2 ) : -1;
+}
+
+void setNeighbourCtus( Cur cur, int col, int row )
+{
+  // thread k the CTU k (its record, its slice's): one wait for the four
+  const int  k     = g_lane & 3;
+  const int  dx    = k == 0 ? -1 : k - 2;
+  const int  dy    = k == 0 ? 0 : -1;
+  const int  cx    = col + dx;
+  const int  cy    = row + dy;
+  const bool there = cx >= 0 && cx < pc.widthInCtus && cy >= 0 && !( dx > 1 - pc.wpp && dy < 0 );
+  uint       slice = 0;
+  bool       avail = false;
+  if( there )
+  {
+    const int ctu = cy * pc.widthInCtus + cx;
+    slice         = independentIdx( sliceOfCtu( ctu ) );
+    avail         = slice == cur.sliceIdx && ctuTile( ctu ) == cur.tile;
+  }
+  const uint4 mask = WaveActiveBallot( avail );
+  g_nbAvail        = mask.x & 15u;
+  for( int j = 0; j < 4; j++ )
+  {
+    g_nbSlice[j] = WaveReadLaneAt( slice, j );
+  }
+}
+
+// the independent slice of the CTU at (x, y): the CU's or one around it (sliceIdxOfCu of the CU there)
+uint sliceIdxAt( Cur cur, int x, int y )
+{
+  const int k = nbCtu( ( x >> pc.log2Ctu ) - ( cur.cu.x >> pc.log2Ctu ), ( y >> pc.log2Ctu ) - ( cur.cu.y >> pc.log2Ctu ) );
+  return k < 0 ? cur.sliceIdx : g_nbSlice[k];
+}
+
 // the independent slice of a CU (its CTU's)
 uint sliceIdxOfCu( int cuIdx )
 {
@@ -524,29 +609,33 @@ void setLutEntry( int lut, int i, Motion m )
 // MotionHist::addMiToLut (HPMVInfo's == compares the motion only)
 void addToLut( int lut, Motion mi )
 {
-  const int count  = s_lutSize[lut];
-  bool      pruned = false;
-  int       same   = 0;
-  for( int i = 0; i < count; i++ )
-  {
-    if( sameMotion( lutEntry( lut, i ), mi ) )
-    {
-      same   = i;
-      pruned = true;
-      break;
-    }
-  }
-  int size = count;
+  // thread i entry i: the first alike by a ballot, the entries after it down by one at once
+  const int  count  = s_lutSize[lut];
+  const int  i      = g_lane;
+  const bool alike  = i < count && sameMotion( lutEntry( lut, min( i, kMaxHmvp - 1 ) ), mi );
+  const uint first  = WaveActiveBallot( alike ).x;
+  const bool pruned = first != 0;
+  const int  same   = pruned ? int( firstbitlow( first ) ) : 0;
+  int        size   = count;
   if( pruned || count == kMaxHmvp )
   {
-    for( int i = same; i + 1 < count; i++ )
+    const bool moves = i >= same && i + 1 < count;
+    Motion     next  = noMotion();
+    if( moves )
     {
-      setLutEntry( lut, i, lutEntry( lut, i + 1 ) );
+      next = lutEntry( lut, i + 1 );
+    }
+    GroupMemoryBarrierWithGroupSync();   // (all read before any writes)
+    if( moves )
+    {
+      setLutEntry( lut, i, next );
     }
     size--;
   }
+  GroupMemoryBarrierWithGroupSync();
   setLutEntry( lut, size, mi );
   s_lutSize[lut] = size + 1;
+  GroupMemoryBarrierWithGroupSync();
 }
 
 // --------------------------------------------------------------------------------------------------------------------
@@ -692,6 +781,54 @@ bool neighbourMotion( int cuIdx, int x, int y, out Motion m )
   return true;
 }
 
+// cuAt and neighbourMotion of a spatial neighbour at (x, y) next to the CU (in its CTU or one of the four around):
+// the CU map's word and the block's motion read together; a translational CU's BCW and half-sample flag from its
+// block (spanMotion's), other kinds' from their CU's record
+bool neighbourAt( Cur cur, int x, int y, out int cuIdx, out Motion m )
+{
+  m     = noMotion();
+  cuIdx = -1;
+  if( x < 0 || y < 0 || x >= pc.width || y >= pc.height )
+  {
+    return false;
+  }
+  const int  idx   = int( pc.cuMap[( y >> 2 ) * pc.widthIn4 + ( x >> 2 )] );
+  int*       mi    = motionPtr( x, y );
+  const int4 mv    = int4( mi[0], mi[1], mi[2], mi[3] );
+  const uint w     = uint( mi[4] );
+  const int  xdiff = ( x >> pc.log2Ctu ) - ( cur.cu.x >> pc.log2Ctu );
+  const int  ydiff = ( y >> pc.log2Ctu ) - ( cur.cu.y >> pc.log2Ctu );
+  if( xdiff == 0 && ydiff == 0 )
+  {
+    cuIdx = idx > cur.cu.index ? -1 : idx;
+  }
+  else
+  {
+    const int k = nbCtu( xdiff, ydiff );
+    cuIdx       = k >= 0 && ( g_nbAvail & ( 1u << k ) ) != 0 ? idx : -1;
+  }
+  if( cuIdx < 0 )
+  {
+    return false;
+  }
+  const int kind = int( ( w >> 16 ) & 0xff );
+  if( kind == kNotInter || kind == kIbc )
+  {
+    return false;   // (CU::isInter)
+  }
+  if( kind != kTranslation )
+  {
+    return neighbourMotion( cuIdx, x, y, m );
+  }
+  m.mv[0]     = mv.xy;
+  m.mv[1]     = mv.zw;
+  m.refIdx[0] = int( int8_t( w & 0xff ) );
+  m.refIdx[1] = int( int8_t( ( w >> 8 ) & 0xff ) );
+  m.bcw       = int( ( w >> 24 ) & 7 );
+  m.hpel      = ( ( w >> 27 ) & 1 ) != 0;
+  return true;
+}
+
 // a spatial candidate from a neighbour's motion: the second list's only in B slices
 Motion spatialCand( Motion n, bool interB )
 {
@@ -761,8 +898,8 @@ int mergeCandidates( Cur cur, int last )
 
   // B1: above
   Motion     above, left;
-  const int  cuAbove = cuAt( cur, rt.x, rt.y - 1 );
-  const bool availB1 = neighbourMotion( cuAbove, rt.x, rt.y - 1, above ) && isDiffMer( lt.x, lt.y, rt.x, rt.y - 1 );
+  int        cuAbove;
+  const bool availB1 = neighbourAt( cur, rt.x, rt.y - 1, cuAbove, above ) && isDiffMer( lt.x, lt.y, rt.x, rt.y - 1 );
   if( availB1 )
   {
     setCand( cnt, spatialCand( above, interB ) );
@@ -772,11 +909,11 @@ int mergeCandidates( Cur cur, int last )
   if( cnt == maxCand ) return cnt;
 
   // A1: left
-  const int  cuLeft  = cuAt( cur, lb.x - 1, lb.y );
-  const bool availA1 = neighbourMotion( cuLeft, lb.x - 1, lb.y, left ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y );
+  int        cuLeft;
+  const bool availA1 = neighbourAt( cur, lb.x - 1, lb.y, cuLeft, left ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y );
   if( availA1 )
   {
-    if( !availB1 || sliceIdxOfCu( cuAbove ) != sliceIdxOfCu( cuLeft ) || !sameMotion( above, left ) )
+    if( !availB1 || sliceIdxAt( cur, rt.x, rt.y - 1 ) != sliceIdxAt( cur, lb.x - 1, lb.y ) || !sameMotion( above, left ) )
     {
       setCand( cnt, spatialCand( left, interB ) );
       if( cnt == last ) return cnt + 1;
@@ -789,11 +926,11 @@ int mergeCandidates( Cur cur, int last )
 
   // B0: above right
   Motion     aboveRight;
-  const int  cuAboveRight = cuAt( cur, rt.x + 1, rt.y - 1 );
-  const bool availB0      = neighbourMotion( cuAboveRight, rt.x + 1, rt.y - 1, aboveRight ) && isDiffMer( lt.x, lt.y, rt.x + 1, rt.y - 1 );
+  int        cuAboveRight;
+  const bool availB0      = neighbourAt( cur, rt.x + 1, rt.y - 1, cuAboveRight, aboveRight ) && isDiffMer( lt.x, lt.y, rt.x + 1, rt.y - 1 );
   if( availB0 )
   {
-    if( !availB1 || sliceIdxOfCu( cuAbove ) != sliceIdxOfCu( cuAboveRight ) || !sameMotion( above, aboveRight ) )
+    if( !availB1 || sliceIdxAt( cur, rt.x, rt.y - 1 ) != sliceIdxAt( cur, rt.x + 1, rt.y - 1 ) || !sameMotion( above, aboveRight ) )
     {
       setCand( cnt, spatialCand( aboveRight, interB ) );
       if( cnt == last ) return cnt + 1;
@@ -804,11 +941,11 @@ int mergeCandidates( Cur cur, int last )
 
   // A0: below left
   Motion     belowLeft;
-  const int  cuBelowLeft = cuAt( cur, lb.x - 1, lb.y + 1 );
-  const bool availA0     = neighbourMotion( cuBelowLeft, lb.x - 1, lb.y + 1, belowLeft ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y + 1 );
+  int        cuBelowLeft;
+  const bool availA0     = neighbourAt( cur, lb.x - 1, lb.y + 1, cuBelowLeft, belowLeft ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y + 1 );
   if( availA0 )
   {
-    if( !availA1 || sliceIdxOfCu( cuBelowLeft ) != sliceIdxOfCu( cuLeft ) || !sameMotion( belowLeft, left ) )
+    if( !availA1 || sliceIdxAt( cur, lb.x - 1, lb.y + 1 ) != sliceIdxAt( cur, lb.x - 1, lb.y ) || !sameMotion( belowLeft, left ) )
     {
       setCand( cnt, spatialCand( belowLeft, interB ) );
       if( cnt == last ) return cnt + 1;
@@ -821,12 +958,13 @@ int mergeCandidates( Cur cur, int last )
   if( cnt < 4 )
   {
     Motion     aboveLeft;
-    const int  cuAboveLeft = cuAt( cur, lt.x - 1, lt.y - 1 );
-    const bool availB2     = neighbourMotion( cuAboveLeft, lt.x - 1, lt.y - 1, aboveLeft ) && isDiffMer( lt.x, lt.y, lt.x - 1, lt.y - 1 );
+    int        cuAboveLeft;
+    const bool availB2     = neighbourAt( cur, lt.x - 1, lt.y - 1, cuAboveLeft, aboveLeft ) && isDiffMer( lt.x, lt.y, lt.x - 1, lt.y - 1 );
     if( availB2 )
     {
-      if( ( !availA1 || sliceIdxOfCu( cuLeft ) != sliceIdxOfCu( cuAboveLeft ) || !sameMotion( left, aboveLeft ) )
-          && ( !availB1 || sliceIdxOfCu( cuAbove ) != sliceIdxOfCu( cuAboveLeft ) || !sameMotion( above, aboveLeft ) ) )
+      const uint sliceB2 = sliceIdxAt( cur, lt.x - 1, lt.y - 1 );
+      if( ( !availA1 || sliceIdxAt( cur, lb.x - 1, lb.y ) != sliceB2 || !sameMotion( left, aboveLeft ) )
+          && ( !availB1 || sliceIdxAt( cur, rt.x, rt.y - 1 ) != sliceB2 || !sameMotion( above, aboveLeft ) ) )
       {
         setCand( cnt, spatialCand( aboveLeft, interB ) );
         if( cnt == last ) return cnt + 1;
@@ -1512,11 +1650,12 @@ bool subPuMvpCand( Cur cur, int count, bool spread )
   // the sub-PUs of 8x8
   const bool biRestricted = cur.cu.w + cur.cu.h <= 12;
   const int  w8           = max( cur.cu.w >> 3, 1 );
+  const int  lw8          = log2Of( w8 );
   for( int u = g_lane; u < w8 * max( cur.cu.h >> 3, 1 ); u += 32 )
   {
     {
-      const int  x      = cur.cu.x + ( u % w8 ) * 8;
-      const int  y      = cur.cu.y + ( u / w8 ) * 8;
+      const int  x      = cur.cu.x + ( u & ( w8 - 1 ) ) * 8;
+      const int  y      = cur.cu.y + ( u >> lw8 ) * 8;
       Motion     mi     = noMotion();
       const int2 colPos = clipColPos( cur, int2( x + 4 + t.x, y + 4 + t.y ) );
       bool       here   = false;
@@ -1834,11 +1973,12 @@ void setAllAffineMv( Cur cur, inout CuMotion c, int2 lt, int2 rt, int2 lb, int l
   {
     flb = clipMv18( roundAffineMv( int2( scaleHor + dHorX * ( w >> 1 ) + dVerX * ( h >> 1 ), scaleVer + dHorY * ( w >> 1 ) + dVerY * ( h >> 1 ) ), shift ) );
   }
-  const int w4 = w >> 2;
+  const int w4  = w >> 2;
+  const int lw4 = log2Of( w4 );
   for( int u = g_lane; u < w4 * ( h >> 2 ); u += 32 )
   {
-    const int x  = ( u % w4 ) * 4;
-    const int y  = ( u / w4 ) * 4;
+    const int x  = ( u & ( w4 - 1 ) ) * 4;
+    const int y  = ( u >> lw4 ) * 4;
     int2      mv = flb;
     if( !spread )
     {
@@ -2128,11 +2268,12 @@ void spanGeo( Cur cur, int splitDir, Motion m0, Motion m1 )
       offsetX += angle < 16 ? ( ( distance * w ) >> 3 ) : -( ( distance * w ) >> 3 );
     }
   }
-  const int w4 = w >> 2;
+  const int w4  = w >> 2;
+  const int lw4 = log2Of( w4 );
   for( int u = g_lane; u < w4 * ( h >> 2 ); u += 32 )
   {
-    const int x         = u % w4;
-    const int y         = u / w4;
+    const int x         = u & ( w4 - 1 );
+    const int y         = u >> lw4;
     const int lookUpY   = ( ( ( 4 * y + offsetY ) * 2 ) + 5 ) * int( kDis[distY] );
     const int motionIdx = ( ( ( 4 * x + offsetX ) * 2 ) + 5 ) * int( kDis[distX] ) + lookUpY;
     const int mask      = abs( motionIdx ) < 32 ? 2 : ( motionIdx <= 0 ? ( flip ? 0 : 1 ) : ( flip ? 1 : 0 ) );
@@ -2147,10 +2288,23 @@ void spanGeo( Cur cur, int splitDir, Motion m0, Motion m1 )
 // the CU's area of 4x4 blocks with one motion
 void spanMotion( Cur cur, Motion m, int kind )
 {
-  const int w4 = cur.cu.w >> 2;
+  // (the CU in one CTU, its sizes powers of two: its CTU's blocks from the CU's first)
+  const int lw4     = log2Of( cur.cu.w ) - 2;
+  const int log2C4  = pc.log2Ctu - 2;
+  const int ctuMask = ( 1 << pc.log2Ctu ) - 1;
+  int*      first   = pc.motion + ( ( ctuOf( cur.cu.x, cur.cu.y ) << ( 2 * log2C4 ) ) + ( ( cur.cu.y & ctuMask ) >> 2 << log2C4 )
+                                  + ( ( cur.cu.x & ctuMask ) >> 2 ) ) * 5;
+  const int w4      = 1 << lw4;
+  const int packed  = int( ( uint( m.refIdx[0] ) & 0xff ) | ( ( uint( m.refIdx[1] ) & 0xff ) << 8 ) | ( uint( kind ) << 16 )
+                            | ( ( uint( m.bcw ) & 7 ) << 24 ) | ( m.hpel ? 1u << 27 : 0u ) );   // (BCW, AMVR's half-sample: neighbourAt's)
   for( int u = g_lane; u < w4 * ( cur.cu.h >> 2 ); u += 32 )
   {
-    storeMotionAt( cur.cu.x + ( u % w4 ) * 4, cur.cu.y + ( u / w4 ) * 4, m, kind );
+    int* mi = first + ( ( ( u >> lw4 ) << log2C4 ) + ( u & ( w4 - 1 ) ) ) * 5;
+    mi[0]   = m.mv[0].x;
+    mi[1]   = m.mv[0].y;
+    mi[2]   = m.mv[1].x;
+    mi[3]   = m.mv[1].y;
+    mi[4]   = packed;
   }
 }
 
@@ -2314,12 +2468,13 @@ void deriveCu( Cur cur )
   if( c.kind == kAffineCu )
   {
     // spanMotionInfo for affine: the lists' reference indices, the unused lists' motion zero
-    const int w4 = cu.w >> 2;
+    const int w4  = cu.w >> 2;
+    const int lw4 = log2Of( w4 );
     for( int u = g_lane; u < w4 * ( cu.h >> 2 ); u += 32 )
     {
       {
-        const int x  = ( u % w4 ) * 4;
-        const int y  = ( u / w4 ) * 4;
+        const int x  = ( u & ( w4 - 1 ) ) * 4;
+        const int y  = ( u >> lw4 ) * 4;
         int*      mi = motionPtr( cu.x + x, cu.y + y );
         for( int l = 0; l < 2; l++ )
         {
@@ -2429,12 +2584,13 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const uint valid = r[20];
   if( ( valid & ( 1u << 17 ) ) != 0 )
   {
-    const int w4 = cu.w >> 2;
-    const int n  = w4 * ( cu.h >> 2 );
+    const int w4  = cu.w >> 2;
+    const int lw4 = log2Of( w4 );
+    const int n   = w4 * ( cu.h >> 2 );
     for( int i = int( local.x ); i < n; i += 64 )
     {
-      const int y = ( cu.y >> 2 ) + i / w4;
-      const int x = ( cu.x >> 2 ) + i % w4;
+      const int y = ( cu.y >> 2 ) + ( i >> lw4 );
+      const int x = ( cu.x >> 2 ) + ( i & ( w4 - 1 ) );
       pc.cuMap[y * pc.widthIn4 + x] = uint( index );
     }
   }
@@ -2445,12 +2601,13 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     const int cy = int( r[19] >> 16 ) << pc.csy;
     const int cw = int( r[20] & 0xff ) << pc.csx;
     const int ch = int( ( r[20] >> 8 ) & 0xff ) << pc.csy;
-    const int w4 = max( cw >> 2, 1 );
-    const int n  = w4 * max( ch >> 2, 1 );
+    const int w4  = max( cw >> 2, 1 );
+    const int lw4 = log2Of( w4 );
+    const int n   = w4 * max( ch >> 2, 1 );
     for( int i = int( local.x ); i < n; i += 64 )
     {
-      const int y = ( cy >> 2 ) + i / w4;
-      const int x = ( cx >> 2 ) + i % w4;
+      const int y = ( cy >> 2 ) + ( i >> lw4 );
+      const int x = ( cx >> 2 ) + ( i & ( w4 - 1 ) );
       pc.cuMapC[y * pc.widthIn4 + x] = uint( index );
     }
   }
@@ -2503,6 +2660,8 @@ void main( uint3 local : SV_GroupThreadID )
     cur.rect     = ctuRect( ctu );
     const int first = int( pc.ctus[ctu * 4] );
     const int count = int( pc.ctus[ctu * 4 + 1] & 0xffff );
+    cacheCtuCus( first, count );
+    setNeighbourCtus( cur, col, row );
     for( int i = first; i < first + count; i++ )
     {
       cur.cu = loadCu( i );
@@ -2520,8 +2679,9 @@ void main( uint3 local : SV_GroupThreadID )
         deriveCu( cur );
       }
       // (the CU's blocks, each thread's, visible to all before the next CU looks them up)
-      AllMemoryBarrierWithGroupSync();
+      workgroupBarrierAll();
     }
+    AllMemoryBarrierWithGroupSync();   // (the CTU's motion visible to the rows below)
     if( g_lane == 0 )
     {
       pc.progress[row].store( uint( col + 1 ), MemoryOrder.Release );

@@ -231,6 +231,21 @@ private:
   VkCommandBuffer m_cmd     = VK_NULL_HANDLE;   // the one being recorded: m_cmdBand, m_cmdFirst or m_cmdRest
   VkCommandBuffer m_cmdFirst = VK_NULL_HANDLE;  // a picture's first part
   VkCommandBuffer m_cmdRest  = VK_NULL_HANDLE;  // and the rest
+  // with the async compute queue: the picture's front end there (recordFront), the semaphore the picture's first
+  // part waits for; the timeline value of the first part (submitFirst's)
+  void            recordFront( const CodingStructure& cs, const PictureJobs& jobs );
+  VkCommandPool   m_poolFront  = VK_NULL_HANDLE;
+  int             m_asyncQueue = 0;                // (Context::takeAsyncQueue's)
+  VkCommandBuffer m_cmdFront   = VK_NULL_HANDLE;   // its first submission (the motion, the jobs)
+  VkCommandBuffer m_cmdFront2  = VK_NULL_HANDLE;   // and its second (intra's waves and order, the deblocking's)
+  VkSemaphore     m_frontDone  = VK_NULL_HANDLE;
+  VkSemaphore     m_frontDone2 = VK_NULL_HANDLE;
+  VkSemaphore     m_waitFront  = VK_NULL_HANDLE;   // the next first part's to wait for
+  VkSemaphore     m_waitFront2 = VK_NULL_HANDLE;   // and the next rest's
+  uint64_t        m_firstValue = 0;
+  uint64_t        m_frontWait  = 0;                // the front end's first submission's (the colocated pictures' first parts)
+  bool            m_frontSplit = false;            // recordJobs ends the first submission after the jobs (splitFront)
+  void            splitFront();
   VkCommandBuffer m_cmdBand  = VK_NULL_HANDLE;  // its top band, queued ahead (startBand)
   VkFence         m_fenceFirst = VK_NULL_HANDLE;   // the first part done
   VkFence         m_fence   = VK_NULL_HANDLE;   // the rest done (without the copy engine, the download too)

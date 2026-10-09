@@ -208,6 +208,11 @@ private:
   // the GPU's front end drives the pictures (all their stages on the GPU; VVDEC_GPU_FRONT=0: not): the CTU tasks parse and
   // write the records, the GPU does the rest
   bool                           m_gpuFrontOn = false;
+public:
+  // the GPU's front end as the environment asks for it: on, unless VVDEC_GPU_FRONT=0 or the motion derivation in
+  // shadow (VVDEC_GPU_MIDER=1)
+  static bool gpuFrontRequested();
+private:
   bool                           m_gpuFront   = false;   // this picture's
   std::vector<std::vector<gpu::CuRecord>> m_gpuCuRecords;   // per CTU
   std::vector<std::vector<gpu::TuRecord>> m_gpuTuRecords;   // per CTU

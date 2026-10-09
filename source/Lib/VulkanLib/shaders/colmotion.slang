@@ -25,8 +25,8 @@ void main( uint3 id : SV_DispatchThreadID )
   {
     return;
   }
-  const int ctu      = i / pc.num8x8;
-  const int e        = i - ctu * pc.num8x8;
+  const int ctu      = i >> ( 2 * ( pc.log2Ctu - 3 ) );   // (num8x8 = 1 << that)
+  const int e        = i & ( pc.num8x8 - 1 );
   const int across8  = 1 << ( pc.log2Ctu - 3 );
   const int ctuSize4 = 1 << ( pc.log2Ctu - 2 );
   const int x4       = ( e & ( across8 - 1 ) ) * 2;
