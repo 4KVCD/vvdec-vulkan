@@ -1196,7 +1196,7 @@ bool GpuRecon::intraSupported( const CodingStructure& cs )
 
 bool GpuRecon::intraSupported( const SPS& sps )
 {
-  return sps.getChromaFormatIdc() == CHROMA_420 && !sps.getUseColorTrans() && !sps.getUseWrapAround();
+  return !sps.getUseColorTrans() && !sps.getUseWrapAround();
 }
 
 void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes )
@@ -1311,7 +1311,7 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
 struct InterPush
 {
   VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion, lmcsFwd, defer0, defer1, defer2, geo;
-  int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth, ctuLog2, widthInCtus, num8x8, wide;
+  int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth, ctuLog2, widthInCtus, num8x8, wide, scaleX, scaleY, numComp;
 };
 // the colocated motion as shaders/inter.slang writes DMVR's refinements into it
 static_assert( sizeof( ColocatedMotionInfo ) == 20 && offsetof( ColocatedMotionInfo, mv ) == 0 && sizeof( Mv ) == 8,
@@ -1444,11 +1444,15 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   push.picHeight = pcv.lumaHeight;
   push.ctuSize   = pcv.maxCUWidth;
   push.bitDepth  = cs.sps->getBitDepth();
+  push.numComp   = int32_t( getNumberValidComponents( pcv.chrFormat ) );
+  push.scaleX    = push.numComp > 1 ? getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) : 0;
+  push.scaleY    = push.numComp > 1 ? getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) : 0;
   // the shader's tile16 loads the planes' rows in aligned pieces of 16 and 8
   // bytes, up to 7 luma (3 chroma) samples before a window and 9 (5) after it:
   // the rows must begin 16-byte aligned, the margins be wide enough (the
-  // reference pictures' planes are laid out as this one's)
-  push.wide = 1;
+  // reference pictures' planes are laid out as this one's); its chroma windows
+  // are 4:2:0's
+  push.wide = pcv.chrFormat == CHROMA_420 ? 1 : 0;
   for( int comp = 0; comp < (int) cs.picture->m_bufs[PIC_RECONSTRUCTION].bufs.size(); comp++ )
   {
     const PelStorage& pic    = cs.picture->m_bufs[PIC_RECONSTRUCTION];

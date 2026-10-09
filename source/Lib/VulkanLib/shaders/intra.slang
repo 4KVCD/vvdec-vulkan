@@ -659,7 +659,9 @@ int mipSample( int x, int y, int w, int h, int pred )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// CCLM (xGetLumaRecPixels, xGetLMParameters, linearTransform), 4:2:0
+// CCLM (xGetLumaRecPixels, xGetLMParameters, linearTransform). The luma under a chroma sample: 4:4:4's the sample
+// itself, 4:2:2's [1 2 1] along the row (all of xGetLumaRecPixels' filters come to that, with its coefficients for
+// 4:2:2), 4:2:0's filtered across two rows
 // --------------------------------------------------------------------------------------------------------------------
 
 int lumaAt( int x, int y )
@@ -667,9 +669,25 @@ int lumaAt( int x, int y )
   return int( pc.plane0[y * pc.stride0 + x] );
 }
 
+// 4:2:2: the [1 2 1] filter around the luma sample (x, y), its left sample the
+// centre's where there is no left (noLeft)
+int lumaRow422( int x, int y, bool noLeft )
+{
+  const int c = lumaAt( x, y );
+  return ( 2 * c + ( noLeft ? c : lumaAt( x - 1, y ) ) + lumaAt( x + 1, y ) + 2 ) >> 2;
+}
+
 // the downsampled luma of chroma sample (i, j) of the block whose luma origin is (lx, ly)
 int lumaDown( int lx, int ly, int i, int j, bool bAbove, bool bLeft )
 {
+  if( pc.scaleX == 0 )
+  {
+    return lumaAt( lx + i, ly + j );   // 4:4:4
+  }
+  if( pc.scaleY == 0 )
+  {
+    return lumaRow422( lx + 2 * i, ly + j, i == 0 && !bLeft );
+  }
   const int x = lx + 2 * i;
   const int y = ly + 2 * j;
   if( pc.collocated != 0 )
@@ -686,6 +704,15 @@ int lumaDown( int lx, int ly, int i, int j, bool bAbove, bool bLeft )
 // the downsampled luma template above the block (i) and to its left (j)
 int lumaTemplateAbove( int lx, int ly, int i, bool bLeft )
 {
+  // 4:4:4 and 4:2:2: the row above the block (a CTU's first row or not)
+  if( pc.scaleX == 0 )
+  {
+    return lumaAt( lx + i, ly - 1 );
+  }
+  if( pc.scaleY == 0 )
+  {
+    return lumaRow422( lx + 2 * i, ly - 1, i == 0 && !bLeft );
+  }
   const int  x             = lx + 2 * i;
   const bool firstRowOfCtu = ( ly & ( ( 1 << pc.ctuLog2 ) - 1 ) ) == 0;
   if( firstRowOfCtu )
@@ -707,6 +734,15 @@ int lumaTemplateAbove( int lx, int ly, int i, bool bLeft )
 
 int lumaTemplateLeft( int lx, int ly, int j, bool bAbove )
 {
+  // 4:4:4 and 4:2:2: the column, centred 1 (4:4:4) or 2 (4:2:2) left of the block
+  if( pc.scaleX == 0 )
+  {
+    return lumaAt( lx - 1, ly + j );
+  }
+  if( pc.scaleY == 0 )
+  {
+    return lumaRow422( lx - 2, ly + j, false );
+  }
   const int x = lx - 2;   // the centre, piSrc[1] of xGetLumaRecPixels
   const int y = ly + 2 * j;
   if( pc.collocated != 0 )
@@ -754,8 +790,8 @@ int cclmTemplateLuma( int x0, int y0, uint lm, CclmPicks p, int k )
 {
   const bool bAbove = ( ( lm >> 16 ) & 1 ) != 0;
   const bool bLeft  = ( ( lm >> 17 ) & 1 ) != 0;
-  return k < p.cntT ? lumaTemplateAbove( x0 << 1, y0 << 1, p.startPos0 + k * p.pickStep0, bLeft )
-                    : lumaTemplateLeft( x0 << 1, y0 << 1, p.startPos1 + ( k - p.cntT ) * p.pickStep1, bAbove );
+  return k < p.cntT ? lumaTemplateAbove( x0 << pc.scaleX, y0 << pc.scaleY, p.startPos0 + k * p.pickStep0, bLeft )
+                    : lumaTemplateLeft( x0 << pc.scaleX, y0 << pc.scaleY, p.startPos1 + ( k - p.cntT ) * p.pickStep1, bAbove );
 }
 
 // the linear model: a, b, shift (from the template's luma in s_tmpl and its
@@ -1025,7 +1061,7 @@ void make( int tid, uint job[12] )
       const int i = tid + 64 * k;
       const int x = ( s0 + i ) & ( w - 1 );
       const int y = ( s0 + i ) >> log2W;
-      luma[k]     = i < m && kind == 2 ? lumaDown( x0 << 1, y0 << 1, x, y, lmAbove, lmLeft )
+      luma[k]     = i < m && kind == 2 ? lumaDown( x0 << pc.scaleX, y0 << pc.scaleY, x, y, lmAbove, lmLeft )
                     : ( i < m && kind == 6 ? int( inter[( y0 + y ) * stride + x0 + x] ) : 0 );
       res[k]      = i < m && residual ? int( dst[( y0 + y ) * stride + x0 + x] ) : 0;
     }

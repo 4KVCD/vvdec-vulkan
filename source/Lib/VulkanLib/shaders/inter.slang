@@ -54,6 +54,10 @@ struct Params
   int        widthInCtus;
   int        num8x8;      // its entries a CTU
   int        wide;        // the planes' rows begin 16-byte aligned, with margins of 16 samples or more: tile16 may load them in 8- and 16-byte pieces
+                          // (and the chroma is 4:2:0's: tile16's windows are laid out for it)
+  int        scaleX;      // the chroma's subsampling: 1, 1 (4:2:0), 1, 0 (4:2:2), 0, 0 (4:4:4)
+  int        scaleY;
+  int        numComp;     // the components: 1 (4:0:0) or 3
 };
 
 [[vk::push_constant]] Params pc;
@@ -205,8 +209,8 @@ int16_t* refPlane( int slot, int comp )
 // a reference sample, its coordinates clamped into the picture: vvdec's border extension
 int refAt( int16_t* p, int comp, int x, int y )
 {
-  const int w = comp == 0 ? pc.picWidth : pc.picWidth >> 1;
-  const int h = comp == 0 ? pc.picHeight : pc.picHeight >> 1;
+  const int w = comp == 0 ? pc.picWidth : pc.picWidth >> pc.scaleX;
+  const int h = comp == 0 ? pc.picHeight : pc.picHeight >> pc.scaleY;
   return int( p[clamp( y, 0, h - 1 ) * ( comp == 0 ? pc.stride0 : pc.stride12 ) + clamp( x, 0, w - 1 )] );
 }
 
@@ -250,11 +254,17 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
                                 int4 window, int2 base, inout int out[PER_THREAD] )
 {
   int16_t*  ref      = refPlane( slot, comp );
-  const int shift    = comp == 0 ? 4 : 5;
-  const int xFrac    = mv.x & ( ( 1 << shift ) - 1 );
-  const int yFrac    = mv.y & ( ( 1 << shift ) - 1 );
-  const int baseX    = windowed ? base.x : bx + ( mv.x >> shift );
-  const int baseY    = windowed ? base.y : by + ( mv.y >> shift );
+  // the motion in the component's samples (1/16 luma: 1 / ( 16 << scale ) of a
+  // chroma sample), the chroma filter's phase in 32nds (InterpolationFilter's
+  // frac << ( 1 - scale ))
+  const int sx       = comp == 0 ? 0 : pc.scaleX;
+  const int sy       = comp == 0 ? 0 : pc.scaleY;
+  const int xFrac    = mv.x & ( ( 16 << sx ) - 1 );
+  const int yFrac    = mv.y & ( ( 16 << sy ) - 1 );
+  const int xPhase   = comp == 0 ? xFrac : xFrac << ( 1 - sx );
+  const int yPhase   = comp == 0 ? yFrac : yFrac << ( 1 - sy );
+  const int baseX    = windowed ? base.x : bx + ( mv.x >> ( 4 + sx ) );
+  const int baseY    = windowed ? base.y : by + ( mv.y >> ( 4 + sy ) );
   const int half     = N / 2 - 1;
   const int headRoom = max( 2, 14 - pc.bitDepth );
   const int maxVal   = ( 1 << pc.bitDepth ) - 1;
@@ -264,8 +274,8 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
   [unroll]
   for( int k = 0; k < N; k++ )
   {
-    cx[k] = int16_t( coeff( comp, xFrac, hpel, k ) );
-    cy[k] = int16_t( coeff( comp, yFrac, hpel, k ) );
+    cx[k] = int16_t( coeff( comp, xPhase, hpel, k ) );
+    cy[k] = int16_t( coeff( comp, yPhase, hpel, k ) );
   }
 
   // the samples the filter reads: rw x rh from (baseX - ox, baseY - oy)
@@ -273,8 +283,8 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
   const int oy = yFrac != 0 ? half : 0;
   const int rw = w + ( xFrac != 0 ? N - 1 : 0 );
   const int rh = h + ( yFrac != 0 ? N - 1 : 0 );
-  const int picW = comp == 0 ? pc.picWidth : pc.picWidth >> 1;
-  const int picH = comp == 0 ? pc.picHeight : pc.picHeight >> 1;
+  const int picW = pc.picWidth >> sx;
+  const int picH = pc.picHeight >> sy;
   if( !windowed && baseX - ox >= 0 && baseX - ox + rw <= picW && baseY - oy >= 0 && baseY - oy + rh <= picH )
   {
     // inside the picture (most blocks): the samples as they are, no clamping
@@ -1505,53 +1515,65 @@ void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, in
   GroupMemoryBarrierWithGroupSync();   // before the next writes to the shared memory
 }
 
-// a list's chroma of the tile: the thread's sample tid of each component, 14-bit (bi-prediction) else final
-void affineChroma( int tid, uint job[24], int list, int x, int y, int w, int h, int cuX, int cuY, int cw, int ch, bool spread, bool bi,
-                   out int pred[2] )
+// the motion of the CU's chroma subblock (csx, csy) of 4 x 4 chroma samples (xPredAffineBlk's chromaMvFld), clipped:
+// 4:4:4 the luma subblock's; else the rounded average of the two luma subblocks summed into it, the two it covers
+// (4:2:2), the top-left and bottom-right of the four (4:2:0)
+int2 affineChromaMv( uint job[24], int list, int csx, int csy, int cw, int ch, bool spread, int cuX, int cuY )
 {
-  const int slot     = int( ( job[7] >> ( 8 * list ) ) & 255 );
-  const int cw2      = w >> 1;   // the tile's chroma
-  const int ch2      = h >> 1;
-  const int ncx      = cw2 >> 2;   // its chroma subblocks
-  const int ncb      = ncx * ( ch2 >> 2 );
-  const int ocx      = ( x - cuX ) >> 3;   // the tile's first chroma subblock in the CU
-  const int ocy      = ( y - cuY ) >> 3;
+  if( pc.scaleX == 0 )
+  {
+    return clipMv( affineMv( job, list, csx, csy, cw, ch, spread ), cuX, cuY );
+  }
+  const int  ly  = csy << pc.scaleY;
+  const int2 sum = affineMv( job, list, 2 * csx, ly, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, ly + pc.scaleY, cw, ch, spread );
+  return clipMv( int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) ), cuX, cuY );
+}
+
+// a list's chroma of the tile, of component comp: the thread's samples t = tid + THREADS k, 14-bit (bi-prediction)
+// else final
+void affineChroma( int tid, uint job[24], int list, int comp, int x, int y, int w, int h, int cuX, int cuY, int cw, int ch, bool spread,
+                   bool bi, out int pred[PER_THREAD] )
+{
+  int16_t*  ref      = refPlane( int( ( job[7] >> ( 8 * list ) ) & 255 ), comp );
+  const int sx       = pc.scaleX;
+  const int sy       = pc.scaleY;
+  const int tw       = w >> sx;   // the tile's chroma
+  const int th       = h >> sy;
+  const int ncx      = tw >> 2;   // its chroma subblocks
+  const int ncb      = ncx * ( th >> 2 );
+  const int ocx      = ( ( x - cuX ) >> sx ) >> 2;   // the tile's first chroma subblock in the CU
+  const int ocy      = ( ( y - cuY ) >> sy ) >> 2;
   const int headRoom = max( 2, 14 - pc.bitDepth );
   const int maxVal   = ( 1 << pc.bitDepth ) - 1;
+  const int log2W    = log2Int( tw );
 
-  // each chroma subblock's motion: the sum of its top-left and bottom-right luma subblocks' rounded, clipped; its
-  // reference samples, 7 x 7 from 1 before its integer position, for each component
-  for( int s = tid; s < 2 * ncb * 49; s += THREADS )
+  // each subblock's reference samples, 7 x 7 from 1 before its integer position
+  for( int s = tid; s < ncb * 49; s += THREADS )
   {
-    const int  comp = 1 + s / ( ncb * 49 );
-    const int  rem  = s % ( ncb * 49 );
-    const int  cb   = rem / 49;
-    const int  r    = ( rem % 49 ) / 7;
-    const int  c    = rem % 7;
-    const int  csx  = ocx + cb % ncx;
-    const int  csy  = ocy + cb / ncx;
-    const int2 sum  = affineMv( job, list, 2 * csx, 2 * csy, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, 2 * csy + 1, cw, ch, spread );
-    const int2 mv   = clipMv( int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) ), cuX, cuY );
-    s_pool[s]       = int16_t( refAt( refPlane( slot, comp ), comp, ( cuX >> 1 ) + 4 * csx + ( mv.x >> 5 ) - 1 + c, ( cuY >> 1 ) + 4 * csy + ( mv.y >> 5 ) - 1 + r ) );
+    const int  cb  = s / 49;
+    const int  r   = ( s % 49 ) / 7;
+    const int  c   = s % 7;
+    const int  csx = ocx + cb % ncx;
+    const int  csy = ocy + cb / ncx;
+    const int2 mv  = affineChromaMv( job, list, csx, csy, cw, ch, spread, cuX, cuY );
+    s_pool[s]      = int16_t( refAt( ref, comp, ( cuX >> sx ) + 4 * csx + ( mv.x >> ( 4 + sx ) ) - 1 + c, ( cuY >> sy ) + 4 * csy + ( mv.y >> ( 4 + sy ) ) - 1 + r ) );
   }
   GroupMemoryBarrierWithGroupSync();
-  for( int comp = 1; comp <= 2; comp++ )
+  for( int k = 0; k < PER_THREAD; k++ )
   {
-    pred[comp - 1] = 0;
-    if( tid >= cw2 * ch2 )
+    const int t = tid + THREADS * k;
+    pred[k]     = 0;
+    if( t >= tw * th )
     {
       continue;
     }
-    const int  i     = tid % cw2;
-    const int  j     = tid / cw2;
-    const int  cb    = ( j >> 2 ) * ncx + ( i >> 2 );
-    const int  csx   = ocx + ( i >> 2 );
-    const int  csy   = ocy + ( j >> 2 );
-    const int2 sum   = affineMv( job, list, 2 * csx, 2 * csy, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, 2 * csy + 1, cw, ch, spread );
-    const int2 mv    = clipMv( int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) ), cuX, cuY );
-    const int  xFrac = mv.x & 31;
-    const int  yFrac = mv.y & 31;
-    const int  at    = ( comp - 1 ) * ncb * 49 + cb * 49;
+    const int  i     = t & ( tw - 1 );
+    const int  j     = t >> log2W;
+    const int2 mv    = affineChromaMv( job, list, ocx + ( i >> 2 ), ocy + ( j >> 2 ), cw, ch, spread, cuX, cuY );
+    // the filter's phases, in 32nds (InterpolationFilter's frac << ( 1 - scale ))
+    const int  xFrac = ( mv.x & ( ( 16 << sx ) - 1 ) ) << ( 1 - sx );
+    const int  yFrac = ( mv.y & ( ( 16 << sy ) - 1 ) ) << ( 1 - sy );
+    const int  at    = ( ( j >> 2 ) * ncx + ( i >> 2 ) ) * 49;
     const int  u     = i & 3;
     const int  v     = j & 3;
     int        val;
@@ -1589,7 +1611,7 @@ void affineChroma( int tid, uint job[24], int list, int x, int y, int w, int h, 
       const int r = ( sum2 + offset ) >> shiftV;
       val         = bi ? r : clip3( 0, maxVal, r );
     }
-    pred[comp - 1] = val;
+    pred[k] = val;
   }
   GroupMemoryBarrierWithGroupSync();
 }
@@ -1619,8 +1641,9 @@ void affineMain( int tid, int index )
   const bool bi     = ( flags & ( FLAG_L0 | FLAG_L1 ) ) == ( FLAG_L0 | FLAG_L1 );
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
-  int pred0[PER_THREAD], pred1[PER_THREAD];
-  int predC0[2], predC1[2];
+  // (weighted prediction: from the 14-bit predictions, a uni-prediction's too)
+  const bool hi = bi || ( flags & FLAG_WP ) != 0;
+  int        pred0[PER_THREAD], pred1[PER_THREAD];
   for( int list = 0; list < 2; list++ )
   {
     if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) == 0 )
@@ -1630,20 +1653,14 @@ void affineMain( int tid, int index )
     const bool prof   = ( ( job[12] >> ( 16 + list ) ) & 1 ) != 0;
     const bool spread = ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
     int        p[PER_THREAD];
-    int        c[2];
-    // (weighted prediction: from the 14-bit predictions, a uni-prediction's too)
-    const bool hi = bi || ( flags & FLAG_WP ) != 0;
     affineLuma( tid, job, list, x, y, w, h, cuX, cuY, cw, ch, spread, prof, hi, p );
-    affineChroma( tid, job, list, x, y, w, h, cuX, cuY, cw, ch, spread, hi, c );
     if( list == 0 || ( flags & FLAG_L0 ) == 0 )
     {
-      pred0  = p;
-      predC0 = c;
+      pred0 = p;
     }
     else
     {
-      pred1  = p;
-      predC1 = c;
+      pred1 = p;
     }
   }
 
@@ -1670,20 +1687,45 @@ void affineMain( int tid, int index )
       ( ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0 )[at] = int16_t( v );
     }
   }
-  for( int comp = 1; comp <= 2; comp++ )
+  // the chroma, a component at a time (the predictions' arrays luma's again)
+  const int tw    = w >> pc.scaleX;   // the tile's chroma
+  const int th    = h >> pc.scaleY;
+  const int log2C = log2Int( tw );
+  for( int comp = 1; comp < pc.numComp; comp++ )
   {
-    const int cw2 = w >> 1;
-    if( tid < cw2 * ( h >> 1 ) )
+    for( int list = 0; list < 2; list++ )
     {
-      int16_t*  dst = comp == 1 ? pc.dst1 : pc.dst2;
-      const int at  = ( ( y >> 1 ) + tid / cw2 ) * pc.stride12 + ( x >> 1 ) + tid % cw2;
-      int       v   = ( flags & FLAG_WP ) != 0 ? wpSample( job[8 + comp], job[11], comp, predC0[comp - 1], predC1[comp - 1], maxVal )
-                      : ( bi ? biAverage( predC0[comp - 1], predC1[comp - 1], flags, bcwW1, shiftNum, offset, maxVal ) : predC0[comp - 1] );
-      if( ( flags & ( FLAG_RES_Y << comp ) ) != 0 )
+      if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) == 0 )
       {
-        v = clip3( 0, maxVal, v + int( dst[at] ) );
+        continue;
       }
-      ( ( flags & ( FLAG_DEFER_CB << ( comp - 1 ) ) ) != 0 ? ( comp == 1 ? pc.defer1 : pc.defer2 ) : dst )[at] = int16_t( v );
+      const bool spread = ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
+      int        p[PER_THREAD];
+      affineChroma( tid, job, list, comp, x, y, w, h, cuX, cuY, cw, ch, spread, hi, p );
+      if( list == 0 || ( flags & FLAG_L0 ) == 0 )
+      {
+        pred0 = p;
+      }
+      else
+      {
+        pred1 = p;
+      }
+    }
+    int16_t* dst = comp == 1 ? pc.dst1 : pc.dst2;
+    for( int k = 0; k < PER_THREAD; k++ )
+    {
+      const int t = tid + THREADS * k;
+      if( t < tw * th )
+      {
+        const int at = ( ( y >> pc.scaleY ) + ( t >> log2C ) ) * pc.stride12 + ( x >> pc.scaleX ) + ( t & ( tw - 1 ) );
+        int       v  = ( flags & FLAG_WP ) != 0 ? wpSample( job[8 + comp], job[11], comp, pred0[k], pred1[k], maxVal )
+                       : ( bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k] );
+        if( ( flags & ( FLAG_RES_Y << comp ) ) != 0 )
+        {
+          v = clip3( 0, maxVal, v + int( dst[at] ) );
+        }
+        ( ( flags & ( FLAG_DEFER_CB << ( comp - 1 ) ) ) != 0 ? ( comp == 1 ? pc.defer1 : pc.defer2 ) : dst )[at] = int16_t( v );
+      }
     }
   }
 }
@@ -1850,11 +1892,14 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const bool bdof = false;
 #endif
   [loop]
-  for( int comp = 0; comp < 3; comp++ )
+  for( int comp = 0; comp < pc.numComp; comp++ )
   {
-    const int s     = comp == 0 ? 0 : 1;
-    const int bx    = x >> s, by = y >> s, bw = w >> s, bh = h >> s;
-    const int shift = comp == 0 ? 4 : 5;
+    // the component's subsampling, the motion's fraction bits in its samples
+    const int sx     = comp == 0 ? 0 : pc.scaleX;
+    const int sy     = comp == 0 ? 0 : pc.scaleY;
+    const int bx     = x >> sx, by = y >> sy, bw = w >> sx, bh = h >> sy;
+    const int shiftX = 4 + sx;
+    const int shiftY = 4 + sy;
     int       pred0[PER_THREAD], pred1[PER_THREAD];
 
     [loop]
@@ -1876,12 +1921,12 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         // xFinalPaddedMCForDMVR: clipped at the subblock; when the refinement moves the integer
         // position, the reads stay in the prefetched window of the merge motion (xPrefetchPad)
         clipped = clipMv( mv, x, y );
-        const int2 deltaInt = int2( ( mv.x >> shift ) - ( merge.x >> shift ), ( mv.y >> shift ) - ( merge.y >> shift ) );
+        const int2 deltaInt = int2( ( mv.x >> shiftX ) - ( merge.x >> shiftX ), ( mv.y >> shiftY ) - ( merge.y >> shiftY ) );
         if( deltaInt.x != 0 || deltaInt.y != 0 )
         {
           const int  half  = comp == 0 ? 3 : 1;
-          const int2 start = clipMv( merge - int2( half << shift, half << shift ), x, y );
-          window   = int4( bx + ( start.x >> shift ), by + ( start.y >> shift ), bw + 2 * half + 1, bh + 2 * half + 1 );
+          const int2 start = clipMv( merge - int2( half << shiftX, half << shiftY ), x, y );
+          window   = int4( bx + ( start.x >> shiftX ), by + ( start.y >> shiftY ), bw + 2 * half + 1, bh + 2 * half + 1 );
           base     = int2( window.x + half + deltaInt.x, window.y + half + deltaInt.y );
           windowed = true;
         }
@@ -1914,7 +1959,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 #if BDOF
       if( bdof && comp == 0 )
       {
-        bdofStore( tid, list, bw, bh, pred, slot, windowed ? base.x : bx + ( clipped.x >> shift ), windowed ? base.y : by + ( clipped.y >> shift ),
+        bdofStore( tid, list, bw, bh, pred, slot, windowed ? base.x : bx + ( clipped.x >> shiftX ), windowed ? base.y : by + ( clipped.y >> shiftY ),
                    clipped, windowed, window );
       }
 #endif
@@ -1954,8 +1999,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       else if( ( flags & FLAG_GEO ) != 0 )
       {
         // (the CU's luma sample under this one)
-        v = geoBlend( pred0[k], pred1[k], geoWeight( job[9], ( bx + i - ( comp == 0 ? cuX : cuX >> 1 ) ) << s, ( by + j - ( comp == 0 ? cuY : cuY >> 1 ) ) << s ),
-                      maxVal );
+        v = geoBlend( pred0[k], pred1[k], geoWeight( job[9], ( bx + i - ( cuX >> sx ) ) << sx, ( by + j - ( cuY >> sy ) ) << sy ), maxVal );
       }
       else
       {
