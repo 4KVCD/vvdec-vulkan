@@ -351,11 +351,19 @@ void GpuRecon::beginCommands( bool resetPool )
     vk.vkCmdWriteTimestamp( m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_queries, m_marks++ );
   }
 
-  // what earlier submissions wrote (the reference pictures), visible to this one
-  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+  // what earlier submissions wrote (the reference pictures), visible to this
+  // one. Not after the picture's band (resetPool false): the band began with
+  // that barrier, and the rest of the first part neither reads nor writes what
+  // the band or the work queued since does (the band's tiles; other pictures'
+  // planes and scratch planes) -- the GPU may start it while the band ends
+  // (VideoQ 1080p +0.5%)
+  if( resetPool )
+  {
+    VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+  }
 }
 
 void GpuRecon::mark( const char* label )
