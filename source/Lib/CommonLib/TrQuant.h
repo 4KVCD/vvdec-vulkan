@@ -78,6 +78,12 @@ public:
   uint32_t getLFNSTIntraMode( int wideAngPredMode );
   bool     getTransposeFlag ( uint32_t intraMode  );
 
+  // the picture's dequantisation matrices (explicit scaling lists), for the
+  // GPU's residuals
+  using Quant::getDequantCoeff;
+  using Quant::getDequantCoeffBuf;
+  using Quant::getNumDequantCoeffs;
+
 protected:
 
   void xInvLfnst      (       TransformUnit &tu, const ComponentID &compID );

@@ -10,6 +10,7 @@
 //   2: last column | last row << 8 of the levels             (the parser wrote [0, last column] x [0, last row])
 //   3: scale   4: right shift (negative: a left shift)   5: the levels' maximum
 //   6: LFNST (0: none): index (1, 2) | set << 2 | transposed << 4 | 8x8 << 5 | 8 inputs << 6
+//   7: an explicit scaling list (0: none): where the block's matrix begins in scaling, + 1
 // flags: 1 transform skip, 2 BDPCM horizontal, 4 BDPCM vertical, 8 zeros (no residual)
 //
 // The threads dequantize the levels into shared memory, run the vertical
@@ -31,6 +32,7 @@ struct Params
   int16_t*  levels2;
   int16_t*  matrices;   // TrQuant's matrices, TrafoJob's order (GpuRecon.cpp)
   int8_t*   lfnst;      // LFNST's matrices: vvdec's g_lfnst8x8, then g_lfnst4x4
+  uint8_t*  scaling;    // the picture's dequantisation matrices (explicit scaling lists), Quant's, a byte a factor
   int       stride0;
   int       stride12;
   int       count;
@@ -85,7 +87,15 @@ int matrixOffset( int type, int log2 )
   return at;
 }
 
-// Quant's DeQuantImpl without scaling lists
+// the scale of the coefficient (x, y) of a block width wide: with an explicit
+// scaling list (sl: word 7), its matrix's factor times the QP's
+// (DeQuantImpl's piDequantCoef[n] * scaleQP)
+int coefScale( uint sl, int scale, int width, int x, int y )
+{
+  return sl != 0 ? int( pc.scaling[sl - 1 + uint( y * width + x )] ) * scale : scale;
+}
+
+// Quant's DeQuantImpl
 int dequant( int level, int scale, int rightShift, int inputMaximum )
 {
   if( level == 0 )
@@ -128,6 +138,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int scale        = int( job[3] );
   const int rightShift   = int( job[4] );
   const int inputMaximum = int( job[5] );
+  const uint sl          = job[7];
   const int width        = 1 << log2W;
   const int height       = 1 << log2H;
   const int stride       = strideOf( comp );
@@ -223,7 +234,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       int sum = 0;
       for( int k = 0; k < count; k++ )
       {
-        sum += dequant( int( levels[ver ? k * stride : k] ), scale, rightShift, inputMaximum ) * int( m[k * n + s] );
+        sum += dequant( int( levels[ver ? k * stride : k] ), coefScale( sl, scale, width, ver ? 0 : k, ver ? k : 0 ), rightShift, inputMaximum )
+               * int( m[k * n + s] );
       }
       const int r = clip3( COEFF_MIN, COEFF_MAX, ( sum + ( 1 << ( shift - 1 ) ) ) >> shift );
       block[ver ? s * stride : s] = int16_t( r );
@@ -251,7 +263,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       const int x  = kLfnstScan[tid] & 3;
       const int y  = kLfnstScan[tid] >> 2;
-      s_lfnst[tid] = x <= lastX && y <= lastY ? dequant( int( levels[y * stride + x] ), scale, rightShift, inputMaximum ) : 0;
+      s_lfnst[tid] = x <= lastX && y <= lastY ? dequant( int( levels[y * stride + x] ), coefScale( sl, scale, width, x, y ), rightShift, inputMaximum ) : 0;
     }
     nx = min( width, 8 );
     ny = min( height, 8 );
@@ -294,7 +306,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       const int k = s / nx;
       const int x = s - k * nx;
-      s_coef[k * 32 + x] = dequant( int( levels[k * stride + x] ), scale, rightShift, inputMaximum );
+      s_coef[k * 32 + x] = dequant( int( levels[k * stride + x] ), coefScale( sl, scale, width, x, k ), rightShift, inputMaximum );
     }
   }
   GroupMemoryBarrierWithGroupSync();

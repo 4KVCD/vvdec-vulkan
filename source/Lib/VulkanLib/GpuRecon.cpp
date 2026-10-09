@@ -362,6 +362,7 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_geo );
   m_ctx->free( m_lmcs );
   m_ctx->free( m_defer );
+  m_ctx->free( m_scaling );
   for( Buffer& buf: m_scratch )
   {
     m_ctx->free( buf );
@@ -1495,24 +1496,13 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
 // the push constants of shaders/trafo.slang
 struct TrafoPush
 {
-  VkDeviceAddress jobs, plane0, plane1, plane2, levels0, levels1, levels2, matrices, lfnst;
+  VkDeviceAddress jobs, plane0, plane1, plane2, levels0, levels1, levels2, matrices, lfnst, scaling;
   int32_t         stride0, stride12, count, bitDepth;
 };
 
 bool GpuRecon::residualSupported( const CodingStructure& cs )
 {
-  if( cs.sps->getBitDepth() > 10 )
-  {
-    return false;
-  }
-  for( const Slice* slice: cs.picture->slices )
-  {
-    if( slice->getExplicitScalingListUsed() )
-    {
-      return false;
-    }
-  }
-  return true;
+  return cs.sps->getBitDepth() <= 10;
 }
 
 void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
@@ -1550,6 +1540,7 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   push.levels2  = levels.addr[COMPONENT_Cr];
   push.matrices = m_matrices.addr;
   push.lfnst    = m_lfnst.addr;
+  push.scaling  = m_scalingOn ? m_scaling.addr : 0;
   push.stride0  = planes.stride[COMPONENT_Y];
   push.stride12 = planes.stride[COMPONENT_Cb];
   push.count    = int32_t( total );
@@ -1591,9 +1582,25 @@ void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptive
   m_prepared.picture = cs.picture;
 }
 
-void GpuRecon::setPicture( const PelStorage& pic, const LmcsTables* tables, bool defer )
+void GpuRecon::setPicture( const PelStorage& pic, const LmcsTables* tables, bool defer, const int* scalingMatrices, size_t scalingCount )
 {
   // the instance's picture before is done: its work no more reads these
+  m_scalingOn = scalingMatrices != nullptr;
+  if( scalingMatrices )
+  {
+    // the matrices' factors, a byte each (the scaling lists' coefficients:
+    // 1 .. 255, 0 where a matrix has none)
+    if( m_scaling.size < scalingCount )
+    {
+      m_ctx->free( m_scaling );
+      m_scaling = m_ctx->alloc( ( scalingCount + 255 ) & ~size_t( 255 ), MemKind::Upload );
+    }
+    for( size_t i = 0; i < scalingCount; i++ )
+    {
+      CHECK( scalingMatrices[i] < 0 || scalingMatrices[i] > 255, "a scaling list's coefficient out of range" );
+      m_scaling.mapped[i] = uint8_t( scalingMatrices[i] );
+    }
+  }
   m_lmcsOn = tables != nullptr;
   if( tables )
   {

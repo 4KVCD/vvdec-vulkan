@@ -98,6 +98,8 @@ class Quant
 {
 public:
   int* getDequantCoeff           ( uint32_t list, uint32_t sizeX, uint32_t sizeY ) { return m_dequantCoef[sizeX][sizeY][list]; };  //!< get DeQuant Coefficent
+  const int*    getDequantCoeffBuf () const { return m_dequantCoefBuf; }   //!< the buffer getDequantCoeff's matrices are in
+  static size_t getNumDequantCoeffs();                                      //!< its size
 
   void setUseScalingList         ( bool bUseScalingList ) { m_scalingListEnabledFlag = bUseScalingList; };
   bool getUseScalingList         ( bool isTransformSkip, const bool lfnstApplied, const bool disableScalingMatrixForLFNSTBlks, const bool disableSMforACT)

@@ -153,8 +153,10 @@ public:
   // forward-mapped, the chroma residuals scaled (tables->chroma), then the
   // luma mapped back before the in-loop filters. defer: inter keeps some of
   // its predictions aside, for intra jobs to finish (LMCS's chroma scaling,
-  // CIIP)
-  void setPicture( const PelStorage& pic, const LmcsTables* tables, bool defer );
+  // CIIP). scalingMatrices: the picture's dequantisation matrices of its
+  // explicit scaling list (TrQuant::getDequantCoeffBuf, scalingCount of them;
+  // null without)
+  void setPicture( const PelStorage& pic, const LmcsTables* tables, bool defer, const int* scalingMatrices = nullptr, size_t scalingCount = 0 );
   void endCompute();
   void endDownload( int download );
 
@@ -267,6 +269,9 @@ private:
   Buffer          m_lmcs;
   Buffer          m_defer;
   Planes          m_deferPlanes{};
+  // the dequantisation matrices of explicit scaling lists (setPicture), a byte a factor
+  bool            m_scalingOn = false;
+  Buffer          m_scaling;
 };
 
 }   // namespace gpu

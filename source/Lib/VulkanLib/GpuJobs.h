@@ -91,6 +91,10 @@ struct TrafoJob
   {
     w[6] = uint32_t( index ) | uint32_t( set ) << 2 | uint32_t( transposed ) << 4 | uint32_t( block8 ) << 5 | uint32_t( inputs8 ) << 6;
   }
+  // an explicit scaling list (Quant's DeQuantScaling): where the block's
+  // matrix (Quant::getDequantCoeff) begins in the picture's matrices, its
+  // factor of the coefficient (x, y) at y * width + x
+  void setScalingList( int offset ) { w[7] = uint32_t( offset + 1 ); }
 };
 
 // one transform block of one component that the GPU predicts and

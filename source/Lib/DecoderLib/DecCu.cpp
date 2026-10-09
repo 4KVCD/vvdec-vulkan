@@ -978,11 +978,19 @@ void DecCu::xGpuTrafoJobs( CodingUnit& cu, std::vector<gpu::TrafoJob>& jobs )
         continue;
       }
 
-      const CompArea&           block = tu.blocks[compID];
-      const QpParam             cQP( tu, compID );
-      const Quant::DequantParam param = Quant::dequantParam( tu, compID, cQP, false );
-      const bool                ts    = tu.mtsIdx( compID ) == MTS_SKIP;
-      CHECK( cu.slice->getExplicitScalingListUsed() || ( param.bdpcm && !ts ), "a residual the GPU cannot reconstruct" );
+      const CompArea& block = tu.blocks[compID];
+      const QpParam   cQP( tu, compID );
+      const bool      ts    = tu.mtsIdx( compID ) == MTS_SKIP;
+      // the slice's explicit scaling list, where Quant::dequant applies it: not
+      // with transform skip, nor where the SPS leaves LFNST's blocks or ACT's
+      // colour space out
+      const SPS&                sps          = *cu.sps;
+      const bool                lfnstApplied = cu.lfnstIdx() > 0 && ( CU::isSepTree( cu ) || isLuma( compID ) );
+      const bool                scalingList  = cu.slice->getExplicitScalingListUsed() && !ts && !( lfnstApplied && sps.getDisableScalingMatrixForLfnstBlks() )
+                                               && !( sps.getScalingMatrixForAlternativeColourSpaceDisabledFlag()
+                                                     && sps.getScalingMatrixDesignatedColourSpaceFlag() == cu.colorTransform() );
+      const Quant::DequantParam param        = Quant::dequantParam( tu, compID, cQP, scalingList );
+      CHECK( param.bdpcm && !ts, "a residual the GPU cannot reconstruct" );
 
       int typeHor = DCT2;
       int typeVer = DCT2;
@@ -1014,6 +1022,13 @@ void DecCu::xGpuTrafoJobs( CodingUnit& cu, std::vector<gpu::TrafoJob>& jobs )
         intraMode = m_pcTrQuant->getLFNSTIntraMode( PU::getWideAngIntraMode( tu, intraMode, compID ) );
         job.setLfnst( cu.lfnstIdx(), g_lfnstLut[intraMode], m_pcTrQuant->getTransposeFlag( intraMode ), block.width >= 8 && block.height >= 8,
                       ( block.width == 4 && block.height == 4 ) || ( block.width == 8 && block.height == 8 ) );
+      }
+      if( scalingList )
+      {
+        // the matrix of the block's size and of its list (Quant's
+        // getScalingListType: intra, else inter, by component)
+        const int list = ( cu.predMode() == MODE_INTRA ? 0 : MAX_NUM_COMPONENT ) + compID;
+        job.setScalingList( int( m_pcTrQuant->getDequantCoeff( list, getLog2( block.width ), getLog2( block.height ) ) - m_pcTrQuant->getDequantCoeffBuf() ) );
       }
       jobs.push_back( job );
     }

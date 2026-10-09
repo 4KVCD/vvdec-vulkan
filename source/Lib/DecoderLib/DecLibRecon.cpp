@@ -530,9 +530,14 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   m_gpuResidual = m_gpuIntra && ( isIntra || m_gpuInter ) && gpu::GpuRecon::residualSupported( cs );
   pcPic->gpuEarlyRef = false;
   // LMCS's tables for the GPU, when it makes the intra blocks (else the CPU's
-  // CTU tasks map the luma back themselves)
+  // CTU tasks map the luma back themselves); the dequantisation matrices of an
+  // explicit scaling list (TrQuant::init made them for the picture), when it
+  // makes the residuals
   if( m_gpuRecon )
   {
+    const bool scaling = m_gpuResidual
+                         && std::any_of( pcPic->slices.begin(), pcPic->slices.end(), []( const Slice* slice ) { return slice->getExplicitScalingListUsed(); } );
+    const TrQuant& trQuant = m_pcThreadResource[0]->m_cTrQuant;
     const bool lmcs = m_gpuIntra && cs.picHeader->getLmcsEnabledFlag();
     if( lmcs )
     {
@@ -543,7 +548,8 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       m_pcThreadResource[0]->m_cReshaper.gpuTables( m_lmcsTables.fwd.data(), m_lmcsTables.inv.data(), m_lmcsTables.chromaScale.data() );
       m_lmcsTables.chroma = lmcsChroma;
     }
-    m_gpuRecon->setPicture( pcPic->m_bufs[PIC_RECONSTRUCTION], lmcs ? &m_lmcsTables : nullptr, ( lmcs && lmcsChroma ) || ( m_gpuInter && sps->getUseCiip() ) );
+    m_gpuRecon->setPicture( pcPic->m_bufs[PIC_RECONSTRUCTION], lmcs ? &m_lmcsTables : nullptr, ( lmcs && lmcsChroma ) || ( m_gpuInter && sps->getUseCiip() ),
+                            scaling ? trQuant.getDequantCoeffBuf() : nullptr, TrQuant::getNumDequantCoeffs() );
   }
   // the picture-sized buffers of what the CPU does itself, the filters' output
   // (SAO, ALF) and the prediction, allocated only for that (an instance's: 4K

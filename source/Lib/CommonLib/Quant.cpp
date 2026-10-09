@@ -592,6 +592,11 @@ bool Quant::processScalingListDec( const int *coeff, int *dequantcoeff, uint32_t
 
 static constexpr int g_numScalingListCoeffs = 96774;
 
+size_t Quant::getNumDequantCoeffs()
+{
+  return g_numScalingListCoeffs;
+}
+
 /** initialization process of scaling list array
  */
 void Quant::xInitScalingList( const Quant* other )
