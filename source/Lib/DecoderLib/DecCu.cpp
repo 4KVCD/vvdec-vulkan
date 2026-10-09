@@ -829,16 +829,27 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
         {
           continue;
         }
-        gpu::IntraJob job;
-        job.set( block.x, block.y, block.width, block.height, compID, gpu::IntraJob::kLmcs, 0, gpu::IntraJob::kResidual, 0 );
-        int wave = 0;
-        if( ( TU::getCbf( tu, compID ) || tu.jointCbCr ) && block.area() > 4 )
+        // (in blocks of powers of two: SBT's transform units without the
+        // residual are 3/4 of the CU, the scaled ones powers of two)
+        const bool scaled = ( TU::getCbf( tu, compID ) || tu.jointCbCr ) && block.area() > 4;
+        for( int y = 0; y < int( block.height ); y += 1 << getLog2( block.height - y ) )
         {
-          wave = gpuLmcsChroma( cu, tu.blocks[COMPONENT_Y].pos(), job, waves );
+          for( int x = 0; x < int( block.width ); x += 1 << getLog2( block.width - x ) )
+          {
+            const int     bw = 1 << getLog2( block.width - x );
+            const int     bh = 1 << getLog2( block.height - y );
+            gpu::IntraJob job;
+            job.set( block.x + x, block.y + y, bw, bh, compID, gpu::IntraJob::kLmcs, 0, gpu::IntraJob::kResidual, 0 );
+            int wave = 0;
+            if( scaled )
+            {
+              wave = gpuLmcsChroma( cu, tu.blocks[COMPONENT_Y].pos(), job, waves );
+            }
+            job.setWave( wave + 1 );
+            waves.set( compID, block.x + x, block.y + y, bw, bh, wave + 1 );
+            intraJobs.push_back( job );
+          }
         }
-        job.setWave( wave + 1 );
-        waves.set( compID, block.x, block.y, block.width, block.height, wave + 1 );
-        intraJobs.push_back( job );
       }
     }
   }

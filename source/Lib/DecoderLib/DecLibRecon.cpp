@@ -519,14 +519,11 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   // CTU tasks list (TaskGpuCtu). With LMCS's chroma residual scaling or
   // CIIP, the inter blocks too: the CPU's finishLMCSAndReco would read the
   // luma the GPU makes, CIIP blends the CPU's inter prediction with the GPU's
-  // intra one. Not yet under LMCS, until a stream checks them: pictures with
-  // inter slices, IBC's chroma scaling (the conformance streams that have
-  // them use tools not on the GPU yet)
-  const bool lmcs        = cs.picHeader->getLmcsEnabledFlag();
-  const bool lmcsChroma  = lmcs && cs.picHeader->getLmcsChromaResidualScaleFlag();
-  const bool lmcsPending = lmcs && ( !isIntra || ( lmcsChroma && cs.sps->getIBCFlag() ) );
-  const bool needsInter  = !isIntra && ( lmcsChroma || cs.sps->getUseCiip() );
-  m_gpuIntra   = m_gpuFilters && gpu::GpuRecon::intraSupported( cs ) && !lmcsPending && ( !needsInter || gpu::GpuRecon::interSupported( cs ) );
+  // intra one
+  const bool lmcs       = cs.picHeader->getLmcsEnabledFlag();
+  const bool lmcsChroma = lmcs && cs.picHeader->getLmcsChromaResidualScaleFlag();
+  const bool needsInter = !isIntra && ( lmcsChroma || cs.sps->getUseCiip() );
+  m_gpuIntra   = m_gpuFilters && gpu::GpuRecon::intraSupported( cs ) && ( !needsInter || gpu::GpuRecon::interSupported( cs ) );
   // and, before those, the inter blocks, from the reference pictures on the GPU
   m_gpuInter   = m_gpuIntra && !isIntra && gpu::GpuRecon::interSupported( cs );
   // and, first of all, the residuals, when the CPU predicts nothing
