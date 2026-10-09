@@ -563,9 +563,18 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
           const CompArea& block = tu.blocks[compID];
           if( trafoJobs )
           {
-            gpu::TrafoJob job;
-            job.set( block.x, block.y, getLog2( block.width ), getLog2( block.height ), compID, 0, 0, gpu::TrafoJob::kZero, 0, 0, 0, 0, 0, 0 );
-            trafoJobs->push_back( job );
+            // in blocks of powers of two (SBT's transform units without the
+            // residual are 3/4 of the CU: 12, 24, 48 luma samples)
+            for( int y = 0; y < int( block.height ); y += 1 << getLog2( block.height - y ) )
+            {
+              for( int x = 0; x < int( block.width ); x += 1 << getLog2( block.width - x ) )
+              {
+                gpu::TrafoJob job;
+                job.set( block.x + x, block.y + y, getLog2( block.width - x ), getLog2( block.height - y ), compID, 0, 0, gpu::TrafoJob::kZero, 0,
+                         0, 0, 0, 0, 0 );
+                trafoJobs->push_back( job );
+              }
+            }
           }
           else
           {
