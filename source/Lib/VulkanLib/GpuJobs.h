@@ -181,6 +181,7 @@ struct InterJob
     kBdof      = 4096, // BDOF (with DMVR: where its cost leaves it on), in the dispatch of the inter_bdof variant
     kAffine    = 8192, // an affine CU's tile: this job and the next make an affine job (setAffine), for the inter_affine
                        // variant
+    kGeo       = 16384, // GPM: the "L0" and "L1" predictions are the partitions', blended (setGeo)
   };
 
   uint32_t w[12];
@@ -204,6 +205,14 @@ struct InterJob
   {
     w[1] |= uint32_t( kBcw ) << 16;
     w[7] |= uint32_t( weight1 + 2 ) << 16;
+  }
+
+  // GPM: the weights' mask (g_globalGeoWeights), its mirroring and the CU's
+  // offsets into it (xWeightedGeoBlk)
+  void setGeo( int mask, int mirror, int offsetX, int offsetY )
+  {
+    w[1] |= uint32_t( kGeo ) << 16;
+    w[9] = uint32_t( mask ) | uint32_t( mirror ) << 8 | uint32_t( offsetX ) << 16 | uint32_t( offsetY ) << 24;
   }
 
   // an affine tile, as two jobs (shaders/inter.slang's AFFINE variant reads

@@ -258,6 +258,7 @@ private:
   Buffer          m_matrices;                       // TrQuant's transform matrices
   Buffer          m_mip;                            // MIP's matrices
   Buffer          m_lfnst;                          // LFNST's matrices
+  Buffer          m_geo;                            // GPM's masks of weights
   // LMCS (setPicture): its tables (the forward and inverse luma mappings,
   // int16, the chroma scales, int32); the planes inter's predictions are
   // kept aside in (LMCS's chroma scaling, CIIP)

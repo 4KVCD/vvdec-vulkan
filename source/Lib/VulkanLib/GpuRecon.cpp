@@ -249,6 +249,14 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
     }
   }
 
+  // GPM's prestored masks of weights (g_globalGeoWeights), for shaders/inter.slang
+  {
+    static_assert( sizeof( g_globalGeoWeights ) == GEO_NUM_PRESTORED_MASK * GEO_WEIGHT_MASK_SIZE * GEO_WEIGHT_MASK_SIZE * sizeof( int16_t ) && GEO_WEIGHT_MASK_SIZE == 112,
+                   "GPM's masks are not those of shaders/inter.slang" );
+    m_geo = m_ctx->alloc( sizeof( g_globalGeoWeights ), MemKind::Upload );
+    memcpy( m_geo.mapped, g_globalGeoWeights, sizeof( g_globalGeoWeights ) );
+  }
+
   // LFNST's matrices, in the order of shaders/trafo.slang: 8x8, then 4x4
   {
     static_assert( sizeof( g_lfnst8x8 ) == 6144 && sizeof( g_lfnst4x4 ) == 2048, "LFNST's matrices are not those of shaders/trafo.slang" );
@@ -351,6 +359,7 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_matrices );
   m_ctx->free( m_mip );
   m_ctx->free( m_lfnst );
+  m_ctx->free( m_geo );
   m_ctx->free( m_lmcs );
   m_ctx->free( m_defer );
   for( Buffer& buf: m_scratch )
@@ -1301,7 +1310,7 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
 // the push constants of shaders/inter.slang
 struct InterPush
 {
-  VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion, lmcsFwd, defer0, defer1, defer2;
+  VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion, lmcsFwd, defer0, defer1, defer2, geo;
   int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth, ctuLog2, widthInCtus, num8x8, wide;
 };
 // the colocated motion as shaders/inter.slang writes DMVR's refinements into it
@@ -1310,7 +1319,7 @@ static_assert( sizeof( ColocatedMotionInfo ) == 20 && offsetof( ColocatedMotionI
 
 bool GpuRecon::interSupported( const SPS& sps )
 {
-  return intraSupported( sps ) && sps.getBitDepth() <= 10 && !sps.getUseGeo() && !sps.getSubPicInfoPresentFlag();
+  return intraSupported( sps ) && sps.getBitDepth() <= 10 && !sps.getSubPicInfoPresentFlag();
 }
 
 bool GpuRecon::interSupported( const CodingStructure& cs )
@@ -1425,6 +1434,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   push.defer0 = m_deferPlanes.addr[COMPONENT_Y];
   push.defer1 = m_deferPlanes.addr[COMPONENT_Cb];
   push.defer2 = m_deferPlanes.addr[COMPONENT_Cr];
+  push.geo    = m_geo.addr;
   push.ctuLog2     = getLog2( pcv.maxCUWidth );
   push.widthInCtus = pcv.widthInCtus;
   push.num8x8      = int32_t( pcv.num8x8CtuBlks );

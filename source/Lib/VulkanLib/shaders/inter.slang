@@ -16,7 +16,8 @@
 // the luma prediction, 256/512 (LMCS's chroma scaling, CIIP) the Cb/Cr prediction kept aside (defer1/2), the residual
 // left in the picture for intra.slang's kind 5 or 6, 1024 (CIIP) so the luma's too (defer0), 2048 BCW's weights,
 // 4096 BDOF (the variant built with BDOF=1 takes those tiles), 8192 an affine tile (the variant built with AFFINE=1
-// takes those, two jobs each: see affineMain)
+// takes those, two jobs each: see affineMain), 16384 GPM (the partitions' predictions as L0's and L1's, blended by the
+// weights of word 9: mask | mirror << 8 | offset x << 16 | offset y << 24)
 
 #include "common.slang"
 
@@ -41,6 +42,7 @@ struct Params
   int16_t*   defer0;      // LMCS, CIIP: the predictions kept aside, laid out as the planes
   int16_t*   defer1;
   int16_t*   defer2;
+  int16_t*   geo;         // GPM's prestored masks of weights (g_globalGeoWeights), 112 x 112 each
   int        stride0;
   int        stride12;
   int        count;
@@ -66,6 +68,26 @@ struct Params
 #define FLAG_DEFER_Y 1024
 #define FLAG_BCW 2048
 #define FLAG_BDOF 4096
+#define FLAG_GEO 16384
+
+// GPM (xWeightedGeoBlk): the weight (of 8) of the first partition at the CU's
+// luma sample (lx, ly), from the mask, mirrored, at the CU's offsets
+int geoWeight( uint params, int lx, int ly )
+{
+  const int mask   = int( params & 255 );
+  const int mirror = int( ( params >> 8 ) & 255 );
+  const int ox     = int( ( params >> 16 ) & 255 );
+  const int oy     = int( params >> 24 );
+  const int at     = mirror == 2 ? ( 111 - oy - ly ) * 112 + ox + lx : ( oy + ly ) * 112 + ( mirror == 1 ? 111 - ox - lx : ox + lx );
+  return int( pc.geo[mask * 112 * 112 + at] );
+}
+
+// the partitions' 14-bit predictions blended
+int geoBlend( int p0, int p1, int weight, int maxVal )
+{
+  const int shift = max( 2, 14 - pc.bitDepth ) + 3;
+  return clip3( 0, maxVal, ( weight * p0 + ( 8 - weight ) * p1 + ( 1 << ( shift - 1 ) ) + ( 8192 << 3 ) ) >> shift );   // IF_INTERNAL_OFFS << 3
+}
 #ifndef BDOF
 #define BDOF 0
 #endif
@@ -1671,7 +1693,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const bool dmvr  = ( flags & FLAG_DMVR ) != 0;
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
-  if( !BDOF && pc.wide != 0 && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
+  if( !BDOF && ( flags & FLAG_GEO ) == 0 && pc.wide != 0 && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
   {
     tile16( tid, index, job, x, y, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel );
     return;
@@ -1894,7 +1916,17 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       }
       const int i  = t & ( bw - 1 );
       const int j  = t >> log2W;
-      int       v  = bdof && comp == 0 ? bdofOut[k] : ( bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k] );
+      int       v;
+      if( ( flags & FLAG_GEO ) != 0 )
+      {
+        // (the CU's luma sample under this one)
+        v = geoBlend( pred0[k], pred1[k], geoWeight( job[9], ( bx + i - ( comp == 0 ? cuX : cuX >> 1 ) ) << s, ( by + j - ( comp == 0 ? cuY : cuY >> 1 ) ) << s ),
+                      maxVal );
+      }
+      else
+      {
+        v = bdof && comp == 0 ? bdofOut[k] : ( bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k] );
+      }
       const int at = ( by + j ) * stride + bx + i;
       if( map )
       {

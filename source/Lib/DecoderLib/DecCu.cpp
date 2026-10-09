@@ -522,8 +522,6 @@ static bool gpuBdof( const CodingUnit& cu )
 void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs, std::vector<gpu::TrafoJob>* trafoJobs,
                            std::vector<gpu::IntraJob>& intraJobs, gpu::WaveMap& waves )
 {
-  CHECK( cu.geoFlag(), "an inter tool the GPU lacks" );
-
   const Slice& slice = *cu.slice;
   // what all the CU's blocks share: AMVR's half-sample filter, LMCS, the
   // residual, CIIP
@@ -653,8 +651,35 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
     }
   };
 
+  if( cu.geoFlag() )
+  {
+    // motionCompensationGeo: each partition a uni-prediction (14-bit), from
+    // its own list's reference and motion, then blended by the mask of the
+    // split's angle
+    const int     dir0    = cu.interDirrefIdxGeo0() >> 4;
+    const int     dir1    = cu.interDirrefIdxGeo1() >> 4;
+    const int     ref0    = refs.slot( slice.getRefPic( RefPicList( dir0 - 1 ), cu.interDirrefIdxGeo0() & 15 ) );
+    const int     ref1    = refs.slot( slice.getRefPic( RefPicList( dir1 - 1 ), cu.interDirrefIdxGeo1() & 15 ) );
+    const Mv&     mv0     = cu.mv[0][1];
+    const Mv&     mv1     = cu.mv[1][1];
+    const uint8_t split   = cu.geoSplitDir;
+    const int     angle   = g_GeoParams[split][0];
+    const int     wIdx    = getLog2( cu.lwidth() ) - GEO_MIN_CU_LOG2;
+    const int     hIdx    = getLog2( cu.lheight() ) - GEO_MIN_CU_LOG2;
+    for( int y = cu.ly(); y < cu.ly() + int( cu.lheight() ); y += 16 )
+    {
+      for( int x = cu.lx(); x < cu.lx() + int( cu.lwidth() ); x += 16 )
+      {
+        gpu::InterJob job;
+        job.set( x, y, std::min<int>( 16, cu.lwidth() ), std::min<int>( 16, cu.lheight() ), flags | gpu::InterJob::kL0 | gpu::InterJob::kL1,
+                 mv0.hor, mv0.ver, mv1.hor, mv1.ver, cu.lx(), cu.ly(), ref0, ref1, 0 );
+        job.setGeo( g_angle2mask[angle], g_angle2mirror[angle], g_weightOffset[split][hIdx][wIdx][0], g_weightOffset[split][hIdx][wIdx][1] );
+        jobs.push_back( job );
+      }
+    }
+  }
   // (SbTMVP's CUs are subblock merge CUs: affine ones, by their flag)
-  if( cu.affineFlag() && cu.mergeType() != MRG_TYPE_SUBPU_ATMVP )
+  else if( cu.affineFlag() && cu.mergeType() != MRG_TYPE_SUBPU_ATMVP )
   {
     // xPredAffineBlk: 4x4 subblocks with motion of their own, refined by PROF;
     // the same motion twice is a uni-prediction (xCheckIdenticalMotion)
