@@ -1,15 +1,17 @@
-// The deblocking's parameters (vvdec's LoopFilter::calcFilterStrengths) on the
-// GPU, from the parse's CUs and TUs (GpuFrontEnd.h's records) and the motion
-// the GPU derived (shaders/mider.slang): per 4x4 luma block and direction its
-// LoopFilterParam -- the edge's boundary strengths, QPs, filter lengths and
-// flags -- as vvdec keeps them (CTU by CTU, the vertical edges' then the
-// horizontal ones').
+// Derives the deblocking parameters on the GPU, as vvdec's
+// LoopFilter::calcFilterStrengths does, from the parsed CUs and TUs
+// (GpuFrontEnd.h's records) and the motion the GPU derived
+// (shaders/mider.slang). The output is one LoopFilterParam per 4x4 luma block
+// and direction -- the edge's boundary strengths, QPs, filter lengths and
+// flags -- laid out as vvdec keeps them: CTU by CTU, first the vertical edges,
+// then the horizontal ones.
 //
-// A thread a CU: a CU writes the parameters of the edges of its own blocks
-// only (the Q side), reading its neighbours' records. Two passes: the CUs of
-// the luma (or the single) tree, then those of the chroma tree, which add
-// their bits to the same blocks' parameters after the luma tree's, as vvdec
-// takes a region's luma tree before its chroma tree.
+// One thread per CU. A CU writes only the parameters of the edges of its own
+// blocks (the Q side of each edge), reading its neighbours' records. There are
+// two passes: first the CUs of the luma tree (or of the single tree), then the
+// CUs of the chroma tree, which add their bits to the same blocks' parameters
+// after the luma tree has written them, as vvdec processes a region's luma
+// tree before its chroma tree.
 
 #include "common.slang"
 
@@ -18,13 +20,13 @@ struct Params
   uint* cus;        // CuRecord, 32 words each
   uint* tus;        // TuRecord, 16 words each
   uint* ctus;       // CtuRecord, 4 words each
-  uint* slices;     // the slice table (mider.slang's)
-  uint* cuMapL;     // the CU at each 4x4 luma block: of the luma tree
-  uint* cuMapC;     // and of the chroma tree (the luma's in a single tree)
-  int*  cuMotion;   // mider.slang's CU records of motion (16 words)
-  int*  motion;     // mider.slang's MotionInfo of the 4x4 blocks
-  uint* lfp;        // out: LoopFilterParam, 2 words, per 4x4 block, per CTU and direction
-  uint* ctuInfo;    // per CTU: its subpicture's index | loop filter across it << 16
+  uint* slices;     // mider.slang's slice table
+  uint* cuMapL;     // the index of the luma-tree CU at each 4x4 luma block
+  uint* cuMapC;     // the same for the chroma tree (in a single tree, the luma tree's CUs)
+  int*  cuMotion;   // mider.slang's motion records per CU (16 words each)
+  int*  motion;     // mider.slang's MotionInfo per 4x4 block
+  uint* lfp;        // out: LoopFilterParam, 2 words per 4x4 block, per CTU and direction
+  uint* ctuInfo;    // per CTU: the index of its subpicture | (loop filter across that subpicture) << 16
   int   numCus;
   int   widthInCtus;
   int   heightInCtus;
@@ -32,13 +34,13 @@ struct Params
   int   width;      // luma samples
   int   height;
   int   widthIn4;
-  int   csx;        // the chroma's subsampling (0, 1)
+  int   csx;        // chroma subsampling shifts (0, 1)
   int   csy;
-  int   chroma;     // a chroma format with chroma
+  int   chroma;     // nonzero unless the format is 4:0:0
   int   qpBdOffset; // the SPS's QpBDOffset
-  int   pass;       // 0: the luma tree's CUs (and the single tree's), 1: the chroma tree's
-  int   flags;      // PPS: loop filter across slices 1, across tiles 2; SPS: subpicture info 4
-  int   vbPosHor[4];   // the virtual boundaries (luma): their count, then up to 3 positions
+  int   pass;       // 0: the CUs of the luma tree (or single tree), 1: the CUs of the chroma tree
+  int   flags;      // bits: 1 loop filter across slices, 2 across tiles (PPS); 4 subpicture info present (SPS)
+  int   vbPosHor[4];   // virtual boundaries: their count, then up to 3 positions in luma samples
   int   vbPosVer[4];
 };
 
@@ -59,14 +61,14 @@ static const int EDGE_HOR = 1;
 static const int MRG_TYPE_SUBPU_ATMVP = 1;
 
 // --------------------------------------------------------------------------------------------------------------------
-// the records
+// The records
 // --------------------------------------------------------------------------------------------------------------------
 
 struct Cu
 {
   int  index;
   int  chType;     // 1: a CU of the chroma tree
-  int  treeType;   // TREE_D 0
+  int  treeType;   // 0: TREE_D
   int  predMode;
   uint flags;
   int  isp;
@@ -97,7 +99,7 @@ Cu loadCu( int index )
   const uint valid = r[20];
   cu.blk[0]   = ( valid & ( 1u << 17 ) ) != 0 ? int4( int( r[0] & 0xffff ), int( r[0] >> 16 ), int( r[1] & 0xff ), int( ( r[1] >> 8 ) & 0xff ) ) : int4( 0 );
   cu.blk[1]   = ( valid & ( 1u << 16 ) ) != 0 ? int4( int( r[19] & 0xffff ), int( r[19] >> 16 ), int( r[20] & 0xff ), int( ( r[20] >> 8 ) & 0xff ) ) : int4( 0 );
-  // its CTU: from its luma position (a chroma tree's CU has no luma block: its chroma block's, in luma samples)
+  // The CU's CTU, from its luma position; a chroma-tree CU has no luma block, so its chroma position is scaled.
   const bool lumaValid = ( valid & ( 1u << 17 ) ) != 0;
   const int  lx        = lumaValid ? int( r[0] & 0xffff ) : int( r[19] & 0xffff ) << pc.csx;
   const int  ly        = lumaValid ? int( r[0] >> 16 ) : int( r[19] >> 16 ) << pc.csy;
@@ -141,11 +143,11 @@ Tu loadTu( int index )
 
 bool valid( int4 b ) { return b.z != 0 && b.w != 0; }
 
-// the channel's scale: luma 0, chroma the format's
+// A channel's subsampling shifts: 0 for luma, the format's for chroma.
 int scaleX( int ch ) { return ch == 0 ? 0 : pc.csx; }
 int scaleY( int ch ) { return ch == 0 ? 0 : pc.csy; }
 
-// CodingStructure::getCU: the CU covering pos (the channel's samples) -- -1 outside the picture
+// The CU covering pos (in the channel's samples), as CodingStructure::getCU finds it; -1 outside the picture.
 int cuAt( int ch, int2 pos )
 {
   const int lx = pos.x << scaleX( ch );
@@ -158,7 +160,8 @@ int cuAt( int ch, int2 pos )
   return int( ch == 0 ? pc.cuMapL[at] : pc.cuMapC[at] );
 }
 
-// LoopFilter's getTU: the CU's TU whose block (of the channel) ends past pos (its only TU when it has one)
+// The CU's TU at pos, as LoopFilter's getTU finds it: the first TU whose block (in channel ch) ends past pos,
+// otherwise the last TU (a CU with one TU returns it directly).
 Tu tuAt( Cu cu, int2 pos, int ch )
 {
   if( cu.numTus == 1 )
@@ -178,7 +181,7 @@ Tu tuAt( Cu cu, int2 pos, int ch )
 
 Tu lastTu( Cu cu ) { return loadTu( cu.firstTu + cu.numTus - 1 ); }
 
-// a slice record (mider.slang's)
+// Slice records (mider.slang's slice table)
 uint* sliceOfCtu( int ctu ) { return pc.slices + pc.widthInCtus * pc.heightInCtus + pc.slices[ctu] * 64; }
 int   slicePoc( uint* s ) { return int( s[0] ); }
 bool  isInterB( uint* s ) { return ( s[1] & ( 1u << 16 ) ) != 0; }
@@ -188,7 +191,7 @@ int   refPoc( uint* s, int list, int refIdx ) { return int( s[16 + 16 * list + r
 uint  ctuTile( int ctu ) { return pc.ctus[ctu * 4 + 2] >> 16; }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the parameters
+// The parameters
 // --------------------------------------------------------------------------------------------------------------------
 
 // LoopFilterParam: qp[3] (int8), bs, sideMaxFiltLength, flags
@@ -200,7 +203,7 @@ struct Lfp
   int flags;
 };
 
-// the entry of the 4x4 luma block at (gx, gy) (4x4 units) for edges of dir
+// The LoopFilterParam entry of the 4x4 luma block at (gx, gy), in 4x4-block units, for the edges of direction dir.
 uint* lfpPtr( int dir, int gx, int gy )
 {
   const int sh   = pc.log2Ctu - 2;
@@ -209,7 +212,7 @@ uint* lfpPtr( int dir, int gx, int gy )
   return pc.lfp + ( ( ( 2 * ctu + dir ) << ( 2 * sh ) ) + ( gx & mask ) + ( ( gy & mask ) << sh ) ) * 2;
 }
 
-// a position of the channel to its 4x4 block (CodingStructure::inCtuPos's unit)
+// Converts a position in the channel's samples to its 4x4 luma block (the unit of CodingStructure::inCtuPos).
 int2 lfpPos( int ch, int2 pos )
 {
   return int2( ( pos.x << scaleX( ch ) ) >> 2, ( pos.y << scaleY( ch ) ) >> 2 );
@@ -241,7 +244,7 @@ bool filterEdge( Lfp l, int ch ) { return ( ( l.flags >> ch ) & 1 ) != 0; }
 void setFilterEdge( inout Lfp l, int ch, bool f ) { l.flags = ( l.flags & ~( 1 << ch ) ) | ( ( f ? 1 : 0 ) << ch ); }
 void setFilterCMFL( inout Lfp l, bool f ) { l.flags = ( l.flags & ~( 1 << 5 ) ) | ( ( f ? 1 : 0 ) << 5 ); }
 
-// the 4x4 motion (mider.slang's) at a luma position
+// The motion of the 4x4 block at a luma position (mider.slang's MotionInfo).
 void motionAt( int2 pos, out int2 mv[2], out int ref[2] )
 {
   const int ctuMask  = ( 1 << pc.log2Ctu ) - 1;
@@ -308,7 +311,7 @@ void boundaryStrength( int dir, inout Lfp lfp, Cu cuQ, int2 localPos, Cu cuP )
 
   const int bsMask = ( hasLuma ? bsSet( 3, 0 ) : 0 ) | bsSet( 3, 3 ) | ( hasChroma ? bsSet( 3, 1 ) : 0 ) | ( hasChroma ? bsSet( 3, 2 ) : 0 );
 
-  // intra: 2 (BDPCM's on both sides: 0)
+  // Intra: bs 2 (0 when both sides use BDPCM).
   if( cuP.predMode == MODE_INTRA || cuQ.predMode == MODE_INTRA )
   {
     const int edgeIdx = ( perp( dir, posQ ) - perp( dir, cuBlk.xy ) ) / 4;
@@ -378,7 +381,7 @@ void boundaryStrength( int dir, inout Lfp lfp, Cu cuQ, int2 localPos, Cu cuP )
     return;
   }
 
-  // the motion (the CU's channel is luma here)
+  // Compare the motion (the CU's channel is luma here).
   int2      mvQ[2], mvP[2];
   int       refQ[2], refP[2];
   motionAt( posQ, mvQ, refQ );
@@ -388,7 +391,7 @@ void boundaryStrength( int dir, inout Lfp lfp, Cu cuQ, int2 localPos, Cu cuP )
 
   if( isInterB( sliceQ ) || isInterB( sliceP ) )
   {
-    // the reference pictures (their POCs; IBC: the current picture)
+    // The reference pictures, as POCs (for IBC, the current picture).
     const int piRefP0 = isIbc( cuP ) ? slicePoc( sliceP ) : refP[0] >= 0 ? refPoc( sliceP, 0, refP[0] ) : kNoPic;
     const int piRefP1 = isIbc( cuP ) ? kNoPic : refP[1] >= 0 ? refPoc( sliceP, 1, refP[1] ) : kNoPic;
     const int piRefQ0 = isIbc( cuQ ) ? slicePoc( sliceQ ) : refQ[0] >= 0 ? refPoc( sliceQ, 0, refQ[0] ) : kNoPic;
@@ -472,7 +475,7 @@ void filterLengthsFromTransforms( int dir, Cu cu, Tu currTu, bool bValue, bool d
       continue;
     }
     const int4 tb       = currTu.blk[ch];
-    int2       lp       = lfpPos( ch, tb.xy );   // the entry, stepped along the edge
+    int2       lp       = lfpPos( ch, tb.xy );   // the LoopFilterParam entry, stepped along the edge
     const int  inc      = dir == EDGE_HOR ? 4 >> scaleX( ch ) : 4 >> scaleY( ch );
     const int  incFst   = dir == EDGE_HOR ? 4 >> scaleX( start ) : 4 >> scaleY( start );
     const bool sameCuTu = perp( dir, tb.xy ) == perp( dir, cu.blk[ch].xy );
@@ -692,7 +695,7 @@ void filterLengthsForSubBlocks( int dir, Cu cu )
   const int4 y4   = cu.blk[0];
   const int  xInc = dir == EDGE_HOR ? 4 : 8;
   const int  yInc = dir == EDGE_HOR ? 8 : 4;
-  const int2 off  = dir == EDGE_HOR ? int2( 0, 1 ) : int2( 1, 0 );   // the 4x4 block across the edge's direction
+  const int2 off  = dir == EDGE_HOR ? int2( 0, 1 ) : int2( 1, 0 );   // step to the next 4x4 block across the edges
   for( int y = 0; y < y4.w; y += yInc )
   {
     for( int x = 0; x < y4.z; x += xInc )
@@ -739,7 +742,7 @@ void filterLengthsForSubBlocks( int dir, Cu cu )
 // LoopFilter::calcFilterStrengths
 // --------------------------------------------------------------------------------------------------------------------
 
-// CU::isAvailable for the loop filter across slices, tiles, subpictures
+// Whether the loop filter may cross from cu to other under the slice, tile and subpicture rules (CU::isAvailable).
 bool lfAvailable( Cu cu, Cu other )
 {
   uint*      s0            = sliceOfCtu( cu.ctu );
@@ -753,7 +756,7 @@ bool lfAvailable( Cu cu, Cu other )
          && ( acrossSubPics || ( sub0 & 0xffff ) == ( sub1 & 0xffff ) );
 }
 
-// isCrossedByVirtualBoundaries: the boundaries (luma) crossing the area, as positions
+// The positions of the virtual boundaries (luma samples) that cross area a, as isCrossedByVirtualBoundaries finds them.
 void virtualBoundaries( int4 a, out int numHor, out int numVer, out int3 hor, out int3 ver )
 {
   numHor = 0;
@@ -780,7 +783,7 @@ void virtualBoundaries( int4 a, out int numHor, out int numVer, out int3 hor, ou
   }
 }
 
-// xDeriveEdgefilterParam
+// Turns off the edges at pos that lie on a virtual boundary (xDeriveEdgefilterParam).
 void edgeFilterParam( int2 pos, int numVer, int numHor, int3 ver, int3 hor, inout bool verEdge, inout bool horEdge )
 {
   for( int i = 0; i < numVer; i++ )
@@ -812,7 +815,7 @@ void calcFilterStrengths( Cu cu )
   virtualBoundaries( int4( area.x << sx, area.y << sy, area.z << sx, area.w << sy ), numHor, numVer, hor, ver );
   const bool crossed = numHor > 0 || numVer > 0;
 
-  // xGetLoopfilterParam: the edges at the CU's left and top
+  // Whether the edges at the CU's left and top are filtered (xGetLoopfilterParam).
   bool leftEdge = false, topEdge = false;
   if( area.x > 0 )
   {
@@ -824,7 +827,7 @@ void calcFilterStrengths( Cu cu )
   }
 
   const bool refineBs       = ( mergeOf( cu ) && mergeTypeOf( cu ) == MRG_TYPE_SUBPU_ATMVP ) || affineOf( cu ) || cu.isp != 0;
-  // LF_PARAM_MAP's unit scale: luma 4x4 blocks
+  // Masks that round to the LF_PARAM_MAP's unit, a 4x4 luma block, in the channel's samples.
   const int  maskBlkX       = ~( ( 1 << ( 2 - sx ) ) - 1 );
   const int  maskBlkY       = ~( ( 1 << ( 2 - sy ) ) - 1 );
   const int  ctuMask        = ( 1 << pc.log2Ctu ) - 1;
@@ -881,7 +884,7 @@ void calcFilterStrengths( Cu cu )
     filterLengthsForSubBlocks( EDGE_HOR, cu );
   }
 
-  // the boundary strengths of the edges the steps above marked
+  // Compute the boundary strengths of the edges that the steps above marked.
   const int pelsX = 4 >> sx;
   const int pelsY = 4 >> sy;
   for( int y = 0; y < area.w; y += pelsY )
@@ -920,7 +923,7 @@ void calcFilterStrengths( Cu cu )
   }
 }
 
-// a thread a CU of the pass's tree (the slice's deblocking on)
+// One thread per CU of the pass's tree; CUs in slices with deblocking off are skipped.
 [shader( "compute" )]
 [numthreads( 64, 1, 1 )]
 void main( uint3 id : SV_DispatchThreadID )

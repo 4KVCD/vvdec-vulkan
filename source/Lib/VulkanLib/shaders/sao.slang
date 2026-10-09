@@ -1,18 +1,19 @@
 // Sample adaptive offset (SAO) of one plane of a picture, as vvdec's
-// SampleAdaptiveOffset::offsetBlock_core does it, from the deblocked picture
-// (src) into another buffer (dst): a thread per sample.
+// SampleAdaptiveOffset::offsetBlock_core applies it: reads the deblocked
+// picture (src) and writes another buffer (dst), one thread per sample.
 //
-// Per CTU and component, 8 int16: type (-1: off, 0-3: edge offset at 0, 90,
-// 135, 45 degrees, 4: band offset), band position, neighbour availability
-// (bits: left, right, above, below, above-left, above-right, below-left,
-// below-right), unused, then 4 offsets: edge classes -2, -1, +1, +2, or the
-// bands from the band position on.
+// The ctus buffer holds 8 int16 per CTU and component: the type (-1: off,
+// 0-3: edge offset at 0, 90, 135, 45 degrees, 4: band offset), the band
+// position, the neighbour availability (bits: left, right, above, below,
+// above-left, above-right, below-left, below-right), an unused entry, then
+// 4 offsets: for edge classes -2, -1, +1, +2, or for the 4 bands starting at
+// the band position.
 //
-// An edge-offset sample changes only when both samples it compares with lie in
-// CTUs the filter may read (its own, or an available neighbour): that is what
-// the start and end positions of offsetBlock_core's loops amount to. Nor where
-// it compares across a virtual boundary: on the boundary, or just before it
-// (isProcessDisabled).
+// An edge-offset sample changes only when both samples it is compared with lie
+// in CTUs the filter may read (its own CTU or an available neighbour); this is
+// what the start and end positions of offsetBlock_core's loops amount to. It
+// also stays unchanged when the comparison crosses a virtual boundary, i.e.
+// when the sample lies on the boundary or just before it (isProcessDisabled).
 
 #include "common.slang"
 
@@ -23,16 +24,16 @@ struct Params
   int16_t* ctus;
   int      srcStride;
   int      dstStride;
-  int      width;    // of the plane
+  int      width;    // plane size in samples
   int      height;
-  int      ctuWidth;   // of a CTU in this plane
+  int      ctuWidth;   // CTU size in this plane's samples
   int      ctuHeight;
   int      widthInCtus;
   int      comp;
   int      bitDepth;
-  int      scaleX;     // the plane's subsampling
+  int      scaleX;     // the plane's subsampling shifts
   int      scaleY;
-  int      numVbVer;   // the picture's virtual boundaries (luma samples), vertical, then horizontal
+  int      numVbVer;   // number of vertical, then horizontal virtual boundaries; positions in luma samples
   int      numVbHor;
   int      vbVer0, vbVer1, vbVer2;
   int      vbHor0, vbHor1, vbHor2;
@@ -45,8 +46,8 @@ int sgn( int v )
   return v > 0 ? 1 : ( v < 0 ? -1 : 0 );
 }
 
-// whether a sample at p of the plane is on a virtual boundary of positions vb
-// (luma samples, scaled by s) or just before one
+// Whether position p of the plane lies on one of the virtual boundaries vb0-vb2
+// (luma samples, shifted right by s for this plane) or just before one.
 bool onBoundary( int p, int num, int vb0, int vb1, int vb2, int s )
 {
   const int vb[3] = { vb0, vb1, vb2 };
@@ -61,13 +62,13 @@ bool onBoundary( int p, int num, int vb0, int vb1, int vb2, int s )
   return false;
 }
 
-// whether the CTU holding the sample at (lx, ly), relative to this CTU of
-// w x h samples, may be read
+// Whether the filter may read the CTU that holds the sample at (lx, ly), given
+// relative to the current CTU of w x h samples.
 bool readable( int lx, int ly, int w, int h, int avail )
 {
   const int dx = lx < 0 ? 0 : ( lx >= w ? 2 : 1 );
   const int dy = ly < 0 ? 0 : ( ly >= h ? 2 : 1 );
-  // [dy][dx] -> bit of avail; the CTU itself is always readable
+  // Maps [dy][dx] to the bit of avail; -1 marks the current CTU, which is always readable.
   static const int kBit[9] = { 4, 2, 5, 0, -1, 1, 6, 3, 7 };
   const int bit = kBit[dy * 3 + dx];
   return bit < 0 || ( ( avail >> bit ) & 1 ) != 0;
@@ -114,7 +115,7 @@ void main( uint3 id : SV_DispatchThreadID )
     {
       dx = -1; dy = 1;
     }
-    // the two samples compared: (x - dx, y - dy) and (x + dx, y + dy)
+    // The sample is compared with (x - dx, y - dy) and (x + dx, y + dy).
     const int lx    = x - cx * pc.ctuWidth;
     const int ly    = y - cy * pc.ctuHeight;
     const int w     = min( pc.ctuWidth, pc.width - cx * pc.ctuWidth );

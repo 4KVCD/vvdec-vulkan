@@ -1,24 +1,26 @@
-// The adaptive loop filter (ALF) and the cross-component ALF of a picture, as
-// vvdec's AdaptiveLoopFilter does it (deriveClassificationBlk, filterBlk,
-// filterBlkCcAlf): the filters see the whole picture, with the samples beyond
-// its edges replicated (vvdec's border extension).
+// The adaptive loop filter (ALF) and the cross-component ALF (CC-ALF) of a
+// picture, as vvdec's AdaptiveLoopFilter applies them (deriveClassificationBlk,
+// filterBlk, filterBlkCcAlf). The filters see the whole picture, with the
+// samples beyond its edges replicated (vvdec's border extension).
 //
-// BOUNDS=1, for pictures with virtual boundaries or slice, tile or subpicture
-// boundaries the loop filters must not cross (AdaptiveLoopFilter::filterCTU):
-// a CTU splits into regions at the virtual boundaries inside it, and a sample's
-// filter sees its region, the samples beyond the region's clipped sides
-// replicated (see Region); a thread reads what it needs of the picture itself.
+// BOUNDS=1 is the variant for pictures with virtual boundaries, or with slice,
+// tile or subpicture boundaries that the loop filters must not cross
+// (AdaptiveLoopFilter::filterCTU). A CTU is split into regions at the virtual
+// boundaries inside it, and a sample's filter sees only the sample's region,
+// with the samples beyond the region's clipped sides replicated (see Region).
+// In this variant each thread reads the samples it needs from the picture.
 //
-// CHROMA=0: a thread classifies one 4x4 luma block and filters it (7x7 diamond),
-//           from the workgroup's 32x32 samples and their 3-sample margin,
-//           read once into shared memory.
-// CHROMA=1: a thread filters one 4x4 block of Cb and of Cr (5x5 diamond), then
-//           adds the cross-component filter of the luma below them.
+// CHROMA=0: a thread classifies one 4x4 luma block and filters it (7x7
+//           diamond), from the workgroup's 32x32 samples and a 3-sample
+//           margin, which the workgroup reads into shared memory once.
+// CHROMA=1: a thread filters one 4x4 block of Cb and one of Cr (5x5 diamond),
+//           then adds the cross-component filter of the co-located luma.
 //
-// Per CTU, 8 bytes: luma filter set (255: off), chroma APS, Cb alternative
-// (255: off), Cr alternative (255: off), Cb and Cr CC-ALF filter as
-// APS * 4 + filter (255: off), the CTU's boundaries (BOUNDS: clipped top 1,
-// bottom 2, left 4, right 8; rasterSliceAlfPad << 4), 1 unused.
+// The ctus buffer holds 8 bytes per CTU: the luma filter set (255: off), the
+// chroma APS, the Cb alternative (255: off), the Cr alternative (255: off),
+// the Cb and Cr CC-ALF filters as APS * 4 + filter (255: off), the CTU's
+// boundaries (BOUNDS only: clipped top 1, bottom 2, left 4, right 8;
+// rasterSliceAlfPad << 4), and 1 unused byte.
 
 #include "common.slang"
 
@@ -41,24 +43,24 @@ struct Params
   int16_t* dst0;
   int16_t* src1;      // Cr
   int16_t* dst1;
-  int16_t* srcLuma;   // chroma: the luma for CC-ALF
+  int16_t* srcLuma;   // CHROMA: the luma plane, for CC-ALF
   uint8_t* ctus;
   int16_t* coeff;     // luma: [set][transpose][class][13]; chroma: [aps][alt][7]
-  int16_t* clip;      // as coeff
+  int16_t* clip;      // clipping values, laid out like coeff
   int16_t* ccCoeff;   // [aps][component][filter][8]
   int      srcStride;
   int      dstStride;
   int      lumaStride;
-  int      width;     // of the plane filtered
+  int      width;     // size of the filtered plane, in samples
   int      height;
   int      lumaWidth;
   int      lumaHeight;
   int      ctuLog2;
   int      widthInCtus;
   int      bitDepth;
-  int      scaleX;    // chroma subsampling
+  int      scaleX;    // chroma subsampling shifts
   int      scaleY;
-  int      numVbVer;  // BOUNDS: the picture's virtual boundaries (luma samples), vertical, then horizontal
+  int      numVbVer;  // BOUNDS: number of vertical, then horizontal virtual boundaries; positions in luma samples
   int      numVbHor;
   int      vbVer0, vbVer1, vbVer2;
   int      vbHor0, vbHor1, vbHor2;
@@ -76,18 +78,19 @@ int clipAlf( int c, int cur, int a, int b )
 #endif
 
 #if BOUNDS
-// the region of its CTU a sample lies in, as filterCTU splits the CTU at the
-// virtual boundaries inside it (in luma samples; x1, y1 past the end), which of
-// its sides clip -- a virtual boundary, a slice, tile or subpicture boundary
-// without loop filtering across (the CTU's: isClipOrCrossedByVirtualBoundaries),
-// the picture's edge -- and the CTU's raster-slice corners (rasterSliceAlfPad:
-// 1 its top-left, 2 its bottom-right, for the regions there)
+// The region of its CTU that a sample lies in, after filterCTU splits the CTU at
+// the virtual boundaries inside it (luma samples; x1 and y1 are exclusive).
+// clipL .. clipB tell which of the region's sides clip the filter: a virtual
+// boundary, a slice, tile or subpicture boundary that loop filtering must not
+// cross (the CTU's, as isClipOrCrossedByVirtualBoundaries finds them), or the
+// picture's edge. pad marks the CTU's raster-slice corners (rasterSliceAlfPad:
+// 1 the top-left, 2 the bottom-right), for the regions at those corners.
 struct Region
 {
   int  x0, x1, y0, y1;
   bool clipL, clipR, clipT, clipB;
   int  pad;
-  int  cx0, cy0, cx1, cy1;   // the CTU
+  int  cx0, cy0, cx1, cy1;   // the CTU's bounds
 };
 
 Region regionOf( int lx, int ly )
@@ -148,7 +151,7 @@ Region regionOf( int lx, int ly )
   return r;
 }
 
-// the region in a plane subsampled by sx, sy
+// The same region in a plane subsampled by sx, sy.
 Region scaled( Region r, int sx, int sy )
 {
   r.x0  >>= sx; r.x1  >>= sx; r.cx0 >>= sx; r.cx1 >>= sx;
@@ -156,10 +159,11 @@ Region scaled( Region r, int sx, int sy )
   return r;
 }
 
-// a sample of a plane (w x h) as the filters of a sample in region r see it
-// (filterCTU's copy of the region with its margin: the raster slice's corners
-// padded from the CTU's edge column, padBorderPel; beyond the clipped sides the
-// region's edge, extendBorderPel; beyond the picture its edge)
+// Reads a sample of a plane (w x h) as the filter of a sample in region r sees
+// it, matching filterCTU's copy of the region with its margin: at the raster
+// slice's corners, the CTU's edge column is padded outwards (padBorderPel);
+// beyond the clipped sides, the region's edge is replicated (extendBorderPel);
+// beyond the picture, the picture's edge.
 int fetch( int16_t* p, int stride, int x, int y, Region r, int w, int h )
 {
   if( ( r.pad & 1 ) != 0 && x < r.cx0 && y < r.cy0 )
@@ -183,8 +187,9 @@ int fetch( int16_t* p, int stride, int x, int y, Region r, int w, int h )
 static const int kTh[16] = { 0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4 };
 static const int kTransposeTable[8] = { 0, 1, 0, 2, 2, 3, 1, 3 };
 
-// a thread a 4x4 luma block: its class from the Laplacians of the 2x2 cells
-// around it, then the filter, every read through its region (fetch)
+// One thread per 4x4 luma block: classifies the block from the Laplacians of
+// the 2x2 cells around it, then filters it, reading every sample through the
+// block's region (fetch).
 [shader( "compute" )]
 [numthreads( 8, 8, 1 )]
 void main( uint3 id : SV_DispatchThreadID )
@@ -213,8 +218,8 @@ void main( uint3 id : SV_DispatchThreadID )
   const int    vbPos = vbH - 4;
   const int    byVb  = by & ( vbH - 1 );
 
-  // classification: the Laplacians of the cells of the block's window, the
-  // 4x4 cells from ( bx - 2, by - 2 ), but the rows the virtual boundary hides
+  // Classification: sum the Laplacians over the block's window, the 4x4 cells
+  // from ( bx - 2, by - 2 ), except the rows that the virtual boundary hides.
   int sumV = 0, sumH = 0, sumD0 = 0, sumD1 = 0;
   const int rFirst = byVb == vbPos ? 1 : 0;
   const int rLast  = byVb == vbPos - 4 ? 2 : 3;
@@ -268,7 +273,7 @@ void main( uint3 id : SV_DispatchThreadID )
     d1 = sumD1; d0 = sumD0; dirTempD = 2;
   }
   int hvd1, hvd0, mainDirection, secondaryDirection;
-  // 32-bit unsigned products, wrapping as vvdec's do
+  // 32-bit unsigned products that wrap around, as vvdec's do
   if( uint( d1 ) * uint( hv0 ) > uint( hv1 ) * uint( d0 ) )
   {
     hvd1 = d1; hvd0 = d0; mainDirection = dirTempD; secondaryDirection = dirTempHV;
@@ -351,33 +356,34 @@ void main( uint3 id : SV_DispatchThreadID )
 
 #elif CHROMA == 0
 
-// the workgroup's samples: 32 x 32 from (s_x0, s_y0), with 3 rows above and
-// below and 4 samples left and right, as the picture's edges replicate them
-// (vvdec's border extension), in groups of 4 samples (8 bytes): what a 4x4
-// block's classification and filter read of a row comes as 3 groups, the
-// samples picked out of them in registers (read one at a time, a block read
-// shared memory some 600 times and waited for most reads: VideoQ 4K, ALF luma
-// 1.55 -> 1.33 ms a picture with ALF)
+// The workgroup's samples in shared memory: 32 x 32 from (s_x0, s_y0) plus 3
+// rows above and below and 4 samples left and right, replicated beyond the
+// picture's edges (vvdec's border extension). They are stored in groups of 4
+// samples (8 bytes): what a 4x4 block's classification and filter read of a
+// row arrives as 3 groups, and the samples are picked out of them in
+// registers. (Reading one sample at a time, a block read shared memory some
+// 600 times and waited for most reads; the groups took VideoQ 4K's ALF luma
+// from 1.55 to 1.33 ms per picture with ALF.)
 #define TILE 32
 #define MARGIN 3                         // rows above and below
-#define GROUPS ( TILE / 4 + 2 )          // groups of 4 samples a row: the tile's and one either side
+#define GROUPS ( TILE / 4 + 2 )          // 4-sample groups per row: the tile's, plus one on each side
 #define TILE_H ( TILE + 2 * MARGIN )
 groupshared uint2 s_tile[TILE_H * GROUPS];
 static int        s_x0, s_y0;
-// the classification's Laplacians, a cell of 2x2 samples at a time (the
-// block's window has 4x4 cells, each cell is in the windows of up to 4
-// blocks): V | H << 16, D0 | D1 << 16 of the cells ( s_x0 - 2 + 2 * cx,
-// s_y0 - 2 + 2 * cy )
+// The classification's Laplacians, computed once per cell of 2x2 samples: a
+// block's window has 4x4 cells, and each cell lies in the windows of up to 4
+// blocks. Entry (cx, cy) holds V | H << 16 and D0 | D1 << 16 of the cell at
+// ( s_x0 - 2 + 2 * cx, s_y0 - 2 + 2 * cy ).
 #define CELLS 18
 groupshared uint2 s_cls[CELLS * CELLS];
 
-// the samples ( bx - 4 .. bx + 7, y ) of the 4x4 block at bx (its group G of
-// the tile, the one before, the one after)
+// The samples ( bx - 4 .. bx + 7, y ) around the 4x4 block at bx: the tile's
+// group G, which holds the block, and the groups before and after it.
 struct Row
 {
   uint2 g0, g1, g2;
 
-  // sample j (a constant: the picks fold into shifts of registers)
+  // Sample j; j is a constant, so the picks fold into register shifts.
   int at( int j )
   {
     const uint2 g = j < 4 ? g0 : ( j < 8 ? g1 : g2 );
@@ -386,7 +392,7 @@ struct Row
   }
 };
 
-// the samples ( s_x0 - 4 + 4 * m .. + 7, y ): the tile's groups m, m + 1
+// The samples ( s_x0 - 4 + 4 * m .. s_x0 + 3 + 4 * m, y ): the tile's groups m and m + 1.
 struct Row2
 {
   uint2 g0, g1;
@@ -427,7 +433,7 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
 {
   s_x0 = int( group.x ) * TILE;
   s_y0 = int( group.y ) * TILE;
-  // the rows begin 8-byte aligned (GpuRecon::recordAlf), the groups too
+  // Rows start 8-byte aligned (GpuRecon::recordAlf), and so do the groups.
   for( int s = int( local.y * 8 + local.x ); s < TILE_H * GROUPS; s += 64 )
   {
     const int r = s / GROUPS;
@@ -452,12 +458,12 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
   const int vbH   = 1 << pc.ctuLog2;
   const int vbPos = vbH - 4;
 
-  // the cells' Laplacians, two neighbours at a time (their samples are 2
-  // groups of the tile's rows)
+  // Compute the cells' Laplacians, two neighbouring cells per iteration (their
+  // samples lie in 2 groups of each tile row).
   for( int t = int( local.y * 8 + local.x ); t < CELLS * CELLS / 2; t += 64 )
   {
     const int cy  = t / ( CELLS / 2 );
-    const int m   = t - cy * ( CELLS / 2 );   // the cells 2 * m, 2 * m + 1 of the row
+    const int m   = t - cy * ( CELLS / 2 );   // this iteration's cells: 2 * m and 2 * m + 1 of row cy
     const int y0  = s_y0 - 2 + 2 * cy;
     int       ym1 = y0 - 1;
     int       yp2 = y0 + 2;
@@ -496,7 +502,7 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
   }
   const int G = ( bx - s_x0 ) / 4 + 1;
 
-  // a CTU holds whole tiles (CTUs of 32 luma samples or more)
+  // Each tile lies within one CTU (CTUs are 32 luma samples or larger).
   const int ctu = ( by >> pc.ctuLog2 ) * pc.widthInCtus + ( bx >> pc.ctuLog2 );
   const int set = int( pc.ctus[ctu * 8 + CTU_LUMA_SET] );
   if( set == 255 )
@@ -511,8 +517,8 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
 
   const int byVb = by & ( vbH - 1 );
 
-  // classification: the Laplacians of the cells of the block's window, the
-  // 4x4 cells from ( bx - 2, by - 2 ), but the rows the virtual boundary hides
+  // Classification: sum the Laplacians over the block's window, the 4x4 cells
+  // from ( bx - 2, by - 2 ), except the rows that the virtual boundary hides.
   int sumV = 0, sumH = 0, sumD0 = 0, sumD1 = 0;
   const int rFirst = byVb == vbPos ? 1 : 0;
   const int rLast  = byVb == vbPos - 4 ? 2 : 3;
@@ -558,7 +564,7 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
     d1 = sumD1; d0 = sumD0; dirTempD = 2;
   }
   int hvd1, hvd0, mainDirection, secondaryDirection;
-  // 32-bit unsigned products, wrapping as vvdec's do
+  // 32-bit unsigned products that wrap around, as vvdec's do
   if( uint( d1 ) * uint( hv0 ) > uint( hv1 ) * uint( d0 ) )
   {
     hvd1 = d1; hvd0 = d0; mainDirection = dirTempD; secondaryDirection = dirTempHV;
@@ -590,8 +596,8 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
     k[i] = int( pc.clip[base + i] );
   }
 
-  // the filter, a row of the block at a time: its 4 samples ( bx + i, y ) are
-  // the rows' samples j = 4 + i
+  // Filter the block one row at a time: its 4 samples ( bx + i, y ) are sample
+  // j = 4 + i of each Row.
   const int maxVal = ( 1 << pc.bitDepth ) - 1;
   [unroll]
   for( int dy = 0; dy < 4; dy++ )
@@ -667,7 +673,7 @@ int lumaPx( int x, int y )
 #endif
 }
 
-// a sample of the chroma plane src (BOUNDS: through the block's region)
+// Reads a sample of the chroma plane src (with BOUNDS, through the block's region).
 int chromaPx( int16_t* src, int x, int y )
 {
 #if BOUNDS
@@ -677,7 +683,7 @@ int chromaPx( int16_t* src, int x, int y )
 #endif
 }
 
-// ALF of one 4x4 block of one chroma plane into out[]
+// Applies ALF to one 4x4 block of one chroma plane, into out[].
 void alfChroma( int16_t* src, int bx, int by, int aps, int alt, inout int out[16] )
 {
   const int vbH   = ( 1 << pc.ctuLog2 ) >> pc.scaleY;
@@ -725,7 +731,7 @@ void alfChroma( int16_t* src, int bx, int by, int aps, int alt, inout int out[16
   }
 }
 
-// CC-ALF of one 4x4 chroma block added to out[]
+// Adds the CC-ALF correction of one 4x4 chroma block to out[].
 void ccAlf( int bx, int by, int filter, int component, inout int out[16] )
 {
   const int base = ( ( ( filter >> 2 ) * 2 + component ) * 4 + ( filter & 3 ) ) * 8;

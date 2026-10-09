@@ -1,17 +1,16 @@
-// The colocated motion of a picture (vvdec's storeColMotion) from the motion
-// the GPU derived (shaders/mider.slang): per CTU, on the 8x8 grid, the motion
-// of each 8x8 block's top-left 4x4 block -- what TMVP in the later pictures
-// reads (DMVR's refinements are written into it later, by shaders/inter.slang).
+// Builds a picture's colocated motion, as vvdec's storeColMotion does, from the motion the GPU derived
+// (shaders/mider.slang): for each CTU, one entry per 8x8 block, copied from the block's top-left 4x4 block.
+// TMVP in later pictures reads it. DMVR's refined motion is written into it afterwards, by shaders/inter.slang.
 
 #include "common.slang"
 
 struct Params
 {
-  int* motion;      // mider.slang's MotionInfo of the 4x4 blocks (5 words), CTU by CTU
-  int* colMotion;   // the picture's ColocatedMotionInfo (5 words), CTU by CTU, num8x8 a CTU
-  int  count;       // the 8x8 blocks of all CTUs
+  int* motion;      // mider.slang's MotionInfo per 4x4 block (5 words), CTU by CTU
+  int* colMotion;   // out: the picture's ColocatedMotionInfo (5 words), CTU by CTU, num8x8 entries per CTU
+  int  count;       // number of 8x8 blocks in all CTUs (one thread each)
   int  log2Ctu;
-  int  num8x8;
+  int  num8x8;      // 8x8 blocks per CTU
 };
 
 [[vk::push_constant]] Params pc;
@@ -25,7 +24,7 @@ void main( uint3 id : SV_DispatchThreadID )
   {
     return;
   }
-  const int ctu      = i >> ( 2 * ( pc.log2Ctu - 3 ) );   // (num8x8 = 1 << that)
+  const int ctu      = i >> ( 2 * ( pc.log2Ctu - 3 ) );   // (num8x8 == 1 << this shift)
   const int e        = i & ( pc.num8x8 - 1 );
   const int across8  = 1 << ( pc.log2Ctu - 3 );
   const int ctuSize4 = 1 << ( pc.log2Ctu - 2 );

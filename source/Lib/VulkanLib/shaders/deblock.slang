@@ -1,18 +1,20 @@
-// The deblocking filter of a picture, in place, as vvdec's LoopFilter does it
-// (xEdgeFilterLuma, xEdgeFilterChroma): all vertical edges (dir 0), then, in
-// another dispatch, all horizontal ones (dir 1). VVC keeps the edges of one
-// direction apart enough that each can be filtered on its own.
+// The deblocking filter of a picture, in place, as vvdec's LoopFilter applies
+// it (xEdgeFilterLuma, xEdgeFilterChroma): all vertical edges (dir 0), then,
+// in another dispatch, all horizontal edges (dir 1). VVC keeps the edges of
+// one direction far enough apart that each edge can be filtered on its own.
 //
-// CHROMA=0: a thread filters 4 lines across one luma edge of a 4x4 block,
-//           the vertical edges with DIR=0, the horizontal ones with DIR=1.
+// CHROMA=0: a thread filters the 4 lines across one luma edge of a 4x4 block;
+//           DIR=0 builds the variant for vertical edges, DIR=1 for horizontal.
 // CHROMA=1: a thread filters the lines across one chroma edge segment, for Cb
 //           and Cr, at the positions vvdec's xDeblockCtuArea visits.
-// The edges come as a list, those the CPU found to filter, each with the
-// bytes of vvdec's LoopFilterParam (qp[3], bs, sideMaxFiltLength, flags) its
-// filter needs (GpuRecon::listEdges, GpuJobs.h Edge).
-// Per CTU, 8 bytes: deblocking disabled, then the beta and tc offsets (div 2)
-// of Y, Cb, Cr. LADF (luma): the QP of an edge's 4 lines moves by the offset
-// of the interval their luma level is in (LoopFilter::deriveLADFShift).
+// The edges arrive as a list of those that need filtering (made by
+// edges.slang with the GPU front end, or by GpuRecon::listEdges with the CPU
+// front end), each a GpuJobs.h Edge carrying the bytes of vvdec's
+// LoopFilterParam that its filter needs (qp[3], bs, sideMaxFiltLength, flags).
+// The ctus buffer holds 8 bytes per CTU: deblocking disabled, then the beta
+// and tc offsets (div 2) of Y, Cb and Cr. With LADF (luma only), the QP of an
+// edge's 4 lines is shifted by the offset of the interval that contains their
+// luma level (LoopFilter::deriveLADFShift).
 
 #include "common.slang"
 
@@ -25,21 +27,21 @@ struct Params
   int16_t* pic0;        // luma, or Cb
   int16_t* pic1;        // Cr
   int8_t*  ctus;
-  uint2*   edges;       // x | y << 16 of each edge (samples of the plane), and its parameters
+  uint2*   edges;       // per edge: x | y << 16 (in the plane's samples), then the edge's parameters
   int      stride;
-  int      width;       // of the plane
+  int      width;       // plane size in samples
   int      height;
-  int      ctuLog2;     // luma
+  int      ctuLog2;     // log2 of the CTU size in luma samples
   int      widthInCtus;
   int      bitDepth;
   int      dir;         // 0: vertical edges, 1: horizontal
-  int      scaleX;      // chroma subsampling
+  int      scaleX;      // chroma subsampling shifts
   int      scaleY;
-  int      count;       // of edges
-  int      ladfNum;     // LADF's intervals (0: no LADF), their QP offsets, the lower bounds of all but the first
-  int      ladfOffset0, ladfOffset1, ladfOffset2, ladfOffset3, ladfOffset4;
-  int      ladfBound1, ladfBound2, ladfBound3, ladfBound4;
-  uint*    countAt;     // with count < 0: the edges' count and the first one's index (the GPU's front end's)
+  int      count;       // number of edges; negative: countAt holds it
+  int      ladfNum;     // number of LADF intervals (0: no LADF)
+  int      ladfOffset0, ladfOffset1, ladfOffset2, ladfOffset3, ladfOffset4;   // QP offset of each interval
+  int      ladfBound1, ladfBound2, ladfBound3, ladfBound4;   // lower bound of each interval but the first
+  uint*    countAt;     // when count < 0: the number of edges and the index of the first, from the GPU front end
 };
 
 int  edgeCount() { return pc.count >= 0 ? pc.count : int( pc.countAt[0] ); }
@@ -58,7 +60,7 @@ static const int kBetaTable[64] = {
 
 #define MAX_QP 63
 
-// deriveLADFShift: the QP offset of the interval the luma level is in
+// Returns the QP offset of the LADF interval that contains the luma level, as deriveLADFShift does.
 int ladfShift( int level )
 {
   const int offsets[5] = { pc.ladfOffset0, pc.ladfOffset1, pc.ladfOffset2, pc.ladfOffset3, pc.ladfOffset4 };
@@ -86,7 +88,7 @@ int tcFromTable( int index )
   return bd < 10 ? ( ( kTcTable[index] + ( 1 << ( 9 - bd ) ) ) >> ( 10 - bd ) ) : ( kTcTable[index] << ( bd - 10 ) );
 }
 
-// a line across the edge: s(k) for k < 0 are the P samples (p0 = s(-1)), k >= 0 the Q ones (q0 = s(0))
+// Access to a line across the edge: sample k < 0 is on the P side (p0 is k = -1), k >= 0 on the Q side (q0 is k = 0).
 int rd( int16_t* p, int base, int off, int k )
 {
   return int( p[base + k * off] );
@@ -159,10 +161,10 @@ static const int kDbCoeffs3[7] = { 53, 32, 11, 0, 0, 0, 0 };
 static const int kTc7[7]       = { 6, 5, 4, 3, 2, 1, 1 };
 static const int kTc3[7]       = { 6, 4, 2, 0, 0, 0, 0 };
 
-// A line across the edge, in registers: s[7 - j] = p_j, s[8 + j] = q_j (p7 .. q7; the samples a filter does not
-// reach are left out of the loads, and of these arrays' uses).
+// In registers, a line across the edge is an array s[16] with s[7 - j] = p_j and s[8 + j] = q_j (p7 .. q7).
+// Samples that the filters do not reach are not loaded, and the code never uses their entries.
 
-// sample c of 4 in 8 bytes
+// Returns sample c of the 4 samples packed in 8 bytes.
 int sample4( uint2 u, int c )
 {
   return c == 0 ? int( u.x & 0xffff ) : ( c == 1 ? int( u.x >> 16 ) : ( c == 2 ? int( u.y & 0xffff ) : int( u.y >> 16 ) ) );
@@ -173,7 +175,7 @@ uint2 pack4( int a, int b, int c, int d )
   return uint2( uint( a ) | uint( b ) << 16, uint( c ) | uint( d ) << 16 );
 }
 
-// xUseStrongFiltering on a line
+// xUseStrongFiltering for one line
 bool strongLine( int s[16], int d, int beta, int tc, bool largeP, bool largeQ, int maxP, int maxQ )
 {
   const int p0 = s[7];
@@ -217,7 +219,8 @@ int dbCoeff( int n, int pos )
   return n == 7 ? kDbCoeffs7[pos] : ( n == 5 ? kDbCoeffs5[pos] : kDbCoeffs3[pos] );
 }
 
-// the long filters (xFilteringPandQCore) on a line: p0 .. p(nP - 1), q0 .. q(nQ - 1), nP and nQ 3, 5 or 7
+// The long filters (xFilteringPandQCore) on one line: they change p0 .. p(nP - 1) and q0 .. q(nQ - 1), where nP and
+// nQ are 3, 5 or 7.
 void longLine( inout int s[16], int nP, int nQ, int tc )
 {
   int ps[8], qs[8];
@@ -289,7 +292,7 @@ void longLine( inout int s[16], int nP, int nQ, int tc )
   }
 }
 
-// the normal filters (xPelFilterLumaCorePel) on a line
+// The normal filters (xPelFilterLumaCorePel) on one line.
 void normalLine( inout int s[16], int tc, bool sw, int thrCut, bool filterSecondP, bool filterSecondQ, int maxVal )
 {
   const int m1 = s[5];
@@ -330,12 +333,12 @@ void normalLine( inout int s[16], int tc, bool sw, int thrCut, bool filterSecond
   }
 }
 
-// The samples of the edge's 4 lines, 8 bytes a load: with DIR 0 (a vertical edge at x), line i is the row y + i,
-// v[4 i + g] its samples x - 8 + 4 g .. x - 5 + 4 g (g 1 and 2: p3 .. q3; 0 and 3: the long filters' p7 .. p4 and
-// q4 .. q7); with DIR 1 (a horizontal edge at y), v[r] is the row y - 8 + r, sample i of it line i's (the columns x
-// .. x + 3). (A thread made some 40 loads of 2 bytes before: VideoQ 4K's vertical edges took 8% longer. What remains
-// of their cost, twice the horizontal edges' an edge, is the cache lines: each line of a vertical edge's 4 is in
-// another, of which it uses 16 bytes.)
+// The samples of the edge's 4 lines are loaded 8 bytes at a time into v[16]. With DIR 0 (a vertical edge at x),
+// line i is row y + i, and v[4 i + g] holds its samples x - 8 + 4 g .. x - 5 + 4 g: g = 1 and 2 hold p3 .. q3, and
+// g = 0 and 3 the long filters' p7 .. p4 and q4 .. q7. With DIR 1 (a horizontal edge at y), v[r] holds row
+// y - 8 + r, and its sample i belongs to line i (columns x .. x + 3). (Before, a thread made some 40 loads of 2 bytes,
+// and VideoQ 4K's vertical edges took 8% longer. A vertical edge still costs twice as much as a horizontal one,
+// because of cache lines: each of its 4 lines is in a different cache line, of which it uses only 16 bytes.)
 #if DIR == 0
 #define SMP( i, k ) sample4( v[4 * ( i ) + ( ( k ) >> 2 )], ( k ) & 3 )
 #else
@@ -350,7 +353,7 @@ void main( uint3 id : SV_DispatchThreadID )
   {
     return;
   }
-  const uint2 edge = pc.edges[firstEdge() + id.x];   // qp | bs << 8 | sideMaxFiltLength << 16
+  const uint2 edge = pc.edges[firstEdge() + id.x];   // .y: qp | bs << 8 | sideMaxFiltLength << 16
   const int   x    = int( edge.x & 0xffff );
   const int   y    = int( edge.x >> 16 );
   const int   bs   = int( edge.y >> 8 ) & 3;
@@ -373,7 +376,7 @@ void main( uint3 id : SV_DispatchThreadID )
 
   const int maxVal           = ( 1 << pc.bitDepth ) - 1;
 
-  // all the loads at once
+  // Issue all the loads at once.
   uint2 v[16];
   [unroll]
   for( int a = 0; a < 16; a++ )
@@ -421,7 +424,7 @@ void main( uint3 id : SV_DispatchThreadID )
   }
 #endif
 
-  // the decisions, from lines 0 and 3
+  // The filter decisions use lines 0 and 3.
   int l0[16], l3[16];
   [unroll]
   for( int k = 0; k < 16; k++ )
@@ -429,8 +432,8 @@ void main( uint3 id : SV_DispatchThreadID )
     l0[k] = SMP( 0, k );
     l3[k] = SMP( 3, k );
   }
-  // the edge's QP (LADF: moved by its lines' luma level, p0 and q0 of lines 0
-  // and 3), tc and beta
+  // The edge's QP (with LADF, shifted by the luma level of p0 and q0 in lines 0
+  // and 3), then tc and beta.
   int qp = int( int8_t( edge.y & 255 ) );
   if( pc.ladfNum > 0 )
   {
@@ -451,7 +454,7 @@ void main( uint3 id : SV_DispatchThreadID )
   const int d0  = dp0 + dq0;
   const int d3  = dp3 + dq3;
 
-  // what the filters change: 0 nothing, 1 the normal filters, 2 the long ones
+  // mode: 0 = no filtering, 1 = the normal filters, 2 = the long filters
   int  mode    = 0;
   int  nP      = 3, nQ = 3;
   bool sw      = false;
@@ -491,7 +494,7 @@ void main( uint3 id : SV_DispatchThreadID )
     return;
   }
 
-  // the lines filtered, back into v
+  // Filter each line and pack the result back into v.
   [unroll]
   for( int i = 0; i < 4; i++ )
   {
@@ -533,14 +536,14 @@ void main( uint3 id : SV_DispatchThreadID )
 #endif
   }
 
-  // the stores: the samples a filter may change, and around them only those no other edge's filter changes
-  // (VVC keeps the edges of a direction apart enough for that)
+  // Store the samples the filters may change, plus neighbouring samples only where no other edge's filter changes
+  // them (VVC keeps the edges of one direction far enough apart for that).
   const int changedP = mode == 2 ? nP : ( sw ? 3 : ( filterP ? 2 : 1 ) );
   const int changedQ = mode == 2 ? nQ : ( sw ? 3 : ( filterQ ? 2 : 1 ) );
 #if DIR == 0
-  // a vertical edge: p3 .. p0 in 8 bytes when the P side's filters may reach 3 samples (the next edge is 8 samples
-  // or more away then), else p1, p0 in 4 bytes; the long filters' p4 .. p7 as far as they reach (p7 is never
-  // changed, nor reached by another edge); the same on the Q side
+  // Vertical edge: store p3 .. p0 as 8 bytes when the P side's filters may reach 3 samples (the next edge is then at
+  // least 8 samples away), else p1 and p0 as 4 bytes. Store the long filters' p4 .. p7 as far as they reach (p7 is
+  // never changed, and no other edge reaches it). The Q side works the same way.
   [unroll]
   for( int i = 0; i < 4; i++ )
   {
@@ -579,7 +582,7 @@ void main( uint3 id : SV_DispatchThreadID )
     }
   }
 #else
-  // a horizontal edge: the rows the filters may change, whole (the edge's 4 columns are this thread's)
+  // Horizontal edge: store each row the filters may change, 8 bytes each (the edge's 4 columns are this thread's).
   [unroll]
   for( int j = 0; j < 7; j++ )
   {
@@ -597,7 +600,7 @@ void main( uint3 id : SV_DispatchThreadID )
 
 #else   // CHROMA
 
-// xPelFilterChroma, one line
+// xPelFilterChroma on one line
 void pelFilterChroma( int16_t* p, int base, int off, int tc, bool sw, int maxVal, bool chromaCtbBoundary )
 {
   const int m2 = rd( p, base, off, -2 );
@@ -639,13 +642,14 @@ void pelFilterChroma( int16_t* p, int base, int off, int tc, bool sw, int maxVal
 [numthreads( 64, 1, 1 )]
 void main( uint3 id : SV_DispatchThreadID )
 {
-  // the segments xDeblockCtuArea visits: along the edge as many lines as a
-  // 4x4 luma block has, across it every 8 chroma samples (at the 4:2:0 rate)
+  // Each edge is one segment as xDeblockCtuArea visits them: along the edge, the
+  // chroma lines of one 4x4 luma block; across the edges, one segment every 8
+  // chroma samples (16 luma samples in 4:2:0).
   if( int( id.x ) >= edgeCount() )
   {
     return;
   }
-  const uint2 edge = pc.edges[firstEdge() + id.x];   // Cb's qp | Cr's qp << 8 | bs << 16 | flags << 24
+  const uint2 edge = pc.edges[firstEdge() + id.x];   // .y: Cb's qp | Cr's qp << 8 | bs << 16 | flags << 24
   const int   x    = int( edge.x & 0xffff );
   const int   y    = int( edge.x >> 16 );
 
@@ -664,8 +668,8 @@ void main( uint3 id : SV_DispatchThreadID )
   const int  off               = pc.dir == 0 ? 1 : pc.stride;
   const int  step              = pc.dir == 0 ? pc.stride : 1;
   const int  base0             = y * pc.stride + x;
-  const int  alongLen          = pc.dir == 0 ? ( 4 >> pc.scaleY ) : ( 4 >> pc.scaleX );   // the lines along the edge
-  // the second line of the decisions: the next one when subsampled across, else the fourth
+  const int  alongLen          = pc.dir == 0 ? ( 4 >> pc.scaleY ) : ( 4 >> pc.scaleX );   // lines along the edge
+  // The decisions use line 0 and a second line: line 1 when the edge's chroma is subsampled along it, else line 3.
   const int  subSamplingShift  = pc.dir == 0 ? pc.scaleY : pc.scaleX;
   const int  base3             = base0 + ( subSamplingShift == 1 ? step : 3 * step );
 

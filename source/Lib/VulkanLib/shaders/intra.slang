@@ -1,41 +1,45 @@
 // Intra prediction, intra block copy (IBC) and the reconstruction of their
-// transform blocks, as vvdec's IntraPrediction and DecCu::predAndReco do it: a
-// workgroup predicts one transform block of one component, adds its residual
+// transform blocks, as vvdec's IntraPrediction and DecCu::predAndReco do them.
+// A workgroup predicts one transform block of one component, adds its residual
 // (already in the picture, where vvdec's TrQuant left it) and writes the
-// result. The blocks come in waves: a block's wave is above the waves of
-// every block whose samples it reads. One dispatch makes all the blocks of a
-// picture: a workgroup takes the next block in the order of the waves (a
-// count of the blocks taken) and waits until the blocks of the waves before
-// its block's are done (a count of the blocks done). Taken in order, those
-// are all with workgroups already running, which wait only for blocks before
-// them: nothing waits for a workgroup that cannot run. (A dispatch a wave,
-// each after a barrier, took 6.5 us a wave, and a picture coded intra has a
-// thousand waves.)
+// result.
+//
+// The blocks are grouped in waves: a block's wave comes after the waves of all
+// blocks whose samples it reads. One dispatch reconstructs all the blocks of a
+// picture. Each workgroup takes the next block in wave order (from a counter
+// of blocks taken) and waits until all blocks of the earlier waves are done (a
+// counter of blocks done). Because the blocks are taken in order, every block
+// a workgroup waits for belongs to a workgroup that is already running and
+// waits only for earlier blocks itself, so no workgroup ever waits for one
+// that cannot run. (One dispatch per wave, each after a barrier, took 6.5 us
+// per wave, and an intra-coded picture has about a thousand waves.)
 //
 // A wave lasts as long as its slowest workgroup, which mostly waits for
-// memory: so a workgroup makes 256 samples at most (GpuRecon::recordIntra
-// cuts the big blocks into bands of rows), four a thread, and first sends
-// out all its reads of the picture together (the references, the residual,
-// CCLM's luma, IBC's source), to compute from shared memory after that.
+// memory. So a workgroup makes at most 256 samples (GpuRecon::recordIntra cuts
+// big blocks into bands of rows), four per thread, and first issues all its
+// reads of the picture together (the references, the residual, CCLM's luma,
+// IBC's source); after that it computes from shared memory.
 //
-// A job, 12 uints (VulkanLib/GpuJobs.h, IntraJob):
-//   0: x | y << 16                (in samples of its component)
+// A job is 12 uints (VulkanLib/GpuJobs.h, IntraJob):
+//   0: x | y << 16                (in the component's samples)
 //   1: width | height << 8 | component << 16 | kind << 24   (kind: 0 planar/DC/angular, 1 BDPCM, 2 CCLM, 3 IBC,
-//      4 MIP, 5 an inter CU's chroma under LMCS: the prediction inter kept aside plus the residual, 6 a CIIP CU's
-//      component: inter's prediction, kept aside, blended with planar's, plus the residual)
+//      4 MIP, 5 the chroma of an inter CU under LMCS: inter's prediction, kept aside, plus the residual, 6 a
+//      component of a CIIP CU: inter's prediction, kept aside, blended with planar's, plus the residual)
 //   2: mode | flags << 8 | bdpcm direction << 16 | reference line << 24   (flags: 1 residual, 2 filtered references,
-//      4 MIP transposed, 8 ISP; the reference line: MRL's, 0 .. 2)
-//   3: top-left units | above units << 8 | left units << 16  (the reference samples available; ISP: the CU's)
-//   4: CCLM: luma above units | luma left units << 8 | bAbove << 16 | bLeft << 17 | aboveAvail << 18 | leftAvail << 19 | lm mode << 24
+//      4 MIP transposed, 8 ISP; the reference line is MRL's, 0 .. 2)
+//   3: top-left units | above units << 8 | left units << 16  (the available reference samples; for ISP, the CU's)
+//   4: CCLM: luma above units | luma left units << 8 | bAbove << 16 | bLeft << 17 | aboveAvail << 18
+//      | leftAvail << 19 | lm mode << 24
 //      ISP: the CU's x | y << 16
 //   5: CCLM: actual top template samples | actual left << 16
-//      ISP: the CU's width | height << 8 | split << 16 (1 horizontal, 2 vertical) | left there << 18 | above there << 19
-//   6: IBC: block vector x | y << 16 (int16, samples of the component); CIIP: planar's weight (0 .. 3)
-//   7: the rows of the block this workgroup makes: first | count << 16, at
-//      most 256 samples (on the CPU: the block's wave)
-//   8: LMCS's chroma residual scaling: x | y << 16 of the luma CU whose
+//      ISP: the CU's width | height << 8 | split << 16 (1 horizontal, 2 vertical) | left available << 18
+//      | above available << 19
+//   6: IBC: block vector x | y << 16 (int16, in the component's samples); CIIP: planar's weight (0 .. 3)
+//   7: the rows of the block that this workgroup makes: first | count << 16, at
+//      most 256 samples (on the CPU, this word holds the block's wave)
+//   8: LMCS chroma residual scaling: x | y << 16 of the luma CU whose
 //      neighbours give the scale
-//   9: LMCS: 1 scaling | 2 left there | 4 above there | log2 of the samples a side << 4
+//   9: LMCS: 1 scaling | 2 left available | 4 above available | log2 of the samples per side << 4
 
 #include "common.slang"
 
@@ -44,25 +48,25 @@ struct Params
   int16_t*      plane0;
   int16_t*      plane1;
   int16_t*      plane2;
-  uint*         jobs;        // the picture's, wave by wave
-  uint*         waits;       // a job's: the jobs of the waves before its, which it waits for
-  Atomic<uint>* sync;        // the jobs taken, the jobs done (zeroed before the dispatch)
-  uint8_t*      mip;         // MIP's matrices: vvdec's mipMatrix4x4, mipMatrix8x8, mipMatrix16x16 in a row
-  int*          lmcsScale;   // LMCS: the chroma residual scale of each average luma
-  int16_t*      defer0;      // LMCS, CIIP: inter's predictions kept aside, laid out as the planes
+  uint*         jobs;        // the picture's jobs, in wave order
+  uint*         waits;       // per job: the number of jobs in earlier waves, which it waits for
+  Atomic<uint>* sync;        // counters: jobs taken, jobs done (zeroed before the dispatch)
+  uint8_t*      mip;         // MIP's matrices: vvdec's mipMatrix4x4, mipMatrix8x8 and mipMatrix16x16, one after another
+  int*          lmcsScale;   // LMCS: the chroma residual scale for each average luma value
+  int16_t*      defer0;      // LMCS, CIIP: inter's predictions, kept aside, laid out like the planes
   int16_t*      defer1;
   int16_t*      defer2;
   int           stride0;
   int           stride12;
-  int           count;       // the jobs
+  int           count;       // number of jobs; negative: countAt holds it
   int           bitDepth;
-  int           ctuLog2;     // luma
-  int           scaleX;      // chroma subsampling
+  int           ctuLog2;     // log2 of the CTU size in luma samples
+  int           scaleX;      // chroma subsampling shifts
   int           scaleY;
-  int           collocated;  // sps CCLM collocated chroma
-  int           picWidth;    // luma
+  int           collocated;  // the SPS's CCLM collocated-chroma flag
+  int           picWidth;    // luma samples
   int           picHeight;
-  uint*         countAt;     // with count < 0: the jobs' count (the GPU's front end's)
+  uint*         countAt;     // when count < 0: the number of jobs, from the GPU front end
 };
 
 [[vk::push_constant]] Params pc;
@@ -115,38 +119,40 @@ int sampleAt( int comp, int x, int y )
   return int( planeOf( comp )[y * strideOf( comp ) + x] );
 }
 
-// the reference samples, as vvdec's xFillReferenceSamples (and
-// xFilterReferenceSamples) lay them out: t[0] is the top-left sample, t[1..]
-// the row above (above-right included), l[0] the top-left again, l[1..] the
-// column to the left (below-left included); shared by the block's threads
+// The reference samples, shared by the block's threads and laid out as vvdec's
+// xFillReferenceSamples (and xFilterReferenceSamples) lay them out: t[0] is the
+// top-left sample, t[1..] the row above (including the above-right part), l[0]
+// the top-left sample again, and l[1..] the column to the left (including the
+// below-left part). tf and lf hold the filtered references.
 groupshared int t[MAX_REF];
 groupshared int l[MAX_REF];
 groupshared int tf[MAX_REF];
 groupshared int lf[MAX_REF];
 groupshared int  s_dc;      // DC's value
 groupshared int3 s_model;   // CCLM's a, b, shift
-groupshared int16_t s_res[256];    // the residual of the workgroup's samples, out of the picture
+groupshared int16_t s_res[256];    // the residual of the workgroup's samples, read from the picture
 groupshared int16_t s_luma[256];   // CCLM: the downsampled luma of the workgroup's samples
-groupshared int     s_tmpl[4];         // CCLM: the luma of the template samples the model picks
+groupshared int     s_tmpl[4];         // CCLM: the luma of the template samples that the model picks
 groupshared int     s_cubic[128];      // kCubic, for luma's angular modes
 
-// xFillReferenceSamples' reads: the samples of the thread's references,
-// t[tid + 64 k] and l[tid + 64 k] (k < 3), of the reference line r rows above
-// and columns left of the block's neighbours (MRL: r = cu.multiRefIdx(), 0
-// but for luma's extra lines): t[0 .. r] and l[0 .. r] the corner, t[1 + r +
-// i] the row above from x0 + i, l[1 + r + i] the column to the left from y0
-// + i. Where neighbours are missing, the samples are padded as vvdec pads them
-// -- each element's source sample (or the middle value), worked out here, so
-// that all the reads go out together
+// The reads of xFillReferenceSamples. Each thread loads its own reference
+// samples, t[tid + 64 k] and l[tid + 64 k] (k < 3), from the reference line r
+// rows above and r columns left of the block's neighbours (MRL: r =
+// cu.multiRefIdx(), which is 0 except for luma's extra lines). t[0 .. r] and
+// l[0 .. r] are the corner, t[1 + r + i] is the row above from x0 + i, and
+// l[1 + r + i] the column to the left from y0 + i. Where neighbours are
+// missing, the samples are padded as vvdec pads them: the code works out each
+// element's source sample (or the middle value) first, so that all the reads
+// can be issued together.
 struct References
 {
   int t[3];
   int l[3];
 };
 
-// a block's xFillReferenceSamples: the block, its references' lengths (the
-// row above, the column to the left), the reference line and the units of
-// neighbours there
+// The inputs of a block's xFillReferenceSamples: the block, the lengths of its
+// references (the row above and the column to the left), the reference line,
+// and how many units of neighbours are available.
 struct RefFill
 {
   int  comp;
@@ -154,9 +160,9 @@ struct RefFill
   int  predSize, predHSize;
   int  r;
   int  nTL, nAbove, nLeft;
-  int  tmpA, tmpL;   // the samples there above and to the left
+  int  tmpA, tmpL;   // the available samples above and to the left
   bool none, all;
-  int2 pad;          // what the corner and the missing parts take when only some neighbours are there
+  int2 pad;          // the sample that the corner and the missing parts copy when only some neighbours are available
 };
 
 RefFill refFill( int comp, int x0, int y0, int predSize, int predHSize, int nTL, int nAbove, int nLeft, int r )
@@ -177,13 +183,14 @@ RefFill refFill( int comp, int x0, int y0, int predSize, int predHSize, int nTL,
   f.tmpL       = min( nLeft * unitH, predHSize );
   f.none       = nTL + nAbove + nLeft == 0;
   f.all        = nTL + nAbove + nLeft == predSize / unitW + predHSize / unitH + 1;
-  // the left: the corner if the top-left is there, else the left column's
-  // first; no left: the row above's first
+  // With a left neighbour, pad from the corner if the top-left is available,
+  // else from the left column's first sample; without one, from the first
+  // sample of the row above.
   f.pad = nLeft > 0 ? ( nTL != 0 ? int2( x0 - 1, y0 - 1 - r ) : int2( x0 - 1 - r, y0 ) ) : int2( x0, y0 - 1 - r );
   return f;
 }
 
-// the sample element j of t takes (of the row y0 - 1 - r)
+// The source sample of element j of t (in row y0 - 1 - r).
 int2 topSource( RefFill f, int j )
 {
   const int rowY = f.y0 - 1 - f.r;
@@ -199,7 +206,7 @@ int2 topSource( RefFill f, int j )
   return f.nAbove != 0 ? int2( f.x0 + min( j - 1 - f.r, f.tmpA - 1 ), rowY ) : f.pad;
 }
 
-// the sample element i of l takes (of the column x0 - 1 - r)
+// The source sample of element i of l (in column x0 - 1 - r).
 int2 leftSource( RefFill f, int i )
 {
   const int rowY = f.y0 - 1 - f.r;
@@ -219,7 +226,7 @@ int2 leftSource( RefFill f, int i )
   return int2( colX, f.y0 + min( i - 1 - f.r, f.tmpL - 1 ) );
 }
 
-// a reference sample's value: its source's, or the middle value with no neighbours
+// A reference sample's value: its source sample's, or the middle value when there are no neighbours.
 int fillValue( RefFill f, int2 at )
 {
   return f.none ? 1 << ( pc.bitDepth - 1 ) : sampleAt( f.comp, at.x, at.y );
@@ -240,14 +247,14 @@ References loadReferences( int tid, RefFill f )
 }
 
 // initIntraPatternChTypeISP: the references of the prediction block (px, py,
-// pw x ph) of a sub-partition of an ISP CU (cx, cy, cw x ch; f: the CU's
-// own fill, as a block of its size): the CU's for its first block; after
-// that, for a horizontal split the row above (the sub-partition before, its
-// last sample repeated) and the CU's left column from that row on, for a
-// vertical split the CU's row above from that column on and the column to
-// the left (the sub-partition before, its last sample repeated). Without the
-// CU's neighbours on that side, the sub-partition before's sample next to
-// the corner stands in for them all.
+// pw x ph) of one sub-partition of an ISP CU (cx, cy, cw x ch; f is the CU's
+// own fill, as for a block of the CU's size). The first sub-partition uses the
+// CU's references. For the later ones, a horizontal split uses the row above
+// (the previous sub-partition, its last sample repeated) and the CU's left
+// column from that row down; a vertical split uses the CU's row above from
+// that column on and the column to the left (the previous sub-partition, its
+// last sample repeated). When the CU has no neighbours on that side, the
+// previous sub-partition's sample next to the corner stands in for all of them.
 References loadReferencesIsp( int tid, RefFill f, int px, int py, int pw, int ph, int cx, int cy, int cw, int ch, bool ver, bool leftAvail,
                               bool aboveAvail )
 {
@@ -258,7 +265,7 @@ References loadReferencesIsp( int tid, RefFill f, int px, int py, int pw, int ph
   {
     const int j = tid + 64 * k;
     int2      at;
-    bool      fromFill;   // of the CU's fill, else a sample of the picture
+    bool      fromFill;   // true: from the CU's fill; false: a sample of the picture
     if( first )
     {
       fromFill = true;
@@ -307,8 +314,8 @@ References loadReferencesIsp( int tid, RefFill f, int px, int py, int pw, int ph
   return refs;
 }
 
-// xFillReferenceSamples' writes, t[0 .. topLast] and l[0 .. leftLast] (l[0],
-// the corner, is t[0])
+// The writes of xFillReferenceSamples: t[0 .. topLast] and l[0 .. leftLast]
+// (l[0], the corner, equals t[0]).
 void storeReferences( int tid, int topLast, int leftLast, References refs )
 {
   [unroll]
@@ -326,7 +333,7 @@ void storeReferences( int tid, int topLast, int leftLast, References refs )
   }
 }
 
-// xFilterReferenceSamples' [1 2 1] filter, each sample by itself (after the fill)
+// xFilterReferenceSamples' [1 2 1] filter, run after the fill; each thread computes its own output samples.
 void filterReferences( int tid, int w, int h )
 {
   const int predSize  = w << 1;
@@ -380,17 +387,17 @@ struct Angular
   int  angle;
   int  absAng;
   int  invAngle;
-  int  width;          // in the frame of a vertical mode
+  int  width;          // as for a vertical mode (swapped for horizontal modes)
   int  height;
   int  refLength;
   int  r;              // the reference line (MRL)
-  bool cubic;          // luma: the cubic filter, else the Gaussian one
-  int  pdpcScale;      // angle 0: PDPC's scale, lev its reach; angle > 0: angularScale (< 0: no PDPC)
+  bool cubic;          // luma: the cubic filter if true, else the Gaussian one
+  int  pdpcScale;      // angle 0: PDPC's scale, with lev its reach; angle > 0: angularScale (negative: no PDPC)
   int  lev;
 };
 
-// refMain[k] and refSide[k] of xPredIntraAng, before its offset by the
-// reference line (k: an index into t and l)
+// refMain[k] and refSide[k] of xPredIntraAng, before xPredIntraAng offsets them
+// by the reference line (k indexes t and l)
 int refMain( Angular a, bool filtered, int k )
 {
   return a.isVer ? refT( filtered, k ) : refL( filtered, k );
@@ -401,10 +408,10 @@ int refSide( Angular a, bool filtered, int k )
   return a.isVer ? refL( filtered, k ) : refT( filtered, k );
 }
 
-// (sizeW x sizeH: the size the wide-angle modes follow, topLength and
-// leftLength the references' lengths: the block's, but for ISP's: the CU's
-// size, the CU's width / height on top of the block's; ISP takes the cubic
-// filter always)
+// sizeW x sizeH is the size that decides the wide-angle modes, and topLength
+// and leftLength are the references' lengths. Both come from the block, except
+// for ISP: then the size is the CU's, and the lengths are the CU's width /
+// height plus the block's. ISP always uses the cubic filter.
 Angular setupAngular( int comp, int w, int h, int mode, int r, int sizeW, int sizeH, int topLength, int leftLength, bool isp )
 {
   Angular a;
@@ -421,7 +428,7 @@ Angular setupAngular( int comp, int w, int h, int mode, int r, int sizeW, int si
   a.r         = r;
   const int diff     = min( abs( a.predMode - HOR_IDX ), abs( a.predMode - VER_IDX ) );
   const int log2Size = ( log2Int( a.width ) + log2Int( a.height ) ) >> 1;
-  // the cubic filter for MRL's extra lines and ISP too, and no PDPC for MRL
+  // MRL's extra lines and ISP also use the cubic filter, and MRL has no PDPC.
   a.cubic = isp || !( diff > kIntraFilterLuma[log2Size] ) || r > 0;
   const bool doPdpc = w >= 4 && h >= 4 && r == 0;
   a.pdpcScale = -1;
@@ -442,7 +449,7 @@ Angular setupAngular( int comp, int w, int h, int mode, int r, int sizeW, int si
   return a;
 }
 
-// the prediction at (x, y) of the frame of a vertical mode
+// The prediction at (x, y), in the coordinates of a vertical mode.
 int predictAngular( Angular a, int comp, bool filtered, int x, int y, int maxVal )
 {
   int v;
@@ -457,16 +464,16 @@ int predictAngular( Angular a, int comp, bool filtered, int x, int y, int maxVal
     return v;
   }
 
-  // (MRL: the line r steps further from the block)
+  // (with MRL, the reference line lies r steps further from the block)
   const int deltaPos   = a.angle * ( y + 1 + a.r );
   const int deltaInt   = deltaPos >> 5;
   const int deltaFract = deltaPos & 31;
   int       p[4];
   for( int k = 0; k < 4; k++ )
   {
-    // refMain extended to the left from the side reference (negative angles,
-    // before the offset of the reference line), to the right by replicating
-    // its last sample
+    // refMain is extended to the left from the side reference (negative
+    // angles, before the offset of the reference line) and to the right by
+    // replicating its last sample.
     const int idx = deltaInt + x + k + a.r;
     if( idx < 0 )
     {
@@ -490,7 +497,7 @@ int predictAngular( Angular a, int comp, bool filtered, int x, int y, int maxVal
     }
     else
     {
-      // kGauss, whose taps of phase deltaFract are 16 - d, 32 - d, 16 + d, d for d = deltaFract / 2
+      // kGauss: the taps of phase deltaFract are 16 - d, 32 - d, 16 + d, d with d = deltaFract / 2
       const int d = deltaFract >> 1;
       v = ( ( 16 - d ) * p[0] + ( 32 - d ) * p[1] + ( 16 + d ) * p[2] + d * p[3] + 32 ) >> 6;
     }
@@ -521,7 +528,7 @@ int predictPlanar( bool filtered, int w, int h, int x, int y )
   return ( ( horPred << log2H ) + ( verPred << log2W ) + ( 1 << ( log2W + log2H ) ) ) >> ( 1 + log2W + log2H );
 }
 
-// (r: the reference line, MRL)
+// (r is the reference line, MRL)
 int dcValue( bool filtered, int w, int h, int r )
 {
   const int denom = w == h ? ( w << 1 ) : max( w, h );
@@ -553,10 +560,10 @@ int pdpcPlanarDc( bool filtered, int w, int h, int x, int y, int val )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// MIP (Mip::PredictorMIP): the block's top and left references averaged down to 2 or 4 samples each, a matrix
-// times them (the reduced prediction, 4x4 or 8x8), upsampled linearly to the block (horizontally, then vertically,
-// from the references at the block's edges). The reduced boundary and prediction live in s_luma (CCLM's), from
-// MIP_BDRY and 0
+// MIP (Mip::PredictorMIP): the block's top and left references are averaged down to 2 or 4 samples each, a matrix
+// multiplies them into the reduced prediction (4x4 or 8x8), and that is upsampled linearly to the block's size
+// (horizontally, then vertically, starting from the references at the block's edges). The reduced boundary and the
+// reduced prediction are kept in s_luma (CCLM's buffer), from MIP_BDRY and from 0.
 // --------------------------------------------------------------------------------------------------------------------
 
 #define MIP_BDRY 64
@@ -566,7 +573,7 @@ int mipSizeId( int w, int h )
   return ( w == 4 && h == 4 ) ? 0 : ( ( w == 4 || h == 4 || ( w == 8 && h == 8 ) ) ? 1 : 2 );
 }
 
-// boundaryDownsampling1D: element b of the reduced boundary, top's (b < bdry) then left's, from t and l
+// boundaryDownsampling1D: element b of the reduced boundary (the top part for b < bdry, then the left), from t and l
 int mipBoundary( int b, int bdry, int w, int h )
 {
   const bool top    = b < bdry;
@@ -586,18 +593,18 @@ int mipBoundary( int b, int bdry, int w, int h )
   return ( sum + ( 1 << ( log2F - 1 ) ) ) >> log2F;
 }
 
-// computeReducedPred: output o (in the order of the matrix's rows) of mode `mode`, from the reduced boundary in
-// s_luma[MIP_BDRY ..]; written where the (transposed) reduced prediction has it
+// computeReducedPred: computes output o (in the order of the matrix's rows) of mode `mode` from the reduced
+// boundary in s_luma[MIP_BDRY ..], and writes it where the (possibly transposed) reduced prediction keeps it.
 void mipReducedPred( int o, int sizeId, int mode, bool transposed )
 {
   const int bdry    = sizeId == 0 ? 2 : 4;
   const int pred    = sizeId < 2 ? 4 : 8;
   const int inSize  = 2 * bdry;
-  const int skip    = sizeId == 2 ? 1 : 0;   // the matrix's first column, unused for the large blocks
+  const int skip    = sizeId == 2 ? 1 : 0;   // 1: the matrix's first column is unused (large blocks)
   const int perOut  = inSize - skip;
   const int base    = sizeId == 0 ? 0 : ( sizeId == 1 ? 1024 : 2048 );
   const int modeLen = ( sizeId == 0 ? 16 : ( sizeId == 1 ? 16 : 64 ) ) * perOut;
-  // the input: the boundary, left's first when transposed, rebased on its first sample
+  // The input: the boundary (its left part first when transposed), relative to its first sample.
   int in[8];
   [unroll]
   for( int i = 0; i < 8; i++ )
@@ -625,8 +632,8 @@ void mipReducedPred( int o, int sizeId, int mode, bool transposed )
   s_luma[transposed ? ( o % pred ) * pred + o / pred : o] = int16_t( v );
 }
 
-// predictionUpsampling: the horizontally upsampled row k of the reduced prediction at column x (the left references
-// at the rows the reduced prediction's lands on)
+// predictionUpsampling: row k of the reduced prediction, upsampled horizontally, at column x. Left of the first
+// column it starts from the left reference at the block row where the reduced prediction's row k lands.
 int mipRow( int k, int x, int w, int h, int pred )
 {
   const int upH = w / pred;
@@ -643,7 +650,7 @@ int mipRow( int k, int x, int w, int h, int pred )
   return ( ( before << log2H ) + ( upH >> 1 ) + ( i + 1 ) * ( behind - before ) ) >> log2H;
 }
 
-// the prediction at (x, y): the rows upsampled vertically (the top references above the first)
+// The prediction at (x, y): mipRow's rows interpolated vertically, with the top references above the first row.
 int mipSample( int x, int y, int w, int h, int pred )
 {
   const int upV = h / pred;
@@ -660,9 +667,9 @@ int mipSample( int x, int y, int w, int h, int pred )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// CCLM (xGetLumaRecPixels, xGetLMParameters, linearTransform). The luma under a chroma sample: 4:4:4's the sample
-// itself, 4:2:2's [1 2 1] along the row (all of xGetLumaRecPixels' filters come to that, with its coefficients for
-// 4:2:2), 4:2:0's filtered across two rows
+// CCLM (xGetLumaRecPixels, xGetLMParameters, linearTransform). The luma value under a chroma sample is, in 4:4:4,
+// the luma sample itself; in 4:2:2, a [1 2 1] filter along the row (all of xGetLumaRecPixels' filters reduce to
+// that with its 4:2:2 coefficients); in 4:2:0, a filter across two rows.
 // --------------------------------------------------------------------------------------------------------------------
 
 int lumaAt( int x, int y )
@@ -670,15 +677,15 @@ int lumaAt( int x, int y )
   return int( pc.plane0[y * pc.stride0 + x] );
 }
 
-// 4:2:2: the [1 2 1] filter around the luma sample (x, y), its left sample the
-// centre's where there is no left (noLeft)
+// 4:2:2: the [1 2 1] filter around the luma sample (x, y); with noLeft, the
+// centre sample stands in for the missing left one.
 int lumaRow422( int x, int y, bool noLeft )
 {
   const int c = lumaAt( x, y );
   return ( 2 * c + ( noLeft ? c : lumaAt( x - 1, y ) ) + lumaAt( x + 1, y ) + 2 ) >> 2;
 }
 
-// the downsampled luma of chroma sample (i, j) of the block whose luma origin is (lx, ly)
+// The downsampled luma of chroma sample (i, j) of the block whose luma origin is (lx, ly).
 int lumaDown( int lx, int ly, int i, int j, bool bAbove, bool bLeft )
 {
   if( pc.scaleX == 0 )
@@ -702,10 +709,10 @@ int lumaDown( int lx, int ly, int i, int j, bool bAbove, bool bLeft )
   return ( 2 * lumaAt( x, y ) + lumaAt( x + 1, y ) + left0 + 2 * lumaAt( x, y + 1 ) + lumaAt( x + 1, y + 1 ) + left1 + 4 ) >> 3;
 }
 
-// the downsampled luma template above the block (i) and to its left (j)
+// The downsampled luma template above the block (sample i) and to its left (sample j).
 int lumaTemplateAbove( int lx, int ly, int i, bool bLeft )
 {
-  // 4:4:4 and 4:2:2: the row above the block (a CTU's first row or not)
+  // 4:4:4 and 4:2:2: the row just above the block, whether or not the block starts a CTU row.
   if( pc.scaleX == 0 )
   {
     return lumaAt( lx + i, ly - 1 );
@@ -735,7 +742,7 @@ int lumaTemplateAbove( int lx, int ly, int i, bool bLeft )
 
 int lumaTemplateLeft( int lx, int ly, int j, bool bAbove )
 {
-  // 4:4:4 and 4:2:2: the column, centred 1 (4:4:4) or 2 (4:2:2) left of the block
+  // 4:4:4 and 4:2:2: the column centred 1 (4:4:4) or 2 (4:2:2) samples left of the block.
   if( pc.scaleX == 0 )
   {
     return lumaAt( lx - 1, ly + j );
@@ -754,9 +761,9 @@ int lumaTemplateLeft( int lx, int ly, int j, bool bAbove )
   return ( lumaAt( x, y ) * 2 + lumaAt( x - 1, y ) + lumaAt( x + 1, y ) + lumaAt( x, y + 1 ) * 2 + lumaAt( x - 1, y + 1 ) + lumaAt( x + 1, y + 1 ) + 4 ) >> 3;
 }
 
-// the template samples the linear model picks: cntT above (t[1 + startPos0 +
-// k * pickStep0]), then cntL to the left (l[1 + startPos1 + k * pickStep1]);
-// four at most
+// The template samples that the linear model picks: cntT above (t[1 + startPos0
+// + k * pickStep0]), then cntL to the left (l[1 + startPos1 + k * pickStep1]);
+// four at most.
 struct CclmPicks
 {
   int cntT;
@@ -786,7 +793,7 @@ CclmPicks cclmPicks( uint lm, uint lm2 )
   return p;
 }
 
-// the downsampled luma of template sample k (< cntT + cntL)
+// The downsampled luma of template sample k (k < cntT + cntL).
 int cclmTemplateLuma( int x0, int y0, uint lm, CclmPicks p, int k )
 {
   const bool bAbove = ( ( lm >> 16 ) & 1 ) != 0;
@@ -795,8 +802,8 @@ int cclmTemplateLuma( int x0, int y0, uint lm, CclmPicks p, int k )
                     : lumaTemplateLeft( x0 << pc.scaleX, y0 << pc.scaleY, p.startPos1 + ( k - p.cntT ) * p.pickStep1, bAbove );
 }
 
-// the linear model: a, b, shift (from the template's luma in s_tmpl and its
-// chroma in t and l)
+// The linear model's a, b and shift, from the template's luma in s_tmpl and
+// its chroma in t and l.
 int3 cclmParameters( uint lm, uint lm2 )
 {
   const bool aboveAvailable = ( ( lm >> 18 ) & 1 ) != 0;
@@ -877,14 +884,14 @@ int3 cclmParameters( uint lm, uint lm2 )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// LMCS's chroma residual scaling (Reshape::calculateChromaAdjVpduNei, AreaBuf::scaleSignal): the average of the luma
-// (still mapped) left of and above the CU at word 8, 1 << log2 count samples a side (rows and columns past the
-// picture: its last), picks the scale
+// LMCS chroma residual scaling (Reshape::calculateChromaAdjVpduNei, AreaBuf::scaleSignal): the average of the luma
+// samples (still mapped) left of and above the CU given in job word 8, 1 << log2 count samples per side, picks the
+// scale. Rows and columns past the picture use the picture's last one.
 // --------------------------------------------------------------------------------------------------------------------
 
-groupshared int s_lsum[4];   // the luma sums of the workgroup's waves
+groupshared int s_lsum[4];   // the luma sums of the workgroup's subgroups (hardware waves)
 
-// this thread's share of the luma: the left sample tid and the above one
+// This thread's share of the luma sum: left sample tid and above sample tid.
 int lmcsLuma( int tid, uint anchor, uint info )
 {
   const int x     = int( anchor & 0xffff );
@@ -902,7 +909,7 @@ int lmcsLuma( int tid, uint anchor, uint info )
   return sum;
 }
 
-// the shares summed a wave at a time into s_lsum (all the threads, before a barrier)
+// Sums the shares of each hardware wave into s_lsum; all threads call it, before a barrier.
 void lmcsShare( int tid, int luma )
 {
   const int sum = WaveActiveSum( luma );
@@ -912,7 +919,7 @@ void lmcsShare( int tid, int luma )
   }
 }
 
-// after that barrier: the scale
+// After that barrier: returns the scale.
 int lmcsScale( uint info )
 {
   int sum = 0;
@@ -927,7 +934,7 @@ int lmcsScale( uint info )
   return pc.lmcsScale[luma];
 }
 
-// a residual scaled (clipped to the bit depth's range first)
+// Scales a residual, after clipping it to the bit depth's range.
 int lmcsResidual( int r, int scale )
 {
   const int range = 1 << pc.bitDepth;
@@ -936,9 +943,9 @@ int lmcsResidual( int r, int scale )
   return clip3( -32768, 32767, c < 0 ? -v : v );
 }
 
-// a job (a block of a component, or a band of its rows): the workgroup's
-// threads read what the block needs of the picture together, then share out
-// the block's samples
+// Makes one job (a block of a component, or a band of its rows): the
+// workgroup's threads first read together what the block needs from the
+// picture, then share out the block's samples.
 void make( int tid, uint job[12] )
 {
   const int   x0     = int( job[0] & 0xffff );
@@ -954,22 +961,22 @@ void make( int tid, uint job[12] )
   const bool  filtered = ( flags & 2 ) != 0;
   const bool  residual = ( flags & 1 ) != 0;
   const int   log2W  = log2Int( w );
-  // the workgroup's samples: the block's rows first .. first + count, m of
-  // them (256 at most: four a thread), the i-th the block's sample s0 + i
+  // The workgroup makes the block's rows first to first + count - 1: m samples
+  // (at most 256, four per thread); its sample i is the block's sample s0 + i.
   const int   s0     = int( job[7] & 0xffff ) * w;
   const int   m      = int( job[7] >> 16 ) * w;
 
   int16_t*  dst    = planeOf( comp );
   const int stride = strideOf( comp );
-  // LMCS: the chroma residual scaled
+  // LMCS: whether to scale the chroma residual
   const uint lmcsInfo = job[9];
   const bool lmcs     = ( lmcsInfo & 1 ) != 0;
 
   if( kind == 3 || kind == 5 )
   {
-    // IBC: the block from elsewhere in the picture, plus the residual; an
-    // inter CU's chroma under LMCS: its prediction, kept aside, plus the
-    // residual (the reads together, then the writes)
+    // IBC: copy the block from elsewhere in the picture and add the residual.
+    // The chroma of an inter CU under LMCS: add the residual to the prediction
+    // kept aside. All the reads are issued together, then the writes.
     const int bvx = int( int16_t( job[6] & 0xffff ) );
     const int bvy = int( int16_t( job[6] >> 16 ) );
     int16_t*  src = kind == 5 ? ( comp == 1 ? pc.defer1 : pc.defer2 ) : dst;
@@ -1001,15 +1008,16 @@ void make( int tid, uint job[12] )
         dst[at]      = int16_t( residual ? clip3( 0, maxVal, pred[k] + ( lmcs ? lmcsResidual( res[k], scale ) : res[k] ) ) : pred[k] );
       }
     }
-    return;   // the whole workgroup
+    return;   // (the whole workgroup returns here)
   }
 
-  // the block the prediction covers (pw x ph, the job's block xoff samples
-  // into it), the size the wide-angle modes follow and the references'
-  // lengths: the job's block's, but for ISP's sub-partitions (flag 8): the
-  // CU's size, the CU's width (height) on top of the block's along the top
-  // (left), and for a vertical split's sub-partitions 1 or 2 samples wide a
-  // block 4 wide, predicted for them all (CU::isPredRegDiffFromTB)
+  // The block that the prediction covers (pw x ph; the job's block starts xoff
+  // samples into it), the size that decides the wide-angle modes, and the
+  // references' lengths. All are the job's block's own, except for ISP
+  // sub-partitions (flag 8): the size is the CU's, the top (left) length is
+  // the CU's width (height) plus the block's, and the sub-partitions of a
+  // vertical split that are 1 or 2 samples wide share one prediction block 4
+  // samples wide (CU::isPredRegDiffFromTB).
   const bool isp   = ( flags & 8 ) != 0;
   const int  cx    = int( job[4] & 0xffff );
   const int  cy    = int( job[4] >> 16 );
@@ -1025,13 +1033,13 @@ void make( int tid, uint job[12] )
   const int  topLength  = isp ? cw + pw : pw << 1;
   const int  leftLength = isp ? ch + ph : ph << 1;
 
-  // the reads: the references, then (while those are on their way) the
-  // residual and CCLM's luma, kCubic for luma's angular modes
+  // The reads: first the references, then, while those are in flight, the
+  // residual, CCLM's luma, and kCubic for luma's angular modes.
   const uint       nb   = job[3];
   References       refs;
   if( isp )
   {
-    // the CU's fill, as a block of its size
+    // the CU's fill, as for a block of the CU's size
     const RefFill f = refFill( comp, cx, cy, cw << 1, ch << 1, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), 0 );
     refs = loadReferencesIsp( tid, f, x0 - xoff, y0, pw, ph, cx, cy, cw, ch, ver, ( ( job[5] >> 18 ) & 1 ) != 0, ( ( job[5] >> 19 ) & 1 ) != 0 );
   }
@@ -1043,7 +1051,7 @@ void make( int tid, uint job[12] )
   const bool       lmLeft  = ( ( job[4] >> 17 ) & 1 ) != 0;
   if( kind == 2 )
   {
-    // the downsampled luma of the samples and of the template's (a thread each)
+    // CCLM: the downsampled luma of the template samples, one thread each (the block's samples follow below)
     const CclmPicks picks = cclmPicks( job[4], job[5] );
     if( tid < picks.cntT + picks.cntL )
     {
@@ -1052,7 +1060,7 @@ void make( int tid, uint job[12] )
   }
   if( kind == 2 || kind == 6 || residual )
   {
-    // (CIIP: inter's prediction where CCLM keeps its luma)
+    // (CIIP keeps inter's prediction where CCLM keeps its luma, in s_luma)
     int16_t* inter = comp == 0 ? pc.defer0 : ( comp == 1 ? pc.defer1 : pc.defer2 );
     int      luma[4];
     int      res[4];
@@ -1090,7 +1098,7 @@ void make( int tid, uint job[12] )
   GroupMemoryBarrierWithGroupSync();
   const int lmcsScaling = lmcs ? lmcsScale( lmcsInfo ) : 0;
 
-  // per block: what the predictor needs of the references
+  // Per block, derive what the predictor needs from the references.
   if( filtered )
   {
     filterReferences( tid, w, h );
@@ -1120,7 +1128,7 @@ void make( int tid, uint job[12] )
   const int mipPred = mipSizeId( w, h ) < 2 ? 4 : 8;
   if( kind == 4 )
   {
-    // MIP: the reduced boundary, then the reduced prediction (a thread an element)
+    // MIP: the reduced boundary, then the reduced prediction (one thread per element)
     const int sizeId = mipSizeId( w, h );
     const int bdry   = sizeId == 0 ? 2 : 4;
     if( tid < 2 * bdry )
@@ -1141,7 +1149,7 @@ void make( int tid, uint job[12] )
   const bool doPdpcPlanarDc = ( kind == 0 || kind == 6 ) && ( mode == PLANAR_IDX || mode == DC_IDX ) && pw >= 4 && ph >= 4 && refLine == 0;
   const int  ciipIntra      = int( job[6] );   // CIIP: planar's weight
 
-  // the samples, from shared memory alone
+  // Compute the samples, from shared memory only.
   for( int i = tid; i < m; i += 64 )
   {
     const int x = ( s0 + i ) & ( w - 1 );
@@ -1183,7 +1191,7 @@ void make( int tid, uint job[12] )
 
 groupshared uint s_job;   // the job the workgroup took
 
-// a workgroup a job: the next one, in the order of the waves
+// One workgroup per job: each workgroup takes the next job in wave order.
 [shader( "compute" )]
 [numthreads( 64, 1, 1 )]
 void main( uint3 local : SV_GroupThreadID )
@@ -1197,9 +1205,9 @@ void main( uint3 local : SV_GroupThreadID )
   const uint index = WaveReadLaneFirst( s_job );
   if( index >= ( pc.count >= 0 ? uint( pc.count ) : pc.countAt[0] ) )
   {
-    return;   // the whole workgroup (the dispatch, in rows of 32768 workgroups, has more than the jobs)
+    return;   // (the whole workgroup: the dispatch, in rows of 32768 workgroups, has more workgroups than jobs)
   }
-  // the job on its way while the workgroup waits for the jobs before
+  // Load the job while the workgroup waits for the earlier jobs.
   const uint4 a = *(uint4*)( pc.jobs + index * 12 );
   const uint4 b = *(uint4*)( pc.jobs + index * 12 + 4 );
   const uint4 c = *(uint4*)( pc.jobs + index * 12 + 8 );
@@ -1210,11 +1218,11 @@ void main( uint3 local : SV_GroupThreadID )
     {
     }
   }
-  // the barrier's acquire: what those jobs wrote, visible to all the threads
+  // The barrier acquires: what those jobs wrote becomes visible to all the threads.
   AllMemoryBarrierWithGroupSync();
   uint job[12] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w, c.x, c.y, c.z, c.w };
   make( tid, job );
-  // the barrier's release: the threads' writes done before the job counts as done
+  // The barrier releases: the threads' writes complete before the job counts as done.
   AllMemoryBarrierWithGroupSync();
   if( tid == 0 )
   {

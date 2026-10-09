@@ -1,51 +1,52 @@
-// Film grain synthesis of an output frame, as vvdec's FilmGrain and FilmGrainImpl
-// (the VFGS reference model) add it: a workgroup takes 1024 samples of a row of
-// one plane, reads them (and one more on each side) into shared memory first
-// -- the samples' intensities before any grain, so the row may be written in
-// place -- then each sample's grain, a thread four samples, in two steps:
-// - the raw grain into shared memory: the frame is cut into blocks of 16x16
-//   luma samples; each block takes a random sign and offset from its seed
-//   into the 64x64 pattern (the luma's or the chroma's) that its sample's
-//   intensity picks (pLUT); on the first two luma rows of a band of blocks
-//   (but the frame's first), the block above's pattern is blended in;
-// - the output: next to each boundary between two blocks of a row, a
-//   sample's grain is [1 3 1] / 4 of the raw grain around it; the grain,
-//   scaled by the intensity's factor (sLUT), is added and the sum clipped to
-//   [0, 255] << ( bit depth - 8 ).
+// Film grain synthesis for an output frame, as vvdec's FilmGrain and FilmGrainImpl
+// (the VFGS reference model) add it. A workgroup takes 1024 samples of a row of
+// one plane, four samples per thread. It first reads its samples (and one more
+// on each side) into shared memory: these are the intensities before any grain,
+// which lets the row be written in place. It then computes each sample's grain
+// in two steps:
+// - The raw grain, into shared memory. The frame is divided into blocks of 16x16
+//   luma samples. From its seed, each block takes a random sign and an offset
+//   into a 64x64 pattern (luma or chroma); each sample's intensity picks which
+//   pattern (pLUT). On the first two luma rows of every band of blocks except
+//   the frame's first band, the pattern of the block above is blended in.
+// - The output. Next to each boundary between two blocks of a row, a sample's
+//   grain becomes [1 3 1] / 4 of the raw grain around it. The grain, scaled by
+//   the intensity's factor (sLUT), is added to the sample, and the sum is
+//   clipped to [0, 255] << ( bit depth - 8 ).
 
 #include "common.slang"
 
 struct Params
 {
-  int16_t* src;        // the plane: the picture's samples, at the frame's origin
-  uint8_t* dst;        // the output: 2 bytes a sample (may be src) or 1
+  int16_t* src;        // the picture's plane, pointing at the frame's top-left sample
+  uint8_t* dst;        // the output: 2 bytes per sample (may be src) or 1
   int8_t*  pattern;    // FilmGrainImpl's patterns [2][9][64][64]
-  uint*    luts;       // sLUT[3][256], then pLUT[3][256] (bytes)
-  uint*    seeds;      // each block's seed (FilmGrain::prepareBlockSeeds), a row of blocks after the other
+  uint*    luts;       // sLUT[3][256], then pLUT[3][256], as bytes
+  uint*    seeds;      // one seed per block (FilmGrain::prepareBlockSeeds), row of blocks after row of blocks
   int      srcStride;  // samples
   int      dstStride;  // bytes
-  int      width;      // of the plane in the frame
-  int      readWidth;  // the plane's samples there are from the frame's origin (the picture's, past the frame's width)
-  int      lumaWidth;  // the frame's
+  int      width;      // plane width within the frame, in samples
+  int      readWidth;  // samples the plane holds from the frame's left edge to the picture's right edge
+  int      lumaWidth;  // frame width in luma samples
   int      comp;
-  int      subx;       // the plane's subsampling: 1 or 2
+  int      subx;       // the plane's subsampling factors: 1 or 2
   int      suby;
   int      bs;         // bit depth - 8: 0 or 2
   int      scaleShift;
   int      dstBytes;
-  int      present;    // the component has a model (else the samples as they are)
+  int      present;    // nonzero when the component has a grain model; otherwise the samples pass unchanged
 };
 
 [[vk::push_constant]] Params pc;
 
-groupshared int16_t s_row[1024 + 2];    // the segment's samples, with one on each side
-groupshared int16_t s_grain[1024 + 2];  // their raw grain
-groupshared uint    s_lut[128];         // the component's sLUT, then its pLUT (bytes, four a word)
+groupshared int16_t s_row[1024 + 2];    // the segment's samples, plus one on each side
+groupshared int16_t s_grain[1024 + 2];  // the raw grain of the samples in s_row
+groupshared uint    s_lut[128];         // the component's sLUT, then its pLUT (bytes, four per word)
 
 int lutS( int i ) { return int( ( s_lut[i >> 2] >> ( 8 * ( i & 3 ) ) ) & 0xff ); }
 int lutP( int i ) { return int( ( s_lut[64 + ( i >> 2 )] >> ( 8 * ( i & 3 ) ) ) & 0xff ); }
 
-// get_offset_y / u / v: the block's sign and offset into the pattern from its seed
+// Derives a block's sign and offset into the pattern from the block's seed, as get_offset_y / u / v do.
 void offsets( uint val, out int s, out int ox, out int oy )
 {
   if( pc.comp == 0 )
@@ -69,7 +70,8 @@ void offsets( uint val, out int s, out int ox, out int oy )
   }
 }
 
-// a block's place in the patterns: its own (row j of its band), and the block above's (the overlap's)
+// Where a block reads the patterns for row j of its band: its own sign and offsets, and those of the block above
+// (for the overlap).
 struct Block
 {
   int s, ox, oy;
@@ -92,8 +94,8 @@ Block blockAt( int bxi, int band, int blocks, int j, bool overlap )
   return b;
 }
 
-// make_grain_pattern: the grain of the sample at i in its block, of the intensity given, before the boundaries'
-// smoothing (oc1, oc2: the overlap's weights, 0 without)
+// Returns the raw grain of the sample at position i of its block for the given intensity, as make_grain_pattern
+// computes it, before the smoothing across block boundaries. oc1 and oc2 are the overlap's weights (0 without one).
 int grainOf( Block b, int i, int intensity, int oc1, int oc2 )
 {
   const int pi   = lutP( intensity ) >> 4;
@@ -113,11 +115,11 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int tid    = int( local.x );
   const int seg0   = int( group.x ) * 1024;
   const int row    = int( group.y );
-  const int nb     = 16 / pc.subx;   // a block's samples across
+  const int nb     = 16 / pc.subx;   // block width in this plane's samples
   const int blocks = ( pc.lumaWidth + 15 ) >> 4;
-  const int end    = blocks * nb;    // the row up to its last block's end
+  const int end    = blocks * nb;    // the row's length rounded up to whole blocks
 
-  // the component's LUTs
+  // Load the component's LUTs.
   if( tid < 64 )
   {
     s_lut[tid] = pc.luts[( pc.comp * 256 ) / 4 + tid];
@@ -126,8 +128,9 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   {
     s_lut[tid] = pc.luts[( 768 + pc.comp * 256 ) / 4 + tid - 64];
   }
-  // the segment's samples (past the frame's width: the picture's, then its
-  // last one -- the border extension), with the halo
+  // Load the segment's samples and the halo. Past the frame's width these are
+  // the picture's samples, and past the picture's width its last sample (the
+  // border extension).
   int16_t*  src = pc.src + row * pc.srcStride;
   const int x0  = seg0 + 4 * tid;
   for( int k = 0; k < 4; k++ )
@@ -162,10 +165,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     oc2 = 12;
   }
   const bool overlap = oc1 != 0;
-  const int  bxi     = x0 / nb;   // the thread's four samples share a block
+  const int  bxi     = x0 / nb;   // the thread's four samples all lie in this block
 
-  // the raw grain: the thread's four samples (their pattern loads together),
-  // the halo's on the ends
+  // The raw grain of the thread's four samples (their pattern loads are issued
+  // together), and of the halo samples at the ends.
   if( pc.present != 0 && x0 < end )
   {
     const Block b = blockAt( bxi, band, blocks, j, overlap );
@@ -207,14 +210,14 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       break;
     }
-    const int at  = 1 + 4 * tid + k;   // x's in s_row and s_grain
+    const int at  = 1 + 4 * tid + k;   // x's index in s_row and s_grain
     const int v   = int( s_row[at] );
     int       out = v;
     if( pc.present != 0 )
     {
       const int i = x - bxi * nb;
       int       g = int( s_grain[at] );
-      // scale_and_output's smoothing across the boundaries between blocks
+      // Smooth the grain across the boundaries between blocks, as scale_and_output does.
       if( ( i == 0 && bxi > 0 ) || ( i == nb - 1 && bxi + 1 < blocks ) )
       {
         g = ( int( s_grain[at - 1] ) + 3 * g + int( s_grain[at + 1] ) + 2 ) >> 2;

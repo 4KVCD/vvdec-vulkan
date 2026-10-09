@@ -1,45 +1,42 @@
-// Intra's jobs in the order of their waves (GpuRecon::recordIntra), on the
-// GPU: from the jobs shaders/jobs.slang made (CTU by CTU, each with its
-// wave), the jobs cut into bands of rows of 256 samples at most, a band a
-// workgroup of shaders/intra.slang, in the order of the waves -- within a
-// wave in the jobs' order -- and each band's count of the bands of the waves
-// before its, which it waits for.
+// On the GPU, puts the intra jobs in the order of their waves (the CPU's version is GpuRecon::recordIntra). The
+// input is the jobs that shaders/jobs.slang made, CTU by CTU, each tagged with its wave. Each job is cut into bands
+// of rows of at most 256 samples, and each band becomes one workgroup of shaders/intra.slang. The bands are written
+// in wave order (within a wave, in the jobs' order), together with each band's wait: the number of bands in all
+// earlier waves, which must be done before the band starts.
 //
-// The jobs' indices are sorted by wave with a stable radix sort, two digits
-// of 8 bits (waves below 65536), each digit in three passes; then the bands.
-// The passes (pc.pass):
-// 0 HIST:    a workgroup a block of 1024 jobs: the block's count of each
-//            digit (hist, digit-major);
-// 1 SCAN:    one workgroup: the digits' and blocks' offsets (in place);
-// 2 SCATTER: a lane a block, the block's jobs in order: each at its digit's
-//            next place (stable);
-// 3 BANDS:   a workgroup a block of 1024 sorted jobs: each one's bands, the
-//            block's sums (bandSums);
-// 4 BSCAN:   one workgroup: the blocks' band offsets, the count of all;
-// 5 PLACE:   a workgroup a block: each sorted job's bands at its place, the
-//            first band of each wave where it begins (waveFirst);
-// 6 WAITS:   a workgroup a block: each band's wait, its wave's first band.
+// The job indices are sorted by wave with a stable radix sort of two 8-bit digits (so waves must be below 65536),
+// three passes per digit; then the bands are built. The passes (pc.pass):
+// 0 HIST:    one workgroup per block of 1024 jobs counts each digit value in the block (hist, digit-major);
+// 1 SCAN:    one workgroup turns the counts into offsets per digit value and block, in place;
+// 2 SCATTER: one lane per block moves the block's jobs, in order, each to the next free place of its digit value
+//            (which keeps the sort stable);
+// 3 BANDS:   one workgroup per block of 1024 sorted jobs counts each job's bands and stores the block's total
+//            (bandSums);
+// 4 BSCAN:   one workgroup turns the blocks' band totals into offsets and stores the number of all bands;
+// 5 PLACE:   one workgroup per block writes each sorted job's bands at the job's offset, and records the first band
+//            of each wave where the wave begins (waveFirst);
+// 6 WAITS:   one workgroup per block writes each band's wait: the first band of the band's wave.
 
 #include "common.slang"
 
 struct Params
 {
-  uint*         jobs;       // jobs.slang's intra jobs (12 words, w7 the wave)
-  uint*         count;      // the jobs' count (jobs.slang's totals: the intra list's)
-  uint*         keysA;      // the jobs' indices: the sort's two buffers (the sorted ones in keysA after the two digits)
+  uint*         jobs;       // jobs.slang's intra jobs, 12 words each; word 7 holds the wave
+  uint*         count;      // number of intra jobs (the intra list's entry in jobs.slang's totals)
+  uint*         keysA;      // job indices: the sort's two buffers; after both digits keysA holds the sorted ones
   uint*         keysB;
-  uint*         hist;       // per digit value (256) and block: counts, then offsets
-  uint*         bandAt;     // per sorted job its first band
-  uint*         bandSums;   // per block its bands, then their offsets; then the count of all
-  uint*         waveFirst;  // per wave its first band (65536)
-  uint*         sorted;     // out: the bands (IntraJob, w7 the rows: first | count << 16)
-  uint*         waits;      // out: each band's count of the bands of the waves before its
-  Atomic<uint>* flags;      // [0]: a wave of 65536 or more
-  int           numBlocks;  // of 1024 jobs (the jobs' room)
+  uint*         hist;       // per digit value (256) and block: counts, which SCAN replaces with offsets
+  uint*         bandAt;     // first band of each sorted job
+  uint*         bandSums;   // bands per block, which BSCAN replaces with offsets; then the number of all bands
+  uint*         waveFirst;  // first band of each wave (65536 entries)
+  uint*         sorted;     // out: the bands as IntraJob records, word 7 replaced by their rows: first | count << 16
+  uint*         waits;      // out: per band, the number of bands in the earlier waves
+  Atomic<uint>* flags;      // [0] is set when a wave is 65536 or more
+  int           numBlocks;  // blocks of 1024 jobs that the jobs buffer can hold
   int           pass;
-  int           shift;      // the digit's: 0, 8
-  int           capacity;   // sorted's and waits' room, in bands
-  uint*         args;       // BSCAN: the front end's arguments (GpuRecon's m_frontArgs): intra's pass
+  int           shift;      // shift of the current digit: 0 or 8
+  int           capacity;   // room in sorted and waits, in bands
+  uint*         args;       // BSCAN: the front end's indirect arguments (GpuRecon's m_frontArgs) for intra's pass
 };
 
 [[vk::push_constant]] Params pc;
@@ -54,7 +51,7 @@ uint waveOf( uint index ) { return pc.jobs[index * 12 + 7]; }
 groupshared uint s_scan[1024];
 groupshared uint s_hist[256];
 
-// an exclusive prefix sum of s_scan (1024 entries) in place, its total returned (all threads)
+// Exclusive prefix sum of the 1024 entries of s_scan, in place; returns the total to every thread.
 uint scan1024( int tid )
 {
   for( int d = 1; d < 1024; d <<= 1 )
@@ -79,7 +76,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int  tid   = int( local.x );
   const int  block = int( group.x );
   const uint n     = pc.count[0];
-  uint*      src   = pc.shift == 0 ? pc.keysA : pc.keysB;   // the digit's input (digit 0: the jobs' order, keysA unused)
+  uint*      src   = pc.shift == 0 ? pc.keysA : pc.keysB;   // this digit's input; digit 0 reads the jobs in order
   uint*      dst   = pc.shift == 0 ? pc.keysB : pc.keysA;
   const uint i     = uint( block * kBlock + tid );
 
@@ -110,7 +107,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   }
   if( pc.pass == 1 )
   {
-    // SCAN: the 256 x numBlocks counts, digit-major, a thread a run of them
+    // SCAN: the 256 x numBlocks counts, digit-major; each thread takes a run of them.
     const int total = 256 * pc.numBlocks;
     const int per   = ( total + 1023 ) / 1024;
     const int a0    = min( tid * per, total );
@@ -134,7 +131,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   }
   if( pc.pass == 2 )
   {
-    // SCATTER: the block's jobs in their order, each to its digit's next place
+    // SCATTER: one lane moves the block's jobs, in order, each to the next place of its digit value.
     if( tid != 0 )
     {
       return;
@@ -151,10 +148,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     return;
   }
 
-  // the sorted jobs (keysA)
+  // The remaining passes read the sorted jobs (keysA).
   if( pc.pass == 3 || pc.pass == 5 )
   {
-    // BANDS: each sorted job's bands, the block's prefix; PLACE: its bands at their places
+    // BANDS counts each sorted job's bands and sums them over the block; PLACE writes each job's bands in place.
     s_scan[tid] = i < n ? uint( bandsOf( pc.jobs + pc.keysA[i] * 12 ) ) : 0u;
     GroupMemoryBarrierWithGroupSync();
     const uint total = scan1024( tid );
@@ -198,7 +195,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   }
   if( pc.pass == 4 )
   {
-    // BSCAN: the blocks' band offsets (a thread a run of blocks), the count of all
+    // BSCAN: turn the blocks' band counts into offsets (each thread takes a run of blocks) and store the total.
     const int per = ( pc.numBlocks + 1023 ) / 1024;
     const int b0  = min( tid * per, pc.numBlocks );
     const int b1  = min( b0 + per, pc.numBlocks );
@@ -220,7 +217,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     if( tid == 0 )
     {
       pc.bandSums[pc.numBlocks] = total;
-      // a workgroup a band, in rows of 32768
+      // intra.slang runs one workgroup per band, in rows of 32768 workgroups.
       pc.args[12] = min( total, 32768u );
       pc.args[13] = ( total + 32767u ) / 32768u;
       pc.args[14] = 1;
@@ -229,7 +226,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     }
     return;
   }
-  // WAITS: each band's wait
+  // WAITS: write each band's wait.
   if( i >= n )
   {
     return;

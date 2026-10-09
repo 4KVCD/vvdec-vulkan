@@ -1,23 +1,25 @@
-// Dequantization and the inverse transforms, as vvdec's Quant::dequant and
-// TrQuant::invTransformNxN and invTransformICT do them: a workgroup takes one
-// transform block of one component, reads the levels the parser left in the
-// picture in host memory and writes the residual to the picture on the GPU.
+// Dequantization and the inverse transforms, as vvdec's Quant::dequant,
+// TrQuant::invTransformNxN and invTransformICT do them. A workgroup takes one
+// transform block of one component, reads the levels that the parser wrote
+// into a picture-sized buffer in host memory, and writes the residual into the
+// picture on the GPU.
 //
-// A job, 8 uints (VulkanLib/GpuJobs.h, TrafoJob):
-//   0: x | y << 16 (in samples of its component)
+// A job is 8 uints (VulkanLib/GpuJobs.h, TrafoJob):
+//   0: x | y << 16 (in the component's samples)
 //   1: log2 width | log2 height << 4 | component << 8 | horizontal type << 12 | vertical type << 14 | flags << 16
 //      | (joint Cb-Cr mode + 4) << 24                      (types: vvdec's TransType, 0 DCT-II, 1 DCT-VIII, 2 DST-VII)
-//   2: last column | last row << 8 of the levels             (the parser wrote [0, last column] x [0, last row])
-//   3: scale   4: right shift (negative: a left shift)   5: the levels' maximum
+//   2: last column | last row << 8 of the levels             (the parser wrote only [0, last column] x [0, last row])
+//   3: scale   4: right shift (negative: a left shift)   5: the levels' maximum (they are clipped to it)
 //   6: LFNST (0: none): index (1, 2) | set << 2 | transposed << 4 | 8x8 << 5 | 8 inputs << 6
-//   7: an explicit scaling list (0: none): where the block's matrix begins in scaling, + 1
+//   7: explicit scaling list (0: none): offset of the block's matrix in scaling, plus 1
 // flags: 1 transform skip, 2 BDPCM horizontal, 4 BDPCM vertical, 8 zeros (no residual)
 //
 // The threads dequantize the levels into shared memory, run the vertical
-// transform (rounded and clipped to 16 bits) into shared memory, then the
-// horizontal one into the picture; with transform skip, each takes samples
-// (with BDPCM, rows or columns) by itself. With LFNST, the top-left
-// coefficients first go through its matrix (TrQuant::xInvLfnst).
+// transform into shared memory (rounded and clipped to 16 bits), then run the
+// horizontal transform into the picture. With transform skip, each thread
+// handles its own samples (with BDPCM, its own rows or columns). With LFNST,
+// the top-left coefficients first go through the LFNST matrix
+// (TrQuant::xInvLfnst).
 
 #include "common.slang"
 
@@ -27,17 +29,17 @@ struct Params
   int16_t*  plane0;
   int16_t*  plane1;
   int16_t*  plane2;
-  int16_t*  levels0;    // the levels: the picture in host memory, laid out as the planes
+  int16_t*  levels0;    // the levels, in host memory, laid out like the planes
   int16_t*  levels1;
   int16_t*  levels2;
-  int16_t*  matrices;   // TrQuant's matrices, TrafoJob's order (GpuRecon.cpp)
+  int16_t*  matrices;   // TrQuant's matrices, laid out as matrixOffset expects (GpuRecon.cpp fills them)
   int8_t*   lfnst;      // LFNST's matrices: vvdec's g_lfnst8x8, then g_lfnst4x4
-  uint8_t*  scaling;    // the picture's dequantisation matrices (explicit scaling lists), Quant's, a byte a factor
+  uint8_t*  scaling;    // the picture's dequantization matrices from explicit scaling lists (Quant's), 1 byte each
   int       stride0;
   int       stride12;
-  int       count;      // the jobs; < 0: countAt's
+  int       count;      // number of jobs; negative: countAt holds it
   int       bitDepth;
-  uint*     countAt;    // the jobs' count and the first one's index (the GPU's front end's)
+  uint*     countAt;    // number of jobs and index of the first one, written by the GPU front end
 };
 
 [[vk::push_constant]] Params pc;
@@ -52,12 +54,12 @@ struct Params
 #define COEFF_MIN ( -32768 )   // maxLog2TrDynamicRange 15
 #define COEFF_MAX 32767
 
-// the levels there are: at most 32 x 32 (64-point transforms keep 32)
+// A block has at most 32 x 32 levels (64-point transforms keep only the first 32 coefficients).
 groupshared int s_coef[32 * 32];   // [row][column]
 groupshared int s_mid[64 * 32];    // the vertical transform's output, [row][column]
 groupshared int s_lfnst[16];       // LFNST's input
 
-// LFNST's input: the top-left 4x4's coefficients in diagonal scan order (x + 4 y)
+// LFNST's input order: the top-left 4x4 coefficients in diagonal scan order, as positions x + 4 y
 static const int kLfnstScan[16] = { 0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15 };
 
 int16_t* planeOf( int comp )
@@ -75,8 +77,8 @@ int strideOf( int comp )
   return comp == 0 ? pc.stride0 : pc.stride12;
 }
 
-// the N x N matrix (N = 1 << log2) of a transform type: DCT-II from 2 to 64
-// points, then DST-VII and DCT-VIII from 4 to 32
+// Offset of the N x N matrix (N = 1 << log2) of a transform type in matrices,
+// which holds DCT-II from 2 to 64 points, then DST-VII and DCT-VIII from 4 to 32.
 int matrixOffset( int type, int log2 )
 {
   const int first = type == 0 ? 1 : 2;
@@ -88,15 +90,15 @@ int matrixOffset( int type, int log2 )
   return at;
 }
 
-// the scale of the coefficient (x, y) of a block width wide: with an explicit
-// scaling list (sl: word 7), its matrix's factor times the QP's
-// (DeQuantImpl's piDequantCoef[n] * scaleQP)
+// The scale of coefficient (x, y) in a block of the given width: the QP's
+// scale, times the matrix's factor when the block has an explicit scaling list
+// (sl: job word 7), like DeQuantImpl's piDequantCoef[n] * scaleQP.
 int coefScale( uint sl, int scale, int width, int x, int y )
 {
   return sl != 0 ? int( pc.scaling[sl - 1 + uint( y * width + x )] ) * scale : scale;
 }
 
-// Quant's DeQuantImpl
+// Dequantizes one level, as Quant's DeQuantImpl does.
 int dequant( int level, int scale, int rightShift, int inputMaximum )
 {
   if( level == 0 )
@@ -108,7 +110,7 @@ int dequant( int level, int scale, int rightShift, int inputMaximum )
   return clip3( COEFF_MIN, COEFF_MAX, value );
 }
 
-// joint Cb-Cr: the other chroma component's residual from this one's (TU::getICTMode)
+// Joint Cb-Cr: derives the other chroma component's residual from this component's (TU::getICTMode).
 int jointResidual( int ict, int v )
 {
   return abs( ict ) == 2 ? ( ict > 0 ? v : -v ) : ( ( ict > 0 ? v : -v ) >> 1 );
@@ -122,7 +124,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int count = pc.count >= 0 ? pc.count : int( pc.countAt[0] );
   if( index >= count )
   {
-    return;   // the whole workgroup
+    return;   // (the whole workgroup returns here)
   }
   const int tid          = int( local.x );
   uint*     job          = pc.jobs + ( ( pc.count >= 0 ? 0 : int( pc.countAt[1] ) ) + index ) * 8;
@@ -159,8 +161,9 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 
   if( ( flags & FLAG_TS ) != 0 )
   {
-    // transform skip: the dequantized levels are the residual; BDPCM first
-    // adds them up along its direction (invResDPCM), a thread per row or column
+    // Transform skip: the dequantized levels are the residual. BDPCM first
+    // accumulates the levels along its direction (invResDPCM), one thread per
+    // row or column.
     if( ( flags & FLAG_BDPCM_HOR ) != 0 )
     {
       for( int y = tid; y < height; y += THREADS )
@@ -215,17 +218,17 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     return;
   }
 
-  // TrQuant::xIT: the vertical transform, rounded and clipped, then the horizontal one
+  // TrQuant::xIT: the vertical transform (rounded and clipped), then the horizontal one.
   int16_t*  mVer   = pc.matrices + matrixOffset( typeVer, log2H );
   int16_t*  mHor   = pc.matrices + matrixOffset( typeHor, log2W );
   const int shift2 = 6 + 15 - 1 - pc.bitDepth;
-  int       nx     = lastX + 1;   // the columns with levels; the others are zero
+  int       nx     = lastX + 1;   // columns that hold levels; the others are zero
   int       ny     = lastY + 1;
 
   if( width == 1 || height == 1 )
   {
-    // xIT's 1-D transforms (ISP's sub-partitions a sample wide or high): one
-    // rounding, by a bit more than the 2-D's second
+    // xIT's 1-D transforms (ISP sub-partitions one sample wide or high): a
+    // single rounding, with a shift one bit larger than the 2-D second shift
     const bool ver   = width == 1;
     const int  n     = ver ? height : width;
     const int  count = ver ? ny : nx;
@@ -252,10 +255,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const uint lfnst = job[6];
   if( lfnst != 0 )
   {
-    // xInvLfnst: the set's matrix times the top-left 4x4's coefficients (8
-    // of them for the blocks of 4x4 and 8x8) gives the top-left 4x4 (the
-    // blocks 4 wide or high), else the top-left 8x8 but its bottom-right
-    // 4x4, row by row or (transposed) column by column; the rest is zero
+    // xInvLfnst: the set's matrix times the top-left 4x4 coefficients (only 8
+    // of them for 4x4 and 8x8 blocks) gives the top-left 4x4 for blocks 4 wide
+    // or high, else the top-left 8x8 without its bottom-right 4x4, row by row
+    // or (transposed) column by column. All other coefficients are zero.
     const int  index     = int( lfnst & 3 ) - 1;
     const int  set       = int( ( lfnst >> 2 ) & 3 );
     const bool transpose = ( lfnst & 16 ) != 0;

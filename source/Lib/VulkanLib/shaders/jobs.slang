@@ -1,25 +1,27 @@
-// The jobs of a picture's reconstruction on the GPU (vvdec's DecCu::TaskGpuCtu:
-// xGpuTrafoJobs, xGpuIntraJobs, xGpuIbcJobs, xGpuInterJobs, xGpuCiipJobs),
-// from the parse's CUs and TUs (GpuFrontEnd.h's records) and the motion the
-// GPU derived (shaders/mider.slang): the residuals' jobs (GpuJobs.h's
-// TrafoJob), inter's (InterJob) and intra's (IntraJob), each list in the
-// CPU's order -- CTU by CTU, each CTU's CUs in decoding order.
+// Builds the jobs of a picture's reconstruction on the GPU (the CPU's version is
+// vvdec's DecCu::TaskGpuCtu: xGpuTrafoJobs, xGpuIntraJobs, xGpuIbcJobs,
+// xGpuInterJobs, xGpuCiipJobs), from the parsed CUs and TUs (GpuFrontEnd.h's
+// records) and the motion the GPU derived (shaders/mider.slang). It writes the
+// residual jobs (GpuJobs.h's TrafoJob), the inter jobs (InterJob) and the intra
+// jobs (IntraJob), each list in the CPU's order: CTU by CTU, and within a CTU,
+// the CUs in decoding order.
 //
 // The passes (pc.pass):
-// 0 COUNT: a thread a CU counts its jobs of each list; per CU its offsets
-//   among its block's (a block: 256 CUs), per block their sums;
-// 1 SCAN:  one workgroup turns the blocks' sums into their offsets, and
-//   writes the totals;
-// 2 WRITE: a thread a CU writes its jobs (an intra job's wave left 0);
-// 3 WAVES: a lane a CTU row, the rows a wavefront as vvdec's CTU tasks run
-//   them: each intra job's wave (one above the highest wave of the samples
-//   it reads, inter's samples wave 0), in decoding order (GpuJobs.h's
-//   WaveMap).
+// 0 COUNT: one thread per CU counts the CU's jobs in each list and stores its
+//          offset within its block of 256 CUs; each block stores its totals.
+// 1 SCAN:  one workgroup turns the blocks' totals into offsets and writes the
+//          overall totals.
+// 2 WRITE: one thread per CU writes the CU's jobs (each intra job's wave is
+//          left at 0).
+// 3 WAVES: sets each intra job's wave, in decoding order: one above the
+//          highest wave of the samples the job reads, where inter's samples
+//          are wave 0 (GpuJobs.h's WaveMap). One lane per CTU row; the rows
+//          run as a wavefront, as vvdec's CTU tasks run them.
 //
-// Five lists: 0 the residuals', 1 inter's regular jobs, 2 intra's, 3 inter's
-// BDOF jobs, 4 inter's affine pairs -- inter's three one after the other in
-// its buffer, as GpuRecon::recordInter lays them out for the inter, inter_bdof
-// and inter_affine passes.
+// There are five lists: 0 the residual jobs, 1 inter's regular jobs, 2 the
+// intra jobs, 3 inter's BDOF jobs, 4 inter's affine pairs. Inter's three lists
+// lie one after another in the inter buffer, as GpuRecon::recordInter lays
+// them out for the inter, inter_bdof and inter_affine passes.
 
 #include "common.slang"
 
@@ -29,15 +31,15 @@ struct Params
   uint* tus;         // TuRecord, 16 words each
   uint* ctus;        // CtuRecord, 4 words each
   uint* slices;      // mider.slang's slice table
-  uint* jobSlices;   // per slice 256 words (GpuFrontEnd.h's JobSlice)
-  uint* cuMapL;      // the CU at each 4x4 luma block: of the luma tree
-  uint* cuMapC;      // and of the chroma tree (the luma's in a single tree)
-  int*  cuMotion;    // mider.slang's records of motion (16 words)
-  int*  motion;      // mider.slang's MotionInfo of the 4x4 blocks (5 words)
+  uint* jobSlices;   // 256 words per slice (GpuFrontEnd.h's JobSlice)
+  uint* cuMapL;      // the index of the luma-tree CU at each 4x4 luma block
+  uint* cuMapC;      // the same for the chroma tree (in a single tree, the luma tree's CUs)
+  int*  cuMotion;    // mider.slang's motion records per CU (16 words each)
+  int*  motion;      // mider.slang's MotionInfo per 4x4 block (5 words)
   uint* tables;      // the constant tables (GpuFrontEnd.h's JobTables)
-  uint* scaling;     // per list (6), log2 width (7), log2 height (7): the dequantisation matrix's offset + 1 (0: none)
-  uint* counts;      // per CU its jobs' offsets among its block's (5 words, a list each)
-  uint* blocks;      // per block its jobs' sums, then their offsets (5 words); then the totals (5 words)
+  uint* scaling;     // per list (6), log2 width (7), log2 height (7): the dequantization matrix's offset + 1 (0: none)
+  uint* counts;      // per CU: the offsets of its jobs within its block, one word per list (5 words)
+  uint* blocks;      // per block: its job totals, which SCAN replaces with offsets (5 words); then the totals (5 words)
   uint* trafo;       // out: TrafoJob, 8 words each
   uint* inter;       // out: InterJob, 12 words each
   uint* intra;       // out: IntraJob, 12 words each
@@ -50,26 +52,26 @@ struct Params
   int   height;
   int   widthIn4;
   int   chromaFormat;   // 0 4:0:0, 1 4:2:0, 2 4:2:2, 3 4:4:4
-  int   csx;            // the chroma's subsampling (0, 1)
+  int   csx;            // chroma subsampling shifts (0, 1)
   int   csy;
   int   bitDepth;
   int   qpBdOffset;
-  int   tsMinQp;        // transform skip's lowest QP: 4 + 6 * the SPS's internal minus input bit depth
+  int   tsMinQp;        // transform skip's minimum QP: 4 + 6 * (the SPS's internal minus input bit depth)
   uint  sps;            // kSps* flags
-  uint  ph;             // kPh* flags (the picture header's, the PPS's, what runs on the GPU)
+  uint  ph;             // kPh* flags (from the picture header and the PPS, and what runs on the GPU)
   int   pass;
-  int   capTrafo;       // the outputs' room, in jobs
+  int   capTrafo;       // room in each output, in jobs
   int   capInter;
   int   capIntra;
-  int   num8x8;         // per CTU: DMVR's refinements' room (PreCalcValues::num8x8CtuBlks)
-  uint* waveMap;        // WAVES: per component the waves of its blocks of 4 luma samples (GpuJobs.h's WaveMap)
-  Atomic<uint>* progress;   // WAVES: per row the CTUs done, then the rows taken (zeroed before the dispatch)
-  uint* args;        // SCAN: the front end's arguments (GpuRecon's m_frontArgs): the residuals' and inter's passes
+  int   num8x8;         // room for DMVR's refinements per CTU (PreCalcValues::num8x8CtuBlks)
+  uint* waveMap;        // WAVES: per component, the wave of each area of 4x4 luma samples (GpuJobs.h's WaveMap)
+  Atomic<uint>* progress;   // WAVES: per CTU row, the CTUs done; then the rows taken (zeroed before the dispatch)
+  uint* args;        // SCAN: the front end's indirect arguments (GpuRecon's m_frontArgs): residual and inter passes
 };
 
 [[vk::push_constant]] Params pc;
 
-// the SPS's flags
+// The SPS's flags
 static const uint kSpsMts          = 1;
 static const uint kSpsImplicitMts  = 2;
 static const uint kSpsIntraMts     = 4;
@@ -83,7 +85,7 @@ static const uint kSpsDmvr         = 512;
 static const uint kSpsProf         = 1024;
 static const uint kSpsBcw          = 2048;
 static const uint kSpsWpp          = 4096;
-// the picture's
+// The picture's flags (picture header and PPS)
 static const uint kPhNoDmvr        = 1;
 static const uint kPhNoBdof        = 2;
 static const uint kPhNoProf        = 4;
@@ -93,7 +95,7 @@ static const uint kPhLmcsChroma    = 32;
 static const uint kPpsWp           = 64;
 static const uint kPpsWpBi         = 128;
 static const uint kPhTrafo         = 256;   // the GPU makes the residuals
-static const uint kPhInter         = 512;   // and inter's prediction
+static const uint kPhInter         = 512;   // the GPU makes inter's prediction
 
 // CuRecord's flags
 static const uint kMerge   = 1;
@@ -127,7 +129,7 @@ static const int DCT2 = 0;
 static const int DCT8 = 1;
 static const int DST7 = 2;
 
-// GpuJobs.h's
+// GpuJobs.h's job flags and kinds
 static const uint kTrafoTransformSkip = 1;
 static const uint kTrafoBdpcmHor      = 2;
 static const uint kTrafoBdpcmVer      = 4;
@@ -159,7 +161,7 @@ static const uint kInterAffine    = 8192;
 static const uint kInterGeo       = 16384;
 static const uint kInterWp        = 32768;
 
-// the constant tables (GpuFrontEnd.h's JobTables)
+// Offsets into the constant tables (GpuFrontEnd.h's JobTables)
 static const int T_LFNST  = 0;      // g_lfnstLut
 static const int T_C422   = 128;    // g_chroma422IntraAngleMappingTable
 static const int T_GEO    = 256;    // g_GeoParams: angle | distance << 8
@@ -175,10 +177,10 @@ static const int kIntraFilter[2][8]    = { { 24, 24, 24, 14, 2, 0, 0, 0 }, { 40,
 static const int kAngTable[32]         = { 0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 18, 20, 23, 26, 29, 32, 35, 39, 45, 51, 57, 64, 73, 86, 102, 128, 171, 256, 341, 512, 1024 };
 static const int kModeShift[6]         = { 0, 6, 10, 12, 14, 15 };
 
-int log2Of( int v ) { return int( firstbithigh( uint( v ) ) ); }   // getLog2: floor
+int log2Of( int v ) { return int( firstbithigh( uint( v ) ) ); }   // floor( log2 ), as getLog2
 
 // --------------------------------------------------------------------------------------------------------------------
-// the records
+// The records
 // --------------------------------------------------------------------------------------------------------------------
 
 struct Cu
@@ -189,7 +191,7 @@ struct Cu
   int  predMode;
   uint flags;
   int  chType;       // 1: a CU of the chroma tree
-  int  treeType;     // TREE_D 0
+  int  treeType;     // 0: TREE_D
   int  isp;
   int  lfnst;
   bool mip;
@@ -203,10 +205,10 @@ struct Cu
   int  planeCbf;
   int  intraDir[2];
   int  qp;
-  int  firstTu;      // global
+  int  firstTu;      // global TU index
   int  numTus;
-  int  dmvrOff;      // global: DMVR's refinements of its subblocks from here (CodingUnit::mvdL0SubPuOff)
-  bool leftAvail;    // its left and above neighbours, as the parse found them (CodingUnit::left, above)
+  int  dmvrOff;      // global index where DMVR's refinements of the CU's subblocks start (CodingUnit::mvdL0SubPuOff)
+  bool leftAvail;    // whether the left and above neighbours exist, as the parse found them (CodingUnit::left, above)
   bool aboveAvail;
   bool smvd;
   int  geoSplit;
@@ -261,7 +263,7 @@ bool isIntra( Cu cu ) { return cu.predMode == MODE_INTRA; }
 bool isSepTree( Cu cu ) { return cu.treeType != 0; }
 bool valid( int4 b ) { return b.z != 0 && b.w != 0; }
 
-// the motion the GPU derived for the CU (mider.slang's CuMotion)
+// The motion the GPU derived for a CU (mider.slang's CuMotion)
 struct Motion
 {
   int2 mv[2][3];
@@ -301,8 +303,8 @@ Motion loadMotion( int index )
 
 struct Tu
 {
-  int  index;   // global
-  int4 blk[2];  // per channel (Cr's block is Cb's)
+  int  index;   // global TU index
+  int4 blk[2];  // per channel (Cr's block equals Cb's)
   int  cbf;
   int  jointCbCr;
   int  mts[3];
@@ -338,11 +340,11 @@ Tu loadTu( int index )
 int  chOf( int comp ) { return comp == 0 ? 0 : 1; }
 bool cbfOf( Tu tu, int comp ) { return ( ( tu.cbf >> comp ) & 1 ) != 0; }
 
-// the channel's scale: luma 0, chroma the format's
+// A channel's subsampling shifts: 0 for luma, the format's for chroma.
 int scaleX( int ch ) { return ch == 0 ? 0 : pc.csx; }
 int scaleY( int ch ) { return ch == 0 ? 0 : pc.csy; }
 
-// a slice record (mider.slang's) and the jobs' (GpuFrontEnd.h's JobSlice)
+// Slice records: mider.slang's slice table and the jobs' JobSlice (GpuFrontEnd.h)
 uint* sliceOfCtu( int ctu ) { return pc.slices + pc.widthInCtus * pc.heightInCtus + pc.slices[ctu] * 64; }
 uint* jobSliceOfCtu( int ctu ) { return pc.jobSlices + pc.slices[ctu] * 256; }
 int   slicePoc( uint* s ) { return int( s[0] ); }
@@ -355,7 +357,7 @@ int   sliceType( uint* j ) { return int( j[0] & 3 ); }   // B 0, P 1, I 2
 bool  sliceLmcs( uint* j ) { return ( j[0] & 4 ) != 0; }
 bool  sliceDepQuant( uint* j ) { return ( j[0] & 8 ) != 0; }
 bool  sliceScalingList( uint* j ) { return ( j[0] & 16 ) != 0; }
-// a reference's: its slot in the reference table, scaled (RPR), of the picture's size, its weights there
+// Per reference: its slot in the reference table, whether it is scaled (RPR) or the picture's size, and its weights
 uint  refInfo( uint* j, int list, int refIdx ) { return j[32 + 16 * list + max( refIdx, 0 )]; }
 int   refSlot( uint* j, int list, int refIdx ) { return int( refInfo( j, list, refIdx ) & 0xff ); }
 bool  refScaled( uint* j, int list, int refIdx ) { return ( refInfo( j, list, refIdx ) & ( 1u << 8 ) ) != 0; }
@@ -363,7 +365,7 @@ bool  refSameSize( uint* j, int list, int refIdx ) { return ( refInfo( j, list, 
 bool  wpPresent( uint* j, int list, int refIdx, int c ) { return ( refInfo( j, list, refIdx ) & ( 1u << ( 10 + c ) ) ) != 0; }
 uint  wpParam( uint* j, int list, int refIdx, int c ) { return j[64 + ( 16 * list + max( refIdx, 0 ) ) * 3 + c]; }
 
-// the CU covering pos (the channel's samples): -1 outside the picture
+// The CU covering pos (in the channel's samples); -1 outside the picture.
 int cuAt( int ch, int2 pos )
 {
   const int lx = pos.x << scaleX( ch );
@@ -376,9 +378,9 @@ int cuAt( int ch, int2 pos )
   return int( ch == 0 ? pc.cuMapL[at] : pc.cuMapC[at] );
 }
 
-// CodingStructure::getCURestricted( pos, cur, chType ): the CU at pos (the channel's samples) where cur may use it, -1
-// where not -- in its CTU decoded before it, else in a CTU left of or above its (the one above right without WPP), the
-// same slice and tile
+// CodingStructure::getCURestricted( pos, cur, chType ): the CU at pos (in the channel's samples) if cur may use it,
+// else -1. Usable CUs lie in cur's CTU and precede cur in decoding order, or lie in a CTU to the left of or above
+// cur's (also the one above-right, without WPP) in the same slice and tile.
 int cuRestricted( int2 pos, Cu cur, int ch )
 {
   const int at = cuAt( ch, pos );
@@ -403,7 +405,7 @@ int cuRestricted( int2 pos, Cu cur, int ch )
   return independentIdx( sliceOfCtu( ctu ) ) == independentIdx( sliceOfCtu( cur.ctu ) ) && ctuTile( ctu ) == ctuTile( cur.ctu ) ? at : -1;
 }
 
-// the CTU of a CU (by index)
+// The CTU of the CU with the given index.
 int ctuOfCu( int index )
 {
   uint* r = pc.cus + index * 32;
@@ -411,7 +413,7 @@ int ctuOfCu( int index )
                                        : ctuOfLuma( int( r[19] & 0xffff ) << pc.csx, int( r[19] >> 16 ) << pc.csy );
 }
 
-// getTU: the CU's TU whose block (of the channel) ends past pos (its only TU when it has one)
+// The CU's TU at pos, as getTU finds it: the first TU whose block (in channel ch) ends past pos, otherwise the last.
 int tuOf( int cuIndex, int2 pos, int ch )
 {
   uint*     r     = pc.cus + cuIndex * 32;
@@ -430,7 +432,7 @@ int tuOf( int cuIndex, int2 pos, int ch )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the jobs out: counted, or written at the CU's offsets
+// Job output: COUNT only counts the jobs; WRITE also writes them at the CU's offsets
 // --------------------------------------------------------------------------------------------------------------------
 
 static const int kLists = 5;
@@ -439,7 +441,7 @@ struct Out
 {
   bool write;
   int  n[5];      // the CU's jobs so far, per list
-  int  base[5];   // where they go
+  int  base[5];   // where the CU's jobs start, per list
 };
 
 void emitTrafo( inout Out o, uint w[12] )
@@ -455,7 +457,7 @@ void emitTrafo( inout Out o, uint w[12] )
   o.n[0]++;
 }
 
-// an inter job to its part: BDOF's (3), the affine pairs' (4), else the regular (1)
+// Adds an inter job to its list: BDOF jobs (3), affine pairs (4), or the regular jobs (1).
 void emitInter( inout Out o, uint w[12] )
 {
   const uint flags = w[1] >> 16;
@@ -471,7 +473,7 @@ void emitInter( inout Out o, uint w[12] )
   o.n[list]++;
 }
 
-// an affine pair's second job (InterJob::setAffine's next), after its first
+// Adds the second job of an affine pair (InterJob::setAffine's next), right after the first.
 void emitAffineNext( inout Out o, uint w[12] )
 {
   if( o.write && o.base[4] + o.n[4] < pc.capInter )
@@ -548,10 +550,10 @@ void setInter( inout uint w[12], int x, int y, int width, int height, uint flags
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// intra modes (UnitTools)
+// Intra modes (UnitTools)
 // --------------------------------------------------------------------------------------------------------------------
 
-// PU::getCoLocatedLumaPU: the luma CU at the centre of the CU's block (its own in a single tree)
+// PU::getCoLocatedLumaPU: the luma CU at the centre of the CU's block (the CU itself in a single tree)
 int coLocatedLuma( Cu cu )
 {
   if( !isSepTree( cu ) )
@@ -564,7 +566,7 @@ int coLocatedLuma( Cu cu )
   return cuAt( 0, int2( ( b.x << sx ) + ( ( b.z << sx ) >> 1 ), ( b.y << sy ) + ( ( b.w << sy ) >> 1 ) ) );
 }
 
-// PU::getIntraDirLuma of a CU: MIP's is planar
+// PU::getIntraDirLuma of a CU (planar for a MIP CU)
 int intraDirLuma( int cuIndex )
 {
   uint* r = pc.cus + cuIndex * 32;
@@ -600,7 +602,7 @@ bool isMip( Cu cu, int ch )
   return !isSepTree( cu ) && pc.chromaFormat == 3 && cuMipOf( coLocatedLuma( cu ) ) && cu.intraDir[1] == DM_CHROMA_IDX;
 }
 
-// PU::getWideAngIntraMode (LFNST's)
+// PU::getWideAngIntraMode (the variant LFNST uses)
 int wideAngIntraMode( Cu cu, Tu tu, int mode, int comp )
 {
   if( mode < 2 )
@@ -621,7 +623,7 @@ int wideAngIntraMode( Cu cu, Tu tu, int mode, int comp )
   return pred;
 }
 
-// IntraPrediction::getWideAngle (the prediction's)
+// IntraPrediction::getWideAngle (the variant the prediction uses)
 int wideAngle( int width, int height, int mode )
 {
   if( mode > DC_IDX && mode <= VDIA_IDX )
@@ -639,7 +641,7 @@ int wideAngle( int width, int height, int mode )
   return mode;
 }
 
-// IntraPrediction::useFilteredIntraRefSamples (of a block width x height)
+// IntraPrediction::useFilteredIntraRefSamples, for a block of width x height
 bool useFilteredRef( Cu cu, int comp, int width, int height )
 {
   const int ch = chOf( comp );
@@ -664,7 +666,7 @@ bool useFilteredRef( Cu cu, int comp, int width, int height )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the residuals' jobs (DecCu::xGpuTrafoJobs)
+// The residual jobs (DecCu::xGpuTrafoJobs)
 // --------------------------------------------------------------------------------------------------------------------
 
 // TrQuant::getTrTypes
@@ -769,7 +771,7 @@ void trafoJobs( Cu cu, inout Out o )
       {
         if( c != 1 )
         {
-          continue;   // with Cb's job
+          continue;   // handled by Cb's job
         }
         comp = ( tu.jointCbCr >> 1 ) != 0 ? 1 : 2;
         ict  = kIctModes[sign ? 1 : 0][tu.jointCbCr];
@@ -781,7 +783,7 @@ void trafoJobs( Cu cu, inout Out o )
       const int4 block = tu.blk[chOf( comp )];
       const bool ts    = tu.mts[comp] == 1;   // MTS_SKIP
 
-      // QpParam: the CU's QP, the parse's chroma QPs (QpParam without ACT's offset), ACT's offset
+      // QpParam: the CU's QP (luma) or the parse's chroma QPs (QpParam without ACT's offset), then ACT's offset
       int baseQp = comp == 0 ? cu.qp + pc.qpBdOffset : tu.chromaQp[comp - 1];
       if( cu.act )
       {
@@ -790,7 +792,7 @@ void trafoJobs( Cu cu, inout Out o )
       }
       const int qp = ts ? max( baseQp, pc.tsMinQp ) : baseQp;
 
-      // the explicit scaling list, where Quant::dequant applies it
+      // Whether the explicit scaling list applies, as Quant::dequant decides it
       const bool lfnstApplied = cu.lfnst > 0 && ( isSepTree( cu ) || comp == 0 );
       const bool scalingList  = sliceScalingList( jslice ) && !ts && !( lfnstApplied && ( pc.sps & kSpsNoSlLfnst ) != 0 )
                                && !( ( pc.sps & kSpsNoSlAct ) != 0 && ( ( pc.sps & kSpsSlActSpace ) != 0 ) == cu.act );
@@ -829,7 +831,7 @@ void trafoJobs( Cu cu, inout Out o )
       uint w[12];
       clearJob( w );
       setTrafo( w, block.x, block.y, log2W, log2H, comp, typeHor, typeVer, flags, ict, maxX, maxY, scale, rightShift, inputMax );
-      // LFNST: its set and orientation from the block's intra mode (TrQuant::xInvLfnst)
+      // LFNST: the set and the orientation follow from the block's intra mode (TrQuant::xInvLfnst)
       if( cu.lfnst != 0 && ( pc.sps & kSpsLfnst ) != 0 && !ts && ( isSepTree( cu ) || comp == 0 ) )
       {
         const int ch   = chOf( comp );
@@ -851,10 +853,11 @@ void trafoJobs( Cu cu, inout Out o )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// intra's neighbourhood (IntraPrediction)
+// The intra neighbourhood (IntraPrediction)
 // --------------------------------------------------------------------------------------------------------------------
 
-// isAboveAvailable: the units above (posLT's row above) of the CUs there, as far as they're decoded
+// isAboveAvailable: counts the units in the row above posLT that are available, stopping at the first unit whose CU
+// cur may not use or whose TU is not decoded yet.
 int aboveAvailable( Cu cu, int tuIndex, int ch, int2 posLT, int numUnits, int unitWidth )
 {
   const int maxDx  = numUnits * unitWidth;
@@ -880,7 +883,7 @@ int aboveAvailable( Cu cu, int tuIndex, int ch, int2 posLT, int numUnits, int un
   return min( dx / unitWidth, numUnits );
 }
 
-// isLeftAvailable
+// isLeftAvailable: the same for the column left of posLT.
 int leftAvailable( Cu cu, int tuIndex, int ch, int2 posLT, int numUnits, int unitHeight )
 {
   const int maxDy  = numUnits * unitHeight;
@@ -906,11 +909,11 @@ int leftAvailable( Cu cu, int tuIndex, int ch, int2 posLT, int numUnits, int uni
   return min( dy / unitHeight, numUnits );
 }
 
-// xDeriveNeighborSize (getNeighborUnits) of the block area of component comp of TU tuIndex; a CU's components after
-// the first of its channel take the units of the last block it derived them for (vvdec's m_lastCUidx)
+// xDeriveNeighborSize (getNeighborUnits) for the block area of component comp of TU tuIndex. A CU's components after
+// the first one of its channel reuse the units last derived for that CU (vvdec's m_lastCUidx).
 struct Units
 {
-  int  cu;   // whose
+  int  cu;   // the CU the units were derived for
   int3 u;    // top-left, above, left
 };
 
@@ -955,7 +958,7 @@ int3 neighborUnits( Cu cu, int tuIndex, int4 area, int comp, inout Units cache )
   return u;
 }
 
-// IntraPrediction::getLmAvailability: CCLM's templates
+// IntraPrediction::getLmAvailability: which of CCLM's templates are available
 void cclmAvailability( Cu cu, int4 area, inout uint w[12] )
 {
   const int  mode    = cu.intraDir[1];
@@ -982,7 +985,7 @@ void cclmAvailability( Cu cu, int4 area, inout uint w[12] )
     lumaAbove                   = aboveUnits >= tuWidthInUnits;
   }
   {
-    // xGetLMParameters (its unit height follows the horizontal subsampling, as there)
+    // xGetLMParameters (the unit height follows the horizontal subsampling, as it does there)
     const int unitWidth       = 4 >> pc.csx;
     const int unitHeight      = 4 >> pc.csx;
     const int tuWidthInUnits  = cWidth / unitWidth;
@@ -1028,7 +1031,8 @@ void cclmAvailability( Cu cu, int4 area, inout uint w[12] )
   w[5] = uint( actualTop ) | uint( actualLeft ) << 16;
 }
 
-// gpuLmcsChroma: LMCS's chroma scale from the luma left of and above the CU at the top-left of the VPDU holding lumaPos
+// gpuLmcsChroma: LMCS's chroma scale comes from the luma left of and above the CU at the top-left of the VPDU that
+// holds lumaPos.
 void setLmcsScale( int2 lumaPos, inout uint w[12] )
 {
   const int  ctuSize = 1 << pc.log2Ctu;
@@ -1044,7 +1048,7 @@ void setLmcsScale( int2 lumaPos, inout uint w[12] )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// intra's jobs (DecCu::xGpuIntraJobs, xGpuIbcJobs)
+// The intra jobs (DecCu::xGpuIntraJobs, xGpuIbcJobs)
 // --------------------------------------------------------------------------------------------------------------------
 
 void intraJobs( Cu cu, inout Out o, inout Units cache )
@@ -1073,7 +1077,7 @@ void intraJobs( Cu cu, inout Out o, inout Units cache )
       }
       else if( isMip( cu, ch ) )
       {
-        // MIP: luma's mode, or (4:4:4 chroma in DM) the co-located luma's
+        // MIP: the luma CU's mode, or for 4:4:4 chroma in DM mode the co-located luma CU's
         kind          = kIntraMip;
         const int lum = comp == 0 ? cu.index : coLocatedLuma( cu );
         jobMode       = int( pc.cus[lum * 32 + 18] & 0xff );
@@ -1100,7 +1104,7 @@ void intraJobs( Cu cu, inout Out o, inout Units cache )
       w[3] = uint( units.x ) | uint( units.y ) << 8 | uint( units.z ) << 16;
       if( isp )
       {
-        // the block predicted: a vertical split's sub-partitions 1 or 2 samples wide share one 4 wide
+        // The predicted block: a vertical split's sub-partitions 1 or 2 samples wide share one block 4 samples wide.
         const int4 cuArea = cu.blk[0];
         int4       pred   = area;
         if( cu.isp == 2 && ( ( cuArea.z == 8 && cuArea.w > 4 ) || cuArea.z == 4 ) )
@@ -1113,7 +1117,7 @@ void intraJobs( Cu cu, inout Out o, inout Units cache )
         w[4]                  = uint( cuArea.x ) | uint( cuArea.y ) << 16;
         w[5]                  = uint( cuArea.z ) | uint( cuArea.w ) << 8 | uint( cu.isp ) << 16 | uint( leftAvail ) << 18 | uint( aboveAvail ) << 19;
       }
-      // LMCS: the chroma residual scaled, by the luma around the VPDU of the block's luma
+      // LMCS: the chroma residual is scaled according to the luma around the VPDU of the block's luma
       if( comp != 0 && sliceLmcs( jslice ) && ( pc.ph & kPhLmcsChroma ) != 0 && area.z * area.w > 4 && ( cbfOf( tu, comp ) || tu.jointCbCr != 0 ) )
       {
         const int2 lumaPos = valid( tu.blk[0] ) ? tu.blk[0].xy : int2( tu.blk[tu.chType].x << scaleX( tu.chType ), tu.blk[tu.chType].y << scaleY( tu.chType ) );
@@ -1132,7 +1136,7 @@ void ibcJobs( Cu cu, Motion m, inout Out o )
 {
   uint*      jslice  = jobSliceOfCtu( cu.ctu );
   const int  numComp = pc.chromaFormat == 0 ? 1 : 3;
-  // the block vector in whole samples (Mv::changePrecision from internal precision)
+  // The block vector in whole samples (Mv::changePrecision from the internal precision)
   int2 bv;
   bv.x = m.mv[0][0].x >= 0 ? ( m.mv[0][0].x + 7 ) >> 4 : ( m.mv[0][0].x + 8 ) >> 4;
   bv.y = m.mv[0][0].y >= 0 ? ( m.mv[0][0].y + 7 ) >> 4 : ( m.mv[0][0].y + 8 ) >> 4;
@@ -1143,7 +1147,7 @@ void ibcJobs( Cu cu, Motion m, inout Out o )
     {
       const int  ch   = chOf( comp );
       const int4 area = tu.blk[ch];
-      // the components of the CU (a skipped CU's TUs span the chroma of a luma-tree CU too)
+      // Only the CU's own components (a skipped CU's TUs also cover the chroma of a luma-tree CU)
       if( !valid( area ) || !valid( cu.blk[ch] ) )
       {
         continue;
@@ -1169,7 +1173,7 @@ void ibcJobs( Cu cu, Motion m, inout Out o )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// inter's jobs (DecCu::xGpuInterJobs, xGpuCiipJobs)
+// The inter jobs (DecCu::xGpuInterJobs, xGpuCiipJobs)
 // --------------------------------------------------------------------------------------------------------------------
 
 // PU::isBiPredFromDifferentDirEqDistPoc
@@ -1211,7 +1215,7 @@ bool dmvrCondition( Cu cu, Motion m, uint* slice, uint* jslice )
          && ( m.refIdx[1] < 0 || refSameSize( jslice, 1, m.refIdx[1] ) );
 }
 
-// gpuBdof: motionCompensation's bioApplied
+// gpuBdof: the bioApplied condition of motionCompensation
 bool bdofCondition( Cu cu, Motion m, uint* slice, uint* jslice )
 {
   if( ( pc.sps & kSpsBdof ) == 0 || ( pc.ph & kPhNoBdof ) != 0 || ( cu.flags & kAffine ) != 0 || ( cu.flags & kCiip ) != 0 || cu.smvd
@@ -1229,7 +1233,7 @@ bool bdofCondition( Cu cu, Motion m, uint* slice, uint* jslice )
   return !refScaled( jslice, 0, m.refIdx[0] ) && !refScaled( jslice, 1, m.refIdx[1] );
 }
 
-// gpuWp: weighted prediction's parameters of the job (flags: its lists, DMVR, BDOF)
+// gpuWp: sets the job's weighted-prediction parameters (flags holds the job's lists and its DMVR and BDOF bits)
 void wpJob( Cu cu, Motion m, uint* jslice, int refIdx0, int refIdx1, uint flags, inout uint w[12] )
 {
   const int st = sliceType( jslice );
@@ -1267,7 +1271,7 @@ void wpJob( Cu cu, Motion m, uint* jslice, int refIdx0, int refIdx1, uint flags,
   w[11] = ( uint( offset[1][0] ) & 255 ) | ( uint( offset[1][1] ) & 255 ) << 8 | ( uint( offset[1][2] ) & 255 ) << 16 | uint( n == 2 ) << 24;
 }
 
-// the blocks motionCompensation predicts with one motion each, in tiles of up to 16 x 16
+// Emits the jobs of a block that motionCompensation predicts with one motion, in tiles of up to 16 x 16.
 void mcBlock( Cu cu, Motion m, uint* slice, uint* jslice, uint flags, int bx, int by, int bw, int bh, int refIdx0, int refIdx1, int2 mv0, int2 mv1,
               bool subPu, inout Out o )
 {
@@ -1321,7 +1325,7 @@ void mcBlock( Cu cu, Motion m, uint* slice, uint* jslice, uint flags, int bx, in
   }
 }
 
-// the 4x4 motion (mider.slang's) at a luma position: its reference indices and motion
+// The motion of the 4x4 block at a luma position (mider.slang's MotionInfo): reference indices and vectors.
 void motionAt( int2 pos, out int ref[2], out int2 mv[2] )
 {
   const int ctuMask  = ( 1 << pc.log2Ctu ) - 1;
@@ -1439,8 +1443,8 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
     flags |= kInterLumaMap;
   }
 
-  // the residual: the GPU adds it where a component has one; inside such a component, the transform blocks without
-  // one cleared, by zero jobs of the residuals
+  // The residual: the GPU adds it to each component that has one. Inside such a component, the transform blocks
+  // without a residual are cleared by zero jobs in the residual list.
   if( cu.rootCbf )
   {
     for( int c = 0; c < numComp; c++ )
@@ -1459,7 +1463,7 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
         const int4 block = tu.blk[chOf( c )];
         if( valid( block ) && !cbfOf( tu, c ) && !( c != 0 && tu.jointCbCr != 0 ) && ( pc.ph & kPhTrafo ) != 0 )
         {
-          // in blocks of powers of two (SBT's transform units without the residual are 3/4 of the CU)
+          // in blocks whose sizes are powers of two (an SBT transform unit without residual can be 3/4 of the CU)
           for( int y = 0; y < block.w; y += 1 << log2Of( block.w - y ) )
           {
             for( int x = 0; x < block.z; x += 1 << log2Of( block.z - x ) )
@@ -1475,7 +1479,7 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
     }
   }
 
-  // CIIP: inter's prediction kept aside, all of it, for the blend with planar's
+  // CIIP: keep all of inter's prediction aside, for the blend with planar's
   if( ( cu.flags & kCiip ) != 0 )
   {
     flags |= kInterDeferY | kInterDeferCb | kInterDeferCb << 1;
@@ -1483,7 +1487,7 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
 
   if( ( cu.flags & kGeo ) != 0 )
   {
-    // motionCompensationGeo: each partition a uni-prediction, blended by the mask of the split's angle
+    // motionCompensationGeo: each partition is a uni-prediction; the two are blended with the mask of the split's angle
     const int  dir0  = m.geo[0] >> 4;
     const int  dir1  = m.geo[1] >> 4;
     const int  ref0  = refSlot( jslice, dir0 - 1, m.geo[0] & 15 );
@@ -1510,7 +1514,7 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
   }
   else if( ( cu.flags & kAffine ) != 0 && m.mrgType != MRG_TYPE_SUBPU_ATMVP )
   {
-    // xPredAffineBlk: 4x4 subblocks with motion of their own, refined by PROF
+    // xPredAffineBlk: 4x4 subblocks, each with its own motion, refined by PROF
     uint aflags = flags;
     int  ref0 = 0, ref1 = 0;
     if( m.refIdx[0] >= 0 )
@@ -1590,7 +1594,7 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
   }
   else if( m.mrgType == MRG_TYPE_SUBPU_ATMVP )
   {
-    // SbTMVP's sub-PUs joined where their motion is the same (xSubPuMC)
+    // SbTMVP: neighbouring sub-PUs with the same motion are joined (xSubPuMC)
     const int  numPartLine = max( y4.z >> 3, 1 );
     const int  numPartCol  = max( y4.w >> 3, 1 );
     const int  puHeight    = numPartCol == 1 ? y4.w : 8;
@@ -1658,7 +1662,7 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
   {
     ciipJobs( cu, o, cache, lmcsChroma );
   }
-  // the chroma kept aside: each transform block's prediction plus its residual, scaled where finishLMCSAndReco does
+  // The chroma kept aside: each transform block's prediction plus its residual, scaled where finishLMCSAndReco does
   else if( ( flags & ( kInterDeferCb | kInterDeferCb << 1 ) ) != 0 )
   {
     for( int t = 0; t < cu.numTus; t++ )
@@ -1692,7 +1696,7 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
   }
 }
 
-// DecCu::TaskGpuCtu, a CU
+// DecCu::TaskGpuCtu for one CU: emits all of the CU's jobs
 void cuJobs( int index, inout Out o )
 {
   const Cu cu    = loadCu( index );
@@ -1716,7 +1720,7 @@ void cuJobs( int index, inout Out o )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the waves of intra's jobs (GpuJobs.h's WaveMap, in DecCu's xGpu*Jobs)
+// The waves of the intra jobs (GpuJobs.h's WaveMap, as DecCu's xGpu*Jobs use it)
 // --------------------------------------------------------------------------------------------------------------------
 
 int waveShiftX( int c ) { return 2 - ( c == 0 ? 0 : pc.csx ); }
@@ -1729,7 +1733,7 @@ uint* waveRow( int c, int j )
   return pc.waveMap + c * planeSize + j * waveWidth( c );
 }
 
-// WaveMap::maxIn: the highest wave in the rectangle (component c's samples), clipped to the picture
+// WaveMap::maxIn: the highest wave in the rectangle (in component c's samples), clipped to the picture
 int waveMaxIn( int c, int x, int y, int width, int height )
 {
   if( x + width <= 0 || y + height <= 0 )
@@ -1768,8 +1772,8 @@ void waveSet( int c, int x, int y, int width, int height, int wave )
   }
 }
 
-// WaveMap::maxIn by the 32 threads of a row's workgroup (lane: the thread's), each a unit in turn: the highest wave in
-// the rectangle, in every thread
+// WaveMap::maxIn computed by the 32 threads of a row's workgroup (lane is the calling thread's), each thread taking
+// every 32nd unit; every thread gets the highest wave in the rectangle.
 int waveMaxInP( int c, int x, int y, int width, int height, int lane )
 {
   if( x + width <= 0 || y + height <= 0 )
@@ -1783,7 +1787,7 @@ int waveMaxInP( int c, int x, int y, int width, int height, int lane )
   const int cols = x1 - x0 + 1;
   const int n    = cols > 0 && y1 >= y0 ? cols * ( y1 - y0 + 1 ) : 0;
   int         wave = 0;
-  const float rcp  = 1.0f / float( max( cols, 1 ) );   // (u / cols exactly: u, cols small)
+  const float rcp  = 1.0f / float( max( cols, 1 ) );   // (exactly u / cols, since u and cols are small)
   for( int u = lane; u < n; u += 32 )
   {
     const int j = y0 + int( ( float( u ) + 0.5f ) * rcp );
@@ -1800,7 +1804,7 @@ void waveSetP( int c, int x, int y, int width, int height, int wave, int lane )
   const int y1   = min( ( y + height - 1 ) >> waveShiftY( c ), waveHeight( c ) - 1 );
   const int cols = x1 - x0 + 1;
   const int n    = cols > 0 && y1 >= y0 ? cols * ( y1 - y0 + 1 ) : 0;
-  const float rcp = 1.0f / float( max( cols, 1 ) );   // (u / cols exactly: u, cols small)
+  const float rcp = 1.0f / float( max( cols, 1 ) );   // (exactly u / cols, since u and cols are small)
   for( int u = lane; u < n; u += 32 )
   {
     const int j                                 = y0 + int( ( float( u ) + 0.5f ) * rcp );
@@ -1808,7 +1812,7 @@ void waveSetP( int c, int x, int y, int width, int height, int wave, int lane )
   }
 }
 
-// a job's wave: one above the highest of what it reads (the row's 32 threads together)
+// Sets a job's wave to one above the highest wave of the samples it reads (the row's 32 threads work together).
 void jobWaveP( uint* job, int lane )
 {
   const int  x     = int( job[0] & 0xffff );
@@ -1881,7 +1885,7 @@ void jobWaveP( uint* job, int lane )
   waveSetP( c, x, y, w, h, wave + 1, lane );
 }
 
-// a job's wave: one above the highest of what it reads
+// Sets a job's wave to one above the highest wave of the samples it reads.
 void jobWave( uint* job )
 {
   const int  x     = int( job[0] & 0xffff );
@@ -1902,8 +1906,8 @@ void jobWave( uint* job )
   {
     if( ( flags & kIntraIsp ) != 0 )
     {
-      // the CU's references for its first sub-partition, else the row above and the column to the left, the CU's
-      // width (height) longer than the block's
+      // ISP: the CU's references for the first sub-partition; for the later ones, the row above and the column to
+      // the left, each longer than the block's by the CU's width (height)
       const int cx    = int( job[4] & 0xffff );
       const int cy    = int( job[4] >> 16 );
       const int cw    = int( job[5] & 0xff );
@@ -1928,7 +1932,7 @@ void jobWave( uint* job )
       wave = max( waveMaxIn( c, x - 1 - refLine, y - 1 - refLine, 2 * w + 1 + refLine, 1 ), waveMaxIn( c, x - 1 - refLine, y - refLine, 1, 2 * h + refLine ) );
     }
   }
-  // LMCS's chroma scale: the luma left of and above the CU at the VPDU's top-left
+  // LMCS's chroma scale reads the luma left of and above the CU at the VPDU's top-left
   if( ( job[9] & 1 ) != 0 )
   {
     const int ax    = int( job[8] & 0xffff );
@@ -1945,7 +1949,7 @@ void jobWave( uint* job )
   }
   if( kind == kIntraCclm )
   {
-    // (no further right than the CTU right of the block's, as DecCu)
+    // (no further right than the CTU to the right of the block's CTU, as in DecCu)
     const int lx    = x << pc.csx, ly = y << pc.csy, lw = w << pc.csx, lh = h << pc.csy;
     const int right = ( ( lx >> pc.log2Ctu ) + 2 ) << pc.log2Ctu;
     wave            = max( wave, waveMaxIn( 0, lx - 4, ly - 4, min( 2 * lw + 8, right - ( lx - 4 ) ), 2 * lh + 8 ) );
@@ -1955,7 +1959,7 @@ void jobWave( uint* job )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the passes
+// The passes
 // --------------------------------------------------------------------------------------------------------------------
 
 groupshared int s_scan[5][256];
@@ -1963,7 +1967,8 @@ groupshared int s_scan[5][256];
 #if defined( WAVES )
 groupshared int s_row;
 
-// a workgroup of 32 threads a CTU row, the rows taken in order (a count of them), the wavefront of vvdec's CTU tasks
+// WAVES: one workgroup of 32 threads per CTU row; the rows are taken in order (from a counter) and run as the
+// wavefront of vvdec's CTU tasks.
 [shader( "compute" )]
 [numthreads( 32, 1, 1 )]
 void main( uint3 local : SV_GroupThreadID )
@@ -1997,7 +2002,7 @@ void main( uint3 local : SV_GroupThreadID )
     const int count = int( pc.ctus[ctu * 4 + 1] & 0xffff );
     if( count > 0 )
     {
-      // the CTU's intra jobs: from its first CU's to the next CTU's first CU's
+      // The CTU's intra jobs: from the first job of its first CU up to the first job of the next CTU's first CU
       const int b0    = first >> 8;
       const int begin = int( pc.blocks[b0 * kLists + 2] + pc.counts[first * kLists + 2] );
       const int next  = first + count;
@@ -2006,7 +2011,7 @@ void main( uint3 local : SV_GroupThreadID )
       for( int j = begin; j < min( end, pc.capIntra ); j++ )
       {
         jobWaveP( pc.intra + j * 12, lane );
-        // (the job's units written before the next job's reads)
+        // (the job's wave-map units are written before the next job reads them)
         workgroupBarrierAll();
       }
     }
@@ -2025,7 +2030,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int tid = int( local.x );
   if( pc.pass == 1 )
   {
-    // SCAN: the blocks' sums into their offsets, each thread a run of blocks
+    // SCAN: turn the blocks' totals into offsets; each thread takes a run of blocks.
     const int per = ( pc.numBlocks + 255 ) / 256;
     const int b0  = min( tid * per, pc.numBlocks );
     const int b1  = min( b0 + per, pc.numBlocks );
@@ -2068,10 +2073,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         at[k] += v;
       }
     }
-    // the indirect dispatches: a workgroup a job (an affine pair), in rows of 32768
+    // The indirect dispatches: one workgroup per job (per pair, for affine), in rows of 32768 workgroups.
     if( tid == 0 )
     {
-      // (inter's parts one after the other in its buffer: their first jobs)
+      // (inter's lists lie one after another in its buffer; first[] holds their first jobs)
       const uint regular  = pc.blocks[pc.numBlocks * kLists + 1];
       const uint bdof     = pc.blocks[pc.numBlocks * kLists + 3];
       const uint total[4] = { pc.blocks[pc.numBlocks * kLists + 0], regular, bdof, pc.blocks[pc.numBlocks * kLists + 4] / 2 };
@@ -2098,7 +2103,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   }
   if( o.write )
   {
-    // inter's parts one after the other
+    // inter's lists lie one after another
     o.base[3] += int( pc.blocks[pc.numBlocks * kLists + 1] );
     o.base[4] += int( pc.blocks[pc.numBlocks * kLists + 1] + pc.blocks[pc.numBlocks * kLists + 3] );
   }
@@ -2108,7 +2113,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   }
   if( pc.pass == 0 )
   {
-    // COUNT: the CU's offsets among its block's, the block's sums
+    // COUNT: store the CU's offsets within its block, and the block's totals.
     for( int k = 0; k < kLists; k++ )
     {
       s_scan[k][tid] = index < pc.numCus ? o.n[k] : 0;

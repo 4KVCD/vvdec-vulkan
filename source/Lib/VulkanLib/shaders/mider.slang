@@ -1,38 +1,40 @@
-// Motion derivation (vvdec's DecCu::TaskDeriveCtuMotionInfo / xDeriveCUMV) on
-// the GPU, from the CUs as the parse left them (GpuFrontEnd.h's records):
+// Motion derivation on the GPU (vvdec's DecCu::TaskDeriveCtuMotionInfo /
+// xDeriveCUMV), from the CUs as the parse left them (GpuFrontEnd.h's records).
+// Two variants:
 //
-// - variant CUMAP: the CU covering each 4x4 luma block of the picture (luma's
-//   tree), a workgroup a CU;
-// - the other: each CTU row's CUs in decoding order, one lane a row (the
-//   history-based candidates go along a row, from each tile's left edge), the
-//   rows a wavefront: a CTU begins once the row above is past the CTU above
-//   right, as vvdec's MIDER tasks wait. A CU's motion goes to its record of
-//   motion (what vvdec keeps in the CodingUnit: its control-point motion,
-//   reference indices, BCW, ...) and to the motion of its 4x4 luma blocks
-//   (vvdec's MotionInfo, CTU by CTU as vvdec keeps it), where its neighbours
-//   look it up.
+// - CUMAP records which CU covers each 4x4 luma block of the picture (luma
+//   tree), one workgroup per CU.
+// - The main variant derives each CTU row's CUs in decoding order, one
+//   32-thread workgroup per row (the history-based candidates run along a
+//   row, starting at each tile's left edge). The rows run as a wavefront: a
+//   CTU starts once the row above is past the CTU above-right, as vvdec's
+//   MIDER tasks wait. A CU's
+//   motion goes to its motion record (what vvdec keeps in the CodingUnit:
+//   control-point motion, reference indices, BCW, ...) and to the motion of
+//   its 4x4 luma blocks (vvdec's MotionInfo, CTU by CTU as vvdec keeps it),
+//   where its neighbours look it up.
 //
-// All of vvdec's: regular merge (spatial, temporal, history-based, pairwise
-// and zero candidates), MMVD, CIIP's (regular merge), AMVP with AMVR (SMVD's
-// motion the parse's), BCW's inheritance, IBC's merge and AMVP with its own
-// history, the subblock merge (SbTMVP, the inherited and constructed affine
-// candidates), affine AMVP, GPM.
+// It covers all of vvdec's motion tools: regular merge (spatial, temporal,
+// history-based, pairwise and zero candidates), MMVD, CIIP (regular merge),
+// AMVP with AMVR (SMVD's motion comes from the parse), BCW inheritance, IBC
+// merge and AMVP with IBC's own history, the subblock merge (SbTMVP, the
+// inherited and constructed affine candidates), affine AMVP, and GPM.
 
 #include "common.slang"
 
-// the thread's lane among its row's 32 (the loops over a CU's blocks take every 32nd from it)
+// The thread's lane in its row's 32-lane workgroup; loops over a CU's blocks take every 32nd block, from this lane.
 static int g_lane = 0;
 
 struct Params
 {
-  uint*         cus;        // GpuFrontEnd.h's CuRecord: 32 words each, CTU by CTU, each CTU's in decoding order
+  uint*         cus;        // GpuFrontEnd.h's CuRecord, 32 words each: CTU by CTU, each CTU's CUs in decoding order
   uint*         ctus;       // CtuRecord: 4 words each
-  uint*         slices;     // the picture's slice table: per CTU its slice, then the SliceRecords (64 words each)
-  uint*         cuMap;      // the CU (its index) at each 4x4 luma block, widthIn4 a row
-  int*          cuMotion;   // out: each CU's motion, 16 words (CuMotion)
-  int*          motion;     // out: each 4x4 luma block's motion, vvdec's MotionInfo (5 words), num4x4 a CTU
-  Atomic<uint>* progress;   // per CTU row: its CTUs done; then the rows taken (all zeroed before the dispatch)
-  uint16_t*     subpics;    // with subpicOn: per CTU the rectangle of its subpicture treated as a picture (or the picture's)
+  uint*         slices;     // the picture's slice table: the slice of each CTU, then the SliceRecords (64 words each)
+  uint*         cuMap;      // the index of the CU at each 4x4 luma block, widthIn4 entries per row
+  int*          cuMotion;   // out: each CU's motion record, 16 words (CuMotion)
+  int*          motion;     // out: each 4x4 luma block's motion as vvdec's MotionInfo (5 words), num4x4 per CTU
+  Atomic<uint>* progress;   // per CTU row: the CTUs done; then the rows taken (all zeroed before the dispatch)
+  uint16_t*     subpics;    // subpicOn: per CTU, its subpicture's rectangle (if treated as a picture) or the picture's
   int           numCus;
   int           widthInCtus;
   int           heightInCtus;
@@ -41,19 +43,19 @@ struct Params
   int           height;
   int           widthIn4;
   int           plevel;     // log2 of the parallel merge level
-  int           wpp;        // entropy coding sync (the CTU above right is out of reach)
+  int           wpp;        // entropy coding sync is on (the CTU above-right is then out of reach)
   int           maxNumMergeCand;   // the SPS's
   int           subpicOn;
-  int           sps;        // the SPS's: SbTMVP 1, affine 2, the 6-parameter model 4
-  uint*         cuMapC;     // the CU at each 4x4 luma block of the chroma tree (the single tree's: the luma's)
-  int           csx;        // the chroma's subsampling
+  int           sps;        // the SPS's flags: 1 SbTMVP, 2 affine, 4 the 6-parameter affine model
+  uint*         cuMapC;     // the same as cuMap for the chroma tree (in a single tree, the luma tree's CUs)
+  int           csx;        // chroma subsampling shifts
   int           csy;
 };
 
 [[vk::push_constant]] Params pc;
 
 // --------------------------------------------------------------------------------------------------------------------
-// the records (GpuFrontEnd.h)
+// The records (GpuFrontEnd.h)
 // --------------------------------------------------------------------------------------------------------------------
 
 static const uint kMerge   = 1;
@@ -73,7 +75,7 @@ static const int MRG_TYPE_DEFAULT_N   = 0;
 static const int MRG_TYPE_SUBPU_ATMVP = 1;
 static const int MRG_TYPE_IBC         = 2;
 
-// the kinds of motion a CU's record holds
+// The kinds of motion a CU's motion record holds
 static const int kNotInter    = 0;
 static const int kTranslation = 1;
 static const int kIbc         = 3;
@@ -91,7 +93,8 @@ struct Cu
   int  index;
 };
 
-// the CTU's CU records' first words (loadCu's), read at the CTU's start: its first CU, how many there
+// Shared-memory copy of words 0-3 of each CU record of the current CTU (the fields loadCu reads); cacheCtuCus fills
+// it when a CTU starts. g_cachedFirst is the CTU's first CU and g_cachedCount the number of CUs cached.
 static const int kCachedCus = 512;
 groupshared uint s_cuRec[4 * kCachedCus];
 static int g_cachedFirst = 0;
@@ -123,7 +126,7 @@ Cu loadCu( int index )
   return cu;
 }
 
-// the CTU's CU records into shared memory (all threads)
+// Copies the CTU's CU records into shared memory; all threads of the workgroup call it.
 void cacheCtuCus( int first, int count )
 {
   g_cachedFirst = first;
@@ -131,7 +134,7 @@ void cacheCtuCus( int first, int count )
   const int n   = g_cachedCount * 4;
   for( int base = 0; base < n; base += 128 )
   {
-    // (a thread's four loads issued together)
+    // (each thread issues its four loads together)
     uint v[4];
     for( int j = 0; j < 4; j++ )
     {
@@ -166,13 +169,13 @@ int2 mvdOf( Cu cu, int list, int k )
   return int2( r[0], r[1] );
 }
 
-// a CTU's record: the first CU, the count, the slice, the tile
+// CtuRecord fields: the first CU, the CU count, the slice and the tile
 uint ctuSliceIdx( int ctu ) { return pc.ctus[ctu * 4 + 1] >> 16; }
 uint ctuTile( int ctu ) { return pc.ctus[ctu * 4 + 2] >> 16; }
 bool ctuTileColStart( int ctu ) { return ( pc.ctus[ctu * 4 + 2] & 1 ) != 0; }
 int  ctuOf( int x, int y ) { return ( y >> pc.log2Ctu ) * pc.widthInCtus + ( x >> pc.log2Ctu ); }
 
-// a slice record (GpuFrontEnd.h's SliceRecord)
+// A slice record (GpuFrontEnd.h's SliceRecord)
 struct Slice
 {
   uint* r;
@@ -202,21 +205,21 @@ uint  independentIdx( Slice s ) { return s.r[3]; }
 bool  usedAsLongTerm( Slice s, int list, int refIdx ) { return ( ( s.r[4] >> ( 16 * list + refIdx ) ) & 1 ) != 0; }
 bool  rplLongTerm( Slice s, int list, int refIdx ) { return ( ( s.r[5] >> ( 16 * list + refIdx ) ) & 1 ) != 0; }
 int   refPoc( Slice s, int list, int refIdx ) { return int( s.r[16 + 16 * list + refIdx] ); }
-// the colocated picture's: its motion (ColocatedMotionInfo, 5 words, num8x8 a CTU) and its slice table
+// The colocated picture's motion (ColocatedMotionInfo, 5 words, num8x8 entries per CTU) and slice table
 int*  colMotion( Slice s ) { return (int*) ( uint64_t( s.r[6] ) | ( uint64_t( s.r[7] ) << 32 ) ); }
 uint* colSlices( Slice s ) { return (uint*) ( uint64_t( s.r[8] ) | ( uint64_t( s.r[9] ) << 32 ) ); }
-// the colocated picture itself (slice.getRefPic( colList, colRefIdx )): its POC in the lists
+// The POC of the colocated picture itself (slice.getRefPic( colList, colRefIdx )), from the reference lists
 int   colPicPoc( Slice s ) { return refPoc( s, isInterB( s ) ? ( colFromL0( s ) ? 0 : 1 ) : 0, colRefIdx( s ) ); }
 
 // --------------------------------------------------------------------------------------------------------------------
-// motion
+// Motion
 // --------------------------------------------------------------------------------------------------------------------
 
-// vvdec's MotionInfo, with what its users keep alongside (MvField lists, HPMVInfo)
+// vvdec's MotionInfo, plus what its users keep alongside it (MvField lists, HPMVInfo)
 struct Motion
 {
   int2 mv[2];
-  int  refIdx[2];   // < 0: the list unused
+  int  refIdx[2];   // < 0: the list is unused
   int  bcw;
   bool hpel;        // AMVR's half-sample filter (useAltHpelIf)
   int  mrgType;     // vvdec's MergeType
@@ -250,7 +253,7 @@ bool sameMotion( Motion a, Motion b )
   return true;
 }
 
-// Mv::mvCliptoStorageBitDepth: periodic, to 18 bits
+// Mv::mvCliptoStorageBitDepth: wraps around to 18 bits
 int wrapMv( int v )
 {
   const int period = 1 << 18;
@@ -276,7 +279,7 @@ int2 changePrecision( int2 v, int src, int dst )
   return int2( v.x >= 0 ? ( v.x + offset - 1 ) >> rs : ( v.x + offset ) >> rs, v.y >= 0 ? ( v.y + offset - 1 ) >> rs : ( v.y + offset ) >> rs );
 }
 
-// Mv::roundToPrecision( src, dst ): to dst and back
+// Mv::roundToPrecision( src, dst ): converts to dst and back
 int2 roundToPrecision( int2 v, int src, int dst )
 {
   return changePrecision( changePrecision( v, src, dst ), dst, src );
@@ -324,7 +327,7 @@ int distScale( int currPoc, int currRefPoc, int colPoc, int colRefPoc )
   return clamp( ( tdb * x + 32 ) >> 6, -4096, 4095 );
 }
 
-// roundMvComp: through vvdec's 6-bit mantissa, 4-bit exponent form
+// roundMvComp: rounds through vvdec's 6-bit mantissa, 4-bit exponent form
 int roundMvComp( int val )
 {
   const int sign  = val >> 31;
@@ -352,7 +355,7 @@ int roundMvComp( int val )
 int log2Of( int v ) { return int( firstbithigh( uint( v ) ) ); }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the motion of the 4x4 blocks, and the CUs' records of motion
+// The motion of the 4x4 blocks, and the CUs' motion records
 // --------------------------------------------------------------------------------------------------------------------
 
 int* motionPtr( int x, int y )
@@ -363,7 +366,7 @@ int* motionPtr( int x, int y )
   return pc.motion + ( ctuOf( x, y ) * ctuSize4 * ctuSize4 + pos ) * 5;
 }
 
-// the MotionInfo at (x, y)
+// The MotionInfo at (x, y)
 Motion motionAt( int x, int y )
 {
   int*       mi = motionPtr( x, y );
@@ -376,7 +379,7 @@ Motion motionAt( int x, int y )
   return m;
 }
 
-// the 4x4 block's MotionInfo; kind in its padding (for the comparison with the CPU's)
+// Stores the 4x4 block's MotionInfo, with kind in its padding (for the comparison with the CPU's motion).
 void storeMotionAt( int x, int y, Motion m, int kind )
 {
   int* mi = motionPtr( x, y );
@@ -387,10 +390,10 @@ void storeMotionAt( int x, int y, Motion m, int kind )
   mi[4]   = int( ( uint( m.refIdx[0] ) & 0xff ) | ( ( uint( m.refIdx[1] ) & 0xff ) << 8 ) | ( uint( kind ) << 16 ) );
 }
 
-// a CU's record of motion, as the CodingUnit keeps it after the derivation:
-// mv[l][k] at w[6 l + 2 k], the reference indices, the inter direction, BCW,
-// AMVR's half-sample (imv == IMV_HPEL), the merge type, the kind of motion,
-// the affine model (6 parameters)
+// A CU's motion record, as the CodingUnit keeps it after the derivation:
+// mv[l][k] at word 6 l + 2 k, then the reference indices, the inter
+// direction, BCW, AMVR's half-sample flag (imv == IMV_HPEL), the merge type,
+// the kind of motion, and whether the affine model has 6 parameters.
 struct CuMotion
 {
   int2 mv[2][3];
@@ -462,7 +465,7 @@ CuMotion loadCuMotion( int cuIdx )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// neighbours
+// Neighbours
 // --------------------------------------------------------------------------------------------------------------------
 
 struct Cur
@@ -472,7 +475,7 @@ struct Cur
   Slice slice;
   uint  sliceIdx;   // the independent slice's index
   uint  tile;
-  int4  rect;       // the subpicture treated as a picture (left, top, right, bottom), or the picture
+  int4  rect;       // the subpicture if treated as a picture, else the picture (left, top, right, bottom)
 };
 
 int4 ctuRect( int ctu )
@@ -485,7 +488,7 @@ int4 ctuRect( int ctu )
   return int4( 0, 0, pc.width - 1, pc.height - 1 );
 }
 
-// CodingStructure::getCURestricted on luma: the CU at (x, y) where cur may use it, -1 where not
+// CodingStructure::getCURestricted on luma: the CU at (x, y) if cur may use it, else -1
 int cuAt( Cur cur, int x, int y )
 {
   if( x < 0 || y < 0 || x >= pc.width || y >= pc.height )
@@ -512,8 +515,9 @@ int cuAt( Cur cur, int x, int y )
   return -1;
 }
 
-// the CTUs left (0), above left (1), above (2) and above right (3) of the CU's: whether getCURestricted lets the CU
-// use them (in its slice and tile, above right not with WPP), their independent slices (setNeighbourCtus, a CTU)
+// The CTUs left (0), above-left (1), above (2) and above-right (3) of the CU's CTU: g_nbAvail tells whether
+// getCURestricted lets the CU use each (same slice and tile; above-right not with WPP), and g_nbSlice holds their
+// independent slices. setNeighbourCtus sets both once per CTU.
 static uint g_nbAvail;
 static uint g_nbSlice[4];
 
@@ -524,7 +528,7 @@ int nbCtu( int xdiff, int ydiff )
 
 void setNeighbourCtus( Cur cur, int col, int row )
 {
-  // thread k the CTU k (its record, its slice's): one wait for the four
+  // Thread k reads CTU k's record and slice, so the four CTUs cost a single wait for memory.
   const int  k     = g_lane & 3;
   const int  dx    = k == 0 ? -1 : k - 2;
   const int  dy    = k == 0 ? 0 : -1;
@@ -547,14 +551,14 @@ void setNeighbourCtus( Cur cur, int col, int row )
   }
 }
 
-// the independent slice of the CTU at (x, y): the CU's or one around it (sliceIdxOfCu of the CU there)
+// The independent slice of the CTU at (x, y), the CU's CTU or one around it (the same as sliceIdxOfCu of the CU there)
 uint sliceIdxAt( Cur cur, int x, int y )
 {
   const int k = nbCtu( ( x >> pc.log2Ctu ) - ( cur.cu.x >> pc.log2Ctu ), ( y >> pc.log2Ctu ) - ( cur.cu.y >> pc.log2Ctu ) );
   return k < 0 ? cur.sliceIdx : g_nbSlice[k];
 }
 
-// the independent slice of a CU (its CTU's)
+// The independent slice of a CU (its CTU's)
 uint sliceIdxOfCu( int cuIdx )
 {
   Cu cu = loadCu( cuIdx );
@@ -573,7 +577,7 @@ bool isDiffMer( int x1, int y1, int x2, int y2 )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the histories (MotionHist), per row: the regular one and IBC's
+// The history tables (MotionHist), one pair per row: the regular one and IBC's
 // --------------------------------------------------------------------------------------------------------------------
 
 static const int kMaxHmvp = 5;   // MAX_NUM_HMVP_CANDS
@@ -609,7 +613,8 @@ void setLutEntry( int lut, int i, Motion m )
 // MotionHist::addMiToLut (HPMVInfo's == compares the motion only)
 void addToLut( int lut, Motion mi )
 {
-  // thread i entry i: the first alike by a ballot, the entries after it down by one at once
+  // Thread i handles entry i: a ballot finds the first entry equal to mi, and the entries after it all move down
+  // by one at once.
   const int  count  = s_lutSize[lut];
   const int  i      = g_lane;
   const bool alike  = i < count && sameMotion( lutEntry( lut, min( i, kMaxHmvp - 1 ) ), mi );
@@ -639,10 +644,10 @@ void addToLut( int lut, Motion mi )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the temporal candidates
+// The temporal candidates
 // --------------------------------------------------------------------------------------------------------------------
 
-// the colocated picture's motion at (x, y): its MotionInfo and its CTU's slice
+// The colocated picture's motion at (x, y): its MotionInfo, and the slice of its CTU
 Motion colMotionAt( Cur cur, int x, int y, out Slice colSlice )
 {
   const int ctuCol = ctuOf( x, y );
@@ -716,21 +721,21 @@ bool colocatedMvp( Cur cur, int list, int x, int y, int refIdx, bool sbFlag, out
   return true;
 }
 
-// the temporal candidate's positions (getInterMergeCandidates, fillMvpCand, the affine constructed candidates'
-// RB): C0 where it may be used, C1
+// The temporal candidate's positions (getInterMergeCandidates, fillMvpCand, the affine constructed candidates'
+// RB): C0 and whether it may be used, then C1
 void colPositions( Cur cur, out bool c0Avail, out int2 c0, out int2 c1 )
 {
   const int2 rb      = int2( cur.cu.x + cur.cu.w - 1 - 3, cur.cu.y + cur.cu.h - 1 - 3 );
   c1                 = int2( cur.cu.x + ( cur.cu.w >> 1 ), cur.cu.y + ( cur.cu.h >> 1 ) );
   c0                 = rb + int2( 4, 4 );
   const int ctuMask  = ( 1 << pc.log2Ctu ) - 1;
-  // (minCUWidth 4): inside the picture, or the subpicture treated as a picture
+  // (minCUWidth 4): C0 must lie inside the picture, or inside the subpicture treated as a picture
   const bool boundary = rb.x + 4 <= cur.rect.z && rb.y + 4 <= cur.rect.w;
   c0Avail             = boundary && ( rb.y & ctuMask ) + 4 < ( 1 << pc.log2Ctu );
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// merge
+// Merge
 // --------------------------------------------------------------------------------------------------------------------
 
 static const int kMaxMerge = 6;
@@ -765,8 +770,8 @@ void setCand( int i, Motion m )
   s_candType[i]   = m.mrgType;
 }
 
-// a neighbour's motion at (x, y) when it is an inter CU (CU::isInter), with
-// what its CU keeps: BCW, AMVR's half-sample
+// A neighbour's motion at (x, y) if it is an inter CU (CU::isInter), with what
+// its CU keeps: BCW and AMVR's half-sample flag.
 bool neighbourMotion( int cuIdx, int x, int y, out Motion m )
 {
   m = noMotion();
@@ -781,9 +786,9 @@ bool neighbourMotion( int cuIdx, int x, int y, out Motion m )
   return true;
 }
 
-// cuAt and neighbourMotion of a spatial neighbour at (x, y) next to the CU (in its CTU or one of the four around):
-// the CU map's word and the block's motion read together; a translational CU's BCW and half-sample flag from its
-// block (spanMotion's), other kinds' from their CU's record
+// cuAt and neighbourMotion for a spatial neighbour at (x, y) next to the CU (in the CU's CTU or one of the four
+// around it). The CU map's word and the block's motion are read together. A translational CU's BCW and half-sample
+// flag come from its block (where spanMotion put them); for other kinds, from the CU's motion record.
 bool neighbourAt( Cur cur, int x, int y, out int cuIdx, out Motion m )
 {
   m     = noMotion();
@@ -829,7 +834,7 @@ bool neighbourAt( Cur cur, int x, int y, out int cuIdx, out Motion m )
   return true;
 }
 
-// a spatial candidate from a neighbour's motion: the second list's only in B slices
+// A spatial candidate from a neighbour's motion; the second list is used only in B slices.
 Motion spatialCand( Motion n, bool interB )
 {
   Motion c    = noMotion();
@@ -845,7 +850,7 @@ Motion spatialCand( Motion n, bool interB )
   return c;
 }
 
-// xCheckSimilarMotion: candidate idx against the not yet pruned ones before prevCnt
+// xCheckSimilarMotion: compares candidate idx with the candidates before prevCnt that are not pruned yet.
 bool similarMotion( int idx, int prevCnt, inout uint pruned )
 {
   const Motion c = cand( idx );
@@ -881,7 +886,7 @@ bool similarMotion( int idx, int prevCnt, inout uint pruned )
   return false;
 }
 
-// PU::getInterMergeCandidates up to candidate last (its fast exit; last < 0: all): returns the candidates there are
+// PU::getInterMergeCandidates up to candidate last (its fast exit; last < 0: all); returns the number of candidates.
 int mergeCandidates( Cur cur, int last )
 {
   const int  maxCand = pc.maxNumMergeCand;
@@ -974,7 +979,7 @@ int mergeCandidates( Cur cur, int last )
     if( cnt == maxCand ) return cnt;
   }
 
-  // the temporal candidate
+  // The temporal candidate
   if( tmvp( cur.slice ) && cur.cu.w + cur.cu.h > 12 )
   {
     bool c0Avail;
@@ -1001,7 +1006,7 @@ int mergeCandidates( Cur cur, int last )
     if( cnt == maxCand ) return cnt;
   }
 
-  // the history (addMergeHMVPCand): the newest first, the first two pruned against B1 and A1
+  // The history candidates (addMergeHMVPCand): newest first; the first two are pruned against B1 and A1.
   const int maxCandMin1 = maxCand - 1;
   if( cnt != maxCandMin1 )
   {
@@ -1038,7 +1043,7 @@ int mergeCandidates( Cur cur, int last )
     }
   }
 
-  // the pairwise average of the first two
+  // The pairwise average of the first two candidates
   if( cnt > 1 && cnt < maxCand )
   {
     Motion c0 = cand( 0 );
@@ -1069,16 +1074,16 @@ int mergeCandidates( Cur cur, int last )
         p.refIdx[l] = rj;
       }
     }
-    setCand( cnt, p );   // (when it isn't one, its hpel stays, as vvdec's)
+    setCand( cnt, p );   // (when p is no candidate, its hpel stays in the slot, as in vvdec)
     if( interDir( p ) > 0 )
     {
-      if( cnt == last ) return cnt + 1;   // (vvdec has no fast exit here: the same list either way)
+      if( cnt == last ) return cnt + 1;   // (vvdec has no fast exit here; the list is the same either way)
       cnt++;
     }
     if( cnt == maxCand ) return cnt;
   }
 
-  // zero candidates
+  // Zero candidates
   const int numRef = interB ? min( numRefIdx( cur.slice, 0 ), numRefIdx( cur.slice, 1 ) ) : numRefIdx( cur.slice, 0 );
   int       r      = 0;
   int       refcnt = 0;
@@ -1109,10 +1114,10 @@ int mergeCandidates( Cur cur, int last )
   return cnt;
 }
 
-// MergeCtx::setMmvdMergeCandiInfo, after getInterMMVDMergeCandidates: the motion of MMVD index idx
+// MergeCtx::setMmvdMergeCandiInfo, after getInterMMVDMergeCandidates: returns the motion of MMVD index idx
 Motion mmvdMotion( Cur cur, int idx, int numCand )
 {
-  // the base candidates: the first two of type DEFAULT_N
+  // The base candidates: the first two candidates of type DEFAULT_N
   Motion base[2];
   base[0]   = noMotion();
   base[1]   = noMotion();
@@ -1200,7 +1205,7 @@ Motion mmvdMotion( Cur cur, int idx, int numCand )
 // AMVP
 // --------------------------------------------------------------------------------------------------------------------
 
-// PU::addMVPCandUnscaled: a neighbour's motion in either list to the current reference picture
+// PU::addMVPCandUnscaled: a neighbour's motion, in either list, that points to the current reference picture
 bool amvpSpatial( Cur cur, int list, int currRefPoc, int x, int y, out int2 mv )
 {
   mv = int2( 0, 0 );
@@ -1222,7 +1227,7 @@ bool amvpSpatial( Cur cur, int list, int currRefPoc, int x, int y, out int2 mv )
   return false;
 }
 
-// PU::fillMvpCand: candidate mvpIdx
+// PU::fillMvpCand: returns candidate mvpIdx
 int2 amvpCandidate( Cur cur, int list, int refIdx, int amvr, int mvpIdx )
 {
   int2 cands[2];
@@ -1265,7 +1270,7 @@ int2 amvpCandidate( Cur cur, int list, int refIdx, int amvr, int mvpIdx )
       cands[num++] = roundToAmvr( mv, amvr );
     }
   }
-  // the history (addAMVPHMVPCand): up to 4 entries, the LUT's first first
+  // The history candidates (addAMVPHMVPCand): up to 4 entries, starting with the LUT's first entry
   if( num < 2 )
   {
     const int count = min( 4, s_lutSize[0] );
@@ -1283,7 +1288,7 @@ int2 amvpCandidate( Cur cur, int list, int refIdx, int amvr, int mvpIdx )
       }
     }
   }
-  // zeros for the rest (after the spatial pair made one: the second's slot too)
+  // Zeros for the rest (including the second slot when the spatial pair collapsed into one)
   for( int i = num; i < 2; i++ )
   {
     cands[i] = int2( 0, 0 );
@@ -1295,7 +1300,7 @@ int2 amvpCandidate( Cur cur, int list, int refIdx, int amvr, int mvpIdx )
 // IBC
 // --------------------------------------------------------------------------------------------------------------------
 
-// an IBC neighbour's block vector (its MotionInfo with miRefIdx[0] made valid)
+// An IBC neighbour's block vector (its MotionInfo, with miRefIdx[0] made valid)
 bool ibcNeighbour( int cuIdx, int x, int y, out Motion m )
 {
   m = noMotion();
@@ -1308,7 +1313,7 @@ bool ibcNeighbour( int cuIdx, int x, int y, out Motion m )
   return true;
 }
 
-// PU::getIBCMergeCandidates up to candidate last: the block vectors in s_candMv[0]
+// PU::getIBCMergeCandidates up to candidate last; the block vectors go to s_candMv[0].
 int ibcMergeCandidates( Cur cur, int last )
 {
   const int  maxCand = maxIbcCand( cur.slice );
@@ -1351,7 +1356,7 @@ int ibcMergeCandidates( Cur cur, int last )
   }
   if( cnt == maxCand ) return cnt;
 
-  // the history (addMergeHMVPCand for IBC): no pairwise candidate, so up to the last
+  // The history candidates (addMergeHMVPCand for IBC): IBC has no pairwise candidate, so they may fill the list
   const int spatialCandPos = cnt;
   if( cnt != maxCand )
   {
@@ -1384,7 +1389,7 @@ int ibcMergeCandidates( Cur cur, int last )
   }
   while( cnt < maxCand )
   {
-    setCand( cnt, noMotion() );   // (0, 0) with NOT_VALID: interDir 1
+    setCand( cnt, noMotion() );   // (0, 0) with NOT_VALID, i.e. interDir 1
     cnt++;
     if( last == cnt )
     {
@@ -1395,7 +1400,7 @@ int ibcMergeCandidates( Cur cur, int last )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// affine
+// Affine
 // --------------------------------------------------------------------------------------------------------------------
 
 static const int kMaxAffine = 5;   // AFFINE_MRG_MAX_NUM_CANDS
@@ -1423,7 +1428,7 @@ void clearAffineCand( int i )
   s_affBcw[i]     = 0;
 }
 
-// PU::xInheritedAffineMv: a neighbouring affine CU's model at the current CU's corners
+// PU::xInheritedAffineMv: evaluates a neighbouring affine CU's model at the current CU's corners
 void inheritedAffineMv( Cur cur, bool is6param, int nIdx, int list, out int2 mv[3] )
 {
   mv[0]              = int2( 0, 0 );
@@ -1441,7 +1446,7 @@ void inheritedAffineMv( Cur cur, bool is6param, int nIdx, int list, out int2 mv[
   bool      topCtu   = false;
   if( ( posNeiY + n.h ) % ( 1 << pc.log2Ctu ) == 0 && posNeiY + n.h == posCurY )
   {
-    // the bottom-left and bottom-right subblocks' motion
+    // (the neighbour's bottom-left and bottom-right subblocks' motion)
     mvLT = motionAt( n.x, n.y + n.h - 1 ).mv[list];
     mvRT = motionAt( n.x + n.w - 1, n.y + n.h - 1 ).mv[list];
     posNeiY += n.h;
@@ -1477,7 +1482,7 @@ void inheritedAffineMv( Cur cur, bool is6param, int nIdx, int list, out int2 mv[
   }
 }
 
-// an affine neighbour for inheritance (affine, of merge type DEFAULT_N), -1 for none
+// An affine neighbour usable for inheritance (affine, of merge type DEFAULT_N), or -1
 int affineNeighbour( Cur cur, int x, int y )
 {
   const int idx = cuAt( cur, x, y );
@@ -1492,8 +1497,8 @@ int affineNeighbour( Cur cur, int x, int y )
   return idx;
 }
 
-// PU::getAffineControlPointCand: a constructed candidate from the corners mi[] (where available) of the model
-// given; added at numValid when it is one
+// PU::getAffineControlPointCand: builds a constructed candidate of the given model from the corners mi[] (where
+// available), and adds it at numValid when it is valid.
 void affineControlPointCand( Cur cur, Motion mi[4], bool avail[4], int4 verIdx, int bcw, int modelIdx, int verNum, inout int numValid )
 {
   const int shift     = 7;
@@ -1589,15 +1594,15 @@ int2 clipColPos( Cur cur, int2 p )
   const int ctuSize = 1 << pc.log2Ctu;
   const int ctuX    = ( cur.cu.x >> pc.log2Ctu ) << pc.log2Ctu;
   const int ctuY    = ( cur.cu.y >> pc.log2Ctu ) << pc.log2Ctu;
-  const int horMax  = min( cur.rect.z, ctuX + ctuSize + 3 );   // (the subpicture's right, or the picture's)
+  const int horMax  = min( cur.rect.z, ctuX + ctuSize + 3 );   // (the right edge of the subpicture, or of the picture)
   const int horMin  = max( 0, ctuX );
   const int verMax  = min( pc.height - 1, ctuY + ctuSize - 1 );
   const int verMin  = max( 0, ctuY );
   return int2( min( horMax, max( horMin, p.x ) ), min( verMax, max( verMin, p.y ) ) );
 }
 
-// PU::getInterMergeSubPuMvpCand: the SbTMVP candidate at count (its center motion), and with spread, its 8x8
-// sub-PUs' motion into the CU's 4x4 blocks
+// PU::getInterMergeSubPuMvpCand: sets the SbTMVP candidate at index count (its centre motion) and, with spread,
+// writes its 8x8 sub-PUs' motion into the CU's 4x4 blocks.
 bool subPuMvpCand( Cur cur, int count, bool spread )
 {
   const bool interB = isInterB( cur.slice );
@@ -1647,7 +1652,7 @@ bool subPuMvpCand( Cur cur, int count, bool spread )
     return found;
   }
 
-  // the sub-PUs of 8x8
+  // The 8x8 sub-PUs
   const bool biRestricted = cur.cu.w + cur.cu.h <= 12;
   const int  w8           = max( cur.cu.w >> 3, 1 );
   const int  lw8          = log2Of( w8 );
@@ -1693,7 +1698,7 @@ bool subPuMvpCand( Cur cur, int count, bool spread )
   return true;
 }
 
-// PU::getAffineMergeCand up to candidate last: the list in s_aff*
+// PU::getAffineMergeCand up to candidate last; the list goes to the s_aff* arrays.
 void affineMergeCandidates( Cur cur, int last )
 {
   const int  maxCand = maxAffineCand( cur.slice );
@@ -1706,8 +1711,8 @@ void affineMergeCandidates( Cur cur, int last )
 
   // SbTMVP
   const bool subPu = ( pc.sps & 1 ) != 0 && !( slicePoc( cur.slice ) == refPoc( cur.slice, 0, 0 ) && sliceIrap( cur.slice ) );
-  // (a colocated picture there with TMVP: unless its tables are missing,
-  // which the comparison shows, and its motion must not be read then)
+  // (With TMVP there is a colocated picture, unless its tables are missing --
+  // the comparison shows such cases -- and then its motion must not be read.)
   if( subPu && tmvp( cur.slice ) && hasColPic( cur.slice ) )
   {
     int        pos = 0;
@@ -1726,7 +1731,7 @@ void affineMergeCandidates( Cur cur, int last )
       }
       pos++;
     }
-    // (the sub-PUs' motion only for the CU taking the candidate: merge index 0)
+    // (the sub-PUs' motion is written only for a CU that takes this candidate: merge index 0)
     if( subPuMvpCand( cur, pos, mergeIdx( cur.cu ) == 0 ) )
     {
       s_affMrgType[numValid] = MRG_TYPE_SUBPU_ATMVP;
@@ -1740,7 +1745,7 @@ void affineMergeCandidates( Cur cur, int last )
 
   if( ( pc.sps & 2 ) != 0 )
   {
-    // inherited: the left's (A0, A1) and the above's (B0, B1, B2) first affine neighbour
+    // Inherited candidates: the first affine neighbour on the left (A0, A1) and the first one above (B0, B1, B2)
     const int2 lt = int2( cur.cu.x, cur.cu.y );
     const int2 rt = int2( cur.cu.x + cur.cu.w - 1, cur.cu.y );
     const int2 lb = int2( cur.cu.x, cur.cu.y + cur.cu.h - 1 );
@@ -1810,7 +1815,7 @@ void affineMergeCandidates( Cur cur, int last )
       }
     }
 
-    // constructed: the corners LT (B2, B3, A2), RT (B1, B0), LB (A1, A0), RB (the temporal)
+    // Constructed candidates, from the corners LT (B2, B3, A2), RT (B1, B0), LB (A1, A0) and RB (the temporal one)
     Motion mi[4];
     bool   avail[4];
     int    neighBcw[2] = { 0, 0 };
@@ -1889,7 +1894,7 @@ void affineMergeCandidates( Cur cur, int last )
     }
   }
 
-  // zero candidates
+  // Zero candidates
   for( int cnt = numValid; cnt < maxCand; cnt++ )
   {
     for( int k = 0; k < 3; k++ )
@@ -1936,8 +1941,8 @@ bool spreadOverLimit( int a, int b, int c, int d, int predType )
   return w * h > ( filterTap + 5 ) * ( filterTap + 9 );
 }
 
-// PU::setAllAffineMv: the subblocks' motion of list l from the corners, into the 4x4 blocks' (mv[l] only); the
-// corners kept in the CU's record
+// PU::setAllAffineMv: derives the subblocks' motion of list l from the corners and writes it into the 4x4 blocks
+// (mv[l] only); the corners are kept in the CU's motion record.
 void setAllAffineMv( Cur cur, inout CuMotion c, int2 lt, int2 rt, int2 lb, int l, bool clipCpmvs, int dir )
 {
   const int w     = cur.cu.w;
@@ -2035,7 +2040,7 @@ bool affineAmvpInherited( Cur cur, int list, int refIdx, int x, int y, int amvr,
   return false;
 }
 
-// PU::fillAffineMvpCand: candidate mvpIdx's corners
+// PU::fillAffineMvpCand: returns the corners of candidate mvpIdx
 void affineAmvpCandidate( Cur cur, int list, int refIdx, int amvr, int mvpIdx, bool cur6, out int2 cand[3] )
 {
   int2 lts[2], rts[2], lbs[2];
@@ -2057,7 +2062,7 @@ void affineAmvpCandidate( Cur cur, int list, int refIdx, int amvr, int mvpIdx, b
   const int2 rt = int2( cur.cu.x + cur.cu.w - 1, cur.cu.y );
   const int2 lb = int2( cur.cu.x, cur.cu.y + cur.cu.h - 1 );
   int2       o[3];
-  // inherited: left (below left, left), above (above right, above, above left)
+  // Inherited candidates: from the left (below-left, left) and from above (above-right, above, above-left)
   if( affineAmvpInherited( cur, list, refIdx, lb.x - 1, lb.y + 1, amvr, cur6, o ) || affineAmvpInherited( cur, list, refIdx, lb.x - 1, lb.y, amvr, cur6, o ) )
   {
     lts[num] = o[0];
@@ -2075,7 +2080,7 @@ void affineAmvpCandidate( Cur cur, int list, int refIdx, int amvr, int mvpIdx, b
   }
   if( num < 2 )
   {
-    // constructed: the corners' motion (addMVPCandUnscaled)
+    // Constructed candidates from the corners' motion (addMVPCandUnscaled)
     const int currRefPoc = refPoc( cur.slice, list, refIdx );
     int       pattern    = 0;
     int2      v[3];
@@ -2150,7 +2155,7 @@ void affineAmvpCandidate( Cur cur, int list, int refIdx, int amvr, int mvpIdx, b
           num++;
         }
       }
-      // (the zero candidates: zeros already)
+      // (the zero candidates are already zero)
     }
   }
   cand[0] = lts[mvpIdx];
@@ -2175,7 +2180,7 @@ static const uint16_t kGeoParams[64] = { 256, 768, 2, 258, 514, 770, 3, 259, 515
                                          276, 532, 788, 277, 533, 789, 280, 792, 283, 539, 795, 284, 540, 796, 285, 541, 797, 286, 542, 798 };
 static const int8_t   kDis[32]       = { 8, 8, 8, 8, 4, 4, 2, 1, 0, -1, -2, -4, -4, -8, -8, -8, -8, -8, -8, -8, -4, -4, -2, -1, 0, 1, 2, 4, 4, 8, 8, 8 };
 
-// PU::getGeoMergeCandidates' candidate idx (each a uni-directional motion), from the full merge list
+// Candidate idx of PU::getGeoMergeCandidates (each candidate is a uni-directional motion), from the full merge list
 Motion geoCandidate( int numMerge, int idx )
 {
   int numValid = 0;
@@ -2218,7 +2223,7 @@ Motion geoCandidate( int numMerge, int idx )
   return noMotion();
 }
 
-// PU::spanGeoMotionInfo: the 4x4 blocks' motion from the split and the partitions' candidates
+// PU::spanGeoMotionInfo: sets the 4x4 blocks' motion from the split and the partitions' candidates
 void spanGeo( Cur cur, int splitDir, Motion m0, Motion m1 )
 {
   Motion    bi = noMotion();
@@ -2282,21 +2287,22 @@ void spanGeo( Cur cur, int splitDir, Motion m0, Motion m1 )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// a CU
+// A CU
 // --------------------------------------------------------------------------------------------------------------------
 
-// the CU's area of 4x4 blocks with one motion
+// Fills the CU's 4x4 blocks with one motion.
 void spanMotion( Cur cur, Motion m, int kind )
 {
-  // (the CU in one CTU, its sizes powers of two: its CTU's blocks from the CU's first)
+  // (the CU lies within one CTU and its sizes are powers of two, so its blocks are addressed from its first block)
   const int lw4     = log2Of( cur.cu.w ) - 2;
   const int log2C4  = pc.log2Ctu - 2;
   const int ctuMask = ( 1 << pc.log2Ctu ) - 1;
   int*      first   = pc.motion + ( ( ctuOf( cur.cu.x, cur.cu.y ) << ( 2 * log2C4 ) ) + ( ( cur.cu.y & ctuMask ) >> 2 << log2C4 )
                                   + ( ( cur.cu.x & ctuMask ) >> 2 ) ) * 5;
   const int w4      = 1 << lw4;
+  // The packed word: the reference indices, the kind, then BCW and AMVR's half-sample flag (for neighbourAt)
   const int packed  = int( ( uint( m.refIdx[0] ) & 0xff ) | ( ( uint( m.refIdx[1] ) & 0xff ) << 8 ) | ( uint( kind ) << 16 )
-                            | ( ( uint( m.bcw ) & 7 ) << 24 ) | ( m.hpel ? 1u << 27 : 0u ) );   // (BCW, AMVR's half-sample: neighbourAt's)
+                            | ( ( uint( m.bcw ) & 7 ) << 24 ) | ( m.hpel ? 1u << 27 : 0u ) );
   for( int u = g_lane; u < w4 * ( cur.cu.h >> 2 ); u += 32 )
   {
     int* mi = first + ( ( ( u >> lw4 ) << log2C4 ) + ( u & ( w4 - 1 ) ) ) * 5;
@@ -2319,7 +2325,7 @@ void restrictBi( Cur cur, inout Motion m )
   }
 }
 
-// DecCu::xDeriveCUMV: the CU's motion into its record and its 4x4 blocks'
+// DecCu::xDeriveCUMV: derives the CU's motion and writes it to the CU's motion record and its 4x4 blocks
 void deriveCu( Cur cur )
 {
   Cu       cu = cur.cu;
@@ -2332,7 +2338,7 @@ void deriveCu( Cur cur )
   {
     for( int k = 0; k < 3; k++ )
     {
-      c.mv[l][k] = mvdOf( cu, l, k );   // (as the CU keeps them where the derivation doesn't set them)
+      c.mv[l][k] = mvdOf( cu, l, k );   // (what the CU keeps where the derivation does not set the motion)
     }
     c.refIdx[l] = refIdxOf( cu, l );
   }
@@ -2392,7 +2398,7 @@ void deriveCu( Cur cur )
     c.mv[0][1]    = m0.mv[interDir( m0 ) == 1 ? 0 : 1];
     c.mv[1][1]    = m1.mv[interDir( m1 ) == 1 ? 0 : 1];
     storeCuMotion( cu.index, c );
-    // the partitions' inter direction << 4 | reference index (CodingUnit's interDirrefIdxGeo0, 1)
+    // The partitions' inter direction << 4 | reference index (CodingUnit's interDirrefIdxGeo0, 1)
     const uint g0 = uint( interDir( m0 ) ) << 4 | uint( m0.refIdx[interDir( m0 ) == 1 ? 0 : 1] );
     const uint g1 = uint( interDir( m1 ) ) << 4 | uint( m1.refIdx[interDir( m1 ) == 1 ? 0 : 1] );
     pc.cuMotion[cu.index * 16 + 13] = int( g0 | g1 << 8 );
@@ -2402,7 +2408,7 @@ void deriveCu( Cur cur )
 
   if( ( cu.flags & kAffine ) != 0 && ( cu.flags & kMerge ) != 0 )
   {
-    // the subblock merge list: SbTMVP, inherited and constructed affine, zero
+    // The subblock merge list: SbTMVP, inherited and constructed affine, and zero candidates
     const int idx = mergeIdx( cu );
     affineMergeCandidates( cur, idx );
     c.interDir = s_affDir[idx];
@@ -2411,8 +2417,8 @@ void deriveCu( Cur cur )
     c.mrgType  = s_affMrgType[idx];
     if( c.mrgType == MRG_TYPE_SUBPU_ATMVP )
     {
-      // (the sub-PUs' motion already in the 4x4 blocks; the CU's reference
-      // indices those of the list's first entry, as vvdec's)
+      // (the sub-PUs' motion is already in the 4x4 blocks; the CU's reference
+      // indices are those of the list's first entry, as in vvdec)
       c.kind      = kSbtmvp;
       c.refIdx[0] = s_affRef[0][idx];
       c.refIdx[1] = s_affRef[1][idx];
@@ -2431,7 +2437,7 @@ void deriveCu( Cur cur )
   }
   else if( ( cu.flags & kAffine ) != 0 )
   {
-    // affine AMVP
+    // Affine AMVP
     c.kind        = kAffineCu;
     const int imv = imvOf( cu );
     const int sh  = imv == 2 ? 2 : 0;
@@ -2467,7 +2473,7 @@ void deriveCu( Cur cur )
 
   if( c.kind == kAffineCu )
   {
-    // spanMotionInfo for affine: the lists' reference indices, the unused lists' motion zero
+    // spanMotionInfo for affine: set the lists' reference indices, and zero the motion of the unused lists
     const int w4  = cu.w >> 2;
     const int lw4 = log2Of( w4 );
     for( int u = g_lane; u < w4 * ( cu.h >> 2 ); u += 32 )
@@ -2491,7 +2497,7 @@ void deriveCu( Cur cur )
     return;
   }
 
-  // translational
+  // Translational motion
   c.kind   = kTranslation;
   Motion m = noMotion();
   if( ( cu.flags & kMerge ) != 0 )
@@ -2501,9 +2507,9 @@ void deriveCu( Cur cur )
       const int idx  = mmvdIdx( cu );
       const int base = idx / 32;
       const int num  = mergeCandidates( cur, base + 1 );
-      m              = mmvdMotion( cur, idx, num );   // (its hpel: the base's)
-      // setMmvdMergeCandiInfo's end: BCW from the merge list's entry at the
-      // base index, the motion clipped, no bi-prediction for 8x4 and 4x8
+      m              = mmvdMotion( cur, idx, num );   // (hpel comes from the base candidate)
+      // The end of setMmvdMergeCandiInfo: BCW from the merge list's entry at
+      // the base index, the motion clipped, no bi-prediction for 8x4 and 4x8
       const Motion b = cand( base );
       m.bcw          = interDir( b ) == 3 ? b.bcw : 0;
       for( int l = 0; l < 2; l++ )
@@ -2517,7 +2523,7 @@ void deriveCu( Cur cur )
     }
     else
     {
-      // (CIIP's too)
+      // (CIIP CUs as well)
       const int idx = mergeIdx( cu );
       mergeCandidates( cur, idx );
       m     = cand( idx );
@@ -2530,7 +2536,7 @@ void deriveCu( Cur cur )
   }
   else
   {
-    // AMVP (applyImv or not: the same here); SMVD's second list the parse's
+    // AMVP (with or without applyImv, the same here); with SMVD, the second list's motion comes from the parse
     const int amvr = imvOf( cu );
     m.hpel         = amvr == 3;
     m.bcw          = bcwIdxOf( cu );
@@ -2553,7 +2559,7 @@ void deriveCu( Cur cur )
   storeCuMotion( cu.index, c );
   spanMotion( cur, m, kTranslation );
 
-  // the history (not for affine, GPM; the parallel merge level's)
+  // Update the history (not for affine or GPM CUs; subject to the parallel merge level)
   const bool on = ( ( cu.x + cu.w ) >> pc.plevel ) > ( cu.x >> pc.plevel ) && ( ( cu.y + cu.h ) >> pc.plevel ) > ( cu.y >> pc.plevel );
   if( on )
   {
@@ -2565,11 +2571,12 @@ void deriveCu( Cur cur )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the entries
+// The entry points
 // --------------------------------------------------------------------------------------------------------------------
 
 #if CUMAP
-// the CU map: a workgroup a CU (luma's tree), its 4x4 blocks
+// The CU map: one workgroup per CU writes the CU's index at each of its 4x4 blocks (luma tree: cuMap; chroma tree:
+// cuMapC).
 [shader( "compute" )]
 [numthreads( 64, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
@@ -2613,8 +2620,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   }
 }
 #else
-// a lane a CTU row: the rows taken in order (a count of them), so that a
-// row waits only for rows whose workgroups run already
+// One 32-thread workgroup per CTU row; the rows are taken in order (from a
+// counter), so a row waits only for rows whose workgroups already run.
 groupshared int s_row;
 
 [shader( "compute" )]
@@ -2634,7 +2641,7 @@ void main( uint3 local : SV_GroupThreadID )
   }
   for( int col = 0; col < pc.widthInCtus; col++ )
   {
-    // the row above past the CTU above right (or done, at the right edge)
+    // Wait until the row above is past the CTU above-right (or done, at the right edge).
     if( row > 0 )
     {
       if( g_lane == 0 )
@@ -2678,10 +2685,10 @@ void main( uint3 local : SV_GroupThreadID )
       {
         deriveCu( cur );
       }
-      // (the CU's blocks, each thread's, visible to all before the next CU looks them up)
+      // (each thread's writes of the CU's blocks become visible to all before the next CU looks them up)
       workgroupBarrierAll();
     }
-    AllMemoryBarrierWithGroupSync();   // (the CTU's motion visible to the rows below)
+    AllMemoryBarrierWithGroupSync();   // (makes the CTU's motion visible to the rows below)
     if( g_lane == 0 )
     {
       pc.progress[row].store( uint( col + 1 ), MemoryOrder.Release );

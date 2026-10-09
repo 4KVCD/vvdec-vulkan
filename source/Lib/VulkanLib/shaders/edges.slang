@@ -1,35 +1,35 @@
-// The edges the deblocking filters (GpuRecon::listEdges) on the GPU, from the
-// deblocking's parameters (shaders/dbparams.slang): luma's vertical and
-// horizontal edges (a 4x4 block's), chroma's (a segment as deblock.slang
-// visits them), each list CTU by CTU, a CTU's rows in order, a row's blocks
-// left to right -- the CPU's order -- as GpuJobs.h's Edge.
+// Lists the edges that the deblocking filter processes, on the GPU (the CPU's version is GpuRecon::listEdges),
+// from the deblocking parameters that shaders/dbparams.slang derived. There are four lists of GpuJobs.h Edge
+// records: luma vertical and luma horizontal edges (one per 4x4 block), then chroma vertical and chroma horizontal
+// edges (one per segment, as deblock.slang visits them). Each list runs CTU by CTU, through a CTU's rows from top
+// to bottom and through each row's blocks from left to right, which is the CPU's order.
 //
-// The passes (pc.pass), a workgroup a CTU but in SCAN:
-// 0 COUNT: each CTU's edges of each list;
-// 1 SCAN:  one workgroup: each CTU's offsets in the lists (each list after
-//   the one before), the lists' firsts and counts;
-// 2 WRITE: each CTU's edges at its offsets.
+// The passes (pc.pass) run one workgroup per CTU, except SCAN:
+// 0 COUNT: counts each CTU's edges in each list;
+// 1 SCAN:  a single workgroup turns the counts into each CTU's offsets in the lists (each list placed after the
+//          previous one) and stores each list's first entry and count;
+// 2 WRITE: each CTU writes its edges at its offsets.
 
 #include "common.slang"
 
 struct Params
 {
-  uint* lfp;         // dbparams.slang's LoopFilterParam, 2 words, per CTU, direction and 4x4 block
+  uint* lfp;         // dbparams.slang's LoopFilterParam, 2 words per 4x4 block, per CTU and direction
   uint* slices;      // mider.slang's slice table
-  uint* counts;      // per CTU its edges of each list (4 words), then its offsets
-  uint* lists;       // per list its first and count (2 words each), then the count of all
-  uint* edges;       // out: Edge (2 words)
+  uint* counts;      // 4 words per CTU: its number of edges in each list; SCAN replaces them with offsets
+  uint* lists;       // first entry and count of each list (2 words each), then the total of all lists
+  uint* edges;       // out: Edge records (2 words each)
   int   widthInCtus;
   int   heightInCtus;
   int   log2Ctu;
   int   width;       // luma samples
   int   height;
-  int   chroma;      // a format with chroma
+  int   chroma;      // nonzero for a format with chroma
   int   csx;
   int   csy;
   int   pass;
-  int   capacity;    // the edges' room
-  uint* args;        // SCAN: the front end's arguments (GpuRecon's m_frontArgs): the deblocking's passes
+  int   capacity;    // room in edges, in Edge records
+  uint* args;        // SCAN: the front end's indirect arguments (GpuRecon's m_frontArgs) for the deblocking passes
 };
 
 [[vk::push_constant]] Params pc;
@@ -39,7 +39,8 @@ bool  deblockingOff( uint* s ) { return ( s[1] & ( 1u << 23 ) ) != 0; }
 
 groupshared uint s_scan[2][256];
 
-// a 4x4 block's edges of a direction: luma's (bit 0), chroma's (bit 1), and their words
+// Returns which edges a 4x4 block has in direction dir (bit 0: a luma edge, bit 1: a chroma segment) and outputs
+// their Edge words.
 uint blockEdges( int ctu, int dir, int r, int c, out uint2 luma, out uint2 chromaEdge )
 {
   const int  n    = 1 << ( pc.log2Ctu - 2 );
@@ -55,8 +56,9 @@ uint blockEdges( int ctu, int dir, int r, int c, out uint2 luma, out uint2 chrom
   {
     return 0;
   }
-  // the luma grid of the chroma segments: across the edge every 8 chroma
-  // samples (at the 4:2:0 rate), along it as many lines as a 4x4 luma block has
+  // The grid of the chroma segments, in luma samples: across the edges, one
+  // every 8 chroma samples (16 luma samples in 4:2:0); along an edge, one per
+  // 4x4 luma block (the segment covers that block's lines).
   const int across = dir == 0 ? ( ( 8 << pc.csx ) / 4 * ( 4 >> pc.csx ) ) << pc.csx : ( ( 8 << pc.csy ) / 4 * ( 4 >> pc.csy ) ) << pc.csy;
   const int gridX  = dir == 0 ? across : ( 4 >> pc.csx ) << pc.csx;
   const int gridY  = dir == 0 ? ( 4 >> pc.csy ) << pc.csy : across;
@@ -84,7 +86,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int ctus = pc.widthInCtus * pc.heightInCtus;
   if( pc.pass == 1 )
   {
-    // SCAN: per list, the CTUs' offsets (a thread a run of CTUs), the lists one after the other
+    // SCAN: for each list in turn, turn the CTUs' counts into offsets (each thread takes a run of CTUs); each list
+    // starts where the previous one ends.
     const int per = ( ctus + 255 ) / 256;
     const int c0  = min( tid * per, ctus );
     const int c1  = min( c0 + per, ctus );
@@ -110,7 +113,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         pc.lists[l * 2]     = base;
         pc.lists[l * 2 + 1] = run;
         s_scan[1][0]        = run;
-        // a thread an edge, workgroups of 64
+        // The deblocking pass for this list runs one thread per edge, in workgroups of 64.
         pc.args[15 + 3 * l]     = ( run + 63 ) / 64;
         pc.args[15 + 3 * l + 1] = 1;
         pc.args[15 + 3 * l + 2] = 1;
@@ -145,7 +148,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const float rcpCols = 1.0f / float( max( cols, 1 ) );
   for( int dir = 0; dir < 2; dir++ )
   {
-    // a thread four blocks in a row's order
+    // Each thread takes four consecutive 4x4 blocks, in raster order within the CTU.
     const int blocks = off ? 0 : rows * cols;
     uint2     e[4][2];
     uint      which[4];
@@ -159,7 +162,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       if( i < blocks )
       {
         uint2 lumaEdge, chromaEdge;
-        const int row = int( ( float( i ) + 0.5f ) * rcpCols );   // (i / cols exactly: i, cols small)
+        const int row = int( ( float( i ) + 0.5f ) * rcpCols );   // (exactly i / cols, since i and cols are small)
         which[k]      = blockEdges( ctu, dir, row, i - row * cols, lumaEdge, chromaEdge );
         e[k][0]  = lumaEdge;
         e[k][1]  = chromaEdge;
