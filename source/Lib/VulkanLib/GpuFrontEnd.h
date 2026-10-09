@@ -50,6 +50,8 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <cstdint>
 #include <vector>
 
+#include "GpuJobs.h"
+
 namespace vvdec
 {
 class CodingStructure;
@@ -89,7 +91,9 @@ struct CuRecord
   // w18: intra direction luma (uint8_t) | chroma << 8 | QT depth << 16 | depth << 20
   // w19: the chroma block (chroma samples), x | y << 16; w20: its width | height << 8 | chroma there << 16 |
   //      luma there << 17
-  // w21..w31: reserved
+  // w21: DMVR's refinements' place (CodingUnit::mvdL0SubPuOff, in its CTU's) | left neighbour there << 16 | above
+  //      << 17 (CodingUnit::left, above) | SMVD << 18
+  // w22..w31: reserved
   uint32_t w[32];
 };
 
@@ -140,11 +144,39 @@ struct MiderStats
   int64_t lfpEdges      = 0;   // of them with a boundary strength (the CPU's)
   int     lfpReported   = 0;
   int     reported   = 0;
+  int64_t jobsCompared[3]   = { 0, 0, 0 };   // the jobs (DecCu's xGpu*Jobs; shaders/jobs.slang): residuals', inter's, intra's
+  int64_t jobsMismatched[3] = { 0, 0, 0 };
+  int     jobsReported      = 0;
+  int64_t sortedCompared    = 0;   // intra's bands in the order of the waves (GpuRecon::recordIntra; shaders/intrasort.slang)
+  int64_t sortedMismatched  = 0;
+  int64_t edgesCompared     = 0;   // the deblocking's edges (GpuRecon::listEdges; shaders/edges.slang)
+  int64_t edgesMismatched   = 0;
+  int     edgesReported     = 0;
 };
 // gpu: the motion of each 4x4 block as the GPU wrote it (shaders/mider.slang's), cpu: as vvdec keeps it
 void compareMotion( const CodingStructure& cs, const int32_t* gpu, const MotionInfo* cpu, MiderStats& stats );
 // gpu: the deblocking's parameters as the GPU wrote them (shaders/dbparams.slang's, 2 words each), cpu: vvdec's
 void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const LoopFilterParam* cpu, MiderStats& stats );
+
+// the jobs' tables (shaders/jobs.slang's T_*): vvdec's, kJobTableWords words
+static constexpr size_t kJobTableWords = 2048;
+void writeJobTables( uint32_t* out );
+// per slice of the picture 256 words for its jobs (shaders/jobs.slang's JobSlice): w0: the slice type | LMCS << 2 |
+// dependent quantisation << 3 | explicit scaling lists << 4; w32 + 16 * list + refIdx: the reference's slot in refs |
+// scaled (RPR) << 8 | of the picture's size << 9 | weights present (Y, Cb, Cr) << 10; w64 + ( 16 * list + refIdx ) *
+// 3 + component: its weight (int16_t) | offset << 16 (int8_t) | log2 denominator << 24
+void writeJobSlices( const CodingStructure& cs, const RefTable& refs, uint32_t* out );
+// gpu: the lists the GPU made (count jobs each, words a job), cpu: the CTU tasks' (list 0 residuals', 1 inter's, 2
+// intra's)
+// gpu: intra's bands in the order of the waves as the GPU made them (12 words each) and each one's wait, count of them;
+// cpu: the CTU tasks' jobs, which recordIntra puts in that order
+void compareSorted( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* waits, size_t count, const std::vector<std::vector<IntraJob>>& cpu,
+                    MiderStats& stats );
+// gpu: the edges the GPU listed (2 words each) and its lists' firsts and counts (2 words each), cpu: the CTU tasks'
+void compareEdges( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* lists, size_t capacity, const std::vector<EdgeLists>& cpu,
+                   MiderStats& stats );
+template<typename Job>
+void compareJobs( const CodingStructure& cs, int list, const uint32_t* gpu, size_t count, const std::vector<std::vector<Job>>& cpu, MiderStats& stats );
 
 }   // namespace gpu
 }   // namespace vvdec

@@ -162,7 +162,10 @@ public:
 
   // after endCompute: the GPU's motion derivation (PictureJobs::cus) against
   // the CPU's, cpu the picture's motion as vvdec keeps it
-  void              compareMider( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp );
+  void              compareMider( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp, const PictureJobs* jobs );
+  // where each explicit scaling list's dequantisation matrix begins among the picture's (Quant::getDequantCoeff),
+  // + 1, per list (6), log2 width and height (0..6), 0 where none: for the GPU's jobs
+  void              setDequantOffsets( const std::vector<uint32_t>& offsets ) { m_dequantOffsets = offsets; }
   const MiderStats& miderStats() const { return m_miderStats; }
 
 private:
@@ -193,7 +196,11 @@ private:
   void          copyPlanes( const PelStorage& pic, int from, int to );
   void          transferBarrier( bool toTransfer );
   // the motion derivation of the picture's CUs (cus, per CTU), for the comparison with the CPU's
-  void          recordMider( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus );
+  void          recordMider( const CodingStructure& cs, const PictureJobs& jobs );
+  // the GPU's jobs of the picture (shaders/jobs.slang), for the comparison with the CTU tasks' (jobs)
+  void          recordJobs( const CodingStructure& cs, const PictureJobs& jobs, VkDeviceAddress slices );
+  // the deblocking's edge lists on the GPU (shaders/edges.slang), for the comparison with the CTU tasks' (jobs.edges)
+  void          recordEdges( const CodingStructure& cs, const PictureJobs& jobs, VkDeviceAddress slices );
   // with subpictures treated as pictures: each CTU's rectangle (its subpicture's
   // or the picture's) in m_subpics, its address returned; else 0
   VkDeviceAddress subpicRects( const CodingStructure& cs );
@@ -298,6 +305,46 @@ private:
   Buffer          m_dbLfp;             // the deblocking's parameters (shaders/dbparams.slang)
   Buffer          m_dbLfpHost;         // their copy, for the comparison
   bool            m_dbRecorded = false;
+  // the job building's (recordJobs)
+  Buffer                m_jobTables;
+  Buffer                m_jobSlices;
+  Buffer                m_jobScaling;
+  Buffer                m_jobCounts;
+  Buffer                m_jobBlocks;
+  Buffer                m_jobBlocksHost;
+  Buffer                m_jobOut[3];
+  Buffer                m_jobOutHost[3];
+  Buffer                m_jobWaves;
+  Buffer                m_jobProgress;
+  // the indirect dispatches' arguments (3 words each) the front end writes, and the counts the passes read: 0 the
+  // residuals', 3 inter's regular, 6 BDOF, 9 affine, 12 the affine pairs; 16 intra's, 19 the bands; 20 deblocking's four
+  Buffer                m_frontArgs;
+  size_t                m_jobCap[3]      = { 0, 0, 0 };
+  int                   m_jobBlockCount  = 0;
+  bool                  m_jobsRecorded   = false;
+  std::vector<uint32_t> m_dequantOffsets;
+  // the edge lists' (recordEdges)
+  Buffer                m_edgeCounts;
+  Buffer                m_edgeLists;
+  Buffer                m_edgeListsHost;
+  Buffer                m_edgeOut;
+  Buffer                m_edgeOutHost;
+  size_t                m_edgeCap        = 0;
+  // intra's order's (recordJobs)
+  Buffer                m_isKeys;        // the jobs' indices, twice (the radix sort's buffers)
+  Buffer                m_isHist;
+  Buffer                m_isBandAt;
+  Buffer                m_isBandSums;
+  Buffer                m_isWaveFirst;
+  Buffer                m_isSorted;
+  Buffer                m_isWaits;
+  Buffer                m_isFlags;
+  Buffer                m_isSortedHost;
+  Buffer                m_isWaitsHost;
+  Buffer                m_isInfoHost;    // the bands' count, the flags
+  size_t                m_isCap          = 0;
+  int                   m_isBlocks       = 0;
+  bool                  m_edgesRecorded  = false;
   Buffer          m_miderProgress;
   MiderStats      m_miderStats;
 };

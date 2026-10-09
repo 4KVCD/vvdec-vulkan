@@ -22,6 +22,10 @@ set( VVDEC_GPU_SHADERS
   "mider|mider"
   "mider_cumap|mider|CUMAP=1"
   "dbparams|dbparams"
+  "jobs|jobs"
+  "jobs_waves|jobs|WAVES=1"
+  "edges|edges"
+  "intrasort|intrasort"
 )
 
 if( NOT VVDEC_SLANGC OR NOT EXISTS "${VVDEC_SLANGC}" )

@@ -369,6 +369,36 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_dbCtuInfo );
   m_ctx->free( m_dbLfp );
   m_ctx->free( m_dbLfpHost );
+  m_ctx->free( m_jobTables );
+  m_ctx->free( m_jobSlices );
+  m_ctx->free( m_jobScaling );
+  m_ctx->free( m_jobCounts );
+  m_ctx->free( m_jobBlocks );
+  m_ctx->free( m_jobBlocksHost );
+  for( int k = 0; k < 3; k++ )
+  {
+    m_ctx->free( m_jobOut[k] );
+    m_ctx->free( m_jobOutHost[k] );
+  }
+  m_ctx->free( m_jobWaves );
+  m_ctx->free( m_jobProgress );
+  m_ctx->free( m_frontArgs );
+  m_ctx->free( m_isKeys );
+  m_ctx->free( m_isHist );
+  m_ctx->free( m_isBandAt );
+  m_ctx->free( m_isBandSums );
+  m_ctx->free( m_isWaveFirst );
+  m_ctx->free( m_isSorted );
+  m_ctx->free( m_isWaits );
+  m_ctx->free( m_isFlags );
+  m_ctx->free( m_isSortedHost );
+  m_ctx->free( m_isWaitsHost );
+  m_ctx->free( m_isInfoHost );
+  m_ctx->free( m_edgeCounts );
+  m_ctx->free( m_edgeLists );
+  m_ctx->free( m_edgeListsHost );
+  m_ctx->free( m_edgeOut );
+  m_ctx->free( m_edgeOutHost );
   m_ctx->free( m_miderProgress );
   m_ctx->free( m_lfnst );
   m_ctx->free( m_geo );
@@ -1866,6 +1896,35 @@ struct DbParamsPush
 };
 static_assert( sizeof( DbParamsPush ) == 168, "DbParamsPush: the layout of dbparams.slang's Params" );
 
+// shaders/jobs.slang's push constants
+struct JobsPush
+{
+  VkDeviceAddress cus, tus, ctus, slices, jobSlices, cuMapL, cuMapC, cuMotion, motion, tables, scaling, counts, blocks, trafo, inter, intra;
+  int32_t         numCus, numBlocks, widthInCtus, heightInCtus, log2Ctu, width, height, widthIn4, chromaFormat, csx, csy, bitDepth, qpBdOffset,
+                  tsMinQp;
+  uint32_t        sps, ph;
+  int32_t         pass, capTrafo, capInter, capIntra, num8x8;
+  VkDeviceAddress waveMap, progress, args;
+};
+static_assert( sizeof( JobsPush ) == 240, "JobsPush: the layout of jobs.slang's Params" );
+
+// shaders/edges.slang's push constants
+struct EdgesPush
+{
+  VkDeviceAddress lfp, slices, counts, lists, edges;
+  int32_t         widthInCtus, heightInCtus, log2Ctu, width, height, chroma, csx, csy, pass, capacity;
+};
+static_assert( sizeof( EdgesPush ) == 80, "EdgesPush: the layout of edges.slang's Params" );
+
+// shaders/intrasort.slang's push constants
+struct IntraSortPush
+{
+  VkDeviceAddress jobs, count, keysA, keysB, hist, bandAt, bandSums, waveFirst, sorted, waits, flags;
+  int32_t         numBlocks, pass, shift, capacity;
+  VkDeviceAddress args;
+};
+static_assert( sizeof( IntraSortPush ) == 112, "IntraSortPush: the layout of intrasort.slang's Params" );
+
 // a buffer of kind of at least size bytes
 static void ensureBuffer( Context* ctx, Buffer& buf, size_t size, MemKind kind )
 {
@@ -1909,8 +1968,10 @@ VkDeviceAddress GpuRecon::subpicRects( const CodingStructure& cs )
   return m_subpics.addr;
 }
 
-void GpuRecon::recordMider( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus )
+void GpuRecon::recordMider( const CodingStructure& cs, const PictureJobs& jobs )
 {
+  const std::vector<std::vector<CuRecord>>& cus = *jobs.cus;
+  const std::vector<std::vector<TuRecord>>& tus = *jobs.tus;
   const PreCalcValues& pcv    = *cs.pcv;
   size_t               numCus = 0;
   size_t               numTus = 0;
@@ -2082,6 +2143,9 @@ void GpuRecon::recordMider( const CodingStructure& cs, const std::vector<std::ve
     vk.vkCmdCopyBuffer( m_cmd, m_dbLfp.buffer, m_dbLfpHost.buffer, 1, &lfpRegion );
     m_dbRecorded = true;
 
+    recordJobs( cs, jobs, push.slices );
+    recordEdges( cs, jobs, push.slices );
+
     VkMemoryBarrier copied{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -2090,7 +2154,282 @@ void GpuRecon::recordMider( const CodingStructure& cs, const std::vector<std::ve
   mark( "mider" );
 }
 
-void GpuRecon::compareMider( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp )
+void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, VkDeviceAddress slices )
+{
+  const PreCalcValues& pcv    = *cs.pcv;
+  const Api&           vk     = m_ctx->api();
+  size_t               numCus = 0;
+  for( const auto& ctu: *jobs.cus )
+  {
+    numCus += ctu.size();
+  }
+  // the outputs' room: the CTU tasks' counts, and some
+  const auto total = []( const auto* lists ) {
+    size_t n = 0;
+    if( lists )
+    {
+      for( const auto& ctu: *lists )
+      {
+        n += ctu.size();
+      }
+    }
+    return n;
+  };
+  const size_t counts[3] = { total( jobs.trafo ), total( jobs.inter ), total( jobs.intra ) };
+  const size_t words[3]  = { 8, 12, 12 };
+  if( !m_frontArgs.valid() )
+  {
+    m_frontArgs = m_ctx->alloc( 64 * sizeof( uint32_t ), MemKind::Device );
+  }
+  for( int k = 0; k < 3; k++ )
+  {
+    m_jobCap[k] = counts[k] + 64;
+    ensureBuffer( m_ctx, m_jobOut[k], m_jobCap[k] * words[k] * sizeof( uint32_t ), MemKind::Device );
+    ensureBuffer( m_ctx, m_jobOutHost[k], m_jobCap[k] * words[k] * sizeof( uint32_t ), MemKind::HostCached );
+  }
+  if( !m_jobTables.valid() )
+  {
+    m_jobTables = m_ctx->alloc( kJobTableWords * sizeof( uint32_t ), MemKind::Upload );
+    writeJobTables( reinterpret_cast<uint32_t*>( m_jobTables.mapped ) );
+  }
+  ensureBuffer( m_ctx, m_jobSlices, cs.picture->slices.size() * 256 * sizeof( uint32_t ), MemKind::Upload );
+  writeJobSlices( cs, *jobs.refs, reinterpret_cast<uint32_t*>( m_jobSlices.mapped ) );
+  ensureBuffer( m_ctx, m_jobScaling, 6 * 7 * 7 * sizeof( uint32_t ), MemKind::Upload );
+  uint32_t* scaling = reinterpret_cast<uint32_t*>( m_jobScaling.mapped );
+  for( size_t i = 0; i < 6 * 7 * 7; i++ )
+  {
+    scaling[i] = i < m_dequantOffsets.size() ? m_dequantOffsets[i] : 0;
+  }
+  m_jobBlockCount = int( ( numCus + 255 ) / 256 );
+  ensureBuffer( m_ctx, m_jobCounts, std::max<size_t>( numCus, 1 ) * 5 * sizeof( uint32_t ), MemKind::Device );
+  ensureBuffer( m_ctx, m_jobBlocks, ( size_t( m_jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ), MemKind::Device );
+  ensureBuffer( m_ctx, m_jobBlocksHost, ( size_t( m_jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ), MemKind::HostCached );
+  const int widthIn4  = int( ( pcv.lumaWidth + 3 ) >> 2 );
+  const int heightIn4 = int( ( pcv.lumaHeight + 3 ) >> 2 );
+  ensureBuffer( m_ctx, m_jobWaves, size_t( widthIn4 ) * heightIn4 * 3 * sizeof( uint32_t ), MemKind::Device );
+  ensureBuffer( m_ctx, m_jobProgress, ( pcv.heightInCtus + 1 ) * sizeof( uint32_t ), MemKind::Device );
+
+  const SPS&       sps    = *cs.sps;
+  const PicHeader& ph     = *cs.picHeader;
+  const PPS&       pps    = *cs.pps;
+  const bool       chroma = isChromaEnabled( pcv.chrFormat );
+  JobsPush         push{};
+  push.cus          = m_miderCus.addr;
+  push.tus          = m_miderTus.addr;
+  push.ctus         = m_miderCtus.addr;
+  push.slices       = slices;
+  push.jobSlices    = m_jobSlices.addr;
+  push.cuMapL       = m_miderCuMap.addr;
+  push.cuMapC       = m_miderCuMapC.addr;
+  push.cuMotion     = m_miderCuMotion.addr;
+  push.motion       = m_miderMotion.addr;
+  push.tables       = m_jobTables.addr;
+  push.scaling      = m_jobScaling.addr;
+  push.counts       = m_jobCounts.addr;
+  push.blocks       = m_jobBlocks.addr;
+  push.trafo        = m_jobOut[0].addr;
+  push.inter        = m_jobOut[1].addr;
+  push.intra        = m_jobOut[2].addr;
+  push.numCus       = int32_t( numCus );
+  push.numBlocks    = m_jobBlockCount;
+  push.widthInCtus  = int32_t( pcv.widthInCtus );
+  push.heightInCtus = int32_t( pcv.heightInCtus );
+  push.log2Ctu      = int32_t( pcv.maxCUWidthLog2 );
+  push.width        = int32_t( pcv.lumaWidth );
+  push.height       = int32_t( pcv.lumaHeight );
+  push.widthIn4     = widthIn4;
+  push.chromaFormat = int32_t( pcv.chrFormat );
+  push.csx          = chroma ? int32_t( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  push.csy          = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  push.bitDepth     = sps.getBitDepth();
+  push.qpBdOffset   = sps.getQpBDOffset();
+  push.tsMinQp      = 4 + 6 * sps.getInternalMinusInputBitDepth();
+  push.sps          = ( sps.getUseMTS() ? 1u : 0u ) | ( sps.getUseImplicitMTS() ? 2u : 0u ) | ( sps.getUseIntraMTS() ? 4u : 0u ) | ( sps.getUseInterMTS() ? 8u : 0u )
+             | ( sps.getUseLFNST() ? 16u : 0u ) | ( sps.getDisableScalingMatrixForLfnstBlks() ? 32u : 0u )
+             | ( sps.getScalingMatrixForAlternativeColourSpaceDisabledFlag() ? 64u : 0u ) | ( sps.getScalingMatrixDesignatedColourSpaceFlag() ? 128u : 0u )
+             | ( sps.getUseBIO() ? 256u : 0u ) | ( sps.getUseDMVR() ? 512u : 0u ) | ( sps.getUsePROF() ? 1024u : 0u ) | ( sps.getUseBcw() ? 2048u : 0u )
+             | ( sps.getEntropyCodingSyncEnabledFlag() ? 4096u : 0u );
+  push.ph = ( ph.getDisDmvrFlag() ? 1u : 0u ) | ( ph.getDisBdofFlag() ? 2u : 0u ) | ( ph.getDisProfFlag() ? 4u : 0u ) | ( ph.getJointCbCrSignFlag() ? 8u : 0u )
+            | ( ph.getLmcsEnabledFlag() ? 16u : 0u ) | ( ph.getLmcsChromaResidualScaleFlag() ? 32u : 0u ) | ( pps.getUseWP() ? 64u : 0u )
+            | ( pps.getWPBiPred() ? 128u : 0u ) | ( jobs.trafo ? 256u : 0u ) | ( jobs.inter ? 512u : 0u );
+  push.capTrafo = int32_t( m_jobCap[0] );
+  push.capInter = int32_t( m_jobCap[1] );
+  push.capIntra = int32_t( m_jobCap[2] );
+  push.num8x8   = int32_t( pcv.num8x8CtuBlks );
+  push.waveMap  = m_jobWaves.addr;
+  push.progress = m_jobProgress.addr;
+  push.args     = m_frontArgs.addr;
+
+  vk.vkCmdFillBuffer( m_cmd, m_jobWaves.buffer, 0, VK_WHOLE_SIZE, 0 );
+  vk.vkCmdFillBuffer( m_cmd, m_jobProgress.buffer, 0, VK_WHOLE_SIZE, 0 );
+  VkMemoryBarrier filled{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  filled.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  filled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &filled, 0, nullptr, 0, nullptr );
+  vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_jobs ) );
+  for( int pass = 0; pass < 3; pass++ )
+  {
+    push.pass = pass;
+    vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+    vk.vkCmdDispatch( m_cmd, pass == 1 ? 1u : uint32_t( std::max( m_jobBlockCount, 1 ) ), 1, 1 );
+    computeBarrier();
+  }
+  push.pass = 3;
+  vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_jobs_waves ) );
+  vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+  vk.vkCmdDispatch( m_cmd, uint32_t( pcv.heightInCtus ), 1, 1 );
+
+  computeBarrier();
+
+  // intra's bands in the order of the waves
+  if( jobs.intra )
+  {
+    size_t bands = 0;
+    for( const auto& ctu: *jobs.intra )
+    {
+      for( const IntraJob& job: ctu )
+      {
+        const int rows = std::max( 1, 256 / job.width() );
+        bands += ( job.height() + rows - 1 ) / rows;
+      }
+    }
+    m_isCap    = bands + 64;
+    m_isBlocks = int( ( m_jobCap[2] + 1023 ) / 1024 );
+    ensureBuffer( m_ctx, m_isKeys, size_t( m_isBlocks ) * 1024 * 2 * sizeof( uint32_t ), MemKind::Device );
+    ensureBuffer( m_ctx, m_isHist, size_t( m_isBlocks ) * 256 * sizeof( uint32_t ), MemKind::Device );
+    ensureBuffer( m_ctx, m_isBandAt, size_t( m_isBlocks ) * 1024 * sizeof( uint32_t ), MemKind::Device );
+    ensureBuffer( m_ctx, m_isBandSums, ( size_t( m_isBlocks ) + 1 ) * sizeof( uint32_t ), MemKind::Device );
+    ensureBuffer( m_ctx, m_isWaveFirst, 65536 * sizeof( uint32_t ), MemKind::Device );
+    ensureBuffer( m_ctx, m_isSorted, m_isCap * sizeof( IntraJob ), MemKind::Device );
+    ensureBuffer( m_ctx, m_isWaits, m_isCap * sizeof( uint32_t ), MemKind::Device );
+    ensureBuffer( m_ctx, m_isFlags, 4 * sizeof( uint32_t ), MemKind::Device );
+    ensureBuffer( m_ctx, m_isSortedHost, m_isCap * sizeof( IntraJob ), MemKind::HostCached );
+    ensureBuffer( m_ctx, m_isWaitsHost, m_isCap * sizeof( uint32_t ), MemKind::HostCached );
+    ensureBuffer( m_ctx, m_isInfoHost, 4 * sizeof( uint32_t ), MemKind::HostCached );
+    vk.vkCmdFillBuffer( m_cmd, m_isFlags.buffer, 0, VK_WHOLE_SIZE, 0 );
+    VkMemoryBarrier zeroed{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    zeroed.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    zeroed.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &zeroed, 0, nullptr, 0, nullptr );
+    IntraSortPush is{};
+    is.jobs      = m_jobOut[2].addr;
+    is.count     = m_jobBlocks.addr + ( size_t( m_jobBlockCount ) * 5 + 2 ) * sizeof( uint32_t );   // jobs.slang's intra total
+    is.args      = m_frontArgs.addr + 16 * sizeof( uint32_t );
+    is.keysA     = m_isKeys.addr;
+    is.keysB     = m_isKeys.addr + size_t( m_isBlocks ) * 1024 * sizeof( uint32_t );
+    is.hist      = m_isHist.addr;
+    is.bandAt    = m_isBandAt.addr;
+    is.bandSums  = m_isBandSums.addr;
+    is.waveFirst = m_isWaveFirst.addr;
+    is.sorted    = m_isSorted.addr;
+    is.waits     = m_isWaits.addr;
+    is.flags     = m_isFlags.addr;
+    is.numBlocks = m_isBlocks;
+    is.capacity  = int32_t( m_isCap );
+    vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_intrasort ) );
+    const auto pass = [&]( int p, int shift, uint32_t groups ) {
+      is.pass  = p;
+      is.shift = shift;
+      vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( is ), &is );
+      vk.vkCmdDispatch( m_cmd, groups, 1, 1 );
+      computeBarrier();
+    };
+    // the radix sort by wave, two digits; then the bands
+    for( int shift = 0; shift <= 8; shift += 8 )
+    {
+      pass( 0, shift, uint32_t( m_isBlocks ) );
+      pass( 1, shift, 1 );
+      pass( 2, shift, uint32_t( m_isBlocks ) );
+    }
+    pass( 3, 0, uint32_t( m_isBlocks ) );
+    pass( 4, 0, 1 );
+    pass( 5, 0, uint32_t( m_isBlocks ) );
+    pass( 6, 0, uint32_t( m_isBlocks ) );
+  }
+
+  VkMemoryBarrier made{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  made.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  made.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &made, 0, nullptr, 0, nullptr );
+  for( int k = 0; k < 3; k++ )
+  {
+    VkBufferCopy region{ 0, 0, m_jobCap[k] * words[k] * sizeof( uint32_t ) };
+    vk.vkCmdCopyBuffer( m_cmd, m_jobOut[k].buffer, m_jobOutHost[k].buffer, 1, &region );
+  }
+  VkBufferCopy blocks{ 0, 0, ( size_t( m_jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ) };
+  vk.vkCmdCopyBuffer( m_cmd, m_jobBlocks.buffer, m_jobBlocksHost.buffer, 1, &blocks );
+  if( jobs.intra )
+  {
+    VkBufferCopy sorted{ 0, 0, m_isCap * sizeof( IntraJob ) };
+    vk.vkCmdCopyBuffer( m_cmd, m_isSorted.buffer, m_isSortedHost.buffer, 1, &sorted );
+    VkBufferCopy waits{ 0, 0, m_isCap * sizeof( uint32_t ) };
+    vk.vkCmdCopyBuffer( m_cmd, m_isWaits.buffer, m_isWaitsHost.buffer, 1, &waits );
+    VkBufferCopy count{ size_t( m_isBlocks ) * sizeof( uint32_t ), 0, sizeof( uint32_t ) };
+    vk.vkCmdCopyBuffer( m_cmd, m_isBandSums.buffer, m_isInfoHost.buffer, 1, &count );
+    VkBufferCopy flags{ 0, 2 * sizeof( uint32_t ), sizeof( uint32_t ) };
+    vk.vkCmdCopyBuffer( m_cmd, m_isFlags.buffer, m_isInfoHost.buffer, 1, &flags );
+  }
+  m_jobsRecorded = true;
+}
+
+void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs, VkDeviceAddress slices )
+{
+  if( !jobs.edges )
+  {
+    return;
+  }
+  const PreCalcValues& pcv = *cs.pcv;
+  const Api&           vk  = m_ctx->api();
+  size_t               cpu = 0;
+  for( const EdgeLists& ctu: *jobs.edges )
+  {
+    for( const auto& list: ctu.lists )
+    {
+      cpu += list.size();
+    }
+  }
+  m_edgeCap = cpu + 64;
+  ensureBuffer( m_ctx, m_edgeOut, m_edgeCap * sizeof( Edge ), MemKind::Device );
+  ensureBuffer( m_ctx, m_edgeOutHost, m_edgeCap * sizeof( Edge ), MemKind::HostCached );
+  ensureBuffer( m_ctx, m_edgeCounts, size_t( pcv.sizeInCtus ) * 4 * sizeof( uint32_t ), MemKind::Device );
+  ensureBuffer( m_ctx, m_edgeLists, 9 * sizeof( uint32_t ), MemKind::Device );
+  ensureBuffer( m_ctx, m_edgeListsHost, 9 * sizeof( uint32_t ), MemKind::HostCached );
+  const bool chroma = isChromaEnabled( pcv.chrFormat );
+  EdgesPush  push{};
+  push.lfp          = m_dbLfp.addr;
+  push.slices       = slices;
+  push.counts       = m_edgeCounts.addr;
+  push.lists        = m_edgeLists.addr;
+  push.edges        = m_edgeOut.addr;
+  push.widthInCtus  = int32_t( pcv.widthInCtus );
+  push.heightInCtus = int32_t( pcv.heightInCtus );
+  push.log2Ctu      = int32_t( pcv.maxCUWidthLog2 );
+  push.width        = int32_t( pcv.lumaWidth );
+  push.height       = int32_t( pcv.lumaHeight );
+  push.chroma       = chroma ? 1 : 0;
+  push.csx          = chroma ? int32_t( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  push.csy          = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  push.capacity     = int32_t( m_edgeCap );
+  vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_edges ) );
+  for( int pass = 0; pass < 3; pass++ )
+  {
+    push.pass = pass;
+    vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+    vk.vkCmdDispatch( m_cmd, pass == 1 ? 1u : uint32_t( pcv.sizeInCtus ), 1, 1 );
+    computeBarrier();
+  }
+  VkMemoryBarrier listed{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  listed.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  listed.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &listed, 0, nullptr, 0, nullptr );
+  VkBufferCopy edges{ 0, 0, m_edgeCap * sizeof( Edge ) };
+  vk.vkCmdCopyBuffer( m_cmd, m_edgeOut.buffer, m_edgeOutHost.buffer, 1, &edges );
+  VkBufferCopy lists{ 0, 0, 9 * sizeof( uint32_t ) };
+  vk.vkCmdCopyBuffer( m_cmd, m_edgeLists.buffer, m_edgeListsHost.buffer, 1, &lists );
+  m_edgesRecorded = true;
+}
+
+void GpuRecon::compareMider( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp, const PictureJobs* jobs )
 {
   compareMotion( cs, reinterpret_cast<const int32_t*>( m_miderMotionHost.mapped ), cpu, m_miderStats );
   if( m_dbRecorded && lfp )
@@ -2098,6 +2437,68 @@ void GpuRecon::compareMider( const CodingStructure& cs, const MotionInfo* cpu, c
     compareLfp( cs, reinterpret_cast<const uint32_t*>( m_dbLfpHost.mapped ), lfp, m_miderStats );
   }
   m_dbRecorded = false;
+  if( m_jobsRecorded && jobs )
+  {
+    const uint32_t* lists  = reinterpret_cast<const uint32_t*>( m_jobBlocksHost.mapped ) + size_t( m_jobBlockCount ) * 5;
+    // the residuals', inter's (its three parts), intra's
+    const uint32_t  totals[3] = { lists[0], lists[1] + lists[3] + lists[4], lists[2] };
+    const auto      count  = [&]( int k ) { return std::min<size_t>( totals[k], m_jobCap[k] ); };
+    if( jobs->trafo )
+    {
+      compareJobs( cs, 0, reinterpret_cast<const uint32_t*>( m_jobOutHost[0].mapped ), totals[0] > m_jobCap[0] ? totals[0] : count( 0 ), *jobs->trafo,
+                   m_miderStats );
+    }
+    if( jobs->inter )
+    {
+      // (in recordInter's order: the regular jobs, BDOF's, the affine pairs)
+      std::vector<std::vector<InterJob>> parts( 1 );
+      for( int part = 0; part < 3; part++ )
+      {
+        for( const auto& ctu: *jobs->inter )
+        {
+          for( size_t i = 0; i < ctu.size(); i++ )
+          {
+            const uint32_t flags = ctu[i].w[1] >> 16;
+            const int      in    = flags & InterJob::kAffine ? 2 : flags & InterJob::kBdof ? 1 : 0;
+            if( in == part )
+            {
+              parts[0].push_back( ctu[i] );
+              if( flags & InterJob::kAffine )
+              {
+                parts[0].push_back( ctu[i + 1] );
+              }
+            }
+            i += flags & InterJob::kAffine ? 1 : 0;
+          }
+        }
+      }
+      compareJobs( cs, 1, reinterpret_cast<const uint32_t*>( m_jobOutHost[1].mapped ), totals[1] > m_jobCap[1] ? totals[1] : count( 1 ), parts,
+                   m_miderStats );
+    }
+    if( jobs->intra )
+    {
+      compareJobs( cs, 2, reinterpret_cast<const uint32_t*>( m_jobOutHost[2].mapped ), totals[2] > m_jobCap[2] ? totals[2] : count( 2 ), *jobs->intra,
+                   m_miderStats );
+      const uint32_t* info = reinterpret_cast<const uint32_t*>( m_isInfoHost.mapped );
+      if( info[2] != 0 )
+      {
+        msg( WARNING, "GPU intra order: POC %d: a wave past 65535\n", cs.picture->poc );
+        m_miderStats.sortedMismatched++;
+      }
+      else
+      {
+        compareSorted( cs, reinterpret_cast<const uint32_t*>( m_isSortedHost.mapped ), reinterpret_cast<const uint32_t*>( m_isWaitsHost.mapped ),
+                       std::min<size_t>( info[0], m_isCap ), *jobs->intra, m_miderStats );
+      }
+    }
+  }
+  m_jobsRecorded = false;
+  if( m_edgesRecorded && jobs && jobs->edges )
+  {
+    compareEdges( cs, reinterpret_cast<const uint32_t*>( m_edgeOutHost.mapped ), reinterpret_cast<const uint32_t*>( m_edgeListsHost.mapped ), m_edgeCap,
+                  *jobs->edges, m_miderStats );
+  }
+  m_edgesRecorded = false;
 }
 
 int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
@@ -2147,7 +2548,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   transferBarrier( false );
   if( jobs.cus )
   {
-    recordMider( cs, *jobs.cus, *jobs.tus );
+    recordMider( cs, jobs );
   }
   if( jobs.trafo )
   {

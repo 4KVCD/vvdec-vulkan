@@ -275,6 +275,15 @@ void DecLib::destroy()
         mider.lfpCompared += s->lfpCompared;
         mider.lfpMismatched += s->lfpMismatched;
         mider.lfpEdges += s->lfpEdges;
+        for( int k = 0; k < 3; k++ )
+        {
+          mider.jobsCompared[k] += s->jobsCompared[k];
+          mider.jobsMismatched[k] += s->jobsMismatched[k];
+        }
+        mider.edgesCompared += s->edgesCompared;
+        mider.sortedCompared += s->sortedCompared;
+        mider.sortedMismatched += s->sortedMismatched;
+        mider.edgesMismatched += s->edgesMismatched;
       }
     }
     if( miderOn )
@@ -283,6 +292,13 @@ void DecLib::destroy()
            (long long) mider.pictures, (long long) mider.compared, (long long) mider.mismatched, (long long) mider.skipped );
       msg( INFO, "GPU: deblocking parameters (VVDEC_GPU_MIDER): %lld compared with the CPU's (%lld with a boundary strength), %lld differ\n",
            (long long) mider.lfpCompared, (long long) mider.lfpEdges, (long long) mider.lfpMismatched );
+      msg( INFO, "GPU: jobs (VVDEC_GPU_MIDER): residuals' %lld compared with the CPU's, %lld differ; inter's %lld, %lld; intra's %lld, %lld\n",
+           (long long) mider.jobsCompared[0], (long long) mider.jobsMismatched[0], (long long) mider.jobsCompared[1],
+           (long long) mider.jobsMismatched[1], (long long) mider.jobsCompared[2], (long long) mider.jobsMismatched[2] );
+      msg( INFO, "GPU: deblocking edges (VVDEC_GPU_MIDER): %lld compared with the CPU's, %lld differ\n", (long long) mider.edgesCompared,
+           (long long) mider.edgesMismatched );
+      msg( INFO, "GPU: intra's order (VVDEC_GPU_MIDER): %lld bands compared with the CPU's, %lld differ\n", (long long) mider.sortedCompared,
+           (long long) mider.sortedMismatched );
     }
   }
 #endif

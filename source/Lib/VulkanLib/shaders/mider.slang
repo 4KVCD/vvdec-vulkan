@@ -2235,6 +2235,10 @@ void deriveCu( Cur cur )
     c.mv[0][1]    = m0.mv[interDir( m0 ) == 1 ? 0 : 1];
     c.mv[1][1]    = m1.mv[interDir( m1 ) == 1 ? 0 : 1];
     storeCuMotion( cu.index, c );
+    // the partitions' inter direction << 4 | reference index (CodingUnit's interDirrefIdxGeo0, 1)
+    const uint g0 = uint( interDir( m0 ) ) << 4 | uint( m0.refIdx[interDir( m0 ) == 1 ? 0 : 1] );
+    const uint g1 = uint( interDir( m1 ) ) << 4 | uint( m1.refIdx[interDir( m1 ) == 1 ? 0 : 1] );
+    pc.cuMotion[cu.index * 16 + 13] = int( g0 | g1 << 8 );
     spanGeo( cur, geoSplitDir( cu ), m0, m1 );
     return;
   }

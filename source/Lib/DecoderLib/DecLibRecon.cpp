@@ -552,6 +552,24 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     }
     m_gpuRecon->setPicture( pcPic->m_bufs[PIC_RECONSTRUCTION], lmcs ? &m_lmcsTables : nullptr, ( lmcs && lmcsChroma ) || ( m_gpuInter && sps->getUseCiip() ),
                             scaling ? trQuant.getDequantCoeffBuf() : nullptr, TrQuant::getNumDequantCoeffs() );
+    if( m_gpuMider && scaling )
+    {
+      // (the matrices' places among the picture's, for the GPU's jobs)
+      TrQuant&              tq = m_pcThreadResource[0]->m_cTrQuant;
+      std::vector<uint32_t> offsets( 6 * 7 * 7, 0 );
+      for( uint32_t list = 0; list < 6; list++ )
+      {
+        for( uint32_t w = 0; w < 7; w++ )
+        {
+          for( uint32_t h = 0; h < 7; h++ )
+          {
+            const int* m = tq.getDequantCoeff( list, w, h );
+            offsets[( list * 7 + w ) * 7 + h] = m ? uint32_t( m - tq.getDequantCoeffBuf() ) + 1 : 0;
+          }
+        }
+      }
+      m_gpuRecon->setDequantOffsets( offsets );
+    }
   }
   // the picture-sized buffers of what the CPU does itself, the filters' output
   // (SAO, ALF) and the prediction, allocated only for that (an instance's: 4K
@@ -887,8 +905,13 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       param->decLib->m_gpuRecon->endCompute();
       if( param->decLib->m_gpuMider && param->decLib->m_gpuIntra )
       {
-        param->decLib->m_gpuRecon->compareMider( *param->pic->cs, param->decLib->m_motionInfo,
-                                                 param->decLib->m_doDeblock ? param->decLib->m_loopFilterParam : nullptr );
+        DecLibRecon*     dec = param->decLib;
+        gpu::PictureJobs cpuJobs;
+        cpuJobs.trafo = dec->m_gpuResidual ? &dec->m_gpuTrafoJobs : nullptr;
+        cpuJobs.inter = dec->m_gpuInter ? &dec->m_gpuInterJobs : nullptr;
+        cpuJobs.intra = dec->m_gpuIntra ? &dec->m_gpuIntraJobs : nullptr;
+        cpuJobs.edges = dec->m_gpuFilters && dec->m_doDeblock ? &dec->m_gpuEdges : nullptr;
+        dec->m_gpuRecon->compareMider( *param->pic->cs, dec->m_motionInfo, dec->m_doDeblock ? dec->m_loopFilterParam : nullptr, &cpuJobs );
       }
       return true;
     };

@@ -51,10 +51,13 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "CommonLib/LoopFilter.h"
 #include "CommonLib/MotionInfo.h"
 #include "CommonLib/Picture.h"
+#include "CommonLib/Rom.h"
 #include "CommonLib/Slice.h"
 #include "CommonLib/Unit.h"
 
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace vvdec
 {
@@ -135,6 +138,10 @@ void writeCuRecords( CodingStructure& cs, int ctuRsAddr, std::vector<CuRecord>& 
       r.w[20]           = uint32_t( b.width ) | uint32_t( b.height ) << 8 | 1u << 16;
     }
     r.w[20] |= cu.blocks[COMPONENT_Y].valid() ? 1u << 17 : 0u;
+    // DMVR's refinements' place in the CTU's (set for luma CUs of 8x8 and more), the neighbours the parse found
+    const ptrdiff_t dmvrOff = cu.mvdL0SubPuOff - ptrdiff_t( ctuRsAddr ) * ptrdiff_t( cs.pcv->num8x8CtuBlks );
+    r.w[21] = ( dmvrOff >= 0 && dmvrOff < 0x10000 ? uint32_t( dmvrOff ) : 0u ) | ( cu.left ? 1u << 16 : 0u ) | ( cu.above ? 1u << 17 : 0u )
+              | ( cu.smvdMode() ? 1u << 18 : 0u );
     out.push_back( r );
   }
 }
@@ -332,6 +339,232 @@ void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const LoopFilte
     }
   }
 }
+
+void writeJobTables( uint32_t* out )
+{
+  memset( out, 0, kJobTableWords * sizeof( uint32_t ) );
+  for( int i = 0; i < NUM_INTRA_MODE + NUM_EXT_LUMA_MODE - 1; i++ )
+  {
+    out[0 + i] = g_lfnstLut[i];
+  }
+  for( int i = 0; i < NUM_INTRA_MODE; i++ )
+  {
+    out[128 + i] = g_chroma422IntraAngleMappingTable[i];
+  }
+  for( int split = 0; split < GEO_NUM_PARTITION_MODE; split++ )
+  {
+    out[256 + split] = uint32_t( g_GeoParams[split][0] ) | uint32_t( g_GeoParams[split][1] ) << 8;
+    for( int h = 0; h < GEO_NUM_CU_SIZE; h++ )
+    {
+      for( int w = 0; w < GEO_NUM_CU_SIZE; w++ )
+      {
+        out[384 + ( split * 4 + h ) * 4 + w] = uint32_t( uint16_t( g_weightOffset[split][h][w][0] ) ) | uint32_t( uint16_t( g_weightOffset[split][h][w][1] ) ) << 16;
+      }
+    }
+  }
+  for( int a = 0; a < GEO_NUM_ANGLES; a++ )
+  {
+    out[320 + a] = uint32_t( int32_t( g_angle2mask[a] ) );
+    out[352 + a] = uint32_t( int32_t( g_angle2mirror[a] ) );
+  }
+  for( int i = 0; i < BCW_NUM; i++ )
+  {
+    out[1408 + i] = uint32_t( int32_t( getBcwWeight( g_BcwInternBcw[i], REF_PIC_LIST_1 ) ) );
+  }
+}
+
+void writeJobSlices( const CodingStructure& cs, const RefTable& refs, uint32_t* out )
+{
+  const auto& slices = cs.picture->slices;
+  const PPS&  pps    = *cs.pps;
+  for( size_t i = 0; i < slices.size(); i++ )
+  {
+    const Slice& s   = *slices[i];
+    uint32_t*    rec = out + 256 * i;
+    memset( rec, 0, 256 * sizeof( uint32_t ) );
+    rec[0] = uint32_t( s.getSliceType() ) | ( s.getLmcsEnabledFlag() ? 4u : 0u ) | ( s.getDepQuantEnabledFlag() ? 8u : 0u )
+             | ( s.getExplicitScalingListUsed() ? 16u : 0u );
+    for( int list = 0; list < 2; list++ )
+    {
+      for( int refIdx = 0; refIdx < s.getNumRefIdx( RefPicList( list ) ) && refIdx < 16; refIdx++ )
+      {
+        const Picture* ref = s.getRefPic( RefPicList( list ), refIdx );
+        const WPScalingParam* wp = nullptr;
+        s.getWpScaling( RefPicList( list ), refIdx, wp );
+        const bool sameSize = ref->cs->pps->getPicWidthInLumaSamples() == pps.getPicWidthInLumaSamples()
+                              && ref->cs->pps->getPicHeightInLumaSamples() == pps.getPicHeightInLumaSamples();
+        uint32_t info = uint32_t( refs.slot( ref ) & 0xff ) | ( ref->isRefScaled( &pps ) ? 1u << 8 : 0u ) | ( sameSize ? 1u << 9 : 0u );
+        for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+        {
+          info |= wp[c].bPresentFlag ? 1u << ( 10 + c ) : 0u;
+          rec[64 + ( 16 * list + refIdx ) * 3 + c] = uint32_t( uint16_t( int16_t( wp[c].iWeight ) ) ) | uint32_t( uint8_t( int8_t( wp[c].iOffset ) ) ) << 16
+                                                     | ( wp[c].uiLog2WeightDenom & 15 ) << 24;
+        }
+        rec[32 + 16 * list + refIdx] = info;
+      }
+    }
+  }
+}
+
+void compareSorted( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* waits, size_t count, const std::vector<std::vector<IntraJob>>& cpu,
+                    MiderStats& stats )
+{
+  // recordIntra's order
+  static constexpr int kBand = 256;
+  const auto    bandRows = []( const IntraJob& job ) { return std::max( 1, kBand / job.width() ); };
+  const auto    bands    = [&]( const IntraJob& job ) { return ( job.height() + bandRows( job ) - 1 ) / bandRows( job ); };
+  int           maxWave  = 0;
+  size_t        total    = 0;
+  for( const auto& ctu: cpu )
+  {
+    for( const IntraJob& job: ctu )
+    {
+      maxWave = std::max( maxWave, job.wave() );
+      total += bands( job );
+    }
+  }
+  if( total != count )
+  {
+    stats.sortedMismatched += std::max( total, count );
+    if( stats.jobsReported < 20 )
+    {
+      stats.jobsReported++;
+      msg( WARNING, "GPU intra order: POC %d: %zu bands on the GPU, %zu on the CPU\n", cs.picture->poc, count, total );
+    }
+    return;
+  }
+  std::vector<uint32_t> first( size_t( maxWave ) + 2, 0 );
+  for( const auto& ctu: cpu )
+  {
+    for( const IntraJob& job: ctu )
+    {
+      first[job.wave() + 1] += bands( job );
+    }
+  }
+  for( int wave = 1; wave <= maxWave + 1; wave++ )
+  {
+    first[wave] += first[wave - 1];
+  }
+  std::vector<uint32_t> next( first.begin(), first.end() - 1 );
+  for( const auto& ctu: cpu )
+  {
+    for( const IntraJob& job: ctu )
+    {
+      const int rows = bandRows( job );
+      for( int row = 0; row < job.height(); row += rows )
+      {
+        const uint32_t at   = next[job.wave()]++;
+        IntraJob       band = job;
+        band.setRows( row, std::min( rows, job.height() - row ) );
+        stats.sortedCompared++;
+        if( memcmp( &band, gpu + size_t( at ) * 12, sizeof( IntraJob ) ) != 0 || waits[at] != first[job.wave()] )
+        {
+          stats.sortedMismatched++;
+          if( stats.jobsReported < 20 )
+          {
+            stats.jobsReported++;
+            msg( WARNING, "GPU intra order: POC %d band %u (wave %d): GPU %08x %08x %08x wait %u, CPU %08x %08x %08x wait %u\n", cs.picture->poc, at,
+                 job.wave(), gpu[at * 12], gpu[at * 12 + 1], gpu[at * 12 + 7], waits[at], band.w[0], band.w[1], band.w[7], first[job.wave()] );
+          }
+        }
+      }
+    }
+  }
+}
+
+void compareEdges( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* lists, size_t capacity, const std::vector<EdgeLists>& cpu,
+                   MiderStats& stats )
+{
+  for( int l = 0; l < 4; l++ )
+  {
+    size_t total = 0;
+    for( const EdgeLists& ctu: cpu )
+    {
+      total += ctu.lists[l].size();
+    }
+    if( total != lists[2 * l + 1] )
+    {
+      stats.edgesMismatched += std::max<size_t>( total, lists[2 * l + 1] );
+      if( stats.edgesReported < 20 )
+      {
+        stats.edgesReported++;
+        msg( WARNING, "GPU edges: POC %d list %d: %u on the GPU, %zu on the CPU\n", cs.picture->poc, l, lists[2 * l + 1], total );
+      }
+      continue;
+    }
+    size_t at = lists[2 * l];
+    for( size_t ctu = 0; ctu < cpu.size(); ctu++ )
+    {
+      for( const Edge& e: cpu[ctu].lists[l] )
+      {
+        stats.edgesCompared++;
+        if( at >= capacity || gpu[2 * at] != e.xy || gpu[2 * at + 1] != e.params )
+        {
+          stats.edgesMismatched++;
+          if( stats.edgesReported < 20 )
+          {
+            stats.edgesReported++;
+            msg( WARNING, "GPU edges: POC %d CTU %zu list %d edge %zu: GPU %08x %08x, CPU %08x %08x\n", cs.picture->poc, ctu, l, at,
+                 at < capacity ? gpu[2 * at] : 0u, at < capacity ? gpu[2 * at + 1] : 0u, e.xy, e.params );
+          }
+        }
+        at++;
+      }
+    }
+  }
+}
+
+template<typename Job>
+void compareJobs( const CodingStructure& cs, int list, const uint32_t* gpu, size_t count, const std::vector<std::vector<Job>>& cpu, MiderStats& stats )
+{
+  static const char* const names[3] = { "residuals'", "inter's", "intra's" };
+  constexpr size_t         words    = sizeof( Job ) / sizeof( uint32_t );
+  size_t                   total    = 0;
+  for( const auto& ctu: cpu )
+  {
+    total += ctu.size();
+  }
+  if( total != count )
+  {
+    stats.jobsMismatched[list] += std::max( total, count );
+    if( stats.jobsReported < 20 )
+    {
+      stats.jobsReported++;
+      msg( WARNING, "GPU jobs: POC %d: %s %zu on the GPU, %zu on the CPU\n", cs.picture->poc, names[list], count, total );
+    }
+  }
+  size_t at = 0;
+  for( size_t ctu = 0; ctu < cpu.size(); ctu++ )
+  {
+    for( const Job& job: cpu[ctu] )
+    {
+      stats.jobsCompared[list]++;
+      if( at < count && memcmp( &job, gpu + at * words, sizeof( Job ) ) != 0 )
+      {
+        stats.jobsMismatched[list]++;
+        if( stats.jobsReported < 20 )
+        {
+          stats.jobsReported++;
+          std::string g, c;
+          for( size_t w = 0; w < words; w++ )
+          {
+            char buf[16];
+            snprintf( buf, sizeof( buf ), " %08x", gpu[at * words + w] );
+            g += buf;
+            snprintf( buf, sizeof( buf ), " %08x", job.w[w] );
+            c += buf;
+          }
+          msg( WARNING, "GPU jobs: POC %d CTU %zu %s job %zu: GPU%s, CPU%s\n", cs.picture->poc, ctu, names[list], at, g.c_str(), c.c_str() );
+        }
+      }
+      at++;
+    }
+  }
+}
+
+template void compareJobs<TrafoJob>( const CodingStructure&, int, const uint32_t*, size_t, const std::vector<std::vector<TrafoJob>>&, MiderStats& );
+template void compareJobs<InterJob>( const CodingStructure&, int, const uint32_t*, size_t, const std::vector<std::vector<InterJob>>&, MiderStats& );
+template void compareJobs<IntraJob>( const CodingStructure&, int, const uint32_t*, size_t, const std::vector<std::vector<IntraJob>>&, MiderStats& );
 
 }   // namespace gpu
 }   // namespace vvdec
