@@ -1310,8 +1310,8 @@ static_assert( sizeof( ColocatedMotionInfo ) == 20 && offsetof( ColocatedMotionI
 
 bool GpuRecon::interSupported( const SPS& sps )
 {
-  return intraSupported( sps ) && sps.getBitDepth() <= 10 && !sps.getUseAffine() && !sps.getUseBIO() && !sps.getUseGeo() && !sps.getUseBcw()
-         && !sps.getSBTMVPEnabledFlag() && !sps.getSubPicInfoPresentFlag();
+  return intraSupported( sps ) && sps.getBitDepth() <= 10 && !sps.getUseAffine() && !sps.getUseBIO() && !sps.getUseGeo()
+         && !sps.getSubPicInfoPresentFlag();
 }
 
 bool GpuRecon::interSupported( const CodingStructure& cs )

@@ -177,6 +177,7 @@ struct InterJob
     kDeferCb   = 256,  // and kDeferCb << 1 for Cr, under LMCS's chroma scaling: the prediction kept aside, the
                        // residual left in the picture, for an intra job of kind IntraJob::kLmcs
     kDeferY    = 1024, // CIIP: so for the luma too (with kDeferCb and Cr), for kind IntraJob::kCiip
+    kBcw       = 2048, // BCW: the bi-prediction weighted (setBcw)
   };
 
   uint32_t w[12];
@@ -194,6 +195,12 @@ struct InterJob
     w[7]  = uint32_t( ref0 ) | uint32_t( ref1 ) << 8;
     w[8]  = uint32_t( dmvrIndex );
     w[9]  = w[10] = w[11] = 0;
+  }
+  // BCW: L1's weight, of 8 (addWeightedAvg's w1; L0's: 8 - w1)
+  void setBcw( int weight1 )
+  {
+    w[1] |= uint32_t( kBcw ) << 16;
+    w[7] |= uint32_t( weight1 + 2 ) << 16;
   }
 };
 

@@ -11,9 +11,10 @@
 //   2, 3: L0 motion vector (1/16 luma)     4, 5: L1 motion vector
 //   6: x | y << 16 of the CU               7: L0 reference | L1 reference << 8 (slots of the table)
 //   8: where DMVR's refinement goes (vvdec's DMVR MV cache)
+//   7, bits 16..19: BCW: L1's weight + 2 (of 8; L0's: 8 - it), with flag 2048
 // flags: 1 L0, 2 L1, 4 DMVR, 8 AMVR half-sample filter, 16/32/64 residual in Y/Cb/Cr, 128 LMCS's forward mapping of
 // the luma prediction, 256/512 (LMCS's chroma scaling, CIIP) the Cb/Cr prediction kept aside (defer1/2), the residual
-// left in the picture for intra.slang's kind 5 or 6, 1024 (CIIP) so the luma's too (defer0)
+// left in the picture for intra.slang's kind 5 or 6, 1024 (CIIP) so the luma's too (defer0), 2048 BCW's weights
 
 #include "common.slang"
 
@@ -61,6 +62,19 @@ struct Params
 #define FLAG_LUMA_MAP 128
 #define FLAG_DEFER_CB 256
 #define FLAG_DEFER_Y 1024
+#define FLAG_BCW 2048
+
+// the average of a bi-prediction's two 14-bit predictions (addAvg), or with
+// BCW's weights (addWeightedAvg: w1 of 8)
+int biAverage( int p0, int p1, int flags, int w1, int shiftNum, int offset, int maxVal )
+{
+  if( ( flags & FLAG_BCW ) != 0 )
+  {
+    const int shift = shiftNum + 2;
+    return clip3( 0, maxVal, ( ( 8 - w1 ) * p0 + w1 * p1 + ( 1 << ( shift - 1 ) ) + ( 8192 << 3 ) ) >> shift );   // IF_INTERNAL_OFFS << 3
+  }
+  return clip3( 0, maxVal, ( p0 + p1 + offset ) >> shiftNum );
+}
 
 #define IF_INTERNAL_OFFS 8192
 #define THREADS 64
@@ -735,6 +749,7 @@ bool tile16Inside( int x, int y, int flags, int2 mv0, int2 mv1 )
 
 void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, int2 mv1, int ref0, int ref1, bool bi, bool dmvr, bool hpel )
 {
+  const int bcwW1 = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW
   const int maxVal   = ( 1 << pc.bitDepth ) - 1;
   const int headRoom = max( 2, 14 - pc.bitDepth );
 
@@ -1063,7 +1078,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   [unroll]
   for( int o = 0; o < 4; o++ )
   {
-    vy[o] = bi ? clip3( 0, maxVal, ( predY[0][o] + predY[1][o] + offset ) >> shiftNum ) : predY[0][o];
+    vy[o] = bi ? biAverage( predY[0][o], predY[1][o], flags, bcwW1, shiftNum, offset, maxVal ) : predY[0][o];
   }
   if( ( flags & FLAG_LUMA_MAP ) != 0 )
   {
@@ -1079,7 +1094,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   [unroll]
   for( int o = 0; o < 2; o++ )
   {
-    vc[o] = bi ? clip3( 0, maxVal, ( predC[0][o] + predC[1][o] + offset ) >> shiftNum ) : predC[0][o];
+    vc[o] = bi ? biAverage( predC[0][o], predC[1][o], flags, bcwW1, shiftNum, offset, maxVal ) : predC[0][o];
   }
   if( ( flags & ( FLAG_RES_Y << ( 1 + cc ) ) ) != 0 )
   {
@@ -1112,6 +1127,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int  cuY   = int( job[6] >> 16 );
   const int  ref0  = int( job[7] & 255 );
   const int  ref1  = int( ( job[7] >> 8 ) & 255 );
+  const int  bcwW1 = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW
   const bool hpel  = ( flags & FLAG_HPEL ) != 0;
   const bool bi    = ( flags & ( FLAG_L0 | FLAG_L1 ) ) == ( FLAG_L0 | FLAG_L1 );
   const bool dmvr  = ( flags & FLAG_DMVR ) != 0;
@@ -1300,7 +1316,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       }
       const int i  = t & ( bw - 1 );
       const int j  = t >> log2W;
-      int       v  = bi ? clip3( 0, maxVal, ( pred0[k] + pred1[k] + offset ) >> shiftNum ) : pred0[k];
+      int       v  = bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k];
       const int at = ( by + j ) * stride + bx + i;
       if( map )
       {

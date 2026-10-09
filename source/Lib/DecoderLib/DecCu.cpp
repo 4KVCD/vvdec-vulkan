@@ -497,32 +497,16 @@ void DecCu::xGpuIbcJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::
 void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs, std::vector<gpu::TrafoJob>* trafoJobs,
                            std::vector<gpu::IntraJob>& intraJobs, gpu::WaveMap& waves )
 {
-  CHECK( cu.affineFlag() || cu.geoFlag() || cu.mergeType() == MRG_TYPE_SUBPU_ATMVP, "an inter tool the GPU lacks" );
+  // (SbTMVP's CUs are subblock merge CUs: affine ones, by their flag; with
+  // affine off, so are the subblock merge list's zero candidates
+  // (getAffineMergeCand's padding): their motion zero everywhere, the same as
+  // a translational block's, without DMVR or BDOF)
+  CHECK( ( cu.affineFlag() && cu.mergeType() != MRG_TYPE_SUBPU_ATMVP && cu.sps->getUseAffine() ) || cu.geoFlag(), "an inter tool the GPU lacks" );
 
   const Slice& slice = *cu.slice;
-  int          flags = 0;
-  int          ref[2] = { 0, 0 };
-  for( int list = 0; list < 2; list++ )
-  {
-    if( cu.refIdx[list] >= 0 )
-    {
-      flags     |= list == 0 ? gpu::InterJob::kL0 : gpu::InterJob::kL1;
-      ref[list]  = refs.slot( slice.getRefPic( RefPicList( list ), cu.refIdx[list] ) );
-    }
-  }
-
-  // as motionCompensation chooses: DMVR, else the same motion twice is a uni-prediction (xCheckIdenticalMotion)
-  const bool dmvr = PU::checkDMVRCondition( cu );
-  if( dmvr )
-  {
-    cu.setDmvrCondition( true );
-    flags |= gpu::InterJob::kDmvr;
-  }
-  else if( slice.isInterB() && !cu.pps->getWPBiPred() && cu.refIdx[0] >= 0 && cu.refIdx[1] >= 0
-           && slice.getRefPOC( REF_PIC_LIST_0, cu.refIdx[0] ) == slice.getRefPOC( REF_PIC_LIST_1, cu.refIdx[1] ) && cu.mv[0][0] == cu.mv[1][0] )
-  {
-    flags &= ~gpu::InterJob::kL1;
-  }
+  // what all the CU's blocks share: AMVR's half-sample filter, LMCS, the
+  // residual, CIIP
+  int flags = 0;
   if( cu.imv() == IMV_HPEL )
   {
     flags |= gpu::InterJob::kHalfPel;
@@ -592,18 +576,123 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
     flags |= gpu::InterJob::kDeferY | gpu::InterJob::kDeferCb | gpu::InterJob::kDeferCb << 1;
   }
 
-  const int tileW = std::min<int>( cu.lwidth(), DMVR_SUBCU_WIDTH );
-  const int tileH = std::min<int>( cu.lheight(), DMVR_SUBCU_HEIGHT );
-  int       num   = 0;
-  for( int y = cu.ly(); y < cu.ly() + int( cu.lheight() ); y += tileH )
+  // the blocks motionCompensation predicts with one motion each: the CU, or
+  // SbTMVP's sub-PUs joined where their motion is the same (xSubPuMC), each
+  // with its own clip of the motion, in tiles of up to 16 x 16 (DMVR's
+  // subblocks)
+  const auto mcBlock = [&]( int bx, int by, int bw, int bh, const int8_t refIdx[2], const Mv mv[2], bool subPu )
   {
-    for( int x = cu.lx(); x < cu.lx() + int( cu.lwidth() ); x += tileW, num++ )
+    int bflags = flags;
+    int ref[2] = { 0, 0 };
+    for( int list = 0; list < 2; list++ )
     {
-      gpu::InterJob job;
-      job.set( x, y, tileW, tileH, flags, cu.mv[0][0].hor, cu.mv[0][0].ver, cu.mv[1][0].hor, cu.mv[1][0].ver, cu.lx(), cu.ly(), ref[0], ref[1],
-               dmvr ? int( cu.mvdL0SubPuOff ) + num : 0 );
-      jobs.push_back( job );
+      if( refIdx[list] >= 0 )
+      {
+        bflags    |= list == 0 ? gpu::InterJob::kL0 : gpu::InterJob::kL1;
+        ref[list]  = refs.slot( slice.getRefPic( RefPicList( list ), refIdx[list] ) );
+      }
     }
+    // as motionCompensation chooses: DMVR (not for sub-PUs), else the same
+    // motion twice is a uni-prediction (xCheckIdenticalMotion), else BCW's
+    // weights (not with CIIP)
+    const bool dmvr = !subPu && PU::checkDMVRCondition( cu );
+    const bool bi   = refIdx[0] >= 0 && refIdx[1] >= 0;
+    if( dmvr )
+    {
+      cu.setDmvrCondition( true );
+      bflags |= gpu::InterJob::kDmvr;
+    }
+    else if( bi && slice.isInterB() && !cu.pps->getWPBiPred()
+             && slice.getRefPOC( REF_PIC_LIST_0, refIdx[0] ) == slice.getRefPOC( REF_PIC_LIST_1, refIdx[1] ) && mv[0] == mv[1] )
+    {
+      bflags &= ~gpu::InterJob::kL1;
+    }
+    const bool bcw = ( bflags & gpu::InterJob::kL1 ) && ( bflags & gpu::InterJob::kL0 ) && cu.BcwIdx() != BCW_DEFAULT && !cu.ciipFlag();
+
+    const int tileW = std::min( bw, DMVR_SUBCU_WIDTH );
+    const int tileH = std::min( bh, DMVR_SUBCU_HEIGHT );
+    int       num   = 0;
+    for( int y = by; y < by + bh; y += tileH )
+    {
+      for( int x = bx; x < bx + bw; x += tileW, num++ )
+      {
+        gpu::InterJob job;
+        job.set( x, y, tileW, tileH, bflags, mv[0].hor, mv[0].ver, mv[1].hor, mv[1].ver, bx, by, ref[0], ref[1],
+                 dmvr ? int( cu.mvdL0SubPuOff ) + num : 0 );
+        if( bcw )
+        {
+          job.setBcw( getBcwWeight( g_BcwInternBcw[cu.BcwIdx()], REF_PIC_LIST_1 ) );
+        }
+        jobs.push_back( job );
+      }
+    }
+  };
+
+  if( cu.mergeType() == MRG_TYPE_SUBPU_ATMVP )
+  {
+    const Position puPos       = cu.lumaPos();
+    const Size     puSize      = cu.lumaSize();
+    const int      numPartLine = std::max<SizeType>( puSize.width >> ATMVP_SUB_BLOCK_SIZE, 1u );
+    const int      numPartCol  = std::max<SizeType>( puSize.height >> ATMVP_SUB_BLOCK_SIZE, 1u );
+    const int      puHeight    = numPartCol == 1 ? puSize.height : 1 << ATMVP_SUB_BLOCK_SIZE;
+    const int      puWidth     = numPartLine == 1 ? puSize.width : 1 << ATMVP_SUB_BLOCK_SIZE;
+    const bool     verMC       = puSize.height > puSize.width;
+    const int      fstStart    = !verMC ? puPos.y : puPos.x;
+    const int      secStart    = !verMC ? puPos.x : puPos.y;
+    const int      fstEnd      = !verMC ? puPos.y + puSize.height : puPos.x + puSize.width;
+    const int      secEnd      = !verMC ? puPos.x + puSize.width : puPos.y + puSize.height;
+    const int      fstStep     = !verMC ? puHeight : puWidth;
+    const int      secStep     = !verMC ? puWidth : puHeight;
+    const bool     scaled      = slice.getRefPic( REF_PIC_LIST_0, 0 )->isRefScaled( cu.pps )
+                                 || ( slice.getSliceType() == B_SLICE ? slice.getRefPic( REF_PIC_LIST_1, 0 )->isRefScaled( cu.pps ) : false );
+    for( int fstDim = fstStart; fstDim < fstEnd; fstDim += fstStep )
+    {
+      for( int secDim = secStart; secDim < secEnd; secDim += secStep )
+      {
+        int               x     = !verMC ? secDim : fstDim;
+        int               y     = !verMC ? fstDim : secDim;
+        const MotionInfo& curMi = cu.getMotionInfo( Position{ x, y } );
+        int               length = secStep;
+        int               later  = secDim + secStep;
+        while( later < secEnd )
+        {
+          const MotionInfo& laterMi = !verMC ? cu.getMotionInfo( Position{ later, fstDim } ) : cu.getMotionInfo( Position{ fstDim, later } );
+          if( !scaled && laterMi == curMi )
+          {
+            length += secStep;
+          }
+          else
+          {
+            break;
+          }
+          later += secStep;
+        }
+        int dx = !verMC ? length : puWidth;
+        int dy = !verMC ? puHeight : length;
+        if( !verMC && ( dx & 15 ) && dx > 16 )
+        {
+          const int dxPart = dx & ~15;
+          mcBlock( x, y, dxPart, dy, curMi.miRefIdx, curMi.mv, true );
+          x  += dxPart;
+          dx -= dxPart;
+        }
+        else if( verMC && ( dy & 15 ) && dy > 16 )
+        {
+          const int dyPart = dy & ~15;
+          mcBlock( x, y, dx, dyPart, curMi.miRefIdx, curMi.mv, true );
+          y  += dyPart;
+          dy -= dyPart;
+        }
+        mcBlock( x, y, dx, dy, curMi.miRefIdx, curMi.mv, true );
+        secDim = later - secStep;
+      }
+    }
+  }
+  else
+  {
+    const int8_t refIdx[2] = { int8_t( cu.refIdx[0] ), int8_t( cu.refIdx[1] ) };
+    const Mv     mv[2]     = { cu.mv[0][0], cu.mv[1][0] };
+    mcBlock( cu.lx(), cu.ly(), cu.lwidth(), cu.lheight(), refIdx, mv, false );
   }
 
   if( cu.ciipFlag() )
