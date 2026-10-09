@@ -100,6 +100,12 @@ public:
   bool isVPDUprocessed(int x, int y) { return ((x == m_vpduX) && (y == m_vpduY)); }
   void setChromaScale (int chromaScale) { m_chromaScale = chromaScale; }
   int  getChromaScale() { return m_chromaScale; }
+
+  // the tables of a picture's LMCS for the GPU (VulkanLib), a value each of
+  // the 1 << bitDepth luma values: the forward mapping (rspBufFwd's), the
+  // inverse one (rspCtuBcw's) and the chroma residual scale of an average
+  // luma (calculateChromaAdj's), each made by those very routines
+  void gpuTables( Pel* fwd, Pel* inv, int* chromaScale ) const;
 };// END CLASS DEFINITION Reshape
 
 }   // namespace vvdec

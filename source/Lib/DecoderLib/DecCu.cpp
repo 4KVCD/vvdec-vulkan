@@ -277,13 +277,42 @@ void DecCu::TaskGpuCtu( CodingStructure& cs, const int ctuRsAddr, const UnitArea
     }
     else if( jobs.inter )
     {
-      xGpuInterJobs( currCU, *jobs.inter, *jobs.refs, jobs.trafo );
+      xGpuInterJobs( currCU, *jobs.inter, *jobs.refs, jobs.trafo, *jobs.intra, *jobs.waves );
     }
     else if( currCU.rootCbf() )
     {
       finishLMCSAndReco( currCU );
     }
   }
+}
+
+// LMCS's chroma residual scaling of a chroma transform block whose luma is at
+// lumaPos (Reshape::calculateChromaAdjVpduNei): the scale comes from the
+// average luma left of and above the CU at the top-left of the VPDU holding
+// lumaPos (64 x 64, the CTU when smaller), min( 64, CTU size ) samples a
+// side; returns the highest wave of those samples
+static int gpuLmcsChroma( const CodingUnit& cu, const Position lumaPos, gpu::IntraJob& job, const gpu::WaveMap& waves )
+{
+  const CodingStructure& cs      = *cu.cs;
+  const int              ctuSize = cs.sps->getCTUSize();
+  const int              count   = std::min( 64, ctuSize );
+  const int              mask    = ctuSize == 128 ? ~63 : ~( ctuSize - 1 );
+  const Position         vpdu( lumaPos.x & mask, lumaPos.y & mask );
+  const CodingUnit*      first   = cs.getCU( vpdu, CHANNEL_TYPE_LUMA );
+  const CodingUnit*      above   = cs.getCURestricted( first->lumaPos().offset( 0, -1 ), *first, CHANNEL_TYPE_LUMA, first->ly() == vpdu.y ? first : first->above );
+  const CodingUnit*      left    = cs.getCURestricted( first->lumaPos().offset( -1, 0 ), *first, CHANNEL_TYPE_LUMA, first->lx() == vpdu.x ? first : first->left );
+  const Position         at      = first->lumaPos();
+  job.setLmcs( at.x, at.y, left != nullptr, above != nullptr, getLog2( count ) );
+  int wave = 0;
+  if( left )
+  {
+    wave = std::max( wave, waves.maxIn( COMPONENT_Y, at.x - 1, at.y, 1, count ) );
+  }
+  if( above )
+  {
+    wave = std::max( wave, waves.maxIn( COMPONENT_Y, at.x, at.y - 1, count, 1 ) );
+  }
+  return wave;
 }
 
 void DecCu::xGpuIntraJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves )
@@ -394,6 +423,14 @@ void DecCu::xGpuIntraJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu
         wave = std::max( waves.maxIn( compID, area.x - 1 - refLine, area.y - 1 - refLine, 2 * area.width + 1 + refLine, 1 ),
                          waves.maxIn( compID, area.x - 1 - refLine, area.y - refLine, 1, 2 * area.height + refLine ) );
       }
+      // LMCS: the chroma residual scaled (predAndReco's doChrScale), by the
+      // luma around the VPDU of the block's luma
+      if( isChroma( compID ) && cu.slice->getLmcsEnabledFlag() && cu.cs->picHeader->getLmcsChromaResidualScaleFlag() && area.area() > 4
+          && ( TU::getCbf( tu, compID ) || tu.jointCbCr ) )
+      {
+        const Position lumaPos = tu.Y().valid() ? tu.Y().pos() : recalcPosition( cu.chromaFormat, tu.chType(), CHANNEL_TYPE_LUMA, tu.blocks[tu.chType()].pos() );
+        wave = std::max( wave, gpuLmcsChroma( cu, lumaPos, job, waves ) );
+      }
       if( kind == gpu::IntraJob::kCclm )
       {
         const IntraPrediction::LmAvailability lm = IntraPrediction::getLmAvailability( cu, area );
@@ -441,7 +478,15 @@ void DecCu::xGpuIbcJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::
       job.set( area.x, area.y, area.width, area.height, compID, gpu::IntraJob::kIbc, 0, flags, 0 );
       job.setBlockVector( bvx, bvy );
 
-      const int wave = waves.maxIn( compID, area.x + bvx, area.y + bvy, area.width, area.height ) + 1;
+      int wave = waves.maxIn( compID, area.x + bvx, area.y + bvy, area.width, area.height );
+      // LMCS: the chroma residual scaled (finishLMCSAndReco), by the luma
+      // around the VPDU of the transform unit's luma
+      if( isChroma( compID ) && cu.rootCbf() && cu.cs->picHeader->getLmcsEnabledFlag() && cu.cs->picHeader->getLmcsChromaResidualScaleFlag()
+          && cu.slice->getLmcsEnabledFlag() && area.area() > 4 && ( TU::getCbf( tu, compID ) || tu.jointCbCr ) )
+      {
+        wave = std::max( wave, gpuLmcsChroma( cu, tu.blocks[COMPONENT_Y].pos(), job, waves ) );
+      }
+      wave += 1;
       job.setWave( wave );
       waves.set( compID, area.x, area.y, area.width, area.height, wave );
       jobs.push_back( job );
@@ -449,7 +494,8 @@ void DecCu::xGpuIbcJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::
   }
 }
 
-void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs, std::vector<gpu::TrafoJob>* trafoJobs )
+void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs, std::vector<gpu::TrafoJob>* trafoJobs,
+                           std::vector<gpu::IntraJob>& intraJobs, gpu::WaveMap& waves )
 {
   CHECK( cu.affineFlag() || cu.geoFlag() || cu.ciipFlag() || cu.mergeType() == MRG_TYPE_SUBPU_ATMVP, "an inter tool the GPU lacks" );
 
@@ -482,6 +528,18 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
     flags |= gpu::InterJob::kHalfPel;
   }
 
+  // LMCS: the luma prediction forward-mapped (rspBufFwd); with its chroma
+  // residual scaling, a chroma component with a residual is finished by
+  // intra jobs once the luma its scale comes from is there
+  // (finishLMCSAndReco): inter keeps its prediction aside
+  const PicHeader& picHeader  = *cu.cs->picHeader;
+  const bool       lmcs       = slice.getLmcsEnabledFlag() && picHeader.getLmcsEnabledFlag();
+  const bool       lmcsChroma = lmcs && picHeader.getLmcsChromaResidualScaleFlag() && cu.rootCbf();
+  if( lmcs )
+  {
+    flags |= gpu::InterJob::kLumaMap;
+  }
+
   // the residual: the GPU adds it where a component has one; inside such a
   // component, the transform blocks without one are cleared, by the GPU when
   // it makes the residuals (trafoJobs), else here
@@ -494,7 +552,7 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
       {
         continue;
       }
-      flags |= gpu::InterJob::kResidualY << c;
+      flags |= lmcsChroma && isChroma( compID ) ? gpu::InterJob::kDeferCb << ( c - 1 ) : gpu::InterJob::kResidualY << c;
       for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
       {
         if( tu.blocks[compID].valid() && !TU::getCbf( tu, compID ) && !( isChroma( compID ) && tu.jointCbCr ) )
@@ -526,6 +584,34 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
       job.set( x, y, tileW, tileH, flags, cu.mv[0][0].hor, cu.mv[0][0].ver, cu.mv[1][0].hor, cu.mv[1][0].ver, cu.lx(), cu.ly(), ref[0], ref[1],
                dmvr ? int( cu.mvdL0SubPuOff ) + num : 0 );
       jobs.push_back( job );
+    }
+  }
+
+  // the chroma kept aside: each transform block's prediction plus its
+  // residual, scaled where finishLMCSAndReco scales it
+  if( flags & ( gpu::InterJob::kDeferCb | gpu::InterJob::kDeferCb << 1 ) )
+  {
+    for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
+    {
+      for( int c = COMPONENT_Cb; c <= COMPONENT_Cr; c++ )
+      {
+        const ComponentID compID = ComponentID( c );
+        const CompArea&   block  = tu.blocks[compID];
+        if( !( flags & ( gpu::InterJob::kDeferCb << ( c - 1 ) ) ) || !block.valid() )
+        {
+          continue;
+        }
+        gpu::IntraJob job;
+        job.set( block.x, block.y, block.width, block.height, compID, gpu::IntraJob::kLmcs, 0, gpu::IntraJob::kResidual, 0 );
+        int wave = 0;
+        if( ( TU::getCbf( tu, compID ) || tu.jointCbCr ) && block.area() > 4 )
+        {
+          wave = gpuLmcsChroma( cu, tu.blocks[COMPONENT_Y].pos(), job, waves );
+        }
+        job.setWave( wave + 1 );
+        waves.set( compID, block.x, block.y, block.width, block.height, wave + 1 );
+        intraJobs.push_back( job );
+      }
     }
   }
 }

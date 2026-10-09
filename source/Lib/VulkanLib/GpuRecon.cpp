@@ -351,6 +351,8 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_matrices );
   m_ctx->free( m_mip );
   m_ctx->free( m_lfnst );
+  m_ctx->free( m_lmcs );
+  m_ctx->free( m_defer );
   for( Buffer& buf: m_scratch )
   {
     m_ctx->free( buf );
@@ -1174,8 +1176,8 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
 // the push constants of shaders/intra.slang
 struct IntraPush
 {
-  VkDeviceAddress plane0, plane1, plane2, jobs, waits, sync, mip;
-  int32_t         stride0, stride12, count, bitDepth, ctuLog2, scaleX, scaleY, collocated;
+  VkDeviceAddress plane0, plane1, plane2, jobs, waits, sync, mip, lmcsScale, defer1, defer2;
+  int32_t         stride0, stride12, count, bitDepth, ctuLog2, scaleX, scaleY, collocated, picWidth, picHeight;
 };
 
 bool GpuRecon::intraSupported( const CodingStructure& cs )
@@ -1185,7 +1187,7 @@ bool GpuRecon::intraSupported( const CodingStructure& cs )
 
 bool GpuRecon::intraSupported( const SPS& sps )
 {
-  return sps.getChromaFormatIdc() == CHROMA_420 && !sps.getUseCiip() && !sps.getUseColorTrans() && !sps.getUseReshaper() && !sps.getUseWrapAround();
+  return sps.getChromaFormatIdc() == CHROMA_420 && !sps.getUseCiip() && !sps.getUseColorTrans() && !sps.getUseWrapAround();
 }
 
 void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes )
@@ -1271,6 +1273,14 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   push.scaleX     = getComponentScaleX( COMPONENT_Cb, pcv.chrFormat );
   push.scaleY     = getComponentScaleY( COMPONENT_Cb, pcv.chrFormat );
   push.collocated = cs.sps->getCclmCollocatedChromaFlag() ? 1 : 0;
+  push.picWidth   = pcv.lumaWidth;
+  push.picHeight  = pcv.lumaHeight;
+  if( m_lmcsOn )
+  {
+    push.lmcsScale = m_lmcs.addr + m_lmcsCount * 2 * sizeof( int16_t );
+    push.defer1    = m_deferPlanes.addr[COMPONENT_Cb];
+    push.defer2    = m_deferPlanes.addr[COMPONENT_Cr];
+  }
   CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
   // the counts of the jobs taken and done from zero; they and what the work
   // before wrote (the residuals, inter's predictions) visible to the jobs
@@ -1290,7 +1300,7 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
 // the push constants of shaders/inter.slang
 struct InterPush
 {
-  VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion;
+  VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion, lmcsFwd, defer1, defer2;
   int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth, ctuLog2, widthInCtus, num8x8, wide;
 };
 // the colocated motion as shaders/inter.slang writes DMVR's refinements into it
@@ -1374,6 +1384,12 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   // memory of the GPU's picture allocator (Picture::gpuMemory)
   CHECK_FATAL( !cs.m_colMiAllocation, "Vulkan: the colocated motion out of the GPU's reach" );
   push.colMotion   = static_cast<HostPlane*>( cs.m_colMiAllocation )->host.addr;
+  if( m_lmcsOn )
+  {
+    push.lmcsFwd = m_lmcs.addr;
+    push.defer1  = m_deferPlanes.addr[COMPONENT_Cb];
+    push.defer2  = m_deferPlanes.addr[COMPONENT_Cr];
+  }
   push.ctuLog2     = getLog2( pcv.maxCUWidth );
   push.widthInCtus = pcv.widthInCtus;
   push.num8x8      = int32_t( pcv.num8x8CtuBlks );
@@ -1487,7 +1503,17 @@ void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptive
   m_prepared.dbSize  = deblockParamSize( cs );
   m_prepared.alfSize = alf ? alfParamSize( cs ) : 0;
   m_prepared.saoSize = sao ? saoParamSize( cs ) : 0;
-  uint8_t* base      = params( m_prepared.dbSize + m_prepared.alfSize + m_prepared.saoSize );
+  // LMCS: per CTU, whether its slice uses it (rspCtuBcw maps its luma back)
+  m_prepared.lmcsSize = m_lmcsOn ? ( size_t( cs.pcv->sizeInCtus ) + 255 ) & ~size_t( 255 ) : 0;
+  uint8_t* base       = params( m_prepared.dbSize + m_prepared.alfSize + m_prepared.saoSize + m_prepared.lmcsSize );
+  if( m_lmcsOn )
+  {
+    uint8_t* ctus = base + m_prepared.dbSize + m_prepared.alfSize + m_prepared.saoSize;
+    for( unsigned ctu = 0; ctu < cs.pcv->sizeInCtus; ctu++ )
+    {
+      ctus[ctu] = cs.getCtuData( ctu ).slice->getLmcsEnabledFlag() ? 1 : 0;
+    }
+  }
   m_prepared.deblock = deblock && prepareDeblock( cs, base );
   m_prepared.sao     = sao && prepareSao( cs, *sao, base + m_prepared.dbSize + m_prepared.alfSize );
   if( alf )
@@ -1495,6 +1521,72 @@ void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptive
     prepareAlf( cs, *alf, base + m_prepared.dbSize );
   }
   m_prepared.picture = cs.picture;
+}
+
+void GpuRecon::setLmcs( const LmcsTables* tables, const PelStorage& pic )
+{
+  m_lmcsOn = tables != nullptr;
+  if( !tables )
+  {
+    return;
+  }
+  // the instance's picture before is done (its work no more reads these)
+  m_lmcsCount       = tables->fwd.size();
+  const size_t size = m_lmcsCount * ( 2 * sizeof( int16_t ) + sizeof( int32_t ) );
+  if( m_lmcs.size < size )
+  {
+    m_ctx->free( m_lmcs );
+    m_lmcs = m_ctx->alloc( size, MemKind::Upload );
+  }
+  memcpy( m_lmcs.mapped, tables->fwd.data(), m_lmcsCount * sizeof( int16_t ) );
+  memcpy( m_lmcs.mapped + m_lmcsCount * sizeof( int16_t ), tables->inv.data(), m_lmcsCount * sizeof( int16_t ) );
+  memcpy( m_lmcs.mapped + m_lmcsCount * 2 * sizeof( int16_t ), tables->chromaScale.data(), m_lmcsCount * sizeof( int32_t ) );
+  if( tables->chroma )
+  {
+    // the planes inter's chroma predictions are kept aside in: laid out as
+    // the picture's chroma planes (from their first sample)
+    const size_t plane = size_t( pic.bufs[COMPONENT_Cb].stride ) * pic.bufs[COMPONENT_Cb].height * sizeof( Pel );
+    CHECK( pic.bufs[COMPONENT_Cb].stride != pic.bufs[COMPONENT_Cr].stride || pic.bufs[COMPONENT_Cb].height != pic.bufs[COMPONENT_Cr].height,
+           "the chroma planes differ" );
+    if( m_defer.size < 2 * plane )
+    {
+      m_ctx->free( m_defer );
+      m_defer = m_ctx->alloc( 2 * plane, MemKind::Device );
+    }
+    m_deferPlanes.addr[COMPONENT_Cb]   = m_defer.addr;
+    m_deferPlanes.addr[COMPONENT_Cr]   = m_defer.addr + plane;
+    m_deferPlanes.stride[COMPONENT_Cb] = pic.bufs[COMPONENT_Cb].stride;
+    m_deferPlanes.stride[COMPONENT_Cr] = pic.bufs[COMPONENT_Cr].stride;
+  }
+}
+
+// the push constants of shaders/lmcs.slang
+struct LmcsPush
+{
+  VkDeviceAddress plane, lut, ctus;
+  int32_t         stride, width, height, ctuLog2, widthInCtus;
+};
+
+void GpuRecon::recordLmcs( const CodingStructure& cs, const Planes& planes, VkDeviceAddress ctus )
+{
+  const PreCalcValues& pcv = *cs.pcv;
+  LmcsPush             push{};
+  push.plane       = planes.addr[COMPONENT_Y];
+  push.lut         = m_lmcs.addr + m_lmcsCount * sizeof( int16_t );
+  push.ctus        = ctus;
+  push.stride      = planes.stride[COMPONENT_Y];
+  push.width       = pcv.lumaWidth;
+  push.height      = pcv.lumaHeight;
+  push.ctuLog2     = getLog2( pcv.maxCUWidth );
+  push.widthInCtus = pcv.widthInCtus;
+  CHECK( pcv.lumaWidth % 4 != 0, "Vulkan: LMCS takes 4 luma samples at a time" );
+
+  const Api& vk = m_ctx->api();
+  vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_lmcs ) );
+  vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+  // a workgroup 256 samples of a row (shaders/lmcs.slang)
+  vk.vkCmdDispatch( m_cmd, uint32_t( ( pcv.lumaWidth + 255 ) / 256 ), uint32_t( pcv.lumaHeight ), 1 );
+  mark( "lmcs" );
 }
 
 void GpuRecon::writeRefTable( const RefTable& refs, const PelStorage& pic, std::vector<const Picture*>& uploads )
@@ -1582,6 +1674,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   m_prepared.picture   = nullptr;   // the next picture's anew
   const size_t dbSize  = m_prepared.dbSize;
   const size_t alfSize = m_prepared.alfSize;
+  const size_t saoSize = m_prepared.saoSize;
 
   // after a band (startBand): the command pool reset, the reference table
   // written, the references uploaded
@@ -1631,6 +1724,11 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   {
     recordIntra( cs, *jobs.intra, planes[cur] );   // in place
     computeBarrier();
+    if( m_lmcsOn )
+    {
+      recordLmcs( cs, planes[cur], m_params.addr + dbSize + alfSize + saoSize );   // in place
+      computeBarrier();
+    }
   }
   if( doDeblock )
   {

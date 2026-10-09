@@ -104,6 +104,7 @@ struct IntraJob
     kCclm    = 2,
     kIbc     = 3,
     kMip     = 4,   // matrix-based intra prediction (the mode: the MIP mode)
+    kLmcs    = 5,   // an inter CU's chroma under LMCS: its prediction (kept aside) plus its residual, scaled
   };
   enum Flags
   {
@@ -113,7 +114,7 @@ struct IntraJob
     kIsp           = 8,   // a luma sub-partition of an ISP CU (setIsp)
   };
 
-  uint32_t w[8];
+  uint32_t w[12];
 
   // refLine: the reference line the block predicts from (MRL: luma's
   // cu.multiRefIdx(), 0 .. 2)
@@ -122,7 +123,7 @@ struct IntraJob
     w[0] = uint32_t( x ) | uint32_t( y ) << 16;
     w[1] = uint32_t( width ) | uint32_t( height ) << 8 | uint32_t( comp ) << 16 | uint32_t( kind ) << 24;
     w[2] = uint32_t( mode ) | uint32_t( flags ) << 8 | uint32_t( bdpcmDir ) << 16 | uint32_t( refLine ) << 24;
-    w[3] = w[4] = w[5] = w[6] = w[7] = 0;
+    w[3] = w[4] = w[5] = w[6] = w[7] = w[8] = w[9] = w[10] = w[11] = 0;
   }
   void setNeighbors( int topLeft, int above, int left ) { w[3] = uint32_t( topLeft ) | uint32_t( above ) << 8 | uint32_t( left ) << 16; }
   void setCclm( bool lumaAbove, bool lumaLeft, bool above, bool left, int actualTop, int actualLeft )
@@ -139,6 +140,14 @@ struct IntraJob
   {
     w[4] = uint32_t( cuX ) | uint32_t( cuY ) << 16;
     w[5] = uint32_t( cuWidth ) | uint32_t( cuHeight ) << 8 | uint32_t( split ) << 16 | uint32_t( leftAvail ) << 18 | uint32_t( aboveAvail ) << 19;
+  }
+  // LMCS's chroma residual scaling (Reshape::calculateChromaAdjVpduNei): the
+  // luma of the CU at (x, y) its average comes from, left of it and above
+  // it (where there), 1 << log2Count samples a side
+  void setLmcs( int x, int y, bool left, bool above, int log2Count )
+  {
+    w[8] = uint32_t( x ) | uint32_t( y ) << 16;
+    w[9] = 1u | uint32_t( left ) << 1 | uint32_t( above ) << 2 | uint32_t( log2Count ) << 4;
   }
   void setWave( int wave ) { w[7] = uint32_t( wave ); }
   int  wave() const { return int( w[7] ); }
@@ -160,6 +169,9 @@ struct InterJob
     kDmvr      = 4,
     kHalfPel   = 8,    // AMVR's half-sample luma filter
     kResidualY = 16,   // and kResidualY << 1, << 2 for Cb, Cr: the picture holds the residual
+    kLumaMap   = 128,  // LMCS: the luma prediction forward-mapped
+    kDeferCb   = 256,  // and kDeferCb << 1 for Cr, under LMCS's chroma scaling: the prediction kept aside, the
+                       // residual left in the picture, for an intra job of kind IntraJob::kLmcs
   };
 
   uint32_t w[12];
@@ -300,6 +312,16 @@ struct CtuJobs
   std::vector<IntraJob>* intra = nullptr;
   WaveMap*               waves = nullptr;   // with intra
   const RefTable*        refs  = nullptr;   // with inter
+};
+
+// a picture's LMCS for the GPU (Reshape::gpuTables): the tables of the 1 <<
+// bit depth luma values
+struct LmcsTables
+{
+  std::vector<int16_t> fwd;           // the forward luma mapping
+  std::vector<int16_t> inv;           // the inverse one
+  std::vector<int32_t> chromaScale;   // the chroma residual scale of an average luma
+  bool                 chroma = false;   // the picture scales its chroma residuals
 };
 
 // a picture's jobs, per CTU, for the stages that run on the GPU (null: the CPU ran that stage)

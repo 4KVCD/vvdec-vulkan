@@ -412,4 +412,29 @@ void Reshape::rspBufFwd( PelBuf& buf ) const
   g_pelBufOP.rspFwd( buf.buf, buf.stride, buf.width, buf.height, m_lumaBD, m_initCW, m_reshapePivot.data(), m_fwdScaleCoef.data(), m_inputPivot.data() );
 }
 
+void Reshape::gpuTables( Pel* fwd, Pel* inv, int* chromaScale ) const
+{
+  const int count = 1 << m_lumaBD;
+  for( int i = 0; i < count; i++ )
+  {
+    fwd[i] = inv[i] = Pel( i );
+  }
+  // every value once, as a row
+  PelBuf fwdRow( fwd, count, count, 1 );
+  rspBufFwd( fwdRow );
+  if( g_pelBufOP.rspBcw )
+  {
+    g_pelBufOP.rspBcw( inv, count, count, 1, m_lumaBD, m_sliceReshapeInfo.reshaperModelMinBinIdx, m_sliceReshapeInfo.reshaperModelMaxBinIdx,
+                       m_reshapePivot.data(), m_invScaleCoef.data(), m_inputPivot.data() );
+  }
+  else
+  {
+    g_pelBufOP.applyLut( inv, count, count, 1, m_invLUT );
+  }
+  for( int i = 0; i < count; i++ )
+  {
+    chromaScale[i] = calculateChromaAdj( Pel( i ) );
+  }
+}
+
 }

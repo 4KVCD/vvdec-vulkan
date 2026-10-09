@@ -98,7 +98,7 @@ public:
   static bool filtersSupported( const CodingStructure& cs );
 
   // whether the GPU predicts the intra and IBC blocks of the picture: 4:2:0,
-  // none of the tools it lacks (CIIP, ACT, LMCS, reference wraparound)
+  // none of the tools it lacks (CIIP, ACT, reference wraparound)
   static bool intraSupported( const CodingStructure& cs );
   static bool intraSupported( const SPS& sps );
   // whether the GPU predicts the inter blocks of the pictures of the sequence:
@@ -146,6 +146,13 @@ public:
   // commands).
   int  startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
                      PelStorage& pic, bool waitFirst );
+  // LMCS for the picture whose work comes next, when the GPU predicts its
+  // intra blocks (tables: null without LMCS): its luma predicted and
+  // reconstructed in the mapped domain, inter's luma forward-mapped, the
+  // chroma residuals scaled (tables->chroma), then the luma mapped back
+  // before the in-loop filters. Set before the picture's work is recorded
+  // (its band's too), once the instance's picture before is done.
+  void setLmcs( const LmcsTables* tables, const PelStorage& pic );
   void endCompute();
   void endDownload( int download );
 
@@ -192,6 +199,7 @@ private:
   void          recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
                              const Planes& levels, const Planes& planes );
   void          recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
+  void          recordLmcs( const CodingStructure& cs, const Planes& planes, VkDeviceAddress ctus );   // the inverse mapping
   void          recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
 
   static constexpr uint32_t kMaxMarks = 64;
@@ -227,7 +235,7 @@ private:
   {
     const Picture* picture = nullptr;
     bool           deblock = false, sao = false;
-    size_t         dbSize = 0, alfSize = 0, saoSize = 0;
+    size_t         dbSize = 0, alfSize = 0, saoSize = 0, lmcsSize = 0;
   } m_prepared;
   // the buffers the CPU only writes, in order, and the shaders read -- the
   // filters' parameters, the reference table, the jobs, the edges, the
@@ -248,6 +256,14 @@ private:
   Buffer          m_matrices;                       // TrQuant's transform matrices
   Buffer          m_mip;                            // MIP's matrices
   Buffer          m_lfnst;                          // LFNST's matrices
+  // LMCS (setLmcs): its tables (the forward and inverse luma mappings,
+  // int16, the chroma scales, int32), and the planes inter's chroma
+  // predictions are kept aside in under its chroma scaling
+  bool            m_lmcsOn    = false;
+  size_t          m_lmcsCount = 0;                  // the values a table
+  Buffer          m_lmcs;
+  Buffer          m_defer;
+  Planes          m_deferPlanes{};
 };
 
 }   // namespace gpu

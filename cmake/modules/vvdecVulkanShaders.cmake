@@ -13,6 +13,7 @@ set( VVDEC_GPU_SHADERS
   "intra|intra"
   "inter|inter"
   "trafo|trafo"
+  "lmcs|lmcs"
 )
 
 if( NOT VVDEC_SLANGC OR NOT EXISTS "${VVDEC_SLANGC}" )

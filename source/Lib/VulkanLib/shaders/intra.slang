@@ -18,10 +18,10 @@
 // out all its reads of the picture together (the references, the residual,
 // CCLM's luma, IBC's source), to compute from shared memory after that.
 //
-// A job, 8 uints (VulkanLib/GpuRecon.h, GpuIntraJob):
+// A job, 12 uints (VulkanLib/GpuJobs.h, IntraJob):
 //   0: x | y << 16                (in samples of its component)
 //   1: width | height << 8 | component << 16 | kind << 24   (kind: 0 planar/DC/angular, 1 BDPCM, 2 CCLM, 3 IBC,
-//      4 MIP)
+//      4 MIP, 5 an inter CU's chroma under LMCS: the prediction inter kept aside plus the residual)
 //   2: mode | flags << 8 | bdpcm direction << 16 | reference line << 24   (flags: 1 residual, 2 filtered references,
 //      4 MIP transposed, 8 ISP; the reference line: MRL's, 0 .. 2)
 //   3: top-left units | above units << 8 | left units << 16  (the reference samples available; ISP: the CU's)
@@ -32,6 +32,9 @@
 //   6: IBC: block vector x | y << 16 (int16, samples of the component)
 //   7: the rows of the block this workgroup makes: first | count << 16, at
 //      most 256 samples (on the CPU: the block's wave)
+//   8: LMCS's chroma residual scaling: x | y << 16 of the luma CU whose
+//      neighbours give the scale
+//   9: LMCS: 1 scaling | 2 left there | 4 above there | log2 of the samples a side << 4
 
 #include "common.slang"
 
@@ -44,6 +47,9 @@ struct Params
   uint*         waits;       // a job's: the jobs of the waves before its, which it waits for
   Atomic<uint>* sync;        // the jobs taken, the jobs done (zeroed before the dispatch)
   uint8_t*      mip;         // MIP's matrices: vvdec's mipMatrix4x4, mipMatrix8x8, mipMatrix16x16 in a row
+  int*          lmcsScale;   // LMCS: the chroma residual scale of each average luma
+  int16_t*      defer1;      // LMCS: the inter CUs' chroma predictions kept aside, laid out as the chroma planes
+  int16_t*      defer2;
   int           stride0;
   int           stride12;
   int           count;       // the jobs
@@ -52,6 +58,8 @@ struct Params
   int           scaleX;      // chroma subsampling
   int           scaleY;
   int           collocated;  // sps CCLM collocated chroma
+  int           picWidth;    // luma
+  int           picHeight;
 };
 
 [[vk::push_constant]] Params pc;
@@ -829,10 +837,70 @@ int3 cclmParameters( uint lm, uint lm2 )
   return int3( a, minC - ( ( a * minY ) >> shift ), shift );
 }
 
+// --------------------------------------------------------------------------------------------------------------------
+// LMCS's chroma residual scaling (Reshape::calculateChromaAdjVpduNei, AreaBuf::scaleSignal): the average of the luma
+// (still mapped) left of and above the CU at word 8, 1 << log2 count samples a side (rows and columns past the
+// picture: its last), picks the scale
+// --------------------------------------------------------------------------------------------------------------------
+
+groupshared int s_lsum[4];   // the luma sums of the workgroup's waves
+
+// this thread's share of the luma: the left sample tid and the above one
+int lmcsLuma( int tid, uint anchor, uint info )
+{
+  const int x     = int( anchor & 0xffff );
+  const int y     = int( anchor >> 16 );
+  const int count = 1 << int( ( info >> 4 ) & 15 );
+  int       sum   = 0;
+  if( tid < count && ( info & 2 ) != 0 )
+  {
+    sum += sampleAt( 0, x - 1, min( y + tid, pc.picHeight - 1 ) );
+  }
+  if( tid < count && ( info & 4 ) != 0 )
+  {
+    sum += sampleAt( 0, min( x + tid, pc.picWidth - 1 ), y - 1 );
+  }
+  return sum;
+}
+
+// the shares summed a wave at a time into s_lsum (all the threads, before a barrier)
+void lmcsShare( int tid, int luma )
+{
+  const int sum = WaveActiveSum( luma );
+  if( WaveIsFirstLane() )
+  {
+    s_lsum[tid / int( WaveGetLaneCount() )] = sum;
+  }
+}
+
+// after that barrier: the scale
+int lmcsScale( uint info )
+{
+  int sum = 0;
+  for( int k = 0; k < 64 / int( WaveGetLaneCount() ); k++ )
+  {
+    sum += s_lsum[k];
+  }
+  const int log2Count = int( ( info >> 4 ) & 15 );
+  const int sides     = int( ( info >> 1 ) & 1 ) + int( ( info >> 2 ) & 1 );
+  const int luma      = sides == 1 ? ( sum + ( 1 << ( log2Count - 1 ) ) ) >> log2Count
+                        : ( sides == 2 ? ( sum + ( 1 << log2Count ) ) >> ( log2Count + 1 ) : 1 << ( pc.bitDepth - 1 ) );
+  return pc.lmcsScale[luma];
+}
+
+// a residual scaled (clipped to the bit depth's range first)
+int lmcsResidual( int r, int scale )
+{
+  const int range = 1 << pc.bitDepth;
+  const int c     = clip3( -range, range - 1, r );
+  const int v     = ( abs( c ) * scale + ( 1 << 10 ) ) >> 11;
+  return clip3( -32768, 32767, c < 0 ? -v : v );
+}
+
 // a job (a block of a component, or a band of its rows): the workgroup's
 // threads read what the block needs of the picture together, then share out
 // the block's samples
-void make( int tid, uint job[8] )
+void make( int tid, uint job[12] )
 {
   const int   x0     = int( job[0] & 0xffff );
   const int   y0     = int( job[0] >> 16 );
@@ -854,13 +922,18 @@ void make( int tid, uint job[8] )
 
   int16_t*  dst    = planeOf( comp );
   const int stride = strideOf( comp );
+  // LMCS: the chroma residual scaled
+  const uint lmcsInfo = job[9];
+  const bool lmcs     = ( lmcsInfo & 1 ) != 0;
 
-  if( kind == 3 )
+  if( kind == 3 || kind == 5 )
   {
-    // IBC: the block from elsewhere in the picture, plus the residual (the
-    // reads together, then the writes)
+    // IBC: the block from elsewhere in the picture, plus the residual; an
+    // inter CU's chroma under LMCS: its prediction, kept aside, plus the
+    // residual (the reads together, then the writes)
     const int bvx = int( int16_t( job[6] & 0xffff ) );
     const int bvy = int( int16_t( job[6] >> 16 ) );
+    int16_t*  src = kind == 5 ? ( comp == 1 ? pc.defer1 : pc.defer2 ) : dst;
     int       pred[4];
     int       res[4];
     [unroll]
@@ -869,8 +942,15 @@ void make( int tid, uint job[8] )
       const int i = tid + 64 * k;
       const int x = ( s0 + i ) & ( w - 1 );
       const int y = ( s0 + i ) >> log2W;
-      pred[k]     = i < m ? sampleAt( comp, x0 + x + bvx, y0 + y + bvy ) : 0;
+      pred[k]     = i < m ? ( kind == 5 ? int( src[( y0 + y ) * stride + x0 + x] ) : sampleAt( comp, x0 + x + bvx, y0 + y + bvy ) ) : 0;
       res[k]      = i < m && residual ? int( dst[( y0 + y ) * stride + x0 + x] ) : 0;
+    }
+    int scale = 0;
+    if( lmcs )
+    {
+      lmcsShare( tid, lmcsLuma( tid, job[8], lmcsInfo ) );
+      GroupMemoryBarrierWithGroupSync();
+      scale = lmcsScale( lmcsInfo );
     }
     [unroll]
     for( int k = 0; k < 4; k++ )
@@ -879,7 +959,7 @@ void make( int tid, uint job[8] )
       if( i < m )
       {
         const int at = ( y0 + ( ( s0 + i ) >> log2W ) ) * stride + x0 + ( ( s0 + i ) & ( w - 1 ) );
-        dst[at]      = int16_t( residual ? clip3( 0, maxVal, pred[k] + res[k] ) : pred[k] );
+        dst[at]      = int16_t( residual ? clip3( 0, maxVal, pred[k] + ( lmcs ? lmcsResidual( res[k], scale ) : res[k] ) ) : pred[k] );
       }
     }
     return;   // the whole workgroup
@@ -960,8 +1040,13 @@ void make( int tid, uint job[8] )
     s_cubic[tid]      = kCubic[tid];
     s_cubic[tid + 64] = kCubic[tid + 64];
   }
+  if( lmcs )
+  {
+    lmcsShare( tid, lmcsLuma( tid, job[8], lmcsInfo ) );
+  }
   storeReferences( tid, topLength + refLine, leftLength + refLine, refs );
   GroupMemoryBarrierWithGroupSync();
+  const int lmcsScaling = lmcs ? lmcsScale( lmcsInfo ) : 0;
 
   // per block: what the predictor needs of the references
   if( filtered )
@@ -1044,7 +1129,7 @@ void make( int tid, uint job[8] )
       v = ang.isVer ? predictAngular( ang, comp, filtered, x + xoff, y, maxVal ) : predictAngular( ang, comp, filtered, y, x + xoff, maxVal );
     }
     const int at = ( y0 + y ) * stride + x0 + x;
-    dst[at]      = int16_t( residual ? clip3( 0, maxVal, v + int( s_res[i] ) ) : v );
+    dst[at]      = int16_t( residual ? clip3( 0, maxVal, v + ( lmcs ? lmcsResidual( int( s_res[i] ), lmcsScaling ) : int( s_res[i] ) ) ) : v );
   }
 }
 
@@ -1067,8 +1152,9 @@ void main( uint3 local : SV_GroupThreadID )
     return;   // the whole workgroup (the dispatch, in rows of 32768 workgroups, has more than the jobs)
   }
   // the job on its way while the workgroup waits for the jobs before
-  const uint4 a = *(uint4*)( pc.jobs + index * 8 );
-  const uint4 b = *(uint4*)( pc.jobs + index * 8 + 4 );
+  const uint4 a = *(uint4*)( pc.jobs + index * 12 );
+  const uint4 b = *(uint4*)( pc.jobs + index * 12 + 4 );
+  const uint4 c = *(uint4*)( pc.jobs + index * 12 + 8 );
   if( tid == 0 )
   {
     const uint before = pc.waits[index];
@@ -1078,7 +1164,7 @@ void main( uint3 local : SV_GroupThreadID )
   }
   // the barrier's acquire: what those jobs wrote, visible to all the threads
   AllMemoryBarrierWithGroupSync();
-  uint job[8] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w };
+  uint job[12] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w, c.x, c.y, c.z, c.w };
   make( tid, job );
   // the barrier's release: the threads' writes done before the job counts as done
   AllMemoryBarrierWithGroupSync();
