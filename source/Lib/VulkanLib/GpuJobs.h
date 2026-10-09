@@ -409,6 +409,12 @@ struct PictureJobs
   // comparison with the CPU's (VVDEC_GPU_MIDER; GpuRecon::compareMider)
   const std::vector<std::vector<CuRecord>>* cus = nullptr;
   const std::vector<std::vector<TuRecord>>* tus = nullptr;   // with cus: their TUs, per CTU
+  // the GPU's front end drives the picture (VVDEC_GPU_FRONT): from cus and tus it derives the motion, the deblocking's
+  // parameters and edges, the jobs (the residuals' with frontTrafo, inter's with frontInter) -- trafo, inter, intra and
+  // edges unused
+  bool                                      front      = false;
+  bool                                      frontTrafo = false;
+  bool                                      frontInter = false;
 };
 
 }   // namespace gpu

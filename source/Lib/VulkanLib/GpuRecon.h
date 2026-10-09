@@ -316,9 +316,17 @@ private:
   Buffer                m_jobOutHost[3];
   Buffer                m_jobWaves;
   Buffer                m_jobProgress;
-  // the indirect dispatches' arguments (3 words each) the front end writes, and the counts the passes read: 0 the
-  // residuals', 3 inter's regular, 6 BDOF, 9 affine, 12 the affine pairs; 16 intra's, 19 the bands; 20 deblocking's four
+  // the front end's arguments: per pass i an indirect dispatch at word 3 i, its jobs' count and first job at 32 + 2 i
+  // (0 the residuals', 1 inter's regular jobs, 2 BDOF's, 3 the affine pairs, 4 intra's bands, 5..8 the deblocking's
+  // edges: luma vertical, horizontal, chroma vertical, horizontal)
   Buffer                m_frontArgs;
+  bool                  m_front      = false;   // the picture's front end on the GPU drives it (PictureJobs::front)
+  bool                  m_frontTrafo = false;
+  bool                  m_frontInter = false;
+  void                  recordIntraFront( const CodingStructure& cs, const Planes& planes );
+  FrontCapacities       m_frontCaps;   // the picture's (recordMider)
+  void                  indirectBarrier();
+  void                  recordColMotion( const CodingStructure& cs );
   size_t                m_jobCap[3]      = { 0, 0, 0 };
   int                   m_jobBlockCount  = 0;
   bool                  m_jobsRecorded   = false;

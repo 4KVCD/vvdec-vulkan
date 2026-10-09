@@ -39,7 +39,7 @@ struct Params
   int           pass;
   int           shift;      // the digit's: 0, 8
   int           capacity;   // sorted's and waits' room, in bands
-  uint*         args;       // BSCAN: intra's indirect dispatch (3 words), then the bands' count
+  uint*         args;       // BSCAN: the front end's arguments (GpuRecon's m_frontArgs): intra's pass
 };
 
 [[vk::push_constant]] Params pc;
@@ -221,10 +221,11 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       pc.bandSums[pc.numBlocks] = total;
       // a workgroup a band, in rows of 32768
-      pc.args[0] = min( total, 32768u );
-      pc.args[1] = ( total + 32767u ) / 32768u;
-      pc.args[2] = 1;
-      pc.args[3] = total;
+      pc.args[12] = min( total, 32768u );
+      pc.args[13] = ( total + 32767u ) / 32768u;
+      pc.args[14] = 1;
+      pc.args[40] = total;
+      pc.args[41] = 0;
     }
     return;
   }

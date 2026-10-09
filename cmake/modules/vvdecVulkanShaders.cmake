@@ -26,6 +26,7 @@ set( VVDEC_GPU_SHADERS
   "jobs_waves|jobs|WAVES=1"
   "edges|edges"
   "intrasort|intrasort"
+  "colmotion|colmotion"
 )
 
 if( NOT VVDEC_SLANGC OR NOT EXISTS "${VVDEC_SLANGC}" )

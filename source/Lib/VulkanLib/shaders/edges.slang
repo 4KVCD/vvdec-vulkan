@@ -29,6 +29,7 @@ struct Params
   int   csy;
   int   pass;
   int   capacity;    // the edges' room
+  uint* args;        // SCAN: the front end's arguments (GpuRecon's m_frontArgs): the deblocking's passes
 };
 
 [[vk::push_constant]] Params pc;
@@ -109,6 +110,12 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         pc.lists[l * 2]     = base;
         pc.lists[l * 2 + 1] = run;
         s_scan[1][0]        = run;
+        // a thread an edge, workgroups of 64
+        pc.args[15 + 3 * l]     = ( run + 63 ) / 64;
+        pc.args[15 + 3 * l + 1] = 1;
+        pc.args[15 + 3 * l + 2] = 1;
+        pc.args[42 + 2 * l]     = run;
+        pc.args[42 + 2 * l + 1] = base;
       }
       GroupMemoryBarrierWithGroupSync();
       uint at = base + s_scan[0][tid];

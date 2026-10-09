@@ -98,6 +98,7 @@ struct CommonTaskParam
   bool                     gpuIntra     = false;  // the GPU predicts the intra and IBC blocks: the CTU tasks make its jobs
   bool                     gpuInter     = false;  // and the inter blocks
   bool                     gpuResidual  = false;  // and the residuals
+  bool                     gpuFront     = false;  // the GPU's front end drives the picture: the CTU tasks only parse
 
   explicit CommonTaskParam( DecLibRecon* dec ) : decLib( *dec ) {}
   void reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool doALF, bool doSAO, bool doDeblock, bool gpuIntra, bool gpuInter,
@@ -204,6 +205,10 @@ private:
   // VVDEC_GPU_MIDER=1: the GPU derives the motion too, from the parse's CUs,
   // and its motion is compared with the CPU's (GpuRecon::compareMider)
   bool                           m_gpuMider = false;
+  // VVDEC_GPU_FRONT=1: the GPU's front end drives the pictures (all their stages on the GPU): the CTU tasks parse and
+  // write the records, the GPU does the rest
+  bool                           m_gpuFrontOn = false;
+  bool                           m_gpuFront   = false;   // this picture's
   std::vector<std::vector<gpu::CuRecord>> m_gpuCuRecords;   // per CTU
   std::vector<std::vector<gpu::TuRecord>> m_gpuTuRecords;   // per CTU
 #endif

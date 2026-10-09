@@ -64,7 +64,7 @@ struct Params
   int   num8x8;         // per CTU: DMVR's refinements' room (PreCalcValues::num8x8CtuBlks)
   uint* waveMap;        // WAVES: per component the waves of its blocks of 4 luma samples (GpuJobs.h's WaveMap)
   Atomic<uint>* progress;   // WAVES: per row the CTUs done, then the rows taken (zeroed before the dispatch)
-  uint* args;        // SCAN: the indirect dispatches of the residuals' pass, inter's three (3 words each), then the affine pairs
+  uint* args;        // SCAN: the front end's arguments (GpuRecon's m_frontArgs): the residuals' and inter's passes
 };
 
 [[vk::push_constant]] Params pc;
@@ -1946,15 +1946,19 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     // the indirect dispatches: a workgroup a job (an affine pair), in rows of 32768
     if( tid == 0 )
     {
-      const uint total[4] = { pc.blocks[pc.numBlocks * kLists + 0], pc.blocks[pc.numBlocks * kLists + 1], pc.blocks[pc.numBlocks * kLists + 3],
-                              pc.blocks[pc.numBlocks * kLists + 4] / 2 };
+      // (inter's parts one after the other in its buffer: their first jobs)
+      const uint regular  = pc.blocks[pc.numBlocks * kLists + 1];
+      const uint bdof     = pc.blocks[pc.numBlocks * kLists + 3];
+      const uint total[4] = { pc.blocks[pc.numBlocks * kLists + 0], regular, bdof, pc.blocks[pc.numBlocks * kLists + 4] / 2 };
+      const uint first[4] = { 0, 0, regular, regular + bdof };
       for( int d = 0; d < 4; d++ )
       {
-        pc.args[3 * d]     = min( total[d], 32768u );
-        pc.args[3 * d + 1] = ( total[d] + 32767u ) / 32768u;
-        pc.args[3 * d + 2] = 1;
+        pc.args[3 * d]          = min( total[d], 32768u );
+        pc.args[3 * d + 1]      = ( total[d] + 32767u ) / 32768u;
+        pc.args[3 * d + 2]      = 1;
+        pc.args[32 + 2 * d]     = total[d];
+        pc.args[32 + 2 * d + 1] = first[d];
       }
-      pc.args[12] = total[3];
     }
     return;
   }

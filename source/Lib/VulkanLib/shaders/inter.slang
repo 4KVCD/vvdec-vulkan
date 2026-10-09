@@ -81,9 +81,13 @@ struct Params
   int        curWinTop;   // collocated flags)
   int        horColloc;
   int        verColloc;
+  uint*      countAt;     // with count < 0: the jobs' count and the first one's index (the GPU's front end's)
 };
 
 [[vk::push_constant]] Params pc;
+
+// the pass's jobs: from the first one the front end wrote, or the buffer's first
+uint* jobBase() { return pc.jobs + ( pc.count >= 0 ? 0u : pc.countAt[1] ) * 12; }
 
 #define FLAG_L0 1
 #define FLAG_L1 2
@@ -2073,7 +2077,7 @@ void affineMain( int tid, int index )
   [unroll]
   for( int k = 0; k < 6; k++ )
   {
-    const uint4 q    = *(uint4*)( pc.jobs + index * 24 + 4 * k );
+    const uint4 q    = *(uint4*)( jobBase() + index * 24 + 4 * k );
     job[4 * k]       = q.x;
     job[4 * k + 1]   = q.y;
     job[4 * k + 2]   = q.z;
@@ -2188,7 +2192,7 @@ void affineMain( int tid, int index )
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
   const int index = int( group.x ) + int( group.y ) * 32768;
-  if( index >= pc.count )
+  if( index >= ( pc.count >= 0 ? pc.count : int( pc.countAt[0] ) ) )
   {
     return;   // the whole workgroup
   }
@@ -2197,7 +2201,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   affineMain( tid, index );
   return;
 #endif
-  uint*      job   = pc.jobs + index * 12;
+  uint*      job   = jobBase() + index * 12;
   const int  x     = int( job[0] & 0xffff );
   const int  y     = int( job[0] >> 16 );
   const int  w     = int( job[1] & 255 );

@@ -35,8 +35,9 @@ struct Params
   uint8_t*  scaling;    // the picture's dequantisation matrices (explicit scaling lists), Quant's, a byte a factor
   int       stride0;
   int       stride12;
-  int       count;
+  int       count;      // the jobs; < 0: countAt's
   int       bitDepth;
+  uint*     countAt;    // the jobs' count and the first one's index (the GPU's front end's)
 };
 
 [[vk::push_constant]] Params pc;
@@ -118,12 +119,13 @@ int jointResidual( int ict, int v )
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
   const int index = int( group.x ) + int( group.y ) * 32768;
-  if( index >= pc.count )
+  const int count = pc.count >= 0 ? pc.count : int( pc.countAt[0] );
+  if( index >= count )
   {
     return;   // the whole workgroup
   }
   const int tid          = int( local.x );
-  uint*     job          = pc.jobs + index * 8;
+  uint*     job          = pc.jobs + ( ( pc.count >= 0 ? 0 : int( pc.countAt[1] ) ) + index ) * 8;
   const int x0           = int( job[0] & 0xffff );
   const int y0           = int( job[0] >> 16 );
   const int log2W        = int( job[1] & 15 );

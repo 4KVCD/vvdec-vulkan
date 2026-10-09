@@ -158,6 +158,13 @@ void compareMotion( const CodingStructure& cs, const int32_t* gpu, const MotionI
 // gpu: the deblocking's parameters as the GPU wrote them (shaders/dbparams.slang's, 2 words each), cpu: vvdec's
 void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const LoopFilterParam* cpu, MiderStats& stats );
 
+// the room the front end's lists of a picture need at most (in jobs, bands, edges), from its records
+struct FrontCapacities
+{
+  size_t trafo = 0, inter = 0, intra = 0, bands = 0, edges = 0;
+};
+FrontCapacities frontCapacities( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus );
+
 // the jobs' tables (shaders/jobs.slang's T_*): vvdec's, kJobTableWords words
 static constexpr size_t kJobTableWords = 2048;
 void writeJobTables( uint32_t* out );

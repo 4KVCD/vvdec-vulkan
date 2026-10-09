@@ -39,7 +39,11 @@ struct Params
   int      ladfNum;     // LADF's intervals (0: no LADF), their QP offsets, the lower bounds of all but the first
   int      ladfOffset0, ladfOffset1, ladfOffset2, ladfOffset3, ladfOffset4;
   int      ladfBound1, ladfBound2, ladfBound3, ladfBound4;
+  uint*    countAt;     // with count < 0: the edges' count and the first one's index (the GPU's front end's)
 };
+
+int  edgeCount() { return pc.count >= 0 ? pc.count : int( pc.countAt[0] ); }
+uint firstEdge() { return pc.count >= 0 ? 0u : pc.countAt[1]; }
 
 [[vk::push_constant]] Params pc;
 
@@ -342,11 +346,11 @@ void normalLine( inout int s[16], int tc, bool sw, int thrCut, bool filterSecond
 [numthreads( 64, 1, 1 )]
 void main( uint3 id : SV_DispatchThreadID )
 {
-  if( int( id.x ) >= pc.count )
+  if( int( id.x ) >= edgeCount() )
   {
     return;
   }
-  const uint2 edge = pc.edges[id.x];   // qp | bs << 8 | sideMaxFiltLength << 16
+  const uint2 edge = pc.edges[firstEdge() + id.x];   // qp | bs << 8 | sideMaxFiltLength << 16
   const int   x    = int( edge.x & 0xffff );
   const int   y    = int( edge.x >> 16 );
   const int   bs   = int( edge.y >> 8 ) & 3;
@@ -637,11 +641,11 @@ void main( uint3 id : SV_DispatchThreadID )
 {
   // the segments xDeblockCtuArea visits: along the edge as many lines as a
   // 4x4 luma block has, across it every 8 chroma samples (at the 4:2:0 rate)
-  if( int( id.x ) >= pc.count )
+  if( int( id.x ) >= edgeCount() )
   {
     return;
   }
-  const uint2 edge = pc.edges[id.x];   // Cb's qp | Cr's qp << 8 | bs << 16 | flags << 24
+  const uint2 edge = pc.edges[firstEdge() + id.x];   // Cb's qp | Cr's qp << 8 | bs << 16 | flags << 24
   const int   x    = int( edge.x & 0xffff );
   const int   y    = int( edge.x >> 16 );
 

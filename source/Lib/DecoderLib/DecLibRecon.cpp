@@ -484,6 +484,8 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     m_gpuRecon = std::make_unique<gpu::GpuRecon>( m_gpu );
     const char* mider = getenv( "VVDEC_GPU_MIDER" );
     m_gpuMider        = mider && atoi( mider ) != 0;
+    const char* front = getenv( "VVDEC_GPU_FRONT" );
+    m_gpuFrontOn      = front && atoi( front ) != 0 && !m_gpuMider;
   }
 #endif
   if( !m_pcThreadResource )
@@ -552,7 +554,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     }
     m_gpuRecon->setPicture( pcPic->m_bufs[PIC_RECONSTRUCTION], lmcs ? &m_lmcsTables : nullptr, ( lmcs && lmcsChroma ) || ( m_gpuInter && sps->getUseCiip() ),
                             scaling ? trQuant.getDequantCoeffBuf() : nullptr, TrQuant::getNumDequantCoeffs() );
-    if( m_gpuMider && scaling )
+    if( ( m_gpuMider || m_gpuFrontOn ) && scaling )
     {
       // (the matrices' places among the picture's, for the GPU's jobs)
       TrQuant&              tq = m_pcThreadResource[0]->m_cTrQuant;
@@ -724,8 +726,11 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   m_doSAO                      = doSAO;
   m_doDeblock                  = !noFilters;
 #if VVDEC_VULKAN
+  // the GPU's front end drives the picture: every stage on the GPU
+  m_gpuFront = m_gpuFrontOn && m_gpuFilters && m_gpuIntra && m_gpuResidual && ( isIntra || m_gpuInter ) && cs.colMiAllocator;
   commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuFilters, doSAO && !m_gpuFilters, m_doDeblock && !m_gpuFilters, m_gpuIntra,
                          m_gpuInter, m_gpuResidual );
+  commonTaskParam.gpuFront = m_gpuFront;
   if( m_gpuRecon )
   {
     ( m_gpuFilters ? m_filterPicturesGpu : m_filterPicturesCpu )++;
@@ -740,7 +745,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   {
     m_gpuEdges.resize( pcv->sizeInCtus );
   }
-  if( m_gpuMider )
+  if( m_gpuMider || m_gpuFront )
   {
     m_gpuCuRecords.resize( pcv->sizeInCtus );
     m_gpuTuRecords.resize( pcv->sizeInCtus );
@@ -807,7 +812,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   // in order, the top half's well before the last row), while the CPU makes
   // the bottom half's jobs (VideoQ 1080p +3.5 to +5.9%, 4K 0 to +1%; 3 to 5
   // bands no faster: more submissions)
-  m_gpuBandRows = m_gpuFilters && m_gpuResidual && m_gpuIntra && heightInCtus >= 4 ? heightInCtus / 2 : 0;
+  m_gpuBandRows = m_gpuFilters && m_gpuResidual && m_gpuIntra && heightInCtus >= 4 && !m_gpuFront ? heightInCtus / 2 : 0;
   m_gpuBandDone.store( false, std::memory_order_relaxed );
 #endif
 
@@ -878,7 +883,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       // the picture's slice table (its CTUs parsed: their slices known), for
       // the GPU's motion derivation of this picture and of those it is the
       // colocated picture of
-      if( dec->m_gpuMider && cs.colMiAllocator )
+      if( ( dec->m_gpuMider || dec->m_gpuFront ) && cs.colMiAllocator )
       {
         gpu::writeSliceTable( cs, cs.gpuSliceTable( gpu::sliceTableWords( cs ) ) );
       }
@@ -889,7 +894,17 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       jobs.refs  = &dec->m_refTable;
       jobs.edges = &dec->m_gpuEdges;
       jobs.bandCtus = size_t( dec->m_gpuBandRows ) * cs.pcv->widthInCtus;
-      jobs.cus      = dec->m_gpuMider && dec->m_gpuIntra ? &dec->m_gpuCuRecords : nullptr;
+      jobs.cus      = ( dec->m_gpuMider || dec->m_gpuFront ) && dec->m_gpuIntra ? &dec->m_gpuCuRecords : nullptr;
+      if( dec->m_gpuFront )
+      {
+        jobs.trafo      = nullptr;
+        jobs.inter      = nullptr;
+        jobs.intra      = nullptr;
+        jobs.edges      = nullptr;
+        jobs.front      = true;
+        jobs.frontTrafo = dec->m_gpuResidual;
+        jobs.frontInter = dec->m_gpuInter;
+      }
       jobs.tus      = &dec->m_gpuTuRecords;
       // with DMVR, the GPU stores the refined motion for TMVP in the next
       // pictures in the first part (the CTU tasks stored the rest)
@@ -1218,11 +1233,17 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       CtuData& ctuData    = cs.getCtuData( ctuRsAddr );
       ctuData.motion      = &decLib.m_motionInfo[cs.pcv->num4x4CtuBlks * ctuRsAddr];
 #if VVDEC_VULKAN
-      if( decLib.m_gpuMider && param->common.gpuIntra )
+      if( ( decLib.m_gpuMider || param->common.gpuFront ) && param->common.gpuIntra )
       {
         // the parse's CUs, before the derivation turns their motion vector
         // differences into motion vectors
         gpu::writeCuRecords( cs, ctuRsAddr, decLib.m_gpuCuRecords[ctuRsAddr], decLib.m_gpuTuRecords[ctuRsAddr] );
+      }
+      if( param->common.gpuFront )
+      {
+        // (the GPU derives the motion)
+        thisCtuState = MIDER_cont;
+        continue;
       }
 #endif
 
@@ -1257,6 +1278,12 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       CtuData& ctuData    = cs.getCtuData( ctuRsAddr );
       ctuData.lfParam[0]  = &decLib.m_loopFilterParam[cs.pcv->num4x4CtuBlks * ( 2 * ctuRsAddr + 0 )];
       ctuData.lfParam[1]  = &decLib.m_loopFilterParam[cs.pcv->num4x4CtuBlks * ( 2 * ctuRsAddr + 1 )];
+#if VVDEC_VULKAN
+      if( param->common.gpuFront )
+      {
+        continue;   // (the GPU derives the deblocking's parameters and edges)
+      }
+#endif
       memset( ctuData.lfParam[0], 0, sizeof( LoopFilterParam ) * 2 * cs.pcv->num4x4CtuBlks );
 
       decLib.m_cLoopFilter.calcFilterStrengthsCTU( cs, ctuRsAddr );
@@ -1310,7 +1337,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       // that of the CUs DMVR refines once the GPU has refined it (finishReconTask)
       if( !ctuData.slice->isIntra() && param->common.gpuInter )
       {
-        if( cs.picture->stillReferenced )
+        if( cs.picture->stillReferenced && !param->common.gpuFront )   // (the GPU's front end writes it)
         {
           decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskColMotion( cs, ctuRsAddr );
         }
@@ -1361,7 +1388,11 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       const int ctuRsAddr    = ctu + line * cs.pcv->widthInCtus;
       const UnitArea ctuArea = getCtuArea( cs, ctu, line, true );
 #if VVDEC_VULKAN
-      if( param->common.gpuIntra )
+      if( param->common.gpuFront )
+      {
+        // (the GPU's front end makes the jobs)
+      }
+      else if( param->common.gpuIntra )
       {
         gpu::CtuJobs jobs;
         jobs.trafo = param->common.gpuResidual ? &decLib.m_gpuTrafoJobs[ctuRsAddr] : nullptr;

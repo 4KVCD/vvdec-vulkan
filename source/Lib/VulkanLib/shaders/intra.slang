@@ -62,6 +62,7 @@ struct Params
   int           collocated;  // sps CCLM collocated chroma
   int           picWidth;    // luma
   int           picHeight;
+  uint*         countAt;     // with count < 0: the jobs' count (the GPU's front end's)
 };
 
 [[vk::push_constant]] Params pc;
@@ -1194,7 +1195,7 @@ void main( uint3 local : SV_GroupThreadID )
   }
   GroupMemoryBarrierWithGroupSync();
   const uint index = WaveReadLaneFirst( s_job );
-  if( index >= uint( pc.count ) )
+  if( index >= ( pc.count >= 0 ? uint( pc.count ) : pc.countAt[0] ) )
   {
     return;   // the whole workgroup (the dispatch, in rows of 32768 workgroups, has more than the jobs)
   }

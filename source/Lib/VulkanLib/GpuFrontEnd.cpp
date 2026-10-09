@@ -340,6 +340,86 @@ void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const LoopFilte
   }
 }
 
+// the pieces a block of a power-of-two size a side splits into (SBT's 3/4 blocks into two)
+static size_t pieces( uint32_t n )
+{
+  size_t count = 0;
+  for( ; n; n &= n - 1 )
+  {
+    count++;
+  }
+  return count;
+}
+
+// a job's bands of rows (GpuRecon::recordIntra's)
+static size_t bandsOf( uint32_t width, uint32_t height )
+{
+  const uint32_t rows = std::max<uint32_t>( 1, 256 / std::max<uint32_t>( width, 1 ) );
+  return ( height + rows - 1 ) / rows;
+}
+
+FrontCapacities frontCapacities( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus )
+{
+  FrontCapacities caps;
+  const bool      chroma = isChromaEnabled( cs.pcv->chrFormat );
+  const int       sx     = chroma ? getComponentScaleX( COMPONENT_Cb, cs.pcv->chrFormat ) : 0;
+  const int       sy     = chroma ? getComponentScaleY( COMPONENT_Cb, cs.pcv->chrFormat ) : 0;
+  for( size_t ctu = 0; ctu < cus.size(); ctu++ )
+  {
+    for( const CuRecord& r: cus[ctu] )
+    {
+      const uint32_t mode     = ( r.w[1] >> 16 ) & 3;
+      const uint32_t flags    = r.w[1] >> 18;
+      const uint32_t w        = r.w[1] & 0xff;
+      const uint32_t h        = ( r.w[1] >> 8 ) & 0xff;
+      const bool     rootCbf  = ( r.w[17] & ( 1u << 18 ) ) != 0;
+      const uint32_t firstTu  = r.w[16] & 0xffff;
+      const uint32_t numTus   = r.w[16] >> 16;
+      const size_t   tiles16  = size_t( ( w + 15 ) / 16 ) * ( ( h + 15 ) / 16 );
+      if( mode == MODE_INTER && ( r.w[20] & ( 1u << 17 ) ) )
+      {
+        // GPM, the regular tiles, affine pairs or SbTMVP's sub-PUs (the subblock merge CUs are affine ones)
+        caps.inter += flags & CuRecord::kAffine ? std::max<size_t>( 2 * tiles16, size_t( std::max<uint32_t>( w / 8, 1 ) ) * std::max<uint32_t>( h / 8, 1 ) )
+                                                : tiles16;
+        if( flags & CuRecord::kCiip )
+        {
+          caps.intra += 3;
+          caps.bands += bandsOf( w, h ) + 2 * bandsOf( w >> sx, h >> sy );
+        }
+        // the subblock grid's edges
+        if( flags & CuRecord::kAffine )
+        {
+          caps.edges += 2 * ( size_t( w / 8 ) * ( h / 4 ) + size_t( h / 8 ) * ( w / 4 ) );
+        }
+      }
+      for( uint32_t t = firstTu; t < firstTu + numTus; t++ )
+      {
+        const TuRecord& tu   = tus[ctu][t];
+        const bool      luma = ( tu.w[1] & ( 1u << 16 ) ) != 0;
+        const bool      chr  = ( tu.w[3] & ( 1u << 16 ) ) != 0;
+        const uint32_t  lw = tu.w[1] & 0xff, lh = ( tu.w[1] >> 8 ) & 0xff;
+        const uint32_t  cw = tu.w[3] & 0xff, ch = ( tu.w[3] >> 8 ) & 0xff;
+        const int       comps = ( luma ? 1 : 0 ) + ( chr ? 2 : 0 );
+        // a job or the pieces of zeros a component; an intra or IBC job, or LMCS's chroma pieces
+        caps.trafo += ( luma ? pieces( lw ) * pieces( lh ) : 0 ) + ( chr ? 2 * pieces( cw ) * pieces( ch ) : 0 );
+        if( mode != MODE_INTER || rootCbf )
+        {
+          caps.intra += size_t( comps ) + ( chr ? 2 * pieces( cw ) * pieces( ch ) : 0 );
+          caps.bands += ( luma ? bandsOf( lw, lh ) : 0 ) + ( chr ? 2 * bandsOf( cw, ch ) + 2 * pieces( cw ) * pieces( ch ) * bandsOf( cw, ch ) : 0 );
+        }
+        // the edges along the TU's left and top sides, luma's and chroma's (on the luma grid)
+        caps.edges += ( luma ? lw / 4 + lh / 4 : 0 ) + ( chr ? ( cw << sx ) / 4 + ( ch << sy ) / 4 : 0 );
+      }
+    }
+  }
+  caps.trafo += 64;
+  caps.inter += 64;
+  caps.intra += 64;
+  caps.bands += 64;
+  caps.edges += 64;
+  return caps;
+}
+
 void writeJobTables( uint32_t* out )
 {
   memset( out, 0, kJobTableWords * sizeof( uint32_t ) );

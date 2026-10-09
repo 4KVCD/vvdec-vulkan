@@ -1067,7 +1067,9 @@ struct DeblockPush
   VkDeviceAddress pic0, pic1, ctus, edges;
   int32_t         stride, width, height, ctuLog2, widthInCtus, bitDepth, dir, scaleX, scaleY, count;
   int32_t         ladfNum, ladfOffset[5], ladfBound[4];
+  VkDeviceAddress countAt;
 };
+static_assert( sizeof( DeblockPush ) == 120, "DeblockPush: the layout of deblock.slang's Params" );
 
 // the index of the lowest bit set in v (not 0)
 static inline int lowestBit( uint32_t v )
@@ -1178,8 +1180,10 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
   const Api&           vk  = m_ctx->api();
   const bool           chroma = isChromaEnabled( pcv.chrFormat );
 
-  // the edges, list after list
+  // the edges, list after list (the front end's: in its buffer, the counts on the GPU)
   size_t first[5] = { 0, 0, 0, 0, 0 };
+  if( !m_front )
+  {
   for( int l = 0; l < 4; l++ )
   {
     first[l + 1] = first[l];
@@ -1201,6 +1205,7 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
       memcpy( all, ctu.lists[l].data(), ctu.lists[l].size() * sizeof( Edge ) );
       all += ctu.lists[l].size();
     }
+  }
   }
 
   DeblockPush push{};
@@ -1241,9 +1246,16 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
     push.stride = planes.stride[COMPONENT_Y];
     push.width  = pcv.lumaWidth;
     push.height = pcv.lumaHeight;
-    push.edges  = m_edges.addr + first[dir] * sizeof( Edge );
-    push.count  = int32_t( first[dir + 1] - first[dir] );
-    if( push.count > 0 )
+    push.edges  = m_front ? m_edgeOut.addr : m_edges.addr + first[dir] * sizeof( Edge );
+    push.count  = m_front ? -1 : int32_t( first[dir + 1] - first[dir] );
+    push.countAt = m_frontArgs.addr + ( 32 + 2 * ( 5 + dir ) ) * sizeof( uint32_t );
+    if( m_front )
+    {
+      vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( dir == 0 ? kShader_deblock_luma_ver : kShader_deblock_luma_hor ) );
+      vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+      vk.vkCmdDispatchIndirect( m_cmd, m_frontArgs.buffer, 3 * ( 5 + dir ) * sizeof( uint32_t ) );
+    }
+    else if( push.count > 0 )
     {
       vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( dir == 0 ? kShader_deblock_luma_ver : kShader_deblock_luma_hor ) );
       vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
@@ -1258,9 +1270,16 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
       push.stride = planes.stride[COMPONENT_Cb];
       push.width  = pcv.lumaWidth >> push.scaleX;
       push.height = pcv.lumaHeight >> push.scaleY;
-      push.edges  = m_edges.addr + first[2 + dir] * sizeof( Edge );
-      push.count  = int32_t( first[3 + dir] - first[2 + dir] );
-      if( push.count > 0 )
+      push.edges   = m_front ? m_edgeOut.addr : m_edges.addr + first[2 + dir] * sizeof( Edge );
+      push.count   = m_front ? -1 : int32_t( first[3 + dir] - first[2 + dir] );
+      push.countAt = m_frontArgs.addr + ( 32 + 2 * ( 7 + dir ) ) * sizeof( uint32_t );
+      if( m_front )
+      {
+        vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_deblock_chroma ) );
+        vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+        vk.vkCmdDispatchIndirect( m_cmd, m_frontArgs.buffer, 3 * ( 7 + dir ) * sizeof( uint32_t ) );
+      }
+      else if( push.count > 0 )
       {
         vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_deblock_chroma ) );
         vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
@@ -1276,7 +1295,9 @@ struct IntraPush
 {
   VkDeviceAddress plane0, plane1, plane2, jobs, waits, sync, mip, lmcsScale, defer0, defer1, defer2;
   int32_t         stride0, stride12, count, bitDepth, ctuLog2, scaleX, scaleY, collocated, picWidth, picHeight;
+  VkDeviceAddress countAt;
 };
+static_assert( sizeof( IntraPush ) == 136, "IntraPush: the layout of intra.slang's Params" );
 
 bool GpuRecon::intraSupported( const CodingStructure& cs )
 {
@@ -1290,6 +1311,11 @@ bool GpuRecon::intraSupported( const SPS& sps )
 
 void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes )
 {
+  if( m_front )
+  {
+    recordIntraFront( cs, planes );
+    return;
+  }
   // the jobs, wave by wave, a big block in bands of rows of kBand samples at
   // most, a workgroup each: a wave lasts as long as its slowest workgroup,
   // and that is the one with the most samples a thread (shaders/intra.slang)
@@ -1396,13 +1422,61 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   mark( "intra" );
 }
 
+void GpuRecon::recordIntraFront( const CodingStructure& cs, const Planes& planes )
+{
+  if( !m_intraSync.valid() )
+  {
+    m_intraSync = m_ctx->alloc( 256, MemKind::Device );
+  }
+  const PreCalcValues& pcv = *cs.pcv;
+  const Api&           vk  = m_ctx->api();
+  IntraPush            push{};
+  push.plane0     = planes.addr[COMPONENT_Y];
+  push.plane1     = planes.addr[COMPONENT_Cb];
+  push.plane2     = planes.addr[COMPONENT_Cr];
+  push.jobs       = m_isSorted.addr;
+  push.waits      = m_isWaits.addr;
+  push.sync       = m_intraSync.addr;
+  push.mip        = m_mip.addr;
+  push.count      = -1;
+  push.countAt    = m_frontArgs.addr + ( 32 + 2 * 4 ) * sizeof( uint32_t );
+  push.stride0    = planes.stride[COMPONENT_Y];
+  push.stride12   = planes.stride[COMPONENT_Cb];
+  push.bitDepth   = cs.sps->getBitDepth();
+  push.ctuLog2    = getLog2( pcv.maxCUWidth );
+  push.scaleX     = getComponentScaleX( COMPONENT_Cb, pcv.chrFormat );
+  push.scaleY     = getComponentScaleY( COMPONENT_Cb, pcv.chrFormat );
+  push.collocated = cs.sps->getCclmCollocatedChromaFlag() ? 1 : 0;
+  push.picWidth   = pcv.lumaWidth;
+  push.picHeight  = pcv.lumaHeight;
+  if( m_lmcsOn )
+  {
+    push.lmcsScale = m_lmcs.addr + m_lmcsCount * 2 * sizeof( int16_t );
+  }
+  push.defer0 = m_deferPlanes.addr[COMPONENT_Y];
+  push.defer1 = m_deferPlanes.addr[COMPONENT_Cb];
+  push.defer2 = m_deferPlanes.addr[COMPONENT_Cr];
+  vk.vkCmdFillBuffer( m_cmd, m_intraSync.buffer, 0, 2 * sizeof( uint32_t ), 0 );
+  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                           &barrier, 0, nullptr, 0, nullptr );
+  vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_intra ) );
+  vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+  vk.vkCmdDispatchIndirect( m_cmd, m_frontArgs.buffer, 3 * 4 * sizeof( uint32_t ) );
+  mark( "intra" );
+}
+
 // the push constants of shaders/inter.slang
 struct InterPush
 {
   VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion, lmcsFwd, defer0, defer1, defer2, geo, subpics;
   int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth, ctuLog2, widthInCtus, num8x8, wide, scaleX, scaleY, numComp, wrapSps,
                   wrapPps, wrapOffset, subpicOn, curWinLeft, curWinTop, horColloc, verColloc;
+  VkDeviceAddress countAt;
 };
+static_assert( sizeof( InterPush ) == 200, "InterPush: the layout of inter.slang's Params" );
 // the colocated motion as shaders/inter.slang writes DMVR's refinements into it
 static_assert( sizeof( ColocatedMotionInfo ) == 20 && offsetof( ColocatedMotionInfo, mv ) == 0 && sizeof( Mv ) == 8,
                "the colocated motion is not laid out as shaders/inter.slang writes it" );
@@ -1432,11 +1506,11 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
                             const Planes& planes )
 {
   size_t total = 0;
-  for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
+  for( size_t ctu = ctuBegin; ctu < ctuEnd && !m_front; ctu++ )
   {
     total += jobs[ctu].size();
   }
-  if( total == 0 )
+  if( total == 0 && !m_front )
   {
     return;
   }
@@ -1448,7 +1522,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   }
   // the BDOF tiles after the others, then the affine ones (two jobs each),
   // for dispatches of the inter_bdof and inter_affine variants of their own
-  // (their code would slow the others down)
+  // (their code would slow the others down; the front end lays them out so)
   size_t bdofs = 0, affines = 0;
   for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
   {
@@ -1489,7 +1563,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
 
   const PreCalcValues& pcv = *cs.pcv;
   InterPush            push{};
-  push.jobs      = buf.addr;
+  push.jobs      = m_front ? m_jobOut[1].addr : buf.addr;
   push.refs      = m_refs.addr;
   push.dst0      = planes.addr[COMPONENT_Y];
   push.dst1      = planes.addr[COMPONENT_Cb];
@@ -1571,6 +1645,21 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   }
 
   const Api& vk = m_ctx->api();
+  if( m_front )
+  {
+    // the front end's three parts, each from its first job, the counts on the GPU
+    const int shaders[3] = { kShader_inter, kShader_inter_bdof, kShader_inter_affine };
+    push.count                = -1;
+    for( int part = 0; part < 3; part++ )
+    {
+      push.countAt = m_frontArgs.addr + ( 32 + 2 * ( 1 + part ) ) * sizeof( uint32_t );
+      vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( shaders[part] ) );
+      vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+      vk.vkCmdDispatchIndirect( m_cmd, m_frontArgs.buffer, 3 * ( 1 + part ) * sizeof( uint32_t ) );
+    }
+    mark( "inter" );
+    return;
+  }
   if( regular > 0 )
   {
     vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_inter ) );
@@ -1603,7 +1692,9 @@ struct TrafoPush
 {
   VkDeviceAddress jobs, plane0, plane1, plane2, levels0, levels1, levels2, matrices, lfnst, scaling;
   int32_t         stride0, stride12, count, bitDepth;
+  VkDeviceAddress countAt;
 };
+static_assert( sizeof( TrafoPush ) == 104, "TrafoPush: the layout of trafo.slang's Params" );
 
 bool GpuRecon::residualSupported( const CodingStructure& cs )
 {
@@ -1614,11 +1705,11 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
                             const Planes& levels, const Planes& planes )
 {
   size_t total = 0;
-  for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
+  for( size_t ctu = ctuBegin; ctu < ctuEnd && !m_front; ctu++ )
   {
     total += jobs[ctu].size();
   }
-  if( total == 0 )
+  if( total == 0 && !m_front )
   {
     return;
   }
@@ -1629,14 +1720,14 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
     buf = m_ctx->alloc( size * 2, MemKind::Upload );
   }
   TrafoJob* all = reinterpret_cast<TrafoJob*>( buf.mapped );
-  for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
+  for( size_t ctu = ctuBegin; ctu < ctuEnd && !m_front; ctu++ )
   {
     memcpy( all, jobs[ctu].data(), jobs[ctu].size() * sizeof( TrafoJob ) );
     all += jobs[ctu].size();
   }
 
   TrafoPush push{};
-  push.jobs     = buf.addr;
+  push.jobs     = m_front ? m_jobOut[0].addr : buf.addr;
   push.plane0   = planes.addr[COMPONENT_Y];
   push.plane1   = planes.addr[COMPONENT_Cb];
   push.plane2   = planes.addr[COMPONENT_Cr];
@@ -1648,7 +1739,8 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   push.scaling  = m_scalingOn ? m_scaling.addr : 0;
   push.stride0  = planes.stride[COMPONENT_Y];
   push.stride12 = planes.stride[COMPONENT_Cb];
-  push.count    = int32_t( total );
+  push.count    = m_front ? -1 : int32_t( total );
+  push.countAt  = m_frontArgs.addr + 32 * sizeof( uint32_t );
   push.bitDepth = cs.sps->getBitDepth();
   CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
   CHECK( levels.stride[COMPONENT_Y] != planes.stride[COMPONENT_Y] || levels.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cb],
@@ -1658,7 +1750,14 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_trafo ) );
   vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
   // a workgroup per job, in rows of 32768 (shaders/trafo.slang)
-  vk.vkCmdDispatch( m_cmd, uint32_t( std::min<size_t>( total, 32768 ) ), uint32_t( ( total + 32767 ) / 32768 ), 1 );
+  if( m_front )
+  {
+    vk.vkCmdDispatchIndirect( m_cmd, m_frontArgs.buffer, 0 );
+  }
+  else
+  {
+    vk.vkCmdDispatch( m_cmd, uint32_t( std::min<size_t>( total, 32768 ) ), uint32_t( ( total + 32767 ) / 32768 ), 1 );
+  }
   mark( "trafo" );
 }
 
@@ -1913,8 +2012,16 @@ struct EdgesPush
 {
   VkDeviceAddress lfp, slices, counts, lists, edges;
   int32_t         widthInCtus, heightInCtus, log2Ctu, width, height, chroma, csx, csy, pass, capacity;
+  VkDeviceAddress args;
 };
-static_assert( sizeof( EdgesPush ) == 80, "EdgesPush: the layout of edges.slang's Params" );
+static_assert( sizeof( EdgesPush ) == 88, "EdgesPush: the layout of edges.slang's Params" );
+
+// shaders/colmotion.slang's push constants
+struct ColMotionPush
+{
+  VkDeviceAddress motion, colMotion;
+  int32_t         count, log2Ctu, num8x8;
+};
 
 // shaders/intrasort.slang's push constants
 struct IntraSortPush
@@ -1999,7 +2106,14 @@ void GpuRecon::recordMider( const CodingStructure& cs, const PictureJobs& jobs )
   const size_t motionSize = size_t( pcv.sizeInCtus ) * pcv.num4x4CtuBlks * 5 * sizeof( int32_t );
   ensureBuffer( m_ctx, m_miderCuMotion, std::max<size_t>( numCus, 1 ) * 16 * sizeof( int32_t ), MemKind::Device );
   ensureBuffer( m_ctx, m_miderMotion, motionSize, MemKind::Device );
-  ensureBuffer( m_ctx, m_miderMotionHost, motionSize, MemKind::HostCached );
+  if( !m_front )
+  {
+    ensureBuffer( m_ctx, m_miderMotionHost, motionSize, MemKind::HostCached );
+  }
+  else
+  {
+    m_frontCaps = frontCapacities( cs, cus, tus );
+  }
   ensureBuffer( m_ctx, m_miderProgress, ( pcv.heightInCtus + 1 ) * sizeof( uint32_t ), MemKind::Device );
   CuRecord* dst = reinterpret_cast<CuRecord*>( m_miderCus.mapped );
   for( const auto& ctu: cus )
@@ -2062,19 +2176,32 @@ void GpuRecon::recordMider( const CodingStructure& cs, const PictureJobs& jobs )
     vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_mider ) );
     vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
     vk.vkCmdDispatch( m_cmd, uint32_t( pcv.heightInCtus ), 1, 1 );
-    // the motion of the 4x4 blocks to host memory, for the comparison
+    mark( "mider" );
+    // the motion of the 4x4 blocks to host memory, for the comparison; or the colocated motion from it
     VkMemoryBarrier derived{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     derived.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    derived.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &derived, 0, nullptr, 0, nullptr );
-    VkBufferCopy region{ 0, 0, motionSize };
-    vk.vkCmdCopyBuffer( m_cmd, m_miderMotion.buffer, m_miderMotionHost.buffer, 1, &region );
+    derived.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                             &derived, 0, nullptr, 0, nullptr );
+    if( m_front )
+    {
+      recordColMotion( cs );
+      mark( "colmotion" );
+    }
+    else
+    {
+      VkBufferCopy region{ 0, 0, motionSize };
+      vk.vkCmdCopyBuffer( m_cmd, m_miderMotion.buffer, m_miderMotionHost.buffer, 1, &region );
+    }
 
     // the deblocking's parameters: zeroed (as the CTU tasks' LF_INIT has
     // them), the luma tree's CUs, then the chroma tree's
     const size_t lfpSize = size_t( pcv.sizeInCtus ) * 2 * pcv.num4x4CtuBlks * 2 * sizeof( uint32_t );
     ensureBuffer( m_ctx, m_dbLfp, lfpSize, MemKind::Device );
-    ensureBuffer( m_ctx, m_dbLfpHost, lfpSize, MemKind::HostCached );
+    if( !m_front )
+    {
+      ensureBuffer( m_ctx, m_dbLfpHost, lfpSize, MemKind::HostCached );
+    }
     ensureBuffer( m_ctx, m_dbCtuInfo, pcv.sizeInCtus * sizeof( uint32_t ), MemKind::Upload );
     uint32_t* info = reinterpret_cast<uint32_t*>( m_dbCtuInfo.mapped );
     for( unsigned ctu = 0; ctu < pcv.sizeInCtus; ctu++ )
@@ -2135,13 +2262,17 @@ void GpuRecon::recordMider( const CodingStructure& cs, const PictureJobs& jobs )
       vk.vkCmdDispatch( m_cmd, std::min<uint32_t>( groups, 1024 ), ( groups + 1023 ) / 1024, 1 );
       computeBarrier();
     }
-    VkMemoryBarrier params{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    params.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    params.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &params, 0, nullptr, 0, nullptr );
-    VkBufferCopy lfpRegion{ 0, 0, lfpSize };
-    vk.vkCmdCopyBuffer( m_cmd, m_dbLfp.buffer, m_dbLfpHost.buffer, 1, &lfpRegion );
-    m_dbRecorded = true;
+    mark( "dbparams" );
+    if( !m_front )
+    {
+      VkMemoryBarrier params{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+      params.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      params.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &params, 0, nullptr, 0, nullptr );
+      VkBufferCopy lfpRegion{ 0, 0, lfpSize };
+      vk.vkCmdCopyBuffer( m_cmd, m_dbLfp.buffer, m_dbLfpHost.buffer, 1, &lfpRegion );
+      m_dbRecorded = true;
+    }
 
     recordJobs( cs, jobs, push.slices );
     recordEdges( cs, jobs, push.slices );
@@ -2151,7 +2282,37 @@ void GpuRecon::recordMider( const CodingStructure& cs, const PictureJobs& jobs )
     copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &copied, 0, nullptr, 0, nullptr );
   }
-  mark( "mider" );
+  mark( "front end" );
+}
+
+void GpuRecon::indirectBarrier()
+{
+  // the front end's arguments and counts, written by its shaders, read by the dispatches and passes after
+  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+  m_ctx->api().vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                     1, &barrier, 0, nullptr, 0, nullptr );
+}
+
+void GpuRecon::recordColMotion( const CodingStructure& cs )
+{
+  if( !cs.m_colMiAllocation )
+  {
+    return;
+  }
+  const PreCalcValues& pcv = *cs.pcv;
+  const Api&           vk  = m_ctx->api();
+  ColMotionPush        push{};
+  push.motion          = m_miderMotion.addr;
+  push.colMotion       = static_cast<HostPlane*>( cs.m_colMiAllocation )->host.addr;
+  push.count           = int32_t( pcv.sizeInCtus * pcv.num8x8CtuBlks );
+  push.log2Ctu         = int32_t( pcv.maxCUWidthLog2 );
+  push.num8x8          = int32_t( pcv.num8x8CtuBlks );
+  const uint32_t groups = uint32_t( ( push.count + 63 ) / 64 );
+  vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_colmotion ) );
+  vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+  vk.vkCmdDispatch( m_cmd, std::min<uint32_t>( groups, 1024 ), ( groups + 1023 ) / 1024, 1 );
 }
 
 void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, VkDeviceAddress slices )
@@ -2163,7 +2324,7 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, V
   {
     numCus += ctu.size();
   }
-  // the outputs' room: the CTU tasks' counts, and some
+  // the outputs' room: the CTU tasks' counts, and some (the front end's: what the records can need)
   const auto total = []( const auto* lists ) {
     size_t n = 0;
     if( lists )
@@ -2175,7 +2336,8 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, V
     }
     return n;
   };
-  const size_t counts[3] = { total( jobs.trafo ), total( jobs.inter ), total( jobs.intra ) };
+  const FrontCapacities caps = m_front ? m_frontCaps : FrontCapacities{};
+  const size_t counts[3] = { m_front ? caps.trafo : total( jobs.trafo ), m_front ? caps.inter : total( jobs.inter ), m_front ? caps.intra : total( jobs.intra ) };
   const size_t words[3]  = { 8, 12, 12 };
   if( !m_frontArgs.valid() )
   {
@@ -2251,7 +2413,7 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, V
              | ( sps.getEntropyCodingSyncEnabledFlag() ? 4096u : 0u );
   push.ph = ( ph.getDisDmvrFlag() ? 1u : 0u ) | ( ph.getDisBdofFlag() ? 2u : 0u ) | ( ph.getDisProfFlag() ? 4u : 0u ) | ( ph.getJointCbCrSignFlag() ? 8u : 0u )
             | ( ph.getLmcsEnabledFlag() ? 16u : 0u ) | ( ph.getLmcsChromaResidualScaleFlag() ? 32u : 0u ) | ( pps.getUseWP() ? 64u : 0u )
-            | ( pps.getWPBiPred() ? 128u : 0u ) | ( jobs.trafo ? 256u : 0u ) | ( jobs.inter ? 512u : 0u );
+            | ( pps.getWPBiPred() ? 128u : 0u ) | ( jobs.trafo || ( m_front && m_frontTrafo ) ? 256u : 0u ) | ( jobs.inter || ( m_front && m_frontInter ) ? 512u : 0u );
   push.capTrafo = int32_t( m_jobCap[0] );
   push.capInter = int32_t( m_jobCap[1] );
   push.capIntra = int32_t( m_jobCap[2] );
@@ -2262,6 +2424,7 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, V
 
   vk.vkCmdFillBuffer( m_cmd, m_jobWaves.buffer, 0, VK_WHOLE_SIZE, 0 );
   vk.vkCmdFillBuffer( m_cmd, m_jobProgress.buffer, 0, VK_WHOLE_SIZE, 0 );
+  vk.vkCmdFillBuffer( m_cmd, m_frontArgs.buffer, 0, VK_WHOLE_SIZE, 0 );
   VkMemoryBarrier filled{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
   filled.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   filled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -2274,18 +2437,21 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, V
     vk.vkCmdDispatch( m_cmd, pass == 1 ? 1u : uint32_t( std::max( m_jobBlockCount, 1 ) ), 1, 1 );
     computeBarrier();
   }
+  mark( "jobs" );
   push.pass = 3;
   vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_jobs_waves ) );
   vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
   vk.vkCmdDispatch( m_cmd, uint32_t( pcv.heightInCtus ), 1, 1 );
 
   computeBarrier();
+  mark( "waves" );
 
   // intra's bands in the order of the waves
-  if( jobs.intra )
+  if( jobs.intra || m_front )
   {
-    size_t bands = 0;
-    for( const auto& ctu: *jobs.intra )
+    size_t bands = m_front ? caps.bands : 0;
+    static const std::vector<std::vector<IntraJob>> none;
+    for( const auto& ctu: m_front ? none : *jobs.intra )
     {
       for( const IntraJob& job: ctu )
       {
@@ -2314,7 +2480,7 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, V
     IntraSortPush is{};
     is.jobs      = m_jobOut[2].addr;
     is.count     = m_jobBlocks.addr + ( size_t( m_jobBlockCount ) * 5 + 2 ) * sizeof( uint32_t );   // jobs.slang's intra total
-    is.args      = m_frontArgs.addr + 16 * sizeof( uint32_t );
+    is.args      = m_frontArgs.addr;
     is.keysA     = m_isKeys.addr;
     is.keysB     = m_isKeys.addr + size_t( m_isBlocks ) * 1024 * sizeof( uint32_t );
     is.hist      = m_isHist.addr;
@@ -2345,8 +2511,13 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, V
     pass( 4, 0, 1 );
     pass( 5, 0, uint32_t( m_isBlocks ) );
     pass( 6, 0, uint32_t( m_isBlocks ) );
+    mark( "intrasort" );
   }
 
+  if( m_front )
+  {
+    return;
+  }
   VkMemoryBarrier made{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
   made.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
   made.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -2374,21 +2545,22 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, V
 
 void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs, VkDeviceAddress slices )
 {
-  if( !jobs.edges )
+  if( !jobs.edges && !m_front )
   {
     return;
   }
   const PreCalcValues& pcv = *cs.pcv;
   const Api&           vk  = m_ctx->api();
   size_t               cpu = 0;
-  for( const EdgeLists& ctu: *jobs.edges )
+  static const std::vector<EdgeLists> none;
+  for( const EdgeLists& ctu: m_front ? none : *jobs.edges )
   {
     for( const auto& list: ctu.lists )
     {
       cpu += list.size();
     }
   }
-  m_edgeCap = cpu + 64;
+  m_edgeCap = m_front ? m_frontCaps.edges : cpu + 64;
   ensureBuffer( m_ctx, m_edgeOut, m_edgeCap * sizeof( Edge ), MemKind::Device );
   ensureBuffer( m_ctx, m_edgeOutHost, m_edgeCap * sizeof( Edge ), MemKind::HostCached );
   ensureBuffer( m_ctx, m_edgeCounts, size_t( pcv.sizeInCtus ) * 4 * sizeof( uint32_t ), MemKind::Device );
@@ -2410,6 +2582,7 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs, 
   push.csx          = chroma ? int32_t( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
   push.csy          = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
   push.capacity     = int32_t( m_edgeCap );
+  push.args         = m_frontArgs.addr;
   vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_edges ) );
   for( int pass = 0; pass < 3; pass++ )
   {
@@ -2417,6 +2590,11 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs, 
     vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
     vk.vkCmdDispatch( m_cmd, pass == 1 ? 1u : uint32_t( pcv.sizeInCtus ), 1, 1 );
     computeBarrier();
+  }
+  mark( "edges" );
+  if( m_front )
+  {
+    return;
   }
   VkMemoryBarrier listed{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
   listed.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -2517,7 +2695,10 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   // written, the references uploaded
   const bool                  band = jobs.bandCtus > 0;
   std::vector<const Picture*> uploads;
-  if( jobs.inter && !band )
+  m_front      = jobs.front;
+  m_frontTrafo = jobs.frontTrafo;
+  m_frontInter = jobs.frontInter;
+  if( ( jobs.inter || ( jobs.front && jobs.frontInter ) ) && !band )
   {
     writeRefTable( cs, *jobs.refs, pic, uploads );
   }
@@ -2541,7 +2722,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   }
   Planes planes[2] = { twinPlanes( pic ), Planes{} };   // the scratch planes taken just before SAO and ALF
   int    cur       = 0;
-  if( !jobs.trafo )
+  if( !jobs.trafo && !( jobs.front && jobs.frontTrafo ) )
   {
     copyPlanes( pic, kHost, kTwin );
   }
@@ -2550,20 +2731,27 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   {
     recordMider( cs, jobs );
   }
-  if( jobs.trafo )
+  if( jobs.front )
   {
-    recordTrafo( cs, *jobs.trafo, jobs.bandCtus, jobs.trafo->size(), m_trafoJobs, hostPlanes( pic ), planes[cur] );
+    indirectBarrier();
+  }
+  static const std::vector<std::vector<TrafoJob>> noTrafo;
+  static const std::vector<std::vector<InterJob>> noInter;
+  static const std::vector<std::vector<IntraJob>> noIntra;
+  if( jobs.trafo || ( jobs.front && jobs.frontTrafo ) )
+  {
+    recordTrafo( cs, jobs.front ? noTrafo : *jobs.trafo, jobs.bandCtus, jobs.front ? 0 : jobs.trafo->size(), m_trafoJobs, hostPlanes( pic ), planes[cur] );
     computeBarrier();
   }
-  if( jobs.inter )
+  if( jobs.inter || ( jobs.front && jobs.frontInter ) )
   {
-    recordInter( cs, *jobs.inter, jobs.bandCtus, jobs.inter->size(), m_interJobs, planes[cur] );   // in place
+    recordInter( cs, jobs.front ? noInter : *jobs.inter, jobs.bandCtus, jobs.front ? 0 : jobs.inter->size(), m_interJobs, planes[cur] );   // in place
     computeBarrier();
   }
   splitCommands();
-  if( jobs.intra )
+  if( jobs.intra || jobs.front )
   {
-    recordIntra( cs, *jobs.intra, planes[cur] );   // in place
+    recordIntra( cs, jobs.front ? noIntra : *jobs.intra, planes[cur] );   // in place
     computeBarrier();
     if( m_lmcsOn )
     {
@@ -2573,7 +2761,8 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   }
   if( doDeblock )
   {
-    recordDeblock( cs, planes[cur], m_params.addr, *jobs.edges );   // in place
+    static const std::vector<EdgeLists> noEdges;
+    recordDeblock( cs, planes[cur], m_params.addr, jobs.front ? noEdges : *jobs.edges );   // in place
   }
   if( doSao || alf )
   {
