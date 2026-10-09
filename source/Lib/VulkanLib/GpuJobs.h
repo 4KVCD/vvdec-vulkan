@@ -178,6 +178,7 @@ struct InterJob
                        // residual left in the picture, for an intra job of kind IntraJob::kLmcs
     kDeferY    = 1024, // CIIP: so for the luma too (with kDeferCb and Cr), for kind IntraJob::kCiip
     kBcw       = 2048, // BCW: the bi-prediction weighted (setBcw)
+    kBdof      = 4096, // BDOF (with DMVR: where its cost leaves it on), in the dispatch of the inter_bdof variant
   };
 
   uint32_t w[12];

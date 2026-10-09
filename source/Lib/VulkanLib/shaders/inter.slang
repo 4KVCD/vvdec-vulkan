@@ -14,7 +14,8 @@
 //   7, bits 16..19: BCW: L1's weight + 2 (of 8; L0's: 8 - it), with flag 2048
 // flags: 1 L0, 2 L1, 4 DMVR, 8 AMVR half-sample filter, 16/32/64 residual in Y/Cb/Cr, 128 LMCS's forward mapping of
 // the luma prediction, 256/512 (LMCS's chroma scaling, CIIP) the Cb/Cr prediction kept aside (defer1/2), the residual
-// left in the picture for intra.slang's kind 5 or 6, 1024 (CIIP) so the luma's too (defer0), 2048 BCW's weights
+// left in the picture for intra.slang's kind 5 or 6, 1024 (CIIP) so the luma's too (defer0), 2048 BCW's weights,
+// 4096 BDOF (the variant built with BDOF=1 takes those tiles)
 
 #include "common.slang"
 
@@ -63,6 +64,10 @@ struct Params
 #define FLAG_DEFER_CB 256
 #define FLAG_DEFER_Y 1024
 #define FLAG_BCW 2048
+#define FLAG_BDOF 4096
+#ifndef BDOF
+#define BDOF 0
+#endif
 
 // the average of a bi-prediction's two 14-bit predictions (addAvg), or with
 // BCW's weights (addWeightedAvg: w1 of 8)
@@ -1105,6 +1110,148 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   *(uint*)outC  = uint( vc.x & 0xffff ) | uint( vc.y ) << 16;
 }
 
+#if BDOF
+// --------------------------------------------------------------------------------------------------------------------
+// BDOF, bi-directional optical flow (vvdec's applyBiOptFlow, BiOptFlowCore, gradFilterCore): each list's 14-bit luma
+// prediction of the tile with a border of a sample around it, from the reference's integer samples nearest the
+// motion (xPredInterBlk), in s_bdof; each 4x4's motion offset (vx, vy) from the gradients and the differences over the
+// 6 x 6 around it (the border's own samples and gradients taken from the nearest inside the tile); the samples
+// averaged with the offset's correction.
+// --------------------------------------------------------------------------------------------------------------------
+#define BS 18                                     // a list's rows in s_bdof: the tile, 16 at most, and its border
+groupshared int16_t s_bdof[2 * BS * BS];
+groupshared int     s_bsum[16 * 5];               // a 4x4's sums: |gx|, |gy|, di by gx's sign, by gy's, gx by gy's sign
+groupshared int2    s_bv[16];                     // a 4x4's (vx, vy)
+groupshared int     s_minCost;                    // DMVR's best cost (BDOF only where it is 2 w h or more)
+
+int bdofP( int list, int x, int y )   // (x, y): -1 .. w, -1 .. h
+{
+  return int( s_bdof[list * BS * BS + ( y + 1 ) * BS + x + 1] );
+}
+
+// the gradients at (x, y) inside the tile, from the samples around it (the border's too)
+int2 bdofGrad( int list, int x, int y )
+{
+  return int2( ( bdofP( list, x + 1, y ) >> 6 ) - ( bdofP( list, x - 1, y ) >> 6 ), ( bdofP( list, x, y + 1 ) >> 6 ) - ( bdofP( list, x, y - 1 ) >> 6 ) );
+}
+
+// a list's prediction into s_bdof: the thread's samples, and the border from the reference: the samples nearest the
+// motion (fractions below 8 round down), at 14 bits; at (baseX, baseY) the integer position of the tile's prediction
+void bdofStore( int tid, int list, int w, int h, int pred[PER_THREAD], int slot, int baseX, int baseY, int2 mv, bool windowed, int4 window )
+{
+  const int log2W = log2Int( w );
+  for( int k = 0; k < PER_THREAD; k++ )
+  {
+    const int t = tid + THREADS * k;
+    if( t < w * h )
+    {
+      s_bdof[list * BS * BS + ( ( t >> log2W ) + 1 ) * BS + ( t & ( w - 1 ) ) + 1] = int16_t( pred[k] );
+    }
+  }
+  const int ring  = 2 * ( w + 2 ) + 2 * h;   // the rows above and below, then the columns left and right
+  const int xOff  = ( mv.x & 15 ) < 8 ? 1 : 0;
+  const int yOff  = ( mv.y & 15 ) < 8 ? 1 : 0;
+  const int shift = max( 2, 14 - pc.bitDepth );
+  int16_t*  ref   = refPlane( slot, 0 );
+  for( int r = tid; r < ring; r += THREADS )
+  {
+    int bx, by;
+    if( r < w + 2 )
+    {
+      bx = r - 1;
+      by = -1;
+    }
+    else if( r < 2 * ( w + 2 ) )
+    {
+      bx = r - ( w + 2 ) - 1;
+      by = h;
+    }
+    else if( r < 2 * ( w + 2 ) + h )
+    {
+      bx = -1;
+      by = r - 2 * ( w + 2 );
+    }
+    else
+    {
+      bx = w;
+      by = r - 2 * ( w + 2 ) - h;
+    }
+    const int v = refSample( ref, 0, baseX + bx + 1 - xOff, baseY + by + 1 - yOff, windowed, window );
+    s_bdof[list * BS * BS + ( by + 1 ) * BS + bx + 1] = int16_t( v * ( 1 << shift ) - IF_INTERNAL_OFFS );
+  }
+}
+
+// after both lists' bdofStore and a barrier: the thread's samples of the tile, corrected and averaged
+void bdofApply( int tid, int w, int h, out int result[PER_THREAD] )
+{
+  const int nsx = w >> 2;
+  const int nsb = nsx * ( h >> 2 );
+  // the sums over each 4x4's 6 x 6: four threads a 4x4, nine samples each
+  if( tid < 4 * nsb )
+  {
+    const int sb = tid >> 2;
+    const int q  = tid & 3;
+    const int sx = sb % nsx;
+    const int sy = sb / nsx;
+    int       absGX = 0, absGY = 0, dIX = 0, dIY = 0, signGX = 0;
+    for( int p = q * 9; p < q * 9 + 9; p++ )
+    {
+      const int  cx = clamp( 4 * sx - 1 + p % 6, 0, w - 1 );
+      const int  cy = clamp( 4 * sy - 1 + p / 6, 0, h - 1 );
+      const int2 g0 = bdofGrad( 0, cx, cy );
+      const int2 g1 = bdofGrad( 1, cx, cy );
+      const int  gx = ( g0.x + g1.x ) >> 1;
+      const int  gy = ( g0.y + g1.y ) >> 1;
+      const int  di = ( bdofP( 1, cx, cy ) >> 4 ) - ( bdofP( 0, cx, cy ) >> 4 );
+      absGX  += abs( gx );
+      absGY  += abs( gy );
+      dIX    += gx < 0 ? -di : ( gx == 0 ? 0 : di );
+      dIY    += gy < 0 ? -di : ( gy == 0 ? 0 : di );
+      signGX += gy < 0 ? -gx : ( gy == 0 ? 0 : gx );
+    }
+    InterlockedAdd( s_bsum[sb * 5], absGX );
+    InterlockedAdd( s_bsum[sb * 5 + 1], absGY );
+    InterlockedAdd( s_bsum[sb * 5 + 2], dIX );
+    InterlockedAdd( s_bsum[sb * 5 + 3], dIY );
+    InterlockedAdd( s_bsum[sb * 5 + 4], signGX );
+  }
+  GroupMemoryBarrierWithGroupSync();
+  if( tid < nsb )
+  {
+    const int absGX  = s_bsum[tid * 5];
+    const int absGY  = s_bsum[tid * 5 + 1];
+    const int dIX    = s_bsum[tid * 5 + 2];
+    const int dIY    = s_bsum[tid * 5 + 3];
+    const int signGX = s_bsum[tid * 5 + 4];
+    // rightShiftMSB: a shift by the denominator's highest bit
+    const int vx   = absGX == 0 ? 0 : clamp( ( dIX * 4 ) >> firstbithigh( uint( absGX ) ), -15, 15 );
+    const int data = ( ( vx * ( signGX >> 12 ) ) * 4096 + vx * ( signGX & 4095 ) ) >> 1;
+    const int vy   = absGY == 0 ? 0 : clamp( ( dIY * 4 - data ) >> firstbithigh( uint( absGY ) ), -15, 15 );
+    s_bv[tid]      = int2( vx, vy );
+  }
+  GroupMemoryBarrierWithGroupSync();
+  const int log2W    = log2Int( w );
+  const int shiftNum = 15 - pc.bitDepth;
+  const int offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
+  const int maxVal   = ( 1 << pc.bitDepth ) - 1;
+  for( int k = 0; k < PER_THREAD; k++ )
+  {
+    const int t = tid + THREADS * k;
+    result[k]   = 0;
+    if( t < w * h )
+    {
+      const int  i  = t & ( w - 1 );
+      const int  j  = t >> log2W;
+      const int2 v  = s_bv[( j >> 2 ) * nsx + ( i >> 2 )];
+      const int2 g0 = bdofGrad( 0, i, j );
+      const int2 g1 = bdofGrad( 1, i, j );
+      const int  b  = v.x * ( g0.x - g1.x ) + v.y * ( g0.y - g1.y );
+      result[k]     = clip3( 0, maxVal, int( int16_t( ( bdofP( 0, i, j ) + bdofP( 1, i, j ) + b + offset ) >> shiftNum ) ) );
+    }
+  }
+}
+#endif
+
 [shader( "compute" )]
 [numthreads( THREADS, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
@@ -1133,7 +1280,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const bool dmvr  = ( flags & FLAG_DMVR ) != 0;
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
-  if( pc.wide != 0 && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
+  if( !BDOF && pc.wide != 0 && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
   {
     tile16( tid, index, job, x, y, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel );
     return;
@@ -1209,6 +1356,18 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       s_sad[12] -= s_sad[12] >> 2;
       const int2 delta       = dmvrDelta( w, h );
+#if BDOF
+      // the best cost the search found (or the centre's, where it stops at once)
+      int minCost = s_sad[12];
+      if( minCost >= w * h )
+      {
+        for( int i = 0; i < 25; i++ )
+        {
+          minCost = min( minCost, s_sad[i] );
+        }
+      }
+      s_minCost = minCost;
+#endif
       const int  index8      = int( job[8] );
       pc.dmvr[index8 * 2]     = delta.x;
       pc.dmvr[index8 * 2 + 1] = delta.y;
@@ -1236,6 +1395,19 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     refined1 = clipStorage( mv1 - s_delta );
   }
 
+#if BDOF
+  // BDOF: with DMVR, only where the best cost is 2 w h or more (xProcessDMVR)
+  const bool bdof = ( flags & FLAG_BDOF ) != 0 && ( !dmvr || s_minCost >= 2 * w * h );
+  if( bdof )
+  {
+    for( int i = tid; i < 16 * 5; i += THREADS )
+    {
+      s_bsum[i] = 0;   // (predictBlock's barriers before the sums)
+    }
+  }
+#else
+  const bool bdof = false;
+#endif
   [loop]
   for( int comp = 0; comp < 3; comp++ )
   {
@@ -1296,7 +1468,22 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       {
         pred1 = pred;
       }
+#if BDOF
+      if( bdof && comp == 0 )
+      {
+        bdofStore( tid, list, bw, bh, pred, slot, windowed ? base.x : bx + ( clipped.x >> shift ), windowed ? base.y : by + ( clipped.y >> shift ),
+                   clipped, windowed, window );
+      }
+#endif
     }
+    int bdofOut[PER_THREAD] = { 0, 0, 0, 0 };
+#if BDOF
+    if( bdof && comp == 0 )
+    {
+      GroupMemoryBarrierWithGroupSync();
+      bdofApply( tid, bw, bh, bdofOut );
+    }
+#endif
 
     int16_t*   dst      = comp == 0 ? pc.dst0 : ( comp == 1 ? pc.dst1 : pc.dst2 );
     const int  stride   = comp == 0 ? pc.stride0 : pc.stride12;
@@ -1316,7 +1503,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       }
       const int i  = t & ( bw - 1 );
       const int j  = t >> log2W;
-      int       v  = bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k];
+      int       v  = bdof && comp == 0 ? bdofOut[k] : ( bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k] );
       const int at = ( by + j ) * stride + bx + i;
       if( map )
       {

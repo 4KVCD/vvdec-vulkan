@@ -12,6 +12,7 @@ set( VVDEC_GPU_SHADERS
   "deblock_chroma|deblock|CHROMA=1"
   "intra|intra"
   "inter|inter"
+  "inter_bdof|inter|BDOF=1"
   "trafo|trafo"
   "lmcs|lmcs"
 )

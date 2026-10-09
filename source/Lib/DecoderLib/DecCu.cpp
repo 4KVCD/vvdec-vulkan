@@ -494,6 +494,31 @@ void DecCu::xGpuIbcJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::
   }
 }
 
+// motionCompensation's bioApplied: whether BDOF refines the CU's bi-prediction
+static bool gpuBdof( const CodingUnit& cu )
+{
+  const Slice& slice = *cu.slice;
+  const PPS&   pps   = *cu.pps;
+  if( !cu.sps->getUseBIO() || cu.cs->picHeader->getDisBdofFlag() || cu.affineFlag() || cu.ciipFlag() || cu.smvdMode()
+      || ( cu.sps->getUseBcw() && cu.BcwIdx() != BCW_DEFAULT ) || cu.refIdx[0] < 0 || cu.refIdx[1] < 0 )
+  {
+    return false;
+  }
+  const WPScalingParam* wp0 = nullptr;
+  const WPScalingParam* wp1 = nullptr;
+  slice.getWpScaling( REF_PIC_LIST_0, cu.refIdx[0], wp0 );
+  slice.getWpScaling( REF_PIC_LIST_1, cu.refIdx[1], wp1 );
+  const bool wp = ( wp0[COMPONENT_Y].bPresentFlag || wp0[COMPONENT_Cb].bPresentFlag || wp0[COMPONENT_Cr].bPresentFlag || wp1[COMPONENT_Y].bPresentFlag
+                    || wp1[COMPONENT_Cb].bPresentFlag || wp1[COMPONENT_Cr].bPresentFlag )
+                  && slice.getSliceType() == B_SLICE;
+  if( wp || ( pps.getUseWP() && slice.getSliceType() == P_SLICE ) || !PU::isBiPredFromDifferentDirEqDistPoc( cu ) || cu.Y().height < 8
+      || cu.Y().width < 8 || cu.Y().area() < 128 )
+  {
+    return false;
+  }
+  return !slice.getRefPic( REF_PIC_LIST_0, cu.refIdx[0] )->isRefScaled( cu.pps ) && !slice.getRefPic( REF_PIC_LIST_1, cu.refIdx[1] )->isRefScaled( cu.pps );
+}
+
 void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs, std::vector<gpu::TrafoJob>* trafoJobs,
                            std::vector<gpu::IntraJob>& intraJobs, gpu::WaveMap& waves )
 {
@@ -592,11 +617,15 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
         ref[list]  = refs.slot( slice.getRefPic( RefPicList( list ), refIdx[list] ) );
       }
     }
-    // as motionCompensation chooses: DMVR (not for sub-PUs), else the same
-    // motion twice is a uni-prediction (xCheckIdenticalMotion), else BCW's
-    // weights (not with CIIP)
+    // as motionCompensation chooses: BDOF and DMVR (not for sub-PUs), else
+    // the same motion twice is a uni-prediction (xCheckIdenticalMotion), else
+    // BCW's weights (not with CIIP)
     const bool dmvr = !subPu && PU::checkDMVRCondition( cu );
     const bool bi   = refIdx[0] >= 0 && refIdx[1] >= 0;
+    if( !subPu && gpuBdof( cu ) )
+    {
+      bflags |= gpu::InterJob::kBdof;
+    }
     if( dmvr )
     {
       cu.setDmvrCondition( true );
