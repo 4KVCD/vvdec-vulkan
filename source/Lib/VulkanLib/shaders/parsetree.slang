@@ -1,24 +1,34 @@
-// parse.slang's coding tree: the maps of CUs and the neighbours, the partitioner (vvdec's Partitioner), the coding
-// tree unit with SAO's and ALF's syntax, the coding tree (CABACReader::coding_tree, split_cu_mode, mode_constraint).
+// The coding tree part of parse.slang, which includes this file. It holds:
+// - the maps of the CUs parsed so far, where the context derivations look up neighbouring CUs;
+// - the partitioner (vvdec's Partitioner), which keeps the stack of splits from the CTU down to the current area;
+// - the split syntax (CABACReader::split_cu_mode, mode_constraint) and the coding tree (CABACReader::coding_tree),
+//   walked with an explicit stack of frames because shaders cannot recurse; each leaf of the tree is a CU, which
+//   codingUnitAtPart (parsecu.slang) parses;
+// - the coding tree unit (CABACReader::coding_tree_unit): SAO's and ALF's syntax, then the CTU's coding tree or, with
+//   the dual tree, its luma and chroma trees.
 
 // --------------------------------------------------------------------------------------------------------------------
-// the CUs parsed so far around the CTU: a word pair each 4x4 luma block -- of the CTU (s_map, per channel type: the
-// luma tree's CUs, the chroma tree's; the single tree's in both), of the bottom row of the CTU above (s_above) and the
-// right column of the CTU left (s_left), zero where none or out of reach (another slice or tile):
+// The maps of the CUs parsed so far around the CTU. Each holds a word pair per 4x4 luma block that describes the CU
+// covering it: s_map covers the CTU itself, with one map per channel type (the luma tree's CUs and the chroma tree's;
+// a single tree's CUs are in both); s_above covers the bottom row of 4x4 blocks of the CTU above, and s_left the
+// right column of the CTU to the left. An entry is zero where no CU has been parsed, and in CTUs out of reach (another
+// slice or tile). The word pair:
 //   x: the CU's index in its CTU + 1 (12 bits) | prediction mode << 12 | skip << 14 | affine << 15 | MIP << 16 |
-//      ISP << 17 | QT depth << 19 | depth << 22 | its block's (the channel type's) log2 width << 26 | log2 height << 29
-//   y: its luma intra mode (byte) | its QP << 8 (byte)
-// written when the CU is done (what is looked up is always another CU, done)
+//      ISP mode << 17 | QT depth << 19 | depth << 22 | log2 width << 26 | log2 height << 29, the size being that of
+//      the CU's block of the map's channel type, in that channel's samples
+//   y: the CU's luma intra mode | its QP << 8 (signed bytes)
+// A CU's entries are written when the CU is done, so a lookup always finds another CU, completely parsed.
 // --------------------------------------------------------------------------------------------------------------------
 
-groupshared uint2 s_map[2048];   // [channel type][y >> 2][x >> 2] from the CTU's corner, 32 a row
-groupshared uint2 s_above[64];   // [channel type][x >> 2]
-groupshared uint2 s_left[64];    // [channel type][y >> 2]
+groupshared uint2 s_map[2048];   // [channel type][y >> 2][x >> 2], from the CTU's top-left corner, 32 entries per row
+groupshared uint2 s_above[64];   // [channel type][x >> 2]: the bottom row of the CTU above
+groupshared uint2 s_left[64];    // [channel type][y >> 2]: the right column of the CTU to the left
 
-static bool g_leftAvail;    // the CTU left (above) in the same slice and tile
-static bool g_aboveAvail;
-static bool g_tileFirstCol; // the CTU in its tile's first column
+static bool g_leftAvail;    // the CTU to the left is in the same slice and tile
+static bool g_aboveAvail;   // the CTU above is in the same slice and tile
+static bool g_tileFirstCol; // the CTU is in its tile's first column
 
+// The fields of a map entry
 bool infoValid( uint2 i )
 {
   return ( i.x & 0xfffu ) != 0;
@@ -84,14 +94,15 @@ int infoQp( uint2 i )
   return int( int8_t( ( i.y >> 8 ) & 0xffu ) );
 }
 
-// whether two CTUs belong to the same slice and tile
+// Whether CTUs a and b belong to the same slice and the same tile
 bool sameSliceTile( int a, int b )
 {
   return uni( pc.ctuInfo[a * 2] ) == uni( pc.ctuInfo[b * 2] ) && ( uni( pc.ctuInfo[a * 2 + 1] ) & 0xffffu ) == ( uni( pc.ctuInfo[b * 2 + 1] ) & 0xffffu );
 }
 
-// CodingStructure::getCU (and getCURestricted's, the CTUs out of reach zero): the CU of the channel type ch at the luma
-// position (x, y) -- in the CTU, the row above it or the column left of it
+// The map entry of the CU of channel type ch at luma position (x, y), as CodingStructure::getCU finds it, for
+// positions in the CTU, in the row of 4x4 blocks just above it or in the column just left of it. As with
+// getCURestricted, CUs out of reach (outside the picture, or in another slice or tile) and other positions give zero.
 uint2 cuAt( int x, int y, int ch )
 {
   if( x < 0 || y < 0 || x >= g_width || y >= g_height )
@@ -115,7 +126,8 @@ uint2 cuAt( int x, int y, int ch )
   return uint2( 0, 0 );
 }
 
-// CodingStructure::getCURestricted( pos, curCu, chType ): in the CTU, not a CU after the current one (its index cur)
+// CodingStructure::getCURestricted( pos, curCu, chType ): as cuAt, but within the CTU a CU that comes after the
+// current CU (whose index is cur) gives zero
 uint2 cuAtRestricted( int x, int y, int cur, int ch )
 {
   const uint2 i  = cuAt( x, y, ch );
@@ -129,11 +141,15 @@ uint2 cuAtRestricted( int x, int y, int cur, int ch )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the partitioner (vvdec's Partitioner): its levels in shared memory, the rest in the thread's
+// The partitioner (vvdec's Partitioner). Its stack of levels lives in shared memory (s_lv...); the rest of its state
+// (g_p) lives in each thread, the same in all threads.
 // --------------------------------------------------------------------------------------------------------------------
 
-static const int kMaxLevels = 24;
+static const int kMaxLevels = 24;   // the deepest stack of levels (deeper gives up the substream)
 
+// Per level of the stack: the split that made it (CTU_LEVEL at level 0, whose one part is the CTU), the index of its
+// current part, its number of parts, the CUs above and left of its current part (setNeighborCu), its quantization
+// group flags, and the area it splits
 groupshared int s_lvSplit[kMaxLevels];
 groupshared int s_lvIdx[kMaxLevels];
 groupshared int s_lvNum[kMaxLevels];
@@ -142,9 +158,10 @@ groupshared uint2 s_lvLeft[kMaxLevels];
 groupshared int s_lvQg[kMaxLevels];    // qgEnable | qgChromaEnable << 1
 groupshared int4 s_lvArea[kMaxLevels]; // the area split (luma samples: x, y, w, h)
 
+// The partitioner's state besides its levels, with the names of vvdec's Partitioner
 struct Part
 {
-  int top;   // the current level
+  int top;   // the current level, the top of the stack
   int currDepth;
   int currQtDepth;
   int currTrDepth;
@@ -154,6 +171,8 @@ struct Part
   int chType;
   int treeType;
   int modeType;
+  // The partition limits, sizes in luma samples: maxBTD (the deepest multi-type tree), maxBtSize, maxTtSize and
+  // minQtSize from kSlPartLuma or kSlPartChroma; minBtSize and minTtSize are the smallest coding block's size
   int maxBTD;
   int maxBtSize;
   int minBtSize;
@@ -164,7 +183,7 @@ struct Part
 
 static Part g_p;
 
-// the area of part idx of a split of a
+// The area of part idx when area a is split with split; CTU_LEVEL's one part is a itself
 int4 partArea( int split, int idx, int4 a )
 {
   if( split == CU_QUAD_SPLIT )
@@ -192,12 +211,15 @@ int4 partArea( int split, int idx, int4 a )
   return a;   // CTU_LEVEL
 }
 
+// The area of the current part (Partitioner::currArea), in luma samples
 int4 currArea()
 {
   const int l = g_p.top;
   return partArea( uni( s_lvSplit[l] ), uni( s_lvIdx[l] ), int4( uni( s_lvArea[l].x ), uni( s_lvArea[l].y ), uni( s_lvArea[l].z ), uni( s_lvArea[l].w ) ) );
 }
 
+// Whether the current part may start a quantization group for the delta QP (Partitioner::currQgEnable) and for the
+// chroma QP offsets (currQgChromaEnable)
 bool currQgEnable()
 {
   return ( uni( s_lvQg[g_p.top] ) & 1 ) != 0;
@@ -208,12 +230,13 @@ bool currQgChromaEnable()
   return ( uni( s_lvQg[g_p.top] ) & 2 ) != 0;
 }
 
+// Partitioner::isSepTree: the current part is in a separate luma or chroma tree (the dual tree, or a local dual tree)
 bool isSepTreeP()
 {
   return g_p.treeType != TREE_D || g_dualTree;
 }
 
-// a step in the channel's samples, in luma samples
+// The width (height) of one sample of channel type ch, in luma samples
 int stepX( int ch )
 {
   return ch == 0 ? 1 : 1 << g_csx;
@@ -224,7 +247,8 @@ int stepY( int ch )
   return ch == 0 ? 1 : 1 << g_csy;
 }
 
-// setNeighborCu
+// Records in level l the CUs above and to the left of its current part, in the partitioner's channel type (the
+// chroma tree's for TREE_C), as vvdec's setNeighborCu does
 void setNeighborCu( int l )
 {
   const int  ch = g_p.treeType == TREE_C ? 1 : g_p.chType;
@@ -236,7 +260,7 @@ void setNeighborCu( int l )
   s_lvLeft[l]  = cuAt( a.x - stepX( ch ), a.y, ch );
 }
 
-// Partitioner::initCtu
+// Sets the partitioner up for the CTU's tree of channel type chType (Partitioner::initCtu): level 0 is the CTU
 void initCtu( int chType )
 {
   g_p.top                 = 0;
@@ -255,7 +279,8 @@ void initCtu( int chType )
   s_lvQg[0]               = 3;
   s_lvArea[0]             = int4( g_ctuX << g_log2Ctu, g_ctuY << g_log2Ctu, g_ctuSize, g_ctuSize );
   setNeighborCu( 0 );
-  // (GDR_ADJ) the luma's limits of intra or inter slices, the dual tree's chroma's
+  // The partition limits, picked as vvdec does with GDR_ADJ: the luma (or single tree) limits of intra or inter
+  // slices, or the dual tree chroma's
   const uint lim          = uint( sliceWord( chType == 1 && g_dualTree ? kSlPartChroma : kSlPartLuma ) );
   g_p.maxBTD              = int( lim & 0xffu );
   g_p.maxBtSize           = int( ( lim >> 8 ) & 0xffu );
@@ -265,12 +290,14 @@ void initCtu( int chType )
   g_p.minTtSize           = 1 << g_log2MinCb;
 }
 
+// Whether area a reaches past the picture's right or bottom edge (its split is then implicit)
 bool outsidePicture( int4 a )
 {
   return a.x + a.z - 1 >= g_width || a.y + a.w - 1 >= g_height;
 }
 
-// Partitioner::splitCurrArea (the CU splits)
+// Splits the current part with split, pushing a level whose current part is the first one (Partitioner::splitCurrArea,
+// for the CU splits). The new level starts with its parent's neighbours, as the first part shares its top-left corner.
 void splitCurrArea( int split )
 {
   const int4 area           = currArea();
@@ -316,7 +343,8 @@ void splitCurrArea( int split )
   s_lvLeft[l]       = s_lvLeft[last];
 }
 
-// Partitioner::nextPart (the CU splits)
+// Moves to the next part of the current level; returns false after its last part (Partitioner::nextPart, for the CU
+// splits)
 bool nextPart()
 {
   const int l   = g_p.top;
@@ -342,7 +370,7 @@ bool nextPart()
   return false;
 }
 
-// Partitioner::exitCurrSplit (the CU splits)
+// Pops the current level, back to the part it split (Partitioner::exitCurrSplit, for the CU splits)
 void exitCurrSplit()
 {
   const int l         = g_p.top;
@@ -371,24 +399,25 @@ void exitCurrSplit()
   }
 }
 
-// Partitioner::canSplit: canNo | canQt << 1 | canBh << 2 | canBv << 3 | canTh << 4 | canTv << 5
+// The splits the current part allows (Partitioner::canSplit), as canNo | canQt << 1 | canBh << 2 | canBv << 3 |
+// canTh << 4 | canTv << 5
 int canSplit()
 {
   bool       canNo = true, canQt = true, canBh = true, canTh = true, canBv = true, canTv = true;
   bool       canBtt = g_p.currMtDepth < ( g_p.maxBTD + g_p.currImplicitBtDepth );
   const int4 area   = currArea();
   const bool chroma = g_p.chType == 1;
-  const int  cw     = area.z >> g_csx;   // the chroma partitioner's chroma block
+  const int  cw     = area.z >> g_csx;   // the part's chroma block, which the chroma tree's limits look at
   const int  chh    = area.w >> g_csy;
   const int  l      = g_p.top;
 
   if( g_dualTree && ( area.z > 64 || area.w > 64 ) )
   {
-    return 2;   // QT only
+    return 2;   // QT only: in the dual tree, a block larger than 64 is split in four (no bin is coded)
   }
   if( g_p.treeType == TREE_C )
   {
-    return 1;   // no split
+    return 1;   // no split: a local dual tree's chroma CU covers its whole area
   }
   const int  lastSplit = uni( s_lvSplit[l] );
   const bool isTrInPic = area.x + area.z <= g_width;
@@ -476,7 +505,9 @@ int canSplit()
   return ( canNo ? 1 : 0 ) | ( canQt ? 2 : 0 ) | ( canBh ? 4 : 0 ) | ( canBv ? 8 : 0 ) | ( canTh ? 16 : 0 ) | ( canTv ? 32 : 0 );
 }
 
-// CABACReader::split_cu_mode
+// Parses how the current part is split (CABACReader::split_cu_mode): split_cu_flag, split_qt_flag,
+// mtt_split_cu_vertical_flag and mtt_split_cu_binary_flag, each only when canSplit leaves a choice. The contexts come
+// from the sizes and QT depths of the CUs left and above.
 int splitCuMode()
 {
   const int  can   = canSplit();
@@ -572,7 +603,9 @@ int splitCuMode()
   return CU_TRIH_SPLIT;
 }
 
-// signalModeCons: 0 inherit, 1 infer (intra), 2 signal
+// vvdec's signalModeCons: whether the parts of split inherit the mode type (0, LDT_MODE_TYPE_INHERIT), are intra
+// only (1, LDT_MODE_TYPE_INFER), or read it from mode_constraint_flag (2, LDT_MODE_TYPE_SIGNAL). Small chroma blocks
+// of the single tree lead to a local dual tree this way.
 int signalModeCons( int split )
 {
   if( g_dualTree || g_p.modeType != MODE_TYPE_ALL || g_chromaFormat == 3 || g_chromaFormat == 0 )
@@ -595,7 +628,7 @@ int signalModeCons( int split )
   return minChromaBlock >= 16 && !is2xNChroma ? 0 : ( ( minLumaArea < 32 || sliceIsIntra() ) ? 1 : 2 );
 }
 
-// CABACReader::mode_constraint
+// The mode type of the parts of split (CABACReader::mode_constraint)
 int modeConstraint( int split )
 {
   const int val = signalModeCons( split );
@@ -614,10 +647,11 @@ int modeConstraint( int split )
   return g_p.modeType;
 }
 
-// the split of the CU's partition at a depth (CU::getSplitAtDepth, from the partitioner's levels)
+// The split made at the given depth on the way down to the current CU, read from the partitioner's levels
+// (CU::getSplitAtDepth); CU_DONT_SPLIT from the CU's own depth on
 int splitAtDepth( int depth )
 {
-  // the levels 1.. are the splits that led to the current area; depth d's is level d + 1
+  // Levels 1 and up hold the splits that led to the current area: the split at depth d is level d + 1's
   if( depth >= g_p.currDepth )
   {
     return CU_DONT_SPLIT;
@@ -626,15 +660,19 @@ int splitAtDepth( int depth )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the coding tree (CABACReader::coding_tree, without recursion: a stack of frames)
+// The coding tree (CABACReader::coding_tree). Shaders cannot recurse, so codingTree walks the tree with a stack of
+// frames instead: frame f stands for the coding_tree call at depth f, and s_frame keeps what a call that split its
+// area needs once its parts are done.
 // --------------------------------------------------------------------------------------------------------------------
 
+// vvdec's CUCtx: what the coding tree carries from CU to CU
 struct CuCtx
 {
-  bool qgStart;
-  bool isDQPCoded;
-  bool isChromaQpAdjCoded;
-  int  qp;
+  bool qgStart;              // a quantization group starts: the next CU predicts its QP
+  bool isDQPCoded;           // the quantization group's cu_qp_delta has been parsed
+  bool isChromaQpAdjCoded;   // the chroma quantization group's cu_chroma_qp_offset has been parsed
+  int  qp;                   // the QP so far (at a quantization group's start, the previous QP that predicts the next)
+  // What the CU's residual coding found, for LFNST's and MTS's indices (residual_lfnst_mode, mts_idx)
   bool violatesLfnstLuma;
   bool violatesLfnstChroma;
   bool lfnstLastScanPos;
@@ -642,6 +680,7 @@ struct CuCtx
   bool mtsLastScanPos;
 };
 
+// A CuCtx that starts from QP qp
 CuCtx newCuCtx( int qp )
 {
   CuCtx c;
@@ -657,14 +696,20 @@ CuCtx newCuCtx( int qp )
   return c;
 }
 
-static const int kMaxFrames = 32;
-groupshared int s_frame[kMaxFrames];   // the frame's state (0: its parts, 1: its chroma) | chromaNotSplit << 1 | modeTypeParent << 2
+static const int kMaxFrames = 32;   // the deepest stack of frames (deeper gives up the substream)
+// Per frame of a split area: bit 0 says what the frame does (0: it parses its parts, 1: it parses the chroma CU of its
+// whole area), bit 1 is chromaNotSplit, and the bits from 2 hold modeTypeParent, the mode type to restore at its end
+groupshared int s_frame[kMaxFrames];
 
+// Whether area a starts inside the picture (coding_tree skips the parts that do not)
 bool inPicture( int4 a )
 {
   return a.x < g_width && a.y < g_height;
 }
 
+// Parses the coding tree of the partitioner's current area (CABACReader::coding_tree). Each pass of the loop either
+// enters a part (enter: its split is parsed, and a part that is not split is a CU, which codingUnitAtPart parses) or
+// resumes frame f after one of its parts.
 void codingTree( inout CuCtx ctx )
 {
   int  f     = 0;
@@ -673,6 +718,7 @@ void codingTree( inout CuCtx ctx )
   {
     if( enter )
     {
+      // A quantization group may start here, for the delta QP (luma) and for the chroma QP offsets
       if( picWord( kPicUseDqp ) != 0 && currQgEnable() && g_p.chType == 0 )
       {
         ctx.qgStart    = true;
@@ -686,6 +732,7 @@ void codingTree( inout CuCtx ctx )
       const int split = splitCuMode();
       if( split == CU_DONT_SPLIT )
       {
+        // Not split: the part is a CU. Then back to the parent's frame.
         codingUnitAtPart( ctx );
         f--;
         enter = false;
@@ -693,9 +740,12 @@ void codingTree( inout CuCtx ctx )
       }
       if( f + 1 >= kMaxFrames || g_p.top + 1 >= kMaxLevels )
       {
-        g_error = true;
+        g_error = true;   // (too deep for the stacks)
         break;
       }
+      // Split: work out the parts' mode type. When they must be intra but the parent allowed every mode, the chroma
+      // is not split (chromaNotSplit): the parts form a luma tree, and the chroma follows as one CU. Then enter the
+      // first part, or skip it when it starts outside the picture.
       const int  modeTypeParent = g_p.modeType;
       g_p.modeType              = modeConstraint( split );
       const bool chromaNotSplit = modeTypeParent == MODE_TYPE_ALL && g_p.modeType == MODE_TYPE_INTRA;
@@ -716,12 +766,13 @@ void codingTree( inout CuCtx ctx )
       }
       continue;
     }
-    // frame f resumes: a part done (or outside the picture)
+    // Frame f resumes after one of its parts (or after skipping one outside the picture)
     const int fr = uni( s_frame[f] );
     if( ( fr & 1 ) == 0 )
     {
       if( nextPart() )
       {
+        // the next part: enter it, unless it starts outside the picture
         if( inPicture( currArea() ) )
         {
           f++;
@@ -732,7 +783,7 @@ void codingTree( inout CuCtx ctx )
       exitCurrSplit();
       if( ( fr & 2 ) != 0 )
       {
-        // chromaNotSplit: the chroma of the whole area, a CU of the chroma tree
+        // chromaNotSplit: after the luma parts, the chroma of the whole area follows as one CU of the chroma tree
         g_p.chType   = 1;
         g_p.treeType = TREE_C;
         setNeighborCu( g_p.top );
@@ -741,10 +792,12 @@ void codingTree( inout CuCtx ctx )
         enter = true;
         continue;
       }
+      // the frame ends: restore the parent's mode type and go back to the parent's frame
       g_p.modeType = fr >> 2;
       f--;
       continue;
     }
+    // The chroma CU of a chromaNotSplit frame is done: back to the single tree, then to the parent's frame
     g_p.chType   = 0;
     g_p.treeType = TREE_D;
     g_p.modeType = fr >> 2;
@@ -753,20 +806,22 @@ void codingTree( inout CuCtx ctx )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the coding tree unit: SAO (CABACReader::sao), ALF (readAlf), the coding tree(s)
+// The coding tree unit: SAO (CABACReader::sao), ALF (readAlf), then the coding tree or trees
 // --------------------------------------------------------------------------------------------------------------------
 
+// Word w of a CTU's ctuOut
 uint ctuOutWord( int ctu, int w )
 {
   return uni( pc.ctuOut[ctu * kCtuOutWords + w] );
 }
 
+// Sets word w of the current CTU's ctuOut
 void setCtuOut( int w, uint v )
 {
   pc.ctuOut[g_ctu * kCtuOutWords + w] = v;
 }
 
-// the CTU's left or above neighbour in the same slice and tile
+// Whether the CTU to the left (above) is in the same slice and tile, as SAO's merge flags and ALF's contexts need
 bool ctuLeftAvailable()
 {
   return g_leftAvail;
@@ -777,8 +832,10 @@ bool ctuAboveAvailable()
   return g_aboveAvail;
 }
 
-// SAO's parameters of a component, out: modeIdc | typeIdc << 4 | typeAuxInfo << 8, then 4 offsets (bytes): the band
-// offset's in band order, the edge offset's classes 0, 1, 3, 4
+// Parses the CTU's SAO parameters (CABACReader::sao) and writes 2 ctuOut words per component, from word 2: modeIdc |
+// typeIdc << 4 | typeAuxInfo << 8, then the 4 offsets as bytes -- a band offset's in band order from its first band
+// (typeAuxInfo), an edge offset's of the classes 0, 1, 3 and 4. A merge stays SAO_MODE_MERGE with typeIdc 0 (left)
+// or 1 (above), as vvdec's parse leaves it.
 void sao()
 {
   int mode[3]   = { SAO_MODE_OFF, SAO_MODE_OFF, SAO_MODE_OFF };
@@ -875,7 +932,8 @@ void sao()
   }
 }
 
-// readAlfCtuFilterIndex
+// Parses the CTU's luma filter set (CABACReader::readAlfCtuFilterIndex): one of the slice's APSs (alf_use_aps_flag,
+// alf_luma_prev_filter_idx), numbered from NUM_FIXED_FILTER_SETS, or one of the fixed sets (alf_luma_fixed_filter_idx)
 int readAlfCtuFilterIndex()
 {
   const int numAps = sliceWord( kSlAlf ) & 0xff;
@@ -896,7 +954,9 @@ int readAlfCtuFilterIndex()
   return filtIndex;
 }
 
-// readAlf, out: enabled (3 bits) | filter index << 3 | Cb's alternative << 8 | Cr's << 12 | CC-ALF Cb's << 16 | Cr's << 20
+// Parses the CTU's ALF and CC-ALF syntax (CABACReader::readAlf) and writes ctuOut word 8: the enable flags of Y, Cb
+// and Cr (bits 0..2) | the luma filter set << 3 | Cb's alternative filter << 8 | Cr's << 12 | Cb's CC-ALF filter << 16
+// | Cr's << 20 (0: off). The contexts look at the same word of the CTUs to the left and above.
 void readAlf()
 {
   const bool leftAvail  = ctuLeftAvailable();
@@ -958,8 +1018,8 @@ void readAlf()
   setCtuOut( 8, alf );
 }
 
-// the chroma tree's or the luma tree's coding tree of a part of the CTU's quad split (dual tree, CTUs of 128: the
-// partitioner as dt_implicit_qt_split leaves it for the part)
+// Dual tree with CTUs of 128: sets the partitioner of channel type chType to quadrant q of the CTU's implicit quad
+// split, as dt_implicit_qt_split leaves it before it parses that quadrant's coding tree
 void partitionerAtQuadrant( int chType, int q )
 {
   initCtu( chType );
@@ -970,7 +1030,8 @@ void partitionerAtQuadrant( int chType, int q )
   }
 }
 
-// CABACReader::coding_tree_unit
+// Parses a CTU (CABACReader::coding_tree_unit): SAO, ALF, then its coding trees. prevQp holds the QPs carried from
+// CTU to CTU: the luma (or single) tree's and the dual tree chroma's.
 void codingTreeUnit( inout int prevQp[2] )
 {
   g_numCus     = 0;
@@ -981,14 +1042,17 @@ void codingTreeUnit( inout int prevQp[2] )
   readAlf();
   PROF_END( kProfSao, saoStart );
 
-  // the CTU's trees: the single tree; the dual tree's luma, then chroma; with CTUs of 128 (dt_implicit_qt_split) the
-  // CTU's quad split, each part's luma tree then its chroma tree (one call of codingTree: inlined, each would copy it)
+  // The CTU's trees: one single tree; or the dual tree's luma tree, then its chroma tree; or, with CTUs of 128 in the
+  // dual tree, the implicit quad split of dt_implicit_qt_split, where each quadrant's luma tree comes before its
+  // chroma tree. All go through the one call of codingTree below: every call is inlined, so each call site would
+  // copy the whole coding tree.
   CuCtx      ctxL  = newCuCtx( prevQp[0] );
   CuCtx      ctxC  = newCuCtx( prevQp[1] );
   const bool dual  = g_dualTree && g_chromaFormat != 0;
   const bool quads = dual && g_ctuSize > 64;
   if( quads )
   {
+    // dt_implicit_qt_split: the CTU starts quantization groups for both trees
     initCtu( 0 );
     if( picWord( kPicUseDqp ) != 0 && currQgEnable() )
     {

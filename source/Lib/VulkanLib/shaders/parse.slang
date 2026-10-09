@@ -1,26 +1,39 @@
-// The parse of the slice data (CABAC) on the GPU: vvdec's DecSlice::parseSlice and CABACReader, from each substream's
-// bytes to what the parse leaves for the reconstruction -- the CUs' and TUs' records (GpuFrontEnd.h's CuRecord and
-// TuRecord, as writeCuRecords writes them from the CPU's parse), the residuals' levels in the planes of levels (as
-// CABACReader::residual_coding leaves them in the picture: each coded block's levels over the rectangle its TU's
-// maxScanPosX / maxScanPosY give, with dependent quantization's 2 q - parity), each CTU's SAO and ALF parameters as
-// the parse leaves them (merges unresolved).
+// The parse of the slice data (CABAC) on the GPU: vvdec's DecSlice::parseSlice and CABACReader ported to a compute
+// shader. From each substream's bytes it produces what the CPU's parse leaves for the reconstruction:
+// - the records of the CUs and TUs (GpuFrontEnd.h's CuRecord and TuRecord, laid out as writeCuRecords writes them
+//   from the CPU's parse);
+// - the coefficient levels, in planes laid out like the picture's planes, as CABACReader::residual_coding leaves them
+//   in the picture: each coded block's levels over the rectangle that its TU's maxScanPosX / maxScanPosY describe.
+//   With dependent quantization, a level q is stored as 2 * |q| - 1 when the quantizer's state was 2 or 3 and as
+//   2 * |q| otherwise, with q's sign, as vvdec stores it;
+// - each CTU's SAO and ALF parameters as the parse leaves them (SAO merges are not resolved).
 //
-// A workgroup of 32 threads takes a substream -- a slice's, a tile's or, with WPP, a row of CTUs, as the entry points
-// split the slice data -- the workgroup of the substream's index. All 32 threads take every step of the parse (the
-// same data, the same results: on a SIMD unit what one thread computes, all compute at the cost of one); the loops
-// over a block's 4x4 units or levels give each thread every 32nd. The arithmetic decoder and the context models are
-// vvdec's (BinDecoder, BinProbModel), the contexts in shared memory, their initial states and rates from the host (each
-// slice's, vvdec's own Ctx::init). With WPP a row begins with the contexts the row above had after its first CTU, and
-// each CTU needs the CTU above it parsed.
+// This file holds the layout of the host's tables, vvdec's constants, the arithmetic decoder and the loop over a
+// substream's CTUs. It includes the rest of the parse: parsetree.slang (the coding tree, SAO and ALF), parsecu.slang
+// (the coding units) and parsetu.slang (the transform units and the residual coding). parsectx.slang numbers the
+// context models as vvdec does.
 //
-// A dispatch parses each substream up to a budget of bins (pc.binBudget, a CU counted as 32 more), then saves where it
-// is at the CTU's end (kSt...) and the next dispatch resumes it; a CTU whose CTU above, another substream's, is not
-// parsed after a short wait pauses its substream till the next dispatch too. So no dispatch runs long (Windows resets a
-// GPU busy for 2 s on one), whatever the slice data; the host records enough of them for the picture.
+// One workgroup of 32 threads parses one substream: workgroup i takes substream i. A substream is a slice, a tile or,
+// with WPP, a row of CTUs in a tile, as the entry points split the slice data. All 32 threads run every step of the
+// parse on the same data and get the same results: on a SIMD unit, a value that one thread computes costs as much as
+// when all 32 compute it. Only the loops over a block's 4x4 units or levels share out the work: each thread takes
+// every 32nd item. The arithmetic decoder and the context models are vvdec's (BinDecoder, BinProbModel). The contexts
+// live in shared memory; their initial states and rates come from the host, which computes them for each slice with
+// vvdec's own Ctx::init. With WPP, a CTU row starts with the contexts the row above had after its first CTU, and each
+// CTU waits until the CTU above it is parsed.
 //
-// The records go to each CTU's slots (as many as a CTU can have CUs and TUs), the neighbours looked up through maps of
-// the CUs (the CU's slot + 1 at each 4x4 luma block, a map per channel type); parsecompact.slang then gathers the
-// records in raster order.
+// The parse can stop and resume. A dispatch parses each substream until it has decoded pc.binBudget bins (each CU
+// counts as 32 bins more), then stops at the end of that CTU, saves where it is (the kSt... words of pc.state), and
+// the next dispatch resumes from there. A substream also pauses until the next dispatch when its next CTU needs the
+// CTU above, which another substream parses, and that CTU is not parsed after a short wait. So no dispatch runs long,
+// whatever the slice data (Windows resets the GPU when one dispatch keeps it busy for 2 s). The host
+// (GpuRecon::runParse in GpuReconParse.cpp) submits the dispatches, a few per submission, until every substream is
+// parsed or none advances any more.
+//
+// The records go to slots reserved for each CTU (as many as a CTU can have CUs and TUs). Neighbouring CUs are looked
+// up in maps that hold, for each 4x4 luma block, a word pair describing the CU there, including its index in the CTU
+// plus one (one map per channel type; see parsetree.slang). parsecompact.slang then gathers the records in raster
+// order of the CTUs.
 
 #include "common.slang"
 #include "parsectx.slang"
@@ -31,63 +44,81 @@
 
 struct Params
 {
-  uint*         bits;      // the slice data of the picture's slices, one after the other (bytes; 256 more readable)
-  uint*         streams;   // per substream: kStreamWords words
-  uint*         ctuList;   // the substreams' CTUs in their order, 2 words each: the CTU's address, kCtu... flags | slot << 8
-  uint*         ctuInfo;   // per CTU, 2 words: its slice; its tile | the first column of its tile << 16
-  uint*         slices;    // per slice: kSliceWords words, then its contexts' initial states and rates (CTX_COUNT each)
+  // The slice data of the picture's slices, one after another, as bytes packed 4 per word. 256 zero bytes follow it,
+  // so that loading a 128-byte window (readByte) never reads past the buffer.
+  uint*         bits;
+  uint*         streams;   // the substreams, kStreamWords words each
+  // The CTUs of all substreams, each substream's in decoding order, 2 words per CTU: its raster-scan address; its
+  // kCtu... flags | its WPP context slot << 8 (CTU row * tile columns + tile column)
+  uint*         ctuList;
+  // Per CTU in raster order, 2 words: the index of its slice; the index of its tile | 1 << 16 if the CTU is in its
+  // tile's first column
+  uint*         ctuInfo;
+  // Per slice, kSliceWords parameter words, then its contexts' initial states and their rates (CTX_COUNT words each)
+  uint*         slices;
   int*          pic;       // the picture's parameters (kPic...)
-  uint*         scanTab;   // vvdec's diagonal scans (g_scanOrder's ungrouped) of the blocks 1..16 x 1..16: kScanTab...
-  uint*         cus;       // out: the CU records, kPicCuSlots slots a CTU
-  uint*         tus;       // out: the TU records, kPicTuSlots slots a CTU
-  uint*         ctuOut;    // out: per CTU kCtuOutWords: its CUs, its TUs, its SAO parameters, its ALF parameters
-  uint2*        bottomRows;// per CTU its CUs' word pairs (s_map's) of its bottom row of 4x4 blocks, luma's then chroma's
-  int16_t*      levels0;   // out: the levels, laid out as the planes
+  // vvdec's diagonal scans (g_scanOrder[SCAN_UNGROUPED]) of the blocks 1, 2, 4, 8 and 16 samples wide and high, 961
+  // words (GpuParse.h's kParseScanTab); loadPicture copies them into s_scanTab
+  uint*         scanTab;
+  uint*         cus;       // out: the CU records (32 words each), g_cuSlots slots per CTU
+  uint*         tus;       // out: the TU records (16 words each), g_tuSlots slots per CTU
+  uint*         ctuOut;    // out: kCtuOutWords words per CTU: its numbers of CUs and TUs, SAO's and ALF's parameters
+  // Per CTU, the map entries (word pairs, see s_map) of its bottom row of 4x4 luma blocks: 32 of the luma tree, then
+  // 32 of the chroma tree. The CTU below reads them.
+  uint2*        bottomRows;
+  int16_t*      levels0;   // out: the coefficient levels of Y, Cb and Cr, each laid out like the picture's plane
   int16_t*      levels1;
   int16_t*      levels2;
-  Atomic<uint>* sync;      // [0] the substreams' runs (a dispatch's each), [1] errors, then per CTU: parsed (all zeroed before)
-  uint*         wppCtx;    // WPP: the contexts after a row's first CTU (CTX_COUNT words a slot)
-  int           numStreams;
-  int           stride0;   // the planes of levels' strides
-  int           stride12;
-  Atomic<uint>* prof;      // PROFILE: the parts' cycles and counts (kProf...), summed
-  uint*         state;     // per substream kStateWords: where its parse is (zeroed before the first dispatch)
-  int           binBudget; // the bins a dispatch parses of a substream (then it pauses after the CTU)
+  // [0] counts the substreams' runs (each workgroup that parses a substream in a dispatch adds 1), [1] counts the
+  // substreams that gave up, and [2 + CTU] turns 1 once that CTU is parsed. The host zeroes it before the first
+  // dispatch.
+  Atomic<uint>* sync;
+  uint*         wppCtx;    // WPP: the context states after the first CTU of a CTU row, CTX_COUNT words per slot
+  int           numStreams;   // the number of substreams (the workgroups past it return at once)
+  int           stride0;   // the stride of the luma plane of levels, in samples
+  int           stride12;  // the stride of the chroma planes of levels
+  Atomic<uint>* prof;      // PROFILE: the cycles and counts of kProf..., summed over the workgroups
+  uint*         state;     // per substream, kStateWords words: where its parse stands (the host zeroes it first)
+  int           binBudget; // the bins a dispatch parses of a substream before it pauses at the end of a CTU
 };
 
-// a substream's state between dispatches
-static const int kStateWords   = 1024;
-static const int kStK          = 0;     // its next CTU (of pc.ctuList's)
-static const int kStDone       = 1;     // parsed (or given up)
-static const int kStRange      = 2;     // the arithmetic decoder's
+// The words of a substream's state between dispatches (pc.state)
+static const int kStateWords   = 1024;  // the words per substream
+static const int kStK          = 0;     // the next CTU to parse, as an index among the substream's CTUs in pc.ctuList
+static const int kStDone       = 1;     // 1 once the substream is parsed (or has given up)
+// The arithmetic decoder's state: g_range, g_value, g_bitsNeeded and g_pos (the next byte to read)
+static const int kStRange      = 2;
 static const int kStValue      = 3;
 static const int kStBitsNeeded = 4;
 static const int kStPos        = 5;
-static const int kStQp0        = 6;     // the QPs before (luma's, the dual tree chroma's)
+// The QPs carried from CTU to CTU (prevQp): the luma tree's (or the single tree's), then the dual tree chroma's
+static const int kStQp0        = 6;
 static const int kStQp1        = 7;
 static const int kStCqpAdj     = 8;     // CodingStructure::chromaQpAdj
-static const int kStCtx        = 16;    // the contexts' states (their rates: the slice's)
-static const int kStLeft       = 400;   // the column left of the next CTU (s_left, 64 word pairs)
+static const int kStCtx        = 16;    // the contexts' states, CTX_COUNT words (their rates are the slice's)
+static const int kStLeft       = 400;   // s_left, the map entries of the column left of the next CTU (64 word pairs)
 
-static uint g_binCount;   // the bins decoded in this dispatch (and 32 a CU)
+static uint g_binCount;   // the bins decoded in this dispatch, plus 32 for each CU parsed (compared with pc.binBudget)
 
-// PROFILE: the parts timed (cycles of the subgroup's clock) and the counts
-static const int kProfCtu      = 0;    // the CTUs, whole
-static const int kProfCu       = 1;    // coding_unit (its prediction data, its residuals)
-static const int kProfResidual = 2;    // residual_coding (its levels' writing too)
-static const int kProfLevels   = 3;    // the levels' writing
-static const int kProfRecords  = 4;    // the CU's and TUs' records, its word pairs in the maps
+// PROFILE: the parts of the parse that are timed (in cycles of the subgroup's clock), then the things counted
+static const int kProfCtu      = 0;    // whole CTUs
+static const int kProfCu       = 1;    // coding_unit (its prediction data and residuals)
+static const int kProfResidual = 2;    // residual_coding, including the writing of its levels
+static const int kProfLevels   = 3;    // the writing of the levels
+static const int kProfRecords  = 4;    // the CU's and its TUs' records, and the CU's entries in the maps
 static const int kProfSao      = 5;    // SAO's and ALF's syntax
-static const int kProfDecode   = 6;    // in decodeBin
-static const int kProfDecodeEP = 7;    // in decodeBinEP
+static const int kProfDecode   = 6;    // the time in decodeBin
+static const int kProfDecodeEP = 7;    // the time in decodeBinEP
 static const int kProfBins     = 8;    // counts: the context-coded bins
 static const int kProfBinsEP   = 9;    // the bypass bins
-static const int kProfCus      = 10;
-static const int kProfTus      = 11;
-static const int kProfBlocks   = 12;   // the coded blocks (residual_coding's)
-static const int kProfLevelsN  = 13;   // the levels (non-zero)
-static const int kProfWords    = 16;
+static const int kProfCus      = 10;   // the CUs
+static const int kProfTus      = 11;   // the TUs
+static const int kProfBlocks   = 12;   // the coded blocks (residual_coding calls)
+static const int kProfLevelsN  = 13;   // the nonzero levels
+static const int kProfWords    = 16;   // the size of the table of counters
 
+// PROF_BEGIN starts timing a part, PROF_END adds the part's cycles to counter k, and PROF_COUNT adds v to counter k.
+// The workgroup sums its counters in g_prof and adds them to pc.prof at the end. Without PROFILE the macros vanish.
 #if PROFILE
 static uint g_prof[kProfWords];
 uint profClock()
@@ -98,8 +129,9 @@ void profAdd( int k, uint v )
 {
   g_prof[k] += v;
 }
+// (On RDNA the subgroup clock counts 20 bits of cycles, so PROF_END takes the difference modulo 2^20.)
 #  define PROF_BEGIN( name ) const uint name = profClock()
-#  define PROF_END( k, name ) profAdd( k, ( profClock() - name ) & 0xfffffu )   // (the subgroup clock: 20 bits of cycles on RDNA)
+#  define PROF_END( k, name ) profAdd( k, ( profClock() - name ) & 0xfffffu )
 #  define PROF_COUNT( k, v ) profAdd( k, uint( v ) )
 #else
 #  define PROF_BEGIN( name )
@@ -110,76 +142,84 @@ void profAdd( int k, uint v )
 [[vk::push_constant]] Params pc;
 
 // --------------------------------------------------------------------------------------------------------------------
-// the host's tables
+// The tables the host writes (GpuParse.cpp's buildParseInput, which uses the same layout)
 // --------------------------------------------------------------------------------------------------------------------
 
-// the picture's parameters (pc.pic)
+// The picture's parameters (pc.pic)
 static const int kPicWidthInCtus  = 0;
 static const int kPicHeightInCtus = 1;
-static const int kPicLog2Ctu      = 2;
-static const int kPicWidth        = 3;    // luma samples
+static const int kPicLog2Ctu      = 2;    // log2 of the CTU size, in luma samples
+static const int kPicWidth        = 3;    // the picture's size, in luma samples
 static const int kPicHeight       = 4;
 static const int kPicChromaFormat = 5;    // vvdec's ChromaFormat: 0 4:0:0, 1 4:2:0, 2 4:2:2, 3 4:4:4
-static const int kPicQpBdOffset   = 6;
-static const int kPicLog2MinCb    = 7;
-static const int kPicMaxTbSize    = 8;
-static const int kPicWpp          = 9;    // entropy coding sync
-static const int kPicLog2MaxTs    = 10;   // the largest transform skip block's log2 size
+static const int kPicQpBdOffset   = 6;    // the SPS's QpBdOffset: 6 * (bit depth - 8)
+static const int kPicLog2MinCb    = 7;    // log2 of the smallest coding block, in luma samples
+static const int kPicMaxTbSize    = 8;    // the largest transform block, in luma samples
+static const int kPicWpp          = 9;    // 1 with entropy coding sync (WPP)
+static const int kPicLog2MaxTs    = 10;   // log2 of the largest transform skip block
 static const int kPicTools        = 11;   // the SPS's tools: kTool...
-static const int kPicMaxMergeCand = 12;
+static const int kPicMaxMergeCand = 12;   // the SPS's numbers of merge candidates: regular, GPM, IBC
 static const int kPicMaxGeoCand   = 13;
 static const int kPicMaxIbcCand   = 14;
 static const int kPicUseDqp       = 15;   // the PPS's cu_qp_delta_enabled_flag
-static const int kPicCqpListLen   = 16;   // the PPS's chroma QP offset list's length
+static const int kPicCqpListLen   = 16;   // the length of the PPS's chroma QP offset list
 static const int kPicTrRange      = 17;   // the SPS's maxLog2TrDynamicRange: luma | chroma << 8
-static const int kPicCuSlots      = 18;   // a CTU's slots of CU records
-static const int kPicTuSlots      = 19;   // and of TU records
-static const int kPicTileCols     = 20;
-static const int kPicCqpOffsets   = 24;   // the PPS's chroma QP offsets (Cb, Cr, joint Cb-Cr), then its list's entries 1..6
-static const int kPicWords        = 48;   // the words before the chroma QP mappings
-static const int kPicChromaQpMap  = 160;  // the SPS's chroma QP mappings (Cb, Cr, joint Cb-Cr), 128 each, at qp + qpBdOffset
+static const int kPicCuSlots      = 18;   // CU record slots per CTU
+static const int kPicTuSlots      = 19;   // TU record slots per CTU
+static const int kPicTileCols     = 20;   // the number of tile columns
+// The PPS's chroma QP offsets (Cb, Cr, joint Cb-Cr), then the entries 1..6 of its chroma QP offset list, 3 words each
+static const int kPicCqpOffsets   = 24;
+static const int kPicWords        = 48;   // the words loadPicture copies into s_pic: all the parameters above
+// The SPS's chroma QP mapping tables (Cb, Cr, joint Cb-Cr), 128 words each, indexed by qp + QpBdOffset
+static const int kPicChromaQpMap  = 160;
 
-// the SPS's tools (kPicTools)
-static const int kToolSbt        = 1 << 0;
+// The SPS's tools, one bit each (kPicTools)
+static const int kToolSbt        = 1 << 0;    // subblock transform
 static const int kToolAffine     = 1 << 1;
-static const int kToolAffineType = 1 << 2;    // the 6-parameter model
+static const int kToolAffineType = 1 << 2;    // the 6-parameter affine model
 static const int kToolAmvr       = 1 << 3;
 static const int kToolAffineAmvr = 1 << 4;
 static const int kToolBcw        = 1 << 5;
 static const int kToolCiip       = 1 << 6;
-static const int kToolGeo        = 1 << 7;
+static const int kToolGeo        = 1 << 7;    // GPM
 static const int kToolMmvd       = 1 << 8;
 static const int kToolSmvd       = 1 << 9;
 static const int kToolIsp        = 1 << 10;
-static const int kToolMrl        = 1 << 11;
+static const int kToolMrl        = 1 << 11;   // multiple reference lines
 static const int kToolMip        = 1 << 12;
 static const int kToolLfnst      = 1 << 13;
-static const int kToolMtsIntra   = 1 << 14;
-static const int kToolMtsInter   = 1 << 15;
-static const int kToolLmChroma   = 1 << 16;
+static const int kToolMtsIntra   = 1 << 14;   // explicit MTS in intra CUs
+static const int kToolMtsInter   = 1 << 15;   // explicit MTS in inter CUs
+static const int kToolLmChroma   = 1 << 16;   // CCLM
 static const int kToolIbc        = 1 << 17;
-static const int kToolAct        = 1 << 18;
+static const int kToolAct        = 1 << 18;   // the adaptive colour transform
 static const int kToolBdpcm      = 1 << 19;
-static const int kToolTs         = 1 << 20;
+static const int kToolTs         = 1 << 20;   // transform skip
 static const int kToolJointCbCr  = 1 << 21;
 static const int kToolMts        = 1 << 22;   // sps_mts_enabled_flag (SPS::getUseMTS)
 
-// a slice's parameters (pc.slices)
-static const int kSliceWords     = 16;
-static const int kSliceStride    = kSliceWords + 2 * CTX_COUNT;
+// A slice's parameters (pc.slices)
+static const int kSliceWords     = 16;   // the parameter words; the slice's initial contexts follow them
+static const int kSliceStride    = kSliceWords + 2 * CTX_COUNT;   // the words per slice
 static const int kSlType         = 0;    // vvdec's SliceType: 0 B, 1 P, 2 I
-static const int kSlQp           = 1;
-static const int kSlFlags        = 2;    // kSl...
-static const int kSlNumRef       = 3;    // L0 | L1 << 8
-static const int kSlSymRef       = 4;    // SMVD's reference indices: L0 | L1 << 8
+static const int kSlQp           = 1;    // the slice QP
+static const int kSlFlags        = 2;    // the kSl... flags below
+static const int kSlNumRef       = 3;    // the number of reference indices: L0 | L1 << 8
+static const int kSlSymRef       = 4;    // SMVD's reference indices: L0 | L1 << 8 (signed bytes)
 static const int kSlMaxAffMerge  = 5;    // the picture header's MaxNumAffineMergeCand
-static const int kSlAlf          = 6;    // ALF's APSs | chroma's alternatives << 8 | CC-ALF's Cb filters << 16 | Cr's << 24
+// ALF: the number of the slice's luma APSs | the number of chroma alternative filters << 8 | the number of CC-ALF
+// filters for Cb << 16 | for Cr << 24
+static const int kSlAlf          = 6;
 static const int kSlSubdiv       = 7;    // cu_qp_delta_subdiv | cu_chroma_qp_offset_subdiv << 8
-static const int kSlChromaQpDelta = 8;   // Cb, Cr, joint Cb-Cr (3 words)
-static const int kSlWp           = 11;   // weighted prediction's reference indices: L0's bits | L1's << 16
-static const int kSlPartLuma     = 12;   // maxBTD | maxBtSize << 8 | maxTtSize << 16 | minQtSize << 24
-static const int kSlPartChroma   = 13;   // the dual tree chroma's
+static const int kSlChromaQpDelta = 8;   // the slice's chroma QP deltas of Cb, Cr and joint Cb-Cr (3 words)
+// Weighted prediction: a bit per reference index whose weights are present, list 0's from bit 0, list 1's from bit 16
+static const int kSlWp           = 11;
+// The partition limits (Partitioner::initCtu's): maxBTD | maxBtSize << 8 | maxTtSize << 16 | minQtSize << 24;
+// kSlPartLuma holds the luma tree's (or the single tree's), kSlPartChroma the dual tree chroma's
+static const int kSlPartLuma     = 12;
+static const int kSlPartChroma   = 13;
 
+// The slice's flags (kSlFlags)
 static const int kSlSaoLuma      = 1 << 0;
 static const int kSlSaoChroma    = 1 << 1;
 static const int kSlAlfY         = 1 << 2;
@@ -187,45 +227,54 @@ static const int kSlAlfCb        = 1 << 3;
 static const int kSlAlfCr        = 1 << 4;
 static const int kSlCcAlfCb      = 1 << 5;
 static const int kSlCcAlfCr      = 1 << 6;
-static const int kSlDepQuant     = 1 << 7;
-static const int kSlSignHiding   = 1 << 8;
+static const int kSlDepQuant     = 1 << 7;   // dependent quantization
+static const int kSlSignHiding   = 1 << 8;   // sign data hiding
 static const int kSlTsResOff     = 1 << 9;   // slice_ts_residual_coding_disabled_flag
-static const int kSlChromaQpAdj  = 1 << 10;
-static const int kSlMvdL1Zero    = 1 << 11;
-static const int kSlBiDirPred    = 1 << 12;
-static const int kSlCheckLDC     = 1 << 13;
+static const int kSlChromaQpAdj  = 1 << 10;  // cu_chroma_qp_offset_enabled_flag
+static const int kSlMvdL1Zero    = 1 << 11;  // the picture header's mvd_l1_zero_flag
+static const int kSlBiDirPred    = 1 << 12;  // Slice::getBiDirPred: the slice has the references SMVD needs
+static const int kSlCheckLDC     = 1 << 13;  // Slice::getCheckLDC: no reference follows the picture (BCW has 5 weights)
 static const int kSlDualTree     = 1 << 14;   // an intra slice with the SPS's dual tree
 
-// a substream (pc.streams)
+// A substream's words (pc.streams)
 static const int kStreamWords    = 8;
 static const int kStOffset       = 0;    // its first byte in pc.bits
-static const int kStSize         = 1;
+static const int kStSize         = 1;    // its size in bytes
 static const int kStFirstCtu     = 2;    // its first CTU in pc.ctuList
-static const int kStCtus         = 3;
-static const int kStSlice        = 4;
+static const int kStCtus         = 3;    // its number of CTUs
+static const int kStSlice        = 4;    // the index of its slice
 
-// the CTUs of pc.ctuList: flags
-static const uint kCtuRestart    = 1;    // the contexts initialised (and the arithmetic decoder restarted, unless the substream's first)
-static const uint kCtuSyncLoad   = 2;    // WPP: then the row above's contexts (slot - tile columns)
-static const uint kCtuSyncSave   = 4;    // WPP: the contexts after the CTU saved (slot)
-static const uint kCtuTerminate  = 8;    // a substream's end within the substream (no entry points): end_of_subset_one_bit
-static const uint kCtuWaitAbove  = 16;   // the CTU above in the same slice and tile, from another substream: wait for it
+// The flags of a CTU in pc.ctuList
+// kCtuRestart: the contexts are initialised again and the arithmetic decoder restarts at this CTU, the first of a
+// tile or, with WPP, of a CTU row in its tile. The host does not set it on a slice's first CTU; a substream's first
+// CTU always starts this way.
+static const uint kCtuRestart    = 1;
+// kCtuSyncLoad: WPP, with the restart: load the contexts that the row above saved, from slot - tile columns
+static const uint kCtuSyncLoad   = 2;
+static const uint kCtuSyncSave   = 4;    // WPP: save the contexts after this CTU (a row's first), in its slot
+// kCtuTerminate: this CTU ends a tile or a WPP row, but the slice data goes on in the same substream (the slice has
+// no entry points): decode end_of_subset_one_bit after it
+static const uint kCtuTerminate  = 8;
+// kCtuWaitAbove: WPP, and the CTU above is in the same slice and tile: wait until it is parsed (another substream
+// parses it when the slice has entry points)
+static const uint kCtuWaitAbove  = 16;
 
-// a CTU's out (pc.ctuOut)
-static const int kCtuOutWords    = 16;   // its CUs, its TUs, SAO (3 x 2 words), ALF (1 word)
+// The words per CTU in pc.ctuOut: 0 its number of CUs, 1 its number of TUs, 2..7 SAO's parameters (2 words per
+// component), 8 ALF's; the rest are unused
+static const int kCtuOutWords    = 16;
 
-// the CU records' flags (GpuFrontEnd.h's CuRecord)
+// The CU records' flags (GpuFrontEnd.h's CuRecord::Flags)
 static const uint kMerge   = 1;
 static const uint kSkip    = 2;
 static const uint kMmvd    = 4;
 static const uint kAffine  = 8;
 static const uint kGeo     = 16;
 static const uint kCiip    = 32;
-static const uint kChroma  = 64;
-static const uint kAffine6 = 128;
+static const uint kChroma  = 64;    // the CU belongs to the chroma tree
+static const uint kAffine6 = 128;   // the 6-parameter affine model
 
 // --------------------------------------------------------------------------------------------------------------------
-// vvdec's constants
+// vvdec's constants and tables, under vvdec's names
 // --------------------------------------------------------------------------------------------------------------------
 
 static const int MODE_INTER = 0;
@@ -296,14 +345,20 @@ static const int COEF_REMAIN_BIN_REDUCTION = 5;
 static const int SBH_THRESHOLD = 4;
 static const int CU_DQP_TU_CMAX = 5;
 
+// BinDecoder's m_RenormTable_32. decodeBin works out the same shift with firstbithigh, so this table is not used.
 static const uint kRenormTable[32] = { 6, 5, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+// g_uiGroupIdx: the group (the value of last_sig_coeff_x/y_prefix) of each last position
 static const int  kGroupIdx[64] = { 0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
                                     10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
                                     11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11 };
+// g_uiMinInGroup: the first position of each group
 static const int  kMinInGroup[14] = { 0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96 };
+// g_auiGoRiceParsCoeff: the Rice parameter for each template sum (templateAbsSum)
 static const int  kGoRiceParsCoeff[32] = { 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3 };
+// CoeffCodingContext's prefix_ctx: the first context of a luma block's last position prefix, by the log2 size
 static const int  kPrefixCtx[8] = { 0, 0, 0, 3, 6, 10, 15, 21 };
-// g_log2SbbSize[log2 w][log2 h]: the coefficient groups' log2 width | log2 height << 4
+// g_log2SbbSize: the coefficient groups' log2 width | log2 height << 4, at [log2 w * 7 + log2 h] for the blocks 1 to
+// 64 samples wide and high
 static const int  kLog2SbbSize[49] = {
   0x00, 0x10, 0x20, 0x30, 0x40, 0x40, 0x40,
   0x01, 0x11, 0x11, 0x31, 0x31, 0x31, 0x31,
@@ -312,45 +367,51 @@ static const int  kLog2SbbSize[49] = {
   0x04, 0x13, 0x22, 0x22, 0x22, 0x22, 0x22,
   0x04, 0x13, 0x22, 0x22, 0x22, 0x22, 0x22,
   0x04, 0x13, 0x22, 0x22, 0x22, 0x22, 0x22 };
+// g_BcwParsingOrder and g_BcwInternFwd: from the parsed BCW index to the index vvdec stores
 static const int  kBcwParsingOrder[5] = { 2, 3, 1, 4, 0 };
 static const int  kBcwInternFwd[5]    = { 1, 2, 0, 3, 4 };
 
 // --------------------------------------------------------------------------------------------------------------------
-// the workgroup's state
+// The workgroup's state
 // --------------------------------------------------------------------------------------------------------------------
 
-static int g_lane = 0;   // the thread's lane: the loops over a block's units give it every 32nd
+static int g_lane = 0;   // the thread's lane (0..31); loops over a block's units take every 32nd unit from it
 
-// the picture's
+// The picture's parameters (loadPicture); sizes in luma samples, g_csx and g_csy the chroma subsampling shifts
 static int  g_widthInCtus, g_heightInCtus, g_log2Ctu, g_ctuSize, g_width, g_height, g_widthIn4;
 static int  g_chromaFormat, g_csx, g_csy, g_qpBdOffset, g_log2MinCb, g_maxTbSize, g_wpp, g_log2MaxTs, g_tools;
 static int  g_cuSlots, g_tuSlots, g_tileCols, g_log2MaxTb;
-// the slice's
+// The substream's slice: its index, type, QP and flags (kSl...), and whether it uses the dual tree
 static int  g_slice, g_sliceType, g_sliceQp, g_sliceFlags;
 static bool g_dualTree;
-// the CTU's
+// The current CTU: its raster-scan address and its position in CTUs
 static int  g_ctu, g_ctuX, g_ctuY;
-static int  g_numCus, g_numTus;    // its CUs and TUs so far
-static int  g_dmvrOffset;          // DMVR's refinements' cache: the CTU's so far (CtuData::dmvrMvCacheOffset)
+static int  g_numCus, g_numTus;    // the CUs and TUs the CTU has so far (its next free slots)
+static int  g_dmvrOffset;          // the DMVR refinements the CTU's CUs reserved so far (CtuData::dmvrMvCacheOffset)
 static int  g_csChromaQpAdj;       // CodingStructure::chromaQpAdj
-static bool g_error;
+static bool g_error;               // the substream gave up: slots or a stack were full, or a block was off the planes
 
+// Whether the SPS enables tool t (kTool...)
 bool tool( int t )
 {
   return ( g_tools & t ) != 0;
 }
 
+// Whether the slice has flag f (kSl...)
 bool sliceFlag( int f )
 {
   return ( g_sliceFlags & f ) != 0;
 }
 
-groupshared int  s_pic[kPicWords];            // the picture's words
-groupshared int  s_cqp[3 * 128];              // its chroma QP mappings
-groupshared uint s_slice[kSliceWords];        // the slice's words
-groupshared uint s_scanTab[961];              // the scans: scan position | its inverse (scan index of the raster position) << 16
+groupshared int  s_pic[kPicWords];            // the picture's parameters (the first kPicWords words of pc.pic)
+groupshared int  s_cqp[3 * 128];              // the picture's chroma QP mapping tables (kPicChromaQpMap)
+groupshared uint s_slice[kSliceWords];        // the slice's parameter words
+// The scan table (pc.scanTab): from where scanTabOffset says for each block size, word k holds the raster position of
+// scan position k | the scan position of raster position k << 16
+groupshared uint s_scanTab[961];
 
-// a value all threads hold alike, so marked for the compiler (scalar registers, scalar branches)
+// Marks a value that all threads hold alike as uniform, so that the compiler can keep it in a scalar register and
+// branch on it with scalar branches
 uint uni( uint v )
 {
   return WaveReadLaneFirst( v );
@@ -366,17 +427,20 @@ uint2 uni( uint2 v )
   return WaveReadLaneFirst( v );
 }
 
+// Word w of the picture's parameters
 int picWord( int w )
 {
   return uni( s_pic[w] );
 }
 
+// Word w of the slice's parameters
 int sliceWord( int w )
 {
   return int( uni( s_slice[w] ) );
 }
 
-// where the scan of a block 1 << log2W wide and 1 << log2H high begins in s_scanTab (log2 sizes 0..4)
+// Where the scan of a block 1 << log2W wide and 1 << log2H high starts in s_scanTab (log2 sizes 0..4). The blocks
+// follow one another by width, and within a width by height; GpuParse.cpp lays the table out the same way.
 int scanTabOffset( int log2W, int log2H )
 {
   return ( ( 1 << log2W ) - 1 ) * 31 + ( 1 << log2W ) * ( ( 1 << log2H ) - 1 );
@@ -387,25 +451,32 @@ bool sliceIsIntra()
   return g_sliceType == I_SLICE;
 }
 
+// floor( log2( v ) ) for v > 0
 int log2i( int v )
 {
   return firstbithigh( uint( v ) );
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the arithmetic decoder (vvdec's BinDecoder) and the context models (BinProbModel)
+// The arithmetic decoder (vvdec's BinDecoder) and the context models (BinProbModel)
 // --------------------------------------------------------------------------------------------------------------------
 
-groupshared uint2 s_ctx[CTX_COUNT];   // per context: its state (m_state[0] | m_state[1] << 16), its rates (m_rate0 | m_rate1 << 8)
+// Per context model: its two probability states (m_state[0] | m_state[1] << 16) and its two adaptation rates
+// (m_rate0 | m_rate1 << 8)
+groupshared uint2 s_ctx[CTX_COUNT];
 
+// The arithmetic decoder's registers, as in BinDecoder (m_Range, m_Value, m_bitsNeeded)
 static uint g_range;
 static uint g_value;
 static int  g_bitsNeeded;
-static uint g_pos;       // the next byte in pc.bits
-static uint g_end;       // the substream's end: bytes past it read as 0
-static uint g_win;       // the window of 128 bytes of the slice data the threads hold, 4 each
-static uint g_winBase;   // its first byte (a multiple of 128)
+static uint g_pos;       // the next byte to read in pc.bits
+static uint g_end;       // the end of the substream's bytes: bytes past it read as 0
+static uint g_win;       // a window of 128 bytes of the slice data, spread over the threads: each holds 4 bytes
+static uint g_winBase;   // the window's first byte (a multiple of 128)
 
+// Reads the next byte of the substream. The 32 threads load a 128-byte window together, one word each, and every
+// thread takes the byte it needs from the thread that holds it, so the slice data is read from memory once per 128
+// bytes.
 uint readByte()
 {
   const uint p = g_pos;
@@ -423,16 +494,18 @@ uint readByte()
   return ( word >> ( ( p & 3u ) * 8u ) ) & 0xffu;
 }
 
-// BinDecoder::start
+// Starts the arithmetic decoder at the next byte (BinDecoder::start)
 void startDecoder()
 {
-  g_winBase    = 0x80000000u;   // (far from any byte: the first read loads the window)
+  g_winBase    = 0x80000000u;   // (far from every byte, so the first read loads the window)
   g_range      = 510;
   g_value      = readByte() << 8;
   g_value     += readByte();
   g_bitsNeeded = -8;
 }
 
+// Decodes a bin with context model ctxId and updates the model (BinDecoder::decodeBin). With PROFILE, decodeBin times
+// decodeBinBody; without it, the #if folds the body into decodeBin. decodeBinEP below is built the same way.
 uint decodeBin( int ctxId )
 {
   PROF_COUNT( kProfBins, 1 );
@@ -457,7 +530,7 @@ uint decodeBinBody( int ctxId )
   const uint sr    = range << 7;
   if( g_value >= sr )
   {
-    const uint numBits = 8u - uint( firstbithigh( lps ) );   // (m_RenormTable_32[lps >> 3]: lps from 4 to 255)
+    const uint numBits = 8u - uint( firstbithigh( lps ) );   // (= m_RenormTable_32[lps >> 3], as lps is 4 to 255)
     g_value            = ( g_value - sr ) << numBits;
     range              = lps << numBits;
     bin ^= 1u;
@@ -475,7 +548,7 @@ uint decodeBinBody( int ctxId )
     g_value += readByte() << uint( g_bitsNeeded );
     g_bitsNeeded -= 8;
   }
-  // BinProbModel::update
+  // Update the context model's two states towards the bin (BinProbModel::update)
   const uint rate0 = cr.y & 0xffu;
   const uint rate1 = cr.y >> 8;
   const int  d0    = int( bin != 0 ? 0x7fffu : ( 0xffffu >> ( 16u - rate0 ) ) ) - int( s0 );
@@ -486,6 +559,7 @@ uint decodeBinBody( int ctxId )
   return bin;
 }
 
+// Decodes a bypass bin, one of equal probabilities (BinDecoder::decodeBinEP)
 uint decodeBinEP()
 {
   PROF_COUNT( kProfBinsEP, 1 );
@@ -517,7 +591,8 @@ uint decodeBinEPBody()
   return bin;
 }
 
-// (as vvdec's decodeBinsEP and decodeAlignedBinsEP: the same bins, one at a time)
+// Decodes numBins bypass bins, the first into the highest bit. vvdec's decodeBinsEP and decodeAlignedBinsEP give the
+// same bins; this decodes them one at a time.
 uint decodeBinsEP( int numBins )
 {
   uint bins = 0;
@@ -528,6 +603,8 @@ uint decodeBinsEP( int numBins )
   return bins;
 }
 
+// Decodes a remainder coded in bypass bins (BinDecoder::decodeRemAbsEP): a unary prefix, then a Rice code with the
+// parameter goRicePar while the prefix is below cutoff, an Exp-Golomb style suffix beyond it
 uint decodeRemAbsEP( int goRicePar, int cutoff, int maxLog2TrDynamicRange )
 {
   int        prefix    = 0;
@@ -553,6 +630,7 @@ uint decodeRemAbsEP( int goRicePar, int cutoff, int maxLog2TrDynamicRange )
   return offset + decodeBinsEP( length );
 }
 
+// Decodes a terminating bin (BinDecoder::decodeBinTrm)
 uint decodeBinTrm()
 {
   g_range -= 2;
@@ -574,7 +652,8 @@ uint decodeBinTrm()
   return 0;
 }
 
-// CABACReader::unary_max_symbol
+// Decodes a truncated unary code of up to maxSymbol, its first bin with context ctxId0 and the others with ctxIdN
+// (CABACReader::unary_max_symbol)
 int unaryMaxSymbol( int ctxId0, int ctxIdN, int maxSymbol )
 {
   int onesRead = 0;
@@ -585,7 +664,7 @@ int unaryMaxSymbol( int ctxId0, int ctxIdN, int maxSymbol )
   return onesRead;
 }
 
-// CABACReader::unary_max_eqprob
+// Decodes a truncated unary code of up to maxSymbol in bypass bins (CABACReader::unary_max_eqprob)
 int unaryMaxEqprob( int maxSymbol )
 {
   for( int k = 0; k < maxSymbol; k++ )
@@ -598,7 +677,8 @@ int unaryMaxEqprob( int maxSymbol )
   return maxSymbol;
 }
 
-// CABACReader::exp_golomb_eqprob (count 0 in VVC)
+// Decodes an Exp-Golomb code of order count in bypass bins (CABACReader::exp_golomb_eqprob). The parse uses it only
+// with count 0, for cu_qp_delta_abs.
 int expGolombEqprob( int count )
 {
   uint symbol = 0;
@@ -616,13 +696,14 @@ int expGolombEqprob( int count )
   return int( symbol );
 }
 
-// g_tbMax: the threshold of truncated binary codes up to 256 symbols
+// vvdec's g_tbMax table, for truncated binary codes of up to 256 symbols: floor( log2( maxSymbol ) ), the length of
+// the short codewords
 int tbMax( int maxSymbol )
 {
   return maxSymbol <= 1 ? 0 : firstbithigh( uint( maxSymbol ) );
 }
 
-// CABACReader::xReadTruncBinCode
+// Decodes a truncated binary code of maxSymbol symbols in bypass bins (CABACReader::xReadTruncBinCode)
 int readTruncBinCode( int maxSymbol )
 {
   int thresh;
@@ -654,7 +735,8 @@ int readTruncBinCode( int maxSymbol )
   return symbol;
 }
 
-// the slice's initial contexts (BinDecoder::reset's Ctx::init, the host's)
+// Loads the slice's initial context states and rates into s_ctx. The host computed them with vvdec's Ctx::init, as
+// BinDecoder::reset does.
 void initContexts()
 {
   const uint base = uint( g_slice * kSliceStride + kSliceWords );
@@ -665,6 +747,7 @@ void initContexts()
   GroupMemoryBarrierWithGroupSync();
 }
 
+// WPP: replaces the context states with those saved in slot (the rates stay the slice's)
 void loadContexts( int slot )
 {
   for( int i = g_lane; i < CTX_COUNT; i += 32 )
@@ -674,6 +757,7 @@ void loadContexts( int slot )
   GroupMemoryBarrierWithGroupSync();
 }
 
+// WPP: saves the context states in slot, for the next CTU row
 void saveContexts( int slot )
 {
   GroupMemoryBarrierWithGroupSync();
@@ -683,18 +767,20 @@ void saveContexts( int slot )
   }
 }
 
+// The syntax: the coding tree, SAO and ALF; the coding units; the transform units and the residual coding
 #include "parsetree.slang"
 #include "parsecu.slang"
 #include "parsetu.slang"
 
 // --------------------------------------------------------------------------------------------------------------------
-// the substreams
+// The substreams
 // --------------------------------------------------------------------------------------------------------------------
 
-groupshared int s_parsed;
+groupshared int s_parsed;   // ctuParsed's answer, which thread 0 shares with the others
 
-// whether the CTU is parsed (its records, maps and contexts visible): another substream's, waited for a little while
-// (it may be parsing it in this dispatch)
+// Whether another substream's CTU is parsed, so that its records, map entries, ctuOut words and saved contexts can be
+// read. Thread 0 polls the CTU's flag for a short while, as the other substream may be parsing the CTU in this very
+// dispatch.
 bool ctuParsed( int ctu )
 {
   if( g_lane == 0 )
@@ -710,6 +796,8 @@ bool ctuParsed( int ctu )
   return uni( s_parsed ) != 0;
 }
 
+// Copies the picture's parameters, its chroma QP mapping tables and the scan table into shared memory, and reads the
+// parameters the parse uses most into the g_... variables
 void loadPicture()
 {
   for( int i = g_lane; i < kPicWords; i += 32 )
@@ -747,8 +835,9 @@ void loadPicture()
   g_tileCols     = picWord( kPicTileCols );
 }
 
-// the CTU's start: its neighbours' availability, its map cleared, the row above it (from the CTU above, when in the
-// same slice and tile), the column left of it (the CTU before, the same then)
+// Prepares the maps for the CTU. It works out whether the CTUs to the left and above are in the same slice and tile,
+// clears the CTU's maps, fills s_above from the bottom rows the CTU above left (zeros when it is out of reach), and
+// clears s_left unless the CTU to the left is in reach: s_left then still holds that CTU's right column (endCtu).
 void beginCtu()
 {
   const uint info = uni( pc.ctuInfo[g_ctu * 2 + 1] );
@@ -757,7 +846,9 @@ void beginCtu()
   g_aboveAvail    = g_ctuY > 0 && sameSliceTile( g_ctu - g_widthInCtus, g_ctu );
   if( g_aboveAvail )
   {
-    AllMemoryBarrierWithGroupSync();   // (the rows the CTU above left, this workgroup's or one before)
+    // (makes visible the bottom rows of the CTU above, which this workgroup, another substream's workgroup or a
+    // workgroup of an earlier dispatch wrote)
+    AllMemoryBarrierWithGroupSync();
   }
   for( int i = g_lane; i < 2048; i += 32 )
   {
@@ -774,7 +865,8 @@ void beginCtu()
   GroupMemoryBarrierWithGroupSync();
 }
 
-// the CTU's end: its right column the next CTU's left, its bottom row for the CTU below
+// Ends the CTU's maps: stores their bottom row in pc.bottomRows for the CTU below, and keeps their right column in
+// s_left for the next CTU
 void endCtu()
 {
   const int last = ( g_ctuSize >> 2 ) - 1;
@@ -788,7 +880,8 @@ void endCtu()
   GroupMemoryBarrierWithGroupSync();
 }
 
-// where the substream's parse is, for the next dispatch: before CTU k, or done
+// Saves where the substream's parse stands, for the next dispatch: its next CTU k (or that it is done), the context
+// states, the arithmetic decoder, the QPs carried to the next CTU, CodingStructure::chromaQpAdj and s_left
 void saveState( uint* state, int k, int prevQp[2], bool done )
 {
   GroupMemoryBarrierWithGroupSync();
@@ -815,6 +908,8 @@ void saveState( uint* state, int k, int prevQp[2], bool done )
   }
 }
 
+// Workgroup i parses substream i: from where the previous dispatch left it, CTU by CTU, until the substream ends, its
+// share of bins for this dispatch is spent, or its next CTU has to wait for the CTU above.
 [shader( "compute" )]
 [numthreads( 32, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
@@ -828,11 +923,11 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   uint* state = pc.state + stream * kStateWords;
   if( uni( state[kStDone] ) != 0 )
   {
-    return;   // (parsed in a dispatch before)
+    return;   // (an earlier dispatch finished the substream)
   }
   if( g_lane == 0 )
   {
-    pc.sync[0].add( 1u );
+    pc.sync[0].add( 1u );   // (counts this run of the substream)
   }
   loadPicture();
   g_error = false;
@@ -865,8 +960,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   int k         = int( uni( state[kStK] ) );
   if( k > 0 )
   {
-    // resumed: the slice's contexts (their rates) with the states the dispatch before left, its decoder, its QPs, the
-    // column left of the CTU
+    // Resuming: take the slice's contexts for their rates, then the states, the arithmetic decoder, the QPs and the
+    // column left of the next CTU as the previous dispatch saved them
     initContexts();
     for( int i = g_lane; i < CTX_COUNT; i += 32 )
     {
@@ -881,7 +976,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     g_value         = uni( state[kStValue] );
     g_bitsNeeded    = int( uni( state[kStBitsNeeded] ) );
     g_pos           = uni( state[kStPos] );
-    g_winBase       = 0x80000000u;   // (far from any byte: the next read loads the window)
+    g_winBase       = 0x80000000u;   // (far from every byte, so the next read loads the window)
     prevQp[0]       = int( uni( state[kStQp0] ) );
     prevQp[1]       = int( uni( state[kStQp1] ) );
     g_csChromaQpAdj = int( uni( state[kStCqpAdj] ) );
@@ -895,7 +990,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     const int  slot   = int( uni( pc.ctuList[( first + k ) * 2 + 1] ) >> 8 );
     g_ctuX            = g_ctu % g_widthInCtus;
     g_ctuY            = g_ctu / g_widthInCtus;
-    // the CTU above another substream's and not parsed: the substream pauses before the CTU (nothing of it changed)
+    // When the CTU needs the CTU above and that one is not parsed yet (another substream parses it), pause before
+    // this CTU. Nothing of it has been parsed, so the next dispatch starts it afresh.
     if( ( flags & ( kCtuSyncLoad | kCtuWaitAbove ) ) != 0 && !ctuParsed( g_ctu - g_widthInCtus ) )
     {
       paused = true;
@@ -903,7 +999,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     }
     if( k == 0 || ( flags & kCtuRestart ) != 0 )
     {
-      // the substream's (or a tile's, a CTU row's) start: the slice's contexts, the arithmetic decoder (re)started
+      // The start of the substream, of a tile or of a WPP row: the slice's initial contexts (or, with WPP, the ones
+      // the row above saved), the arithmetic decoder started at the next byte, the QPs reset to the slice QP
       initContexts();
       if( ( flags & kCtuSyncLoad ) != 0 )
       {
@@ -926,9 +1023,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     }
     if( ( flags & kCtuTerminate ) != 0 )
     {
-      decodeBinTrm();   // end_of_subset_one_bit (1): the next CTU restarts the decoder at the next byte
+      decodeBinTrm();   // end_of_subset_one_bit (1); the next CTU restarts the decoder at the next byte
     }
-    // the CTU's out, then the CTU parsed (its records and maps visible to the substreams below)
+    // Write the CTU's numbers of CUs and TUs, make everything the CTU wrote visible, then mark it parsed for the
+    // substreams that wait for it
     pc.ctuOut[g_ctu * kCtuOutWords + 0] = uint( g_numCus );
     pc.ctuOut[g_ctu * kCtuOutWords + 1] = uint( g_numTus );
     AllMemoryBarrierWithGroupSync();
@@ -937,7 +1035,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       pc.sync[2 + g_ctu].store( 1u, MemoryOrder.Release );
     }
     k++;
-    // the dispatch's share of the work parsed: the substream pauses after the CTU
+    // This dispatch's share of bins is spent: pause after the CTU
     if( g_binCount >= uint( pc.binBudget ) && k < count )
     {
       paused = true;
@@ -958,7 +1056,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 #endif
   if( g_error )
   {
-    // given up: the rest of the substream's CTUs marked parsed all the same, for the rows that wait for them
+    // Given up: count the error, and mark the substream's remaining CTUs parsed all the same, so that the rows that
+    // wait for them do not wait in vain
     AllMemoryBarrierWithGroupSync();
     if( g_lane == 0 )
     {

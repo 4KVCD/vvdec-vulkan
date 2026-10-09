@@ -1,31 +1,37 @@
-// parse.slang's coding units: CABACReader::coding_unit and what it calls for the prediction (skip, the prediction
-// mode, BDPCM, the intra modes, the prediction unit's merge data and motion vector differences, AMVR, BCW), the CU's
-// creation (CodingStructure::addCU) and its record (GpuFrontEnd.cpp's writeCuRecords).
+// The coding unit part of parse.slang, which includes this file. For each leaf of the coding tree it creates the CU
+// (CodingStructure::addCU) and predicts its QP, parses CABACReader::coding_unit with the prediction syntax it calls
+// (skip, the prediction mode, BDPCM, the intra luma and chroma modes, the prediction unit's merge data and motion
+// vector differences, AMVR, BCW), then writes the CU's record (laid out as GpuFrontEnd.cpp's writeCuRecords writes
+// it), its TUs' records and its entries in the maps of parsed CUs. The residual syntax is in parsetu.slang.
 
+// The CU being parsed: the fields of its record (GpuFrontEnd.h's CuRecord), plus what the parse needs on the way
 struct Cu
 {
-  int  slot;
+  int  slot;                   // its record's slot in pc.cus: the CTU's first slot + local
   int  local;                  // its index among its CTU's CUs
-  int  lx, ly, lw, lh;         // its luma block (lw 0: none)
+  int  lx, ly, lw, lh;         // its luma block, in luma samples (lw 0: none)
   int  cx, cy, cw, chh;        // its chroma block, in chroma samples (cw 0: none)
   int  chType, treeType, modeType;
-  int  predMode;
+  int  predMode;               // vvdec's PredMode: MODE_INTER, MODE_INTRA or MODE_IBC
   uint flags;                  // CuRecord's kMerge, kSkip, ...
   int  mergeIdx, mmvdIdx, geoSplitDir, geoIdx0, geoIdx1, imv, bcw, interDir;
   int  mvpIdx0, mvpIdx1, refIdx0, refIdx1;
   int  qp, chromaQpAdj;
-  int2 mv[6];                  // [list * 3 + k]: the motion vector differences as the parse leaves them
+  int2 mv[6];                  // [list * 3 + k]: the motion vector differences as parsed (k: affine control point)
   int  isp, lfnst, mipT, mrl, bdpcmL, bdpcmC, sbtInfo, smvd;
   bool mip, act, rootCbf;
-  int  planeCbf;               // a bit a component
+  int  planeCbf;               // the coded block flags of its planes, a bit per component
   int  intraDirL, intraDirC, qtDepth, depth;
-  uint2 left, above;           // the partitioner's neighbours (their word pairs: zero none)
-  int  dmvrOff;                // DMVR's refinements' place in the CTU's (0: none)
+  uint2 left, above;           // the partitioner's neighbours, as map entries (zero: none)
+  // Where its DMVR refinements start among the CTU's (luma CUs of at least 8x8 and 128 samples reserve room). Other
+  // CUs keep 0, which is also where the CTU's first CU with room starts.
+  int  dmvrOff;
   int  firstTu, numTus;        // its TUs among the CTU's
 };
 
 static Cu g_cu;
 
+// The CU's prediction mode, tree and flags
 bool cuIsIntra()
 {
   return g_cu.predMode == MODE_INTRA;
@@ -61,16 +67,19 @@ bool cuAffine()
   return ( g_cu.flags & kAffine ) != 0;
 }
 
+// Sets or clears the record flag f
 void setFlag( uint f, bool on )
 {
   g_cu.flags = on ? ( g_cu.flags | f ) : ( g_cu.flags & ~f );
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the CU's creation and record
+// The CU's creation and its record
 // --------------------------------------------------------------------------------------------------------------------
 
-// CodingStructure::addCU and what coding_tree sets: the CU of the partitioner's current area
+// Starts the CU of the partitioner's current area, as CodingStructure::addCU and coding_tree set it up: its luma and
+// chroma blocks (a chroma tree's CU has no luma block, a luma tree's CU no chroma block), its slot, its neighbours and
+// its place among the CTU's DMVR refinements. Returns false, giving up the substream, when the CTU's slots are full.
 bool addCu()
 {
   if( g_numCus >= g_cuSlots )
@@ -119,7 +128,7 @@ bool addCu()
   cu.interDir = 0;
   cu.mvpIdx0  = 0;
   cu.mvpIdx1  = 0;
-  cu.refIdx0  = -1;   // CodingUnit::minInit
+  cu.refIdx0  = -1;   // (as CodingUnit::minInit sets them)
   cu.refIdx1  = -1;
   cu.qp       = 0;
   cu.chromaQpAdj = 0;
@@ -139,13 +148,15 @@ bool addCu()
   cu.act      = false;
   cu.rootCbf  = false;
   cu.planeCbf = 0;
-  cu.intraDirL = DC_IDX;   // CodingUnit::minInit
+  cu.intraDirL = DC_IDX;   // (as CodingUnit::minInit sets it)
   cu.intraDirC = 0;
   cu.qtDepth  = g_p.currQtDepth;
   cu.depth    = g_p.currDepth;
   cu.left     = uni( s_lvLeft[g_p.top] );
   cu.above    = uni( s_lvAbove[g_p.top] );
   cu.dmvrOff  = 0;
+  // A luma CU of at least 8x8 and 128 samples reserves room for DMVR's refinements: one per 16x16 subblock (a side
+  // shorter than 16 counts as one subblock)
   if( lumaValid && a.w >= 8 && a.z >= 8 && a.z * a.w >= 128 )
   {
     cu.dmvrOff = g_dmvrOffset;
@@ -157,7 +168,8 @@ bool addCu()
   return true;
 }
 
-// the CU (done) in the CTU's maps: the luma tree's (with its luma block), the chroma tree's (with its chroma block)
+// Enters the finished CU into the CTU's maps: into the luma tree's map over its luma block, and into the chroma tree's
+// map over its chroma block
 void writeCuInfo()
 {
   const Cu   cu   = g_cu;
@@ -174,7 +186,7 @@ void writeCuInfo()
     {
       continue;
     }
-    // the block in luma samples, its size in the channel type's
+    // The block in luma samples; the entry holds its size in the channel type's samples
     const int  bx = ch == 0 ? cu.lx : cu.cx << g_csx;
     const int  by = ch == 0 ? cu.ly : cu.cy << g_csy;
     const int  bw = ch == 0 ? cu.lw : cu.cw << g_csx;
@@ -192,6 +204,8 @@ void writeCuInfo()
   GroupMemoryBarrierWithGroupSync();
 }
 
+// Writes the CU's record (GpuFrontEnd.h's CuRecord) into its slot, word for word as writeCuRecords writes it from the
+// CPU's parse
 void writeCuRecord()
 {
   const Cu  cu  = g_cu;
@@ -221,13 +235,15 @@ void writeCuRecord()
   }
 }
 
-// CU::predictQP
+// The QP predicted at the start of a quantization group (CU::predictQP): the mean of the QPs of the CUs above and to
+// the left, each replaced by prevQp across the CTU's edge. At the top-left corner of a CTU in a tile's first column,
+// it is the QP of the CU above, when that is in the same slice and tile.
 int predictQp( int prevQp )
 {
   const int ch     = g_cu.chType;
   const int x      = ch == 0 ? g_cu.lx : g_cu.cx << g_csx;
   const int y      = ch == 0 ? g_cu.ly : g_cu.cy << g_csy;
-  const uint2 above = cuAt( x, y - stepY( ch ), ch );   // (the CTU above's: zero out of the slice or tile)
+  const uint2 above = cuAt( x, y - stepY( ch ), ch );   // (zero when the CTU above is in another slice or tile)
   const uint2 left  = cuAt( x - stepX( ch ), y, ch );
   const int   mask  = g_ctuSize - 1;
   if( g_tileFirstCol && ( x & mask ) == 0 && ( y & mask ) == 0 && infoValid( above ) )
@@ -239,10 +255,11 @@ int predictQp( int prevQp )
   return ( a + b + 1 ) >> 1;
 }
 
-// QpParam( tu, comp, false ).Qp( false ): a TU's chroma QP
+// The chroma QP of component comp (1 Cb, 2 Cr) of a TU of the CU with joint Cb-Cr mode jointCbCr, as
+// QpParam( tu, comp, false ).Qp( false ) works it out
 int chromaQp( int comp, int jointCbCr )
 {
-  const int jCbCr  = jointCbCr == 3 ? 3 : comp;   // TU::getICTMode( tu, false ) == 2
+  const int jCbCr  = jointCbCr == 3 ? 3 : comp;   // (mode 3 is TU::getICTMode( tu, false ) == 2: the joint QP)
   int       offset = picWord( kPicCqpOffsets + jCbCr - 1 ) + sliceWord( kSlChromaQpDelta + jCbCr - 1 );
   if( g_cu.chromaQpAdj > 0 )
   {
@@ -253,7 +270,8 @@ int chromaQp( int comp, int jointCbCr )
   return clip3( 0, MAX_QP + g_qpBdOffset, baseQp + offset + g_qpBdOffset );
 }
 
-// coding_tree's CU: its creation, QP, coding_unit, the TUs' chroma QPs, the records
+// Parses the CU at a leaf of the coding tree, as coding_tree does there: creates the CU, predicts its QP when a
+// quantization group starts, parses coding_unit, works out its TUs' chroma QPs, and writes its records and map entries
 void codingUnitAtPart( inout CuCtx ctx )
 {
   if( !addCu() )
@@ -265,6 +283,8 @@ void codingUnitAtPart( inout CuCtx ctx )
     ctx.qgStart = false;
     ctx.qp      = predictQp( ctx.qp );
   }
+  // With delta QP, a chroma CU of a separate tree takes the QP of the luma CU at its centre; the luma QP comes back
+  // after the CU
   int        lumaQpLocal = -1;
   const bool sepChroma   = picWord( kPicUseDqp ) != 0 && isSepTreeP() && g_cu.chType == 1;
   if( sepChroma )
@@ -283,13 +303,14 @@ void codingUnitAtPart( inout CuCtx ctx )
   codingUnit( ctx );
   PROF_END( kProfCu, cuStart );
   PROF_COUNT( kProfCus, 1 );
-  g_binCount += 32u;   // (a CU's work besides its bins: about 32 bins')
+  g_binCount += 32u;   // (the CU's work besides its bins counts as 32 bins against the dispatch's budget)
   PROF_COUNT( kProfTus, g_cu.numTus );
 
   if( sepChroma )
   {
     ctx.qp = lumaQpLocal;
   }
+  // The chroma QPs of the CU's TUs (TU record word 5)
   if( g_chromaFormat != 0 )
   {
     for( int t = 0; t < g_cu.numTus; t++ )
@@ -312,6 +333,7 @@ void codingUnitAtPart( inout CuCtx ctx )
 // coding_unit
 // --------------------------------------------------------------------------------------------------------------------
 
+// Whether the CU's mode type allows only intra (inter) prediction (CU::isConsIntra, CU::isConsInter)
 bool isConsIntra()
 {
   return g_cu.modeType == MODE_TYPE_INTRA;
@@ -322,14 +344,17 @@ bool isConsInter()
   return g_cu.modeType == MODE_TYPE_INTER;
 }
 
+// The context offset of cu_skip_flag (flag kSkip) or of the affine flags (flag kAffine): how many of the CUs to the
+// left and above have that flag
 int ctxLeftAbove( uint flag )
 {
-  // (the flags of the word pairs: skip, affine)
+  // (the map entries hold only these two flags)
   const bool left  = flag == kSkip ? infoSkip( g_cu.left ) : infoAffine( g_cu.left );
   const bool above = flag == kSkip ? infoSkip( g_cu.above ) : infoAffine( g_cu.above );
   return ( left ? 1 : 0 ) + ( above ? 1 : 0 );
 }
 
+// The context offset of pred_mode_ibc_flag: how many of the CUs to the left and above are IBC CUs
 int ctxIbcFlag()
 {
   int ctx = ( infoValid( g_cu.left ) && infoPredMode( g_cu.left ) == MODE_IBC ) ? 1 : 0;
@@ -337,7 +362,7 @@ int ctxIbcFlag()
   return ctx;
 }
 
-// CABACReader::cu_skip_flag
+// Parses cu_skip_flag, and pred_mode_ibc_flag for a skipped CU (CABACReader::cu_skip_flag)
 void cuSkipFlag()
 {
   const bool ibcFlag = tool( kToolIbc ) && g_cu.lw <= 64 && g_cu.lh <= 64;
@@ -378,7 +403,8 @@ void cuSkipFlag()
   }
 }
 
-// CABACReader::pred_mode
+// Parses pred_mode_flag and pred_mode_ibc_flag, as far as the slice, the CU's size and its mode type leave them to
+// the bitstream (CABACReader::pred_mode)
 void predMode()
 {
   if( isConsInter() )
@@ -413,7 +439,7 @@ void predMode()
   }
 }
 
-// CABACReader::adaptive_color_transform
+// Parses cu_act_enabled_flag (CABACReader::adaptive_color_transform)
 void adaptiveColorTransform()
 {
   if( !tool( kToolAct ) || cuIsSepTree() )
@@ -423,7 +449,8 @@ void adaptiveColorTransform()
   g_cu.act = decodeBin( CTX_ACTFlag ) != 0;
 }
 
-// CABACReader::bdpcm_mode
+// Parses the BDPCM flag and direction of the luma (comp 0) or the chroma (CABACReader::bdpcm_mode): 0 off,
+// 1 horizontal, 2 vertical
 void bdpcmMode( int comp )
 {
   const int  tsMax   = 1 << g_log2MaxTs;
@@ -450,7 +477,8 @@ void bdpcmMode( int comp )
   }
 }
 
-// CABACReader::coding_unit with cu_pred_data (the skip's prediction unit and cu_pred_data's one call)
+// CABACReader::coding_unit, with cu_pred_data folded in. A skipped CU's prediction_unit and cu_pred_data's share the
+// one call of predictionUnit below, as every call is inlined and a second call site would copy it.
 void codingUnit( inout CuCtx ctx )
 {
   bool skipped = false;
@@ -491,7 +519,7 @@ void codingUnit( inout CuCtx ctx )
   }
   else if( !skipped && g_cu.lw == 0 )
   {
-    g_cu.predMode = MODE_IBC;   // a dual tree's chroma CU
+    g_cu.predMode = MODE_IBC;   // (a chroma tree's CU that is not intra is IBC, as in cu_pred_data)
   }
   else
   {
@@ -516,10 +544,11 @@ void codingUnit( inout CuCtx ctx )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// intra
+// Intra prediction data
 // --------------------------------------------------------------------------------------------------------------------
 
-// CABACReader::mip_flag, mip_pred_mode
+// Parses intra_mip_flag (CABACReader::mip_flag). Its context counts the MIP CUs to the left and above, except for
+// blocks more than twice as wide as high or as high as wide, which use context 3.
 void mipFlag()
 {
   if( !tool( kToolMip ) )
@@ -532,6 +561,8 @@ void mipFlag()
   g_cu.mip = decodeBin( CTX_MipFlag + ctxId ) != 0;
 }
 
+// Parses intra_mip_transposed_flag and intra_mip_mode, a truncated binary code of 16, 8 or 6 modes by the block's
+// size (CABACReader::mip_pred_mode)
 void mipPredMode()
 {
   g_cu.mipT          = int( decodeBinEP() );
@@ -540,7 +571,7 @@ void mipPredMode()
   g_cu.intraDirL     = readTruncBinCode( numModes );
 }
 
-// CABACReader::extend_ref_line
+// Parses the MRL index, 0, 1 or 2 (CABACReader::extend_ref_line); a CU on the CTU's top row has none
 void extendRefLine()
 {
   if( g_cu.bdpcmL != 0 || !tool( kToolMrl ) )
@@ -559,7 +590,8 @@ void extendRefLine()
   g_cu.mrl = mrl;
 }
 
-// CU::canUseISPSplit
+// The ISP splits a w x h CU allows (CU::canUseISPSplit): 4 when both directions are allowed, 0
+// (NOT_INTRA_SUBPARTITIONS) when ISP is not, as the CU has too few samples or exceeds the largest transform
 int canUseIspSplit( int w, int h )
 {
   const bool notEnoughSamplesToSplit   = log2i( w ) + log2i( h ) <= 4;
@@ -569,7 +601,8 @@ int canUseIspSplit( int w, int h )
   return widthCanBeUsed >> heightCanBeUsed;
 }
 
-// CABACReader::isp_mode
+// Parses intra_subpartitions_mode_flag and intra_subpartitions_split_flag (CABACReader::isp_mode): ISP mode 1
+// horizontal, 2 vertical
 void ispMode()
 {
   if( g_cu.mrl != 0 || !tool( kToolIsp ) || g_cu.bdpcmL != 0 || g_cu.act )
@@ -598,13 +631,14 @@ void ispMode()
   }
 }
 
-// PU::getIntraDirLuma of a neighbour
+// The intra luma mode of a neighbouring CU, given its map entry (PU::getIntraDirLuma): planar for a MIP CU
 int intraDirLumaOf( uint2 info )
 {
   return infoMip( info ) ? PLANAR_IDX : infoIntraDir( info );
 }
 
-// PU::getIntraMPMs
+// The CU's 6 most probable intra modes (PU::getIntraMPMs), from the modes of the intra CUs to the left (beside the
+// CU's bottom-left sample) and above (over its top-right sample, not across the CTU's top edge)
 void getIntraMpms( out int mpm[6] )
 {
   int leftIntraDir  = PLANAR_IDX;
@@ -687,7 +721,9 @@ void getIntraMpms( out int mpm[6] )
   }
 }
 
-// CABACReader::intra_luma_pred_mode
+// Parses the CU's intra luma mode (CABACReader::intra_luma_pred_mode): BDPCM's direction fixes it; else MIP's flag
+// and mode, or MRL, ISP and then an MPM (intra_luma_mpm_flag, intra_luma_not_planar_flag, the MPM index) or one of
+// the remaining modes
 void intraLumaPredMode()
 {
   if( g_cu.bdpcmL != 0 )
@@ -729,7 +765,7 @@ void intraLumaPredMode()
   else
   {
     int ipredMode = readTruncBinCode( NUM_LUMA_MODE - 6 );
-    // the MPMs sorted
+    // Not an MPM: the coded value counts the modes that are not MPMs, so step over the MPMs in ascending order
     for( int i = 1; i < 6; i++ )
     {
       for( int j = i; j > 0 && mpm[j - 1] > mpm[j]; j-- )
@@ -747,13 +783,14 @@ void intraLumaPredMode()
   }
 }
 
-// the luma CU of the chroma block's centre (PU::getCoLocatedLumaPU of a separate tree's CU)
+// The luma CU at the centre of the CU's chroma block, as PU::getCoLocatedLumaPU finds it for a CU of a separate tree
 uint2 coLocatedLumaCu()
 {
   return cuAt( ( g_cu.cx << g_csx ) + ( ( g_cu.cw << g_csx ) >> 1 ), ( g_cu.cy << g_csy ) + ( ( g_cu.chh << g_csy ) >> 1 ), 0 );
 }
 
-// CU::checkCCLMAllowed
+// Whether the CU may use CCLM (CU::checkCCLMAllowed). Only the dual tree with CTUs of 64 or more restricts it, by how
+// the CU's 64x64 area was split and by the luma CU at the CU's top-left corner.
 bool checkCclmAllowed()
 {
   if( !g_dualTree )
@@ -795,7 +832,8 @@ bool checkCclmAllowed()
   return allow;
 }
 
-// CABACReader::intra_chroma_pred_mode
+// Parses the CU's intra chroma mode (CABACReader::intra_chroma_pred_mode): BDPCM's direction or ACT fixes it; else
+// a CCLM mode, the DM mode (the luma's), or one of 4 listed modes
 void intraChromaPredMode()
 {
   if( g_cu.bdpcmC != 0 )
@@ -812,7 +850,7 @@ void intraChromaPredMode()
   {
     if( decodeBin( CTX_CclmModeFlag ) != 0 )
     {
-      // intra_chroma_lmc_mode
+      // cclm_mode_idx (vvdec's intra_chroma_lmc_mode): LM, MDLM_L or MDLM_T
       int symbol = int( decodeBin( CTX_CclmModeIdx ) );
       if( symbol != 0 )
       {
@@ -828,7 +866,8 @@ void intraChromaPredMode()
     return;
   }
   const int candId = int( decodeBinsEP( 2 ) );
-  // PU::getIntraChromaCandModes: planar, vertical, horizontal, DC (the colocated luma mode's place: VDIA)
+  // The listed modes (PU::getIntraChromaCandModes): planar, vertical, horizontal and DC, where the one equal to the
+  // colocated luma mode is replaced by VDIA
   int modeList[4] = { PLANAR_IDX, VER_IDX, HOR_IDX, DC_IDX };
   const bool dmChromaMip = !cuIsSepTree() && g_chromaFormat == 3 && g_cu.mip;
   if( !dmChromaMip )
@@ -855,10 +894,10 @@ void intraChromaPredMode()
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// inter: the prediction unit
+// Inter and IBC: the prediction unit
 // --------------------------------------------------------------------------------------------------------------------
 
-// CABACReader::mvd_coding
+// Parses one motion vector difference (CABACReader::mvd_coding)
 int2 mvdCoding()
 {
   int horAbs = int( decodeBin( CTX_Mvd ) );
@@ -896,17 +935,19 @@ int2 mvdCoding()
   return int2( horAbs, verAbs );
 }
 
+// The slice's number of reference indices of a list
 int numRefIdx( int list )
 {
   return ( sliceWord( kSlNumRef ) >> ( 8 * list ) ) & 0xff;
 }
 
+// SMVD's reference index of a list (Slice::getSymRefIdx)
 int symRefIdx( int list )
 {
   return int( int8_t( ( sliceWord( kSlSymRef ) >> ( 8 * list ) ) & 0xff ) );
 }
 
-// CABACReader::ref_idx
+// Parses the reference index of a list (CABACReader::ref_idx); an SMVD CU uses SMVD's instead
 int refIdxOf( int list )
 {
   if( g_cu.smvd != 0 )
@@ -932,7 +973,7 @@ int refIdxOf( int list )
   return 0;
 }
 
-// CABACReader::inter_pred_idc
+// Parses the CU's inter direction (CABACReader::inter_pred_idc): 1 list 0, 2 list 1, 3 both
 void interPredIdc()
 {
   if( g_sliceType == P_SLICE )
@@ -940,7 +981,7 @@ void interPredIdc()
     g_cu.interDir = 1;
     return;
   }
-  if( !( g_cu.lw + g_cu.lh <= 12 ) )   // PU::isBipredRestriction
+  if( !( g_cu.lw + g_cu.lh <= 12 ) )   // (PU::isBipredRestriction: 8x4 and 4x8 CUs cannot predict from both lists)
   {
     const int ctxId = 7 - ( ( log2i( g_cu.lw ) + log2i( g_cu.lh ) + 1 ) >> 1 );
     if( decodeBin( CTX_InterDir + ctxId ) != 0 )
@@ -957,7 +998,7 @@ void interPredIdc()
   g_cu.interDir = 1;
 }
 
-// CABACReader::affine_flag
+// Parses inter_affine_flag and cu_affine_type_flag (CABACReader::affine_flag)
 void affineFlag()
 {
   if( tool( kToolAffine ) && g_cu.lw >= 16 && g_cu.lh >= 16 )
@@ -970,7 +1011,7 @@ void affineFlag()
   }
 }
 
-// CABACReader::smvd_mode
+// Parses sym_mvd_flag (CABACReader::smvd_mode); g_cu.smvd becomes 1 when it is set
 void smvdMode()
 {
   if( g_cu.interDir != 3 || cuAffine() || !tool( kToolSmvd ) || sliceFlag( kSlMvdL1Zero ) )
@@ -984,7 +1025,7 @@ void smvdMode()
   g_cu.smvd = decodeBin( CTX_SmvdFlag ) != 0 ? 1 : 0;
 }
 
-// CABACReader::subblock_merge_flag
+// Parses merge_subblock_flag (CABACReader::subblock_merge_flag), which makes the CU affine
 void subblockMergeFlag()
 {
   if( !sliceIsIntra() && sliceWord( kSlMaxAffMerge ) > 0 && g_cu.lw >= 8 && g_cu.lh >= 8 )
@@ -993,7 +1034,8 @@ void subblockMergeFlag()
   }
 }
 
-// CABACReader::merge_idx
+// Parses the merge index (CABACReader::merge_idx): a GPM CU's split direction and two merge candidates, or the merge
+// index of an IBC, affine (subblock) or regular merge CU
 void mergeIdx()
 {
   if( ( g_cu.flags & kGeo ) != 0 )
@@ -1044,7 +1086,8 @@ void mergeIdx()
   g_cu.mergeIdx = idx;
 }
 
-// CABACReader::mmvd_merge_idx
+// Parses MMVD's base candidate, distance and direction (CABACReader::mmvd_merge_idx), stored as
+// mmvdIdx = base * 32 + distance * 4 + direction
 void mmvdMergeIdx()
 {
   int       var0 = 0, var1 = 0, var2 = 0;
@@ -1074,7 +1117,8 @@ void mmvdMergeIdx()
   g_cu.mmvdIdx = var0 * 32 + var1 * 4 + var2;
 }
 
-// CABACReader::merge_data
+// Parses a merge CU's merge data (CABACReader::merge_data): which merge mode it uses -- subblock (affine), regular,
+// MMVD, CIIP or GPM -- and its indices
 void mergeData()
 {
   if( cuIsIbc() )
@@ -1133,7 +1177,7 @@ void mergeData()
   }
 }
 
-// CABACReader::prediction_unit
+// Parses the prediction unit of an inter or IBC CU (CABACReader::prediction_unit): merge data, or the AMVP syntax
 void predictionUnit()
 {
   if( cuSkip() )
@@ -1150,8 +1194,9 @@ void predictionUnit()
   }
   else
   {
-    // IBC's AMVP (list 0, one difference) or inter's: each list's reference index, differences and predictor (one call
-    // of mvdCoding)
+    // AMVP. IBC uses list 0 with one difference. Inter parses, for each list the CU uses, the reference index, the
+    // differences (one, or one per affine control point) and the predictor index. The loops keep mvdCoding to one
+    // call site, as every call is inlined.
     const bool ibc = cuIsIbc();
     if( ibc )
     {
@@ -1211,9 +1256,10 @@ void predictionUnit()
       }
     }
   }
+  // SMVD: the other list mirrors the coded list's difference and takes SMVD's reference index
   if( g_cu.smvd != 0 )
   {
-    const int cur = g_cu.smvd - 1;   // the list coded
+    const int cur = g_cu.smvd - 1;   // (the list whose difference was coded: smvdMode sets 1, so always list 0)
     if( cur == 0 )
     {
       g_cu.mv[3]   = -g_cu.mv[0];
@@ -1227,7 +1273,7 @@ void predictionUnit()
   }
 }
 
-// CU::hasSubCUNonZeroMVd
+// Whether a coded motion vector difference of the CU is nonzero (CU::hasSubCUNonZeroMVd); AMVR is coded only then
 bool hasSubCuNonZeroMvd()
 {
   bool nonZero = false;
@@ -1245,7 +1291,7 @@ bool hasSubCuNonZeroMvd()
   return nonZero;
 }
 
-// CU::hasSubCUNonZeroAffineMVd
+// The same for an affine CU's control point differences (CU::hasSubCUNonZeroAffineMVd)
 bool hasSubCuNonZeroAffineMvd()
 {
   const int n       = ( g_cu.flags & kAffine6 ) != 0 ? 3 : 2;
@@ -1270,7 +1316,9 @@ bool hasSubCuNonZeroAffineMvd()
   return nonZero;
 }
 
-// CABACReader::amvr_mode
+// Parses amvr_flag and amvr_precision_idx (CABACReader::amvr_mode) into imv: 0 quarter-sample, 1 full-sample,
+// 2 four-sample, IMV_HPEL half-sample precision. An IBC CU codes no amvr_flag (it counts as 1), so its
+// amvr_precision_idx picks full- or four-sample precision.
 void amvrMode()
 {
   if( !tool( kToolAmvr ) || !hasSubCuNonZeroMvd() )
@@ -1295,7 +1343,7 @@ void amvrMode()
   }
 }
 
-// CABACReader::affine_amvr_mode
+// Parses an affine CU's amvr_flag and amvr_precision_idx (CABACReader::affine_amvr_mode) into imv 0, 1 or 2
 void affineAmvrMode()
 {
   if( !tool( kToolAffineAmvr ) || !hasSubCuNonZeroAffineMvd() )
@@ -1311,7 +1359,8 @@ void affineAmvrMode()
   g_cu.imv = int( value );
 }
 
-// CU::isBcwIdxCoded
+// Whether bcw_idx is coded (CU::isBcwIdxCoded): for bi-predicted inter CUs of at least 256 luma samples whose two
+// references have no weighted prediction
 bool isBcwIdxCoded()
 {
   if( !tool( kToolBcw ) )
@@ -1327,7 +1376,7 @@ bool isBcwIdxCoded()
     return false;
   }
   const uint wp = uint( sliceWord( kSlWp ) );
-  // Slice::getWpScaling: a negative reference index takes index 0's
+  // (Slice::getWpScaling looks up a negative reference index as index 0)
   const int r0 = max( g_cu.refIdx0, 0 );
   const int r1 = max( g_cu.refIdx1, 0 );
   if( ( ( wp >> uint( r0 ) ) & 1u ) != 0 || ( ( wp >> uint( 16 + r1 ) ) & 1u ) != 0 )
@@ -1337,7 +1386,7 @@ bool isBcwIdxCoded()
   return true;
 }
 
-// CABACReader::cu_bcw_flag
+// Parses bcw_idx (CABACReader::cu_bcw_flag): 5 weights when no reference follows the picture (getCheckLDC), else 3
 void cuBcwFlag()
 {
   if( !isBcwIdxCoded() )
@@ -1357,5 +1406,5 @@ void cuBcwFlag()
     }
   }
   const int bcwIdx = kBcwParsingOrder[idx];
-  g_cu.bcw         = kBcwInternFwd[bcwIdx];   // CU::setBcwIdx: an AMVP bi-predicted CU's
+  g_cu.bcw         = kBcwInternFwd[bcwIdx];   // (CU::setBcwIdx stores it for an AMVP bi-predicted CU, which this is)
 }

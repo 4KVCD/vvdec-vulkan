@@ -39,7 +39,16 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ------------------------------------------------------------------------------------------- */
 
 /** \file     GpuParse.cpp
-    \brief    the GPU's parse of the slice data (shaders/parse.slang): its inputs, the comparison with the CPU's
+    \brief    The host side of the GPU's parse of the slice data (shaders/parse.slang): its inputs, and the comparison
+              of its results with the CPU's parse
+
+    buildParseInput lays out a picture's slices as parse.slang reads them: the slice data, the substreams (split at
+    the entry points, as DecSlice::parseSlice splits them), the CTUs in decoding order with flags that tell the
+    shader where to restart the arithmetic decoder and, with WPP, where to save and load the contexts and where to
+    wait for the CTU above, each slice's parameters and initial contexts (from vvdec's own Ctx::init), and the
+    picture's parameters. writeParseScans writes the scan table, and checkParseContexts checks the tables the shader
+    shares with vvdec. With VVDEC_GPU_PARSE=1, captureSaoAlf keeps the CPU's SAO and ALF parameters of each CTU, and
+    compareParse compares the GPU's records, parameters and levels with the CPU's. GpuReconParse.cpp runs the shaders.
 */
 
 #include "GpuParse.h"
@@ -59,12 +68,12 @@ namespace vvdec
 namespace gpu
 {
 
-// the context sets' first contexts (CTX_...) and their count, as parse.slang has them
+// The first context of each context set (CTX_...) and their number (CTX_COUNT): the #defines parse.slang uses
 #include "shaders/parsectx.slang"
 
 namespace
 {
-// parse.slang's tables (keep in step with it)
+// The layout of parse.slang's tables, under the names of its constants (keep the two in step). The picture's words:
 enum PicWord : int
 {
   kPicWidthInCtus  = 0,
@@ -92,6 +101,7 @@ enum PicWord : int
   kPicChromaQpMap  = 160,
 };
 
+// The bits of kPicTools: the SPS's tools
 enum Tool : int
 {
   kToolSbt        = 1 << 0,
@@ -119,6 +129,7 @@ enum Tool : int
   kToolMts        = 1 << 22,
 };
 
+// A slice's parameter words
 enum SliceWord : int
 {
   kSlType          = 0,
@@ -135,6 +146,7 @@ enum SliceWord : int
   kSlPartChroma    = 13,
 };
 
+// The bits of kSlFlags
 enum SliceFlag : uint32_t
 {
   kSlSaoLuma     = 1 << 0,
@@ -154,6 +166,7 @@ enum SliceFlag : uint32_t
   kSlDualTree    = 1 << 14,
 };
 
+// The flags of a CTU in ctuList; parse.slang's kCtu... constants say what each one makes the shader do
 enum CtuFlag : uint32_t
 {
   kCtuRestart   = 1,
@@ -163,9 +176,13 @@ enum CtuFlag : uint32_t
   kCtuWaitAbove = 16,
 };
 
+// The words of each slice in ParseInput::slices: its parameters, then its contexts' initial states and rates
 constexpr size_t kSliceStride = kParseSliceWords + 2 * CTX_COUNT;
 
-// Partitioner::initCtu's limits of a channel (GDR_ADJ): maxBTD | maxBtSize << 8 | maxTtSize << 16 | minQtSize << 24
+// The partition limits of channel type ch in the slice, as Partitioner::initCtu works them out: the picture header's
+// when it overrides them, else the SPS's for the kind of slice (vvdec is built with GDR_ADJ, which picks them by
+// whether the slice is intra rather than IRAP). Packed as maxBTD | maxBtSize << 8 | maxTtSize << 16 |
+// minQtSize << 24; maxBTD is the deepest multi-type tree, the sizes are in luma samples.
 uint32_t partitionLimits( const Slice& slice, const SPS& sps, const PicHeader& ph, ChannelType ch )
 {
   const int valIdx = slice.isIntra() ? ( slice.getSPS()->getUseDualITree() ? int( ch ) << 1 : 0 ) : 1;
@@ -214,7 +231,8 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
   in.slices.assign( kSliceStride * pic.slices.size(), 0u );
   in.pic.assign( kParsePicWords, 0 );
 
-  // a CTU's records at most: its luma's 4x4 blocks, its chroma's of 16 samples (the chroma tree's CUs)
+  // The most CUs a CTU can have: one per 4x4 luma block, plus one per 16 chroma samples (the chroma tree's CUs).
+  // The TUs get as many slots.
   const int ctuSize  = int( pcv.maxCUWidth );
   const int chromaW  = chFmt == CHROMA_400 ? 0 : ctuSize >> getChannelTypeScaleX( CH_C, chFmt );
   const int chromaH  = chFmt == CHROMA_400 ? 0 : ctuSize >> getChannelTypeScaleY( CH_C, chFmt );
@@ -223,7 +241,7 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
   in.wppSlots        = uint32_t( pcv.heightInCtus * pps.getNumTileColumns() );
   in.contexts        = CTX_COUNT;
 
-  // the CTUs' slices and tiles
+  // Each CTU's tile and whether it is in its tile's first column, then each CTU's slice
   for( int ctu = 0; ctu < ctus; ctu++ )
   {
     const int x             = ctu % int( pcv.widthInCtus );
@@ -254,7 +272,7 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
     const uint32_t   sliceOffset = uint32_t( in.bits.size() );
     in.bits.insert( in.bits.end(), data.begin(), data.end() );
 
-    // the slice's words
+    // The slice's parameter words
     uint32_t* w      = in.slices.data() + kSliceStride * si;
     w[kSlType]       = uint32_t( slice->getSliceType() );
     w[kSlQp]         = uint32_t( slice->getSliceQp() );
@@ -315,7 +333,8 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
     w[kSlWp]          = wp;
     w[kSlPartLuma]    = partitionLimits( *slice, sps, ph, CHANNEL_TYPE_LUMA );
     w[kSlPartChroma]  = slice->isIntra() && sps.getUseDualITree() ? partitionLimits( *slice, sps, ph, CHANNEL_TYPE_CHROMA ) : 0u;
-    // the initial contexts (CABACReader::initCtxModels)
+    // The slice's initial contexts, from the table CABACReader::initCtxModels picks (cabac_init_flag swaps the P and
+    // B tables), computed with vvdec's own Ctx::init
     SliceType initType = slice->getSliceType();
     if( slice->getPPS()->getCabacInitPresentFlag() && slice->getCabacInitFlag() )
     {
@@ -329,7 +348,12 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
       w[kParseSliceWords + CTX_COUNT + k] = ctx[k].gpuRates();
     }
 
-    // the substreams (DecSlice::parseSlice)
+    // The slice's substreams and its CTUs in decoding order. A new substream begins after each CTU that ends a tile
+    // or, with WPP, a CTU row of a tile, when the slice has entry points; without them the data runs on in the same
+    // substream and the shader decodes end_of_subset_one_bit there. As DecSlice::parseSlice does, the flags restart
+    // the contexts and the arithmetic decoder at a tile's or a WPP row's first CTU, load the contexts the row above
+    // saved and save them after a WPP row's first CTU; with WPP they also make the shader wait until the CTU above
+    // is parsed.
     const uint32_t numSubstreams = slice->getNumberOfSubstreamSizes() + 1;
     uint32_t       streamOffset  = sliceOffset;
     uint32_t       subStream     = 0;
@@ -407,7 +431,7 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
     endStream();
   }
 
-  // the picture's
+  // The picture's parameters
   int32_t* p           = in.pic.data();
   p[kPicWidthInCtus]   = int32_t( pcv.widthInCtus );
   p[kPicHeightInCtus]  = int32_t( pcv.heightInCtus );
@@ -466,7 +490,7 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
       }
       const int qpBdOffset = sps.getQpBDOffset();
       CHECK( MAX_QP + 1 + qpBdOffset > 128, "the chroma QP mapping does not fit" );
-      // (joint Cb-Cr's table only with it: vvdec makes it then)
+      // (joint Cb-Cr's mapping only when joint Cb-Cr is enabled: vvdec builds that table only then)
       for( int qp = -qpBdOffset; qp <= MAX_QP && ( c < 2 || sps.getJointCbCrEnabledFlag() ); qp++ )
       {
         p[kPicChromaQpMap + c * 128 + qp + qpBdOffset] = sps.getMappedChromaQpValue( comps[c], qp );
@@ -476,6 +500,8 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
   return true;
 }
 
+// Where the scan of a block 1 << log2W wide and 1 << log2H high starts in the scan table, as parse.slang's
+// scanTabOffset works it out: the blocks follow one another by width (1, 2, 4, 8, 16), and within a width by height.
 static int scanTabOffset( int log2W, int log2H )
 {
   return ( ( 1 << log2W ) - 1 ) * 31 + ( 1 << log2W ) * ( ( 1 << log2H ) - 1 );
@@ -500,8 +526,10 @@ void writeParseScans( uint32_t* out )
   }
 }
 
-// parse.slang's grouped scans (the groups' diagonal scan, each group's) against vvdec's g_scanOrder[SCAN_GROUPED_4x4],
-// over the positions the parse reaches (the zero-out's groups)
+// Checks how parse.slang composes the grouped scan of a block -- the diagonal scan of its coefficient groups, then
+// the diagonal scan inside each group, both from the scan table -- against vvdec's g_scanOrder[SCAN_GROUPED_4x4], for
+// every block size and over the scan positions the parse can reach (the groups inside the zero-out's 32 x 32).
+// Prints the first 4 differences; returns whether there were none.
 static bool checkParseScans()
 {
   std::vector<uint32_t> tab( kParseScanTab );
@@ -653,6 +681,8 @@ void captureSaoAlf( const CodingStructure& cs, int ctuRsAddr, uint32_t out[7] )
     uint32_t offs      = 0;
     if( o.modeIdc == SAO_MODE_NEW )
     {
+      // The 4 offsets as bytes: a band offset's in band order from its first band (typeAuxInfo), an edge offset's of
+      // the classes 0, 1, 3 and 4 (class 2's is always 0)
       int v[4];
       if( o.typeIdc == SAO_TYPE_START_BO )
       {
@@ -698,14 +728,14 @@ void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint
       msg( WARNING, "GPU parse: POC %d: %u substreams gave up\n", poc, errors );
     }
   }
+  // The CPU's CTU records, made from its CU and TU records as for the GPU front end
   std::vector<CtuRecord> cpuCtus( static_cast<size_t>( ctus ) );
   writeCtuRecords( cs, cpuCus, cpuTus, cpuCtus.data() );
   for( int ctu = 0; ctu < ctus; ctu++ )
   {
-    // the CTU's record
+    // The CTU's record, and its SAO and ALF parameters when the CPU's were captured
     stats.ctusCompared++;
     bool same = memcmp( cpuCtus[ctu].w, gpuCtus + 4 * ctu, 4 * sizeof( uint32_t ) ) == 0;
-    // its SAO and ALF parameters
     if( !cpuSaoAlf.empty() )
     {
       same = same && memcmp( cpuSaoAlf.data() + 7 * ctu, gpuCtuOut + kParseCtuOutWords * ctu + 2, 7 * sizeof( uint32_t ) ) == 0;
@@ -728,7 +758,8 @@ void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint
         }
       }
     }
-    // its CUs and TUs, when the GPU's has as many
+    // The CTU's CUs and TUs, record by record, when the GPU's parse found as many of each as the CPU's; otherwise all
+    // of them count as differing
     const uint32_t first   = gpuCtus[4 * ctu];
     const uint32_t count   = gpuCtus[4 * ctu + 1] & 0xffff;
     const uint32_t firstTu = gpuCtus[4 * ctu + 3];
@@ -783,6 +814,7 @@ void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint
       }
     }
   }
+  // The levels, as parsecompact.slang's check counted them
   (void) gpuTotals;
   stats.levelsCompared += levels[0];
   stats.levelsDiffer += levels[1];

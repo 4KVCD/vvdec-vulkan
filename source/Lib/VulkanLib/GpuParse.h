@@ -40,10 +40,16 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #pragma once
 
-// The GPU's parse of the slice data (shaders/parse.slang): its inputs, built from a picture's slices (their slice
-// data as the CPU's parse task captures it, the substreams, the CTUs in decoding order, the slices' parameters and
-// initial contexts -- vvdec's own Ctx::init), and the comparison of what it leaves with the CPU's parse
-// (VVDEC_GPU_PARSE=1).
+// The host side of the GPU's parse of the slice data (the CABAC parse in shaders/parse.slang and the shaders it
+// includes). With VVDEC_GPU_PARSE=1 the GPU parses every picture as well, and the result is compared with the CPU's
+// parse; the CPU's parse still drives the decoding. This header declares:
+// - buildParseInput, which lays out a picture's slices as parse.slang reads them: the slice data after each slice
+//   header (which the CPU's parse task keeps for this), the substreams the entry points split it into, the CTUs in
+//   decoding order, each slice's parameters and initial contexts (computed with vvdec's own Ctx::init), and the
+//   picture's parameters;
+// - writeParseScans and checkParseContexts, for the tables the shader shares with vvdec;
+// - captureSaoAlf and compareParse, which compare what the GPU's parse leaves with what the CPU's parse left.
+// GpuRecon (GpuReconParse.cpp) uploads the inputs, runs the shaders and calls compareParse.
 
 #include "GpuFrontEnd.h"
 
@@ -58,66 +64,81 @@ class CodingStructure;
 namespace gpu
 {
 
-// the layout of shaders/parse.slang's tables
-static constexpr int kParsePicWords    = 160 + 3 * 128;
-static constexpr int kParseSliceWords  = 16;
-static constexpr int kParseStreamWords = 8;
-static constexpr int kParseCtuOutWords = 16;
-static constexpr int kParseScanTab     = 961;   // the scans' table: the diagonal scans of the blocks 1..16 x 1..16
+// The layout of parse.slang's tables (keep in step with its constants)
+static constexpr int kParsePicWords    = 160 + 3 * 128;   // the picture's: 160 parameter words, 3 chroma QP maps of 128
+static constexpr int kParseSliceWords  = 16;    // a slice's parameter words (its initial contexts follow them)
+static constexpr int kParseStreamWords = 8;     // a substream's words
+static constexpr int kParseCtuOutWords = 16;    // the words parse.slang writes per CTU besides the records (ctuOut)
+static constexpr int kParseScanTab     = 961;   // the scan table's words (writeParseScans)
 
-// the inputs of a picture's parse, as parse.slang reads them
+// The inputs of a picture's parse, laid out as parse.slang reads them
 struct ParseInput
 {
-  std::vector<uint8_t>  bits;      // the slices' data, one after the other
-  std::vector<uint32_t> streams;   // kParseStreamWords a substream
-  std::vector<uint32_t> ctuList;   // 2 words a CTU, in decoding order
-  std::vector<uint32_t> ctuInfo;   // 2 words a CTU, raster order
-  std::vector<uint32_t> slices;    // a slice's words and initial contexts
-  std::vector<int32_t>  pic;       // kParsePicWords
-  uint32_t              numStreams = 0;
-  uint32_t              cuSlots    = 0;   // a CTU's slots of CU records
-  uint32_t              tuSlots    = 0;
-  uint32_t              wppSlots   = 0;   // WPP's saved contexts
-  uint32_t              contexts   = 0;   // the context models (CTX_COUNT)
+  std::vector<uint8_t>  bits;      // the slices' data (each from the end of its slice header), one after another
+  // Per substream, kParseStreamWords words: its first byte in bits, its size in bytes, its first CTU in ctuList, its
+  // number of CTUs and the index of its slice (words 5..7 are unused)
+  std::vector<uint32_t> streams;
+  // Per CTU in decoding order, 2 words: its raster-scan address; its flags (parse.slang's kCtu...) | its WPP context
+  // slot << 8 (CTU row * tile columns + tile column)
+  std::vector<uint32_t> ctuList;
+  // Per CTU in raster order, 2 words: the index of its slice; the index of its tile | 1 << 16 if the CTU is in its
+  // tile's first column
+  std::vector<uint32_t> ctuInfo;
+  // Per slice, kParseSliceWords parameter words, then its contexts' initial states and their rates (CTX_COUNT words
+  // each)
+  std::vector<uint32_t> slices;
+  std::vector<int32_t>  pic;       // the picture's parameters, kParsePicWords words
+  uint32_t              numStreams = 0;   // the number of substreams in streams
+  uint32_t              cuSlots    = 0;   // CU record slots per CTU: the most CUs a CTU can have
+  uint32_t              tuSlots    = 0;   // TU record slots per CTU (as many)
+  uint32_t              wppSlots   = 0;   // slots for WPP's saved contexts: one per CTU row and tile column
+  uint32_t              contexts   = 0;   // the number of context models (CTX_COUNT)
 };
 
-// VVDEC_GPU_PARSE=1: the GPU parses the pictures too, compared with the CPU's parse (the CPU's parse task keeps the
-// slice data for it)
+// Whether VVDEC_GPU_PARSE=1 asks for the GPU's parse. With it, the GPU parses every picture as well, the result is
+// compared with the CPU's parse, and the CPU's parse task keeps each slice's data for the GPU.
 bool parseShadowRequested();
 
-// the picture's inputs; false when a slice's data was not captured
+// Fills in with the inputs of the picture's parse. Returns false when a slice's data was not kept; the picture is then
+// not parsed on the GPU.
 bool buildParseInput( const CodingStructure& cs, ParseInput& in );
-// the diagonal scans of the blocks 1..16 x 1..16 (vvdec's g_scanOrder[SCAN_UNGROUPED]): per position its raster
-// position | the scan index of the raster position << 16, kParseScanTab words
+// Writes the scan table, kParseScanTab words: the diagonal scans of the blocks 1, 2, 4, 8 and 16 samples wide and
+// high (vvdec's g_scanOrder[SCAN_UNGROUPED]). Each block's scan takes w * h words from where scanTabOffset says; word
+// k holds the raster position of scan position k | the scan position of raster position k << 16.
 void writeParseScans( uint32_t* out );
-// parsectx.slang's context sets against vvdec's (Ctx) and vvdec's grouped scans against parse.slang's composition of
-// them: false when one differs (printed)
+// Checks parsectx.slang's context sets against vvdec's (Ctx), and the grouped scans parse.slang composes from the
+// scan table against vvdec's. Returns false, after printing what differs, when anything does.
 bool checkParseContexts();
-// a CTU's SAO and ALF parameters as the CPU's parse left them, as parse.slang writes them (its ctuOut's words 2..8)
+// Writes a CTU's SAO and ALF parameters as the CPU's parse left them, in the 7 words that parse.slang writes for them
+// (words 2..8 of the CTU's ctuOut).
 void captureSaoAlf( const CodingStructure& cs, int ctuRsAddr, uint32_t out[7] );
 
-// the comparison of the GPU's parse with the CPU's
+// The comparison of the GPU's parse with the CPU's, summed over the pictures
 struct ParseStats
 {
   int64_t pictures       = 0;
-  int64_t errors         = 0;   // pictures the GPU's parse gave up on (a CTU's slots full, ...)
+  int64_t errors         = 0;   // pictures with a substream that gave up (slots full, ...) or was left unparsed
   int64_t cusCompared    = 0;
   int64_t cusDiffer      = 0;
   int64_t tusCompared    = 0;
   int64_t tusDiffer      = 0;
   int64_t ctusCompared   = 0;
-  int64_t ctusDiffer     = 0;   // CTU records and SAO / ALF parameters
+  int64_t ctusDiffer     = 0;   // CTUs whose record or SAO / ALF parameters differ
   int64_t levelsCompared = 0;
   int64_t levelsDiffer   = 0;
-  int     reported       = 0;
+  int     reported       = 0;   // the differences printed so far (compareParse prints at most 20)
   int64_t substreams     = 0;
-  int64_t runs           = 0;    // the substreams' runs: one per substream and dispatch, until parsed
+  int64_t runs           = 0;    // the substreams' runs: one per substream and dispatch until the substream is parsed
   int64_t submissions    = 0;    // the parse's submissions (GpuRecon::runParse)
-  uint64_t prof[16]      = {};   // VVDEC_GPU_PROFILE: parse_prof's sums (parse.slang's kProf...)
+  uint64_t prof[16]      = {};   // VVDEC_GPU_PROFILE: the sums of parse_prof's counters (parse.slang's kProf...)
 };
-// gpu*: the GPU's records in raster order of the CTUs, its CTU records and ctuOut words, the totals; cpu*: the CPU's
-// records CTU by CTU and its SAO / ALF parameters (captureSaoAlf's, 7 words a CTU); levels: the check's counts (levels
-// compared, differ, the first differing TU + 1, its component); errors: parse.slang's
+// Compares the GPU's parse of a picture with the CPU's, adds the counts to stats and prints the first differences.
+// gpuCus, gpuTus: the GPU's CU and TU records in raster order of the CTUs (gathered by parsecompact.slang); gpuCtus:
+// its CTU records; gpuCtuOut: parse.slang's ctuOut words; gpuTotals: the numbers of CUs and TUs (not used).
+// cpuCus, cpuTus: the CPU's records, CTU by CTU; cpuSaoAlf: the CPU's SAO and ALF parameters, 7 words per CTU
+// (captureSaoAlf's; empty when they were not captured). levels: the levels check's counts (the levels compared, the
+// levels that differ, the index + 1 of the first TU found to differ, a component of it that differs). errors: the
+// number of substreams that gave up or were left unparsed.
 void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint32_t* gpuTus, const uint32_t* gpuCtus, const uint32_t* gpuCtuOut,
                    const uint32_t* gpuTotals, const std::vector<std::vector<CuRecord>>& cpuCus, const std::vector<std::vector<TuRecord>>& cpuTus,
                    const std::vector<uint32_t>& cpuSaoAlf, const uint32_t* levels, uint32_t errors, ParseStats& stats );

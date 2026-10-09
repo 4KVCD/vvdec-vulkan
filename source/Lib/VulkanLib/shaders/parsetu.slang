@@ -1,14 +1,18 @@
-// parse.slang's transform units: CABACReader::cu_residual and what it calls -- the transform tree, the transform
-// units' coded block flags, QP deltas and chroma QP offsets, joint Cb-Cr, the residual coding (regular and transform
-// skip's) into the planes of levels, LFNST's and MTS's indices -- with the TUs' records (TuRecord).
+// The transform unit part of parse.slang, which includes this file: CABACReader::cu_residual and what it calls. That
+// is the transform tree and its TUs (the CU, or its tiles of the largest transform size, ISP's or SBT's parts), each
+// TU's coded block flags, delta QP, chroma QP offset and joint Cb-Cr mode, the residual coding (regular and transform
+// skip) of each coded block, and the CU's LFNST and MTS indices. The TUs' records (GpuFrontEnd.h's TuRecord) stay in
+// shared memory while their CU is parsed; the residual coding writes each coded block's levels into the planes of
+// levels (pc.levels0..2).
 
 // --------------------------------------------------------------------------------------------------------------------
-// the CU's TUs: their records' words in shared memory until the CU is done
+// The current CU's TUs: their records stay in shared memory until the CU is done; writeTuRecords then stores them
 // --------------------------------------------------------------------------------------------------------------------
 
-static const int kMaxCuTus = 16;
+static const int kMaxCuTus = 16;   // the most TUs a CU may have here (more give up the substream)
 groupshared uint s_tu[kMaxCuTus * 16];
 
+// Word w of the record of TU t (t: the TU's index in the current CU)
 uint tuWord( int t, int w )
 {
   return uni( s_tu[t * 16 + w] );
@@ -19,6 +23,7 @@ void setTuWord( int t, int w, uint v )
   s_tu[t * 16 + w] = v;
 }
 
+// The fields of a TU record (see GpuFrontEnd.h's TuRecord)
 bool tuLumaValid( int t )
 {
   return ( tuWord( t, 1 ) & 0x10000u ) != 0;
@@ -45,6 +50,8 @@ int tuJoint( int t )
   return int( ( tuWord( t, 4 ) >> 3 ) & 3u );
 }
 
+// The MTS index of component comp: luma's (3 bits), or a chroma component's transform skip flag, which is MTS_SKIP
+// or MTS_DCT2_DCT2
 int tuMts( int t, int comp )
 {
   const uint w = tuWord( t, 4 );
@@ -69,12 +76,13 @@ void setTuMts( int t, int comp, int v )
   setTuWord( t, 4, w );
 }
 
+// The channel type of the partitioner when TU t was added
 int tuChType( int t )
 {
   return int( ( tuWord( t, 4 ) >> 10 ) & 1u );
 }
 
-// a TU's block of a component: x, y, w, h in the component's samples
+// TU t's block of a component: x, y, w, h in the component's samples
 int4 tuBlock( int t, int comp )
 {
   const uint p = comp == 0 ? tuWord( t, 0 ) : tuWord( t, 2 );
@@ -82,6 +90,7 @@ int4 tuBlock( int t, int comp )
   return int4( int( p & 0xffffu ), int( p >> 16 ), int( s & 0xffu ), int( ( s >> 8 ) & 0xffu ) );
 }
 
+// Sets the component's maxScanPosX and maxScanPosY (record words 6 and 7, a byte per component)
 void setMaxScanPos( int t, int comp, int x, int y )
 {
   const uint shift = uint( comp ) * 8u;
@@ -89,7 +98,9 @@ void setMaxScanPos( int t, int comp, int x, int y )
   setTuWord( t, 7, ( tuWord( t, 7 ) & ~( 0xffu << shift ) ) | ( uint( y ) & 0xffu ) << shift );
 }
 
-// CodingStructure::addTU: luma's block (luma samples) and chroma's (chroma samples) when valid
+// Adds a TU to the current CU (CodingStructure::addTU) with its luma block (in luma samples) and its chroma block (in
+// chroma samples), each when valid. Returns the TU's index in the CU, or -1, giving up the substream, when the CTU's
+// slots or the CU's room are full.
 int addTu( int4 luma, bool lumaValid, int4 chroma, bool chromaValid )
 {
   if( g_numTus >= g_tuSlots || g_cu.numTus >= kMaxCuTus )
@@ -113,6 +124,7 @@ int addTu( int4 luma, bool lumaValid, int4 chroma, bool chromaValid )
   return t;
 }
 
+// Stores the CU's TU records in the CTU's TU slots, after those of the CTU's earlier CUs
 void writeTuRecords()
 {
   for( int t = 0; t < g_cu.numTus; t++ )
@@ -125,12 +137,14 @@ void writeTuRecords()
   }
 }
 
+// The chroma block, in chroma samples, of an area in luma samples
 int4 chromaOf( int4 a )
 {
   return int4( a.x >> g_csx, a.y >> g_csy, a.z >> g_csx, a.w >> g_csy );
 }
 
-// g_rsScanToZ: the max transform size's tiles in z-order
+// vvdec's g_rsScanToZ: the raster index of the i-th tile of the largest transform size, in decoding order. That order
+// is z-order when the CU is 4 tiles wide, raster order otherwise.
 int rsScanToZ( int numLog2H, int i )
 {
   if( numLog2H == 2 )
@@ -141,7 +155,8 @@ int rsScanToZ( int numLog2H, int i )
   return i;
 }
 
-// CodingStructure::addEmptyTUs
+// Adds the TUs of a CU without residuals, skipped or with rqt_root_cbf 0 (CodingStructure::addEmptyTUs): one TU for
+// the CU, or one per tile of the largest transform size
 void addEmptyTUs()
 {
   const int4 a  = currArea();
@@ -170,10 +185,10 @@ void addEmptyTUs()
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// cu_residual, the transform tree
+// cu_residual and the transform tree
 // --------------------------------------------------------------------------------------------------------------------
 
-// CU::checkAllowedSbt: a bit an SBT index
+// The SBT types the CU allows (CU::checkAllowedSbt), a bit per type: 1 << SBT_VER_HALF, ...
 int checkAllowedSbt()
 {
   if( !tool( kToolSbt ) || g_cu.predMode != MODE_INTER || ( g_cu.flags & kCiip ) != 0 )
@@ -193,7 +208,8 @@ int checkAllowedSbt()
   return allowed;
 }
 
-// CABACReader::sbt_mode
+// Parses cu_sbt_flag, cu_sbt_quad_flag, cu_sbt_horizontal_flag and cu_sbt_pos_flag (CABACReader::sbt_mode) into
+// sbtInfo: the SBT type in bits 0..3, the position in bits 4 and 5
 void sbtMode()
 {
   const int sbtAllowed = checkAllowedSbt();
@@ -231,7 +247,8 @@ void sbtMode()
   g_cu.sbtInfo  = ( pos << 4 ) + ( g_cu.sbtInfo & 0xcf );
 }
 
-// CU::getISPSplitDim
+// The size of each ISP part across the split, in luma samples (CU::getISPSplitDim): a quarter of the CU's side, but
+// at least enough for the part to hold 16 samples
 int ispSplitDim( int w, int h, bool horizontal )
 {
   const int splitDim    = horizontal ? h : w;
@@ -240,7 +257,8 @@ int ispSplitDim( int w, int h, bool horizontal )
   return ( splitDim >> 2 ) < factor ? factor : ( splitDim >> 2 );
 }
 
-// a part of the transform tree: its TU (getArea: one channel's blocks in separate trees) and transform_unit
+// A leaf of the transform tree: adds its TU, which in a separate tree has only the current channel type's blocks (as
+// vvdec's getArea gives them), and parses its transform_unit
 void transformLeaf( int4 luma, int4 chroma, bool chromaValid, int idx, int trDepth, inout CuCtx ctx )
 {
   bool tuLuma   = true;
@@ -263,9 +281,10 @@ void transformLeaf( int4 luma, int4 chroma, bool chromaValid, int idx, int trDep
   }
 }
 
-// CABACReader::transform_tree: the CU's area, or its parts -- the max transform size's tiles (getMaxTuTiling), ISP's
-// (getTUIntraSubPartitions: luma split, the chroma with the last part, none in the dual tree), SBT's (getSbtTuTiling)
-// -- each a TU (one call of transformLeaf)
+// Parses the CU's transform tree (CABACReader::transform_tree): one TU for the CU, or one for each of its parts -- the
+// tiles of the largest transform size (getMaxTuTiling), ISP's parts (getTUIntraSubPartitions: the luma is split, the
+// chroma goes with the last part, and in the dual tree there is none) or SBT's two parts (getSbtTuTiling). The loop
+// keeps transformLeaf to one call site, as every call is inlined.
 void transformTree( inout CuCtx ctx )
 {
   const int4 a     = currArea();
@@ -273,16 +292,16 @@ void transformTree( inout CuCtx ctx )
   const int4 c     = chromaOf( a );
   const bool isp   = g_cu.isp != 0 && g_p.chType == 0;
   const bool split = a.z > g_maxTbSize || a.w > g_maxTbSize || g_cu.sbtInfo != 0 || isp;
-  const int  kind  = !split ? 0 : ( isp ? 2 : ( g_cu.sbtInfo != 0 ? 3 : 1 ) );
-  // the tiles'
+  const int  kind  = !split ? 0 : ( isp ? 2 : ( g_cu.sbtInfo != 0 ? 3 : 1 ) );   // 0 the CU, 1 tiles, 2 ISP, 3 SBT
+  // The tiles of the largest transform size
   const int numTilesH = max( 1, a.z >> g_log2MaxTb );
   const int numTilesV = max( 1, a.w >> g_log2MaxTb );
   const int numLog2H  = log2i( numTilesH );
   const int numLog2V  = log2i( numTilesV );
-  // ISP's
+  // ISP's parts, dim luma samples across the split
   const bool horizontal = g_cu.isp == HOR_INTRA_SUBPARTITIONS;
   const int  dim        = isp ? ispSplitDim( a.z, a.w, horizontal ) : 1;
-  // SBT's
+  // SBT's type and position
   const int sbtIdx = g_cu.sbtInfo & 0xf;
   const int sbtPos = ( g_cu.sbtInfo >> 4 ) & 3;
   const int n      = kind == 0 ? 1 : ( kind == 1 ? numTilesH * numTilesV : ( kind == 2 ? ( horizontal ? a.w >> log2i( dim ) : a.z >> log2i( dim ) ) : 2 ) );
@@ -342,7 +361,8 @@ void transformTree( inout CuCtx ctx )
   }
 }
 
-// CABACReader::cu_residual
+// Parses the CU's residuals (CABACReader::cu_residual): an inter CU's rqt_root_cbf and SBT, ACT for inter and IBC
+// CUs, the transform tree, LFNST's and MTS's indices, and finally the CU's root CBF from its planes' CBFs
 void cuResidual( inout CuCtx ctx )
 {
   if( !cuIsIntra() )
@@ -399,7 +419,7 @@ void cuResidual( inout CuCtx ctx )
 // transform_unit
 // --------------------------------------------------------------------------------------------------------------------
 
-// TU::checkTuNoResidual
+// With SBT, whether part idx of the CU is the one without residual (TU::checkTuNoResidual)
 bool checkTuNoResidual( int idx )
 {
   if( ( g_cu.sbtInfo & 0xf ) == 0 )
@@ -410,7 +430,8 @@ bool checkTuNoResidual( int idx )
   return ( pos == 0 && idx == 1 ) || ( pos == 1 && idx == 0 );
 }
 
-// CABACReader::cbf_comp
+// Parses a TU's coded block flag of component comp (CABACReader::cbf_comp). prevCbf is Cb's flag when parsing Cr's,
+// and the previous ISP part's luma flag with useIsp; both choose the context.
 bool cbfComp( int comp, bool prevCbf, bool useIsp )
 {
   const int set = comp == 0 ? CTX_QtCbf_0 : ( comp == 1 ? CTX_QtCbf_1 : CTX_QtCbf_2 );
@@ -430,7 +451,8 @@ bool cbfComp( int comp, bool prevCbf, bool useIsp )
   return decodeBin( set + ctx ) != 0;
 }
 
-// CABACReader::cu_qp_delta
+// Parses cu_qp_delta_abs and cu_qp_delta_sign_flag (CABACReader::cu_qp_delta) and sets the CU's QP from the
+// predicted QP predQp, wrapped into the valid range
 void cuQpDelta( int predQp )
 {
   int qpY = predQp;
@@ -450,7 +472,8 @@ void cuQpDelta( int predQp )
   g_cu.qp = qpY;
 }
 
-// CABACReader::cu_chroma_qp_offset
+// Parses cu_chroma_qp_offset_flag and cu_chroma_qp_offset_idx (CABACReader::cu_chroma_qp_offset): 0 none, else the
+// entry of the PPS's chroma QP offset list plus one. CodingStructure::chromaQpAdj keeps it for the next CUs.
 void cuChromaQpOffset()
 {
   const int length = picWord( kPicCqpListLen );
@@ -463,7 +486,8 @@ void cuChromaQpOffset()
   g_csChromaQpAdj  = qpAdj;
 }
 
-// CABACReader::joint_cb_cr
+// Parses tu_joint_cbcr_residual_flag (CABACReader::joint_cb_cr); when it is set, TU t's joint Cb-Cr mode is its chroma
+// CBF mask (Cb's flag << 1 | Cr's)
 void jointCbCr( int t, int cbfMask )
 {
   if( !tool( kToolJointCbCr ) )
@@ -477,11 +501,15 @@ void jointCbCr( int t, int cbfMask )
   }
 }
 
-// CABACReader::transform_unit; areaCbValid: the partitioner's part has its chroma
+// Parses TU t (CABACReader::transform_unit): its coded block flags, then, when it has a coded block, the delta QP, the
+// chroma QP offset, the joint Cb-Cr mode and the residual coding of each coded block. idx is the TU's part in the
+// transform tree's split, trDepth its depth there (0 or 1); areaCbValid says whether the partitioner's part has a
+// chroma block.
 void transformUnit( int t, int idx, int trDepth, bool areaCbValid, inout CuCtx ctx )
 {
   const bool chromaCbfIsp = g_chromaFormat != 0 && areaCbValid && g_cu.isp != 0;
   const bool tuNoResidual = checkTuNoResidual( idx );
+  // The chroma CBFs
   bool       cbfCb = false, cbfCr = false;
   if( g_chromaFormat != 0 && areaCbValid && ( !cuIsSepTree() || g_p.chType == 1 ) && ( g_cu.isp == 0 || chromaCbfIsp ) )
   {
@@ -491,6 +519,9 @@ void transformUnit( int t, int idx, int trDepth, bool areaCbValid, inout CuCtx c
       cbfCr = cbfComp( 2, cbfCb, false );
     }
   }
+  // The luma CBF. It is inferred for an inter CU's unsplit TU without chroma residual (1), for SBT's part without
+  // residual (0) and its other part when that has no chroma residual (1), and for an ISP CU's last part when no part
+  // before it has one (1); otherwise it is parsed.
   const bool sigChroma = g_chromaFormat != 0 && ( cbfCb || cbfCr );
   if( g_p.chType == 0 )
   {
@@ -529,7 +560,7 @@ void transformUnit( int t, int idx, int trDepth, bool areaCbValid, inout CuCtx c
         }
         if( !lastCbfIsInferred )
         {
-          // TU::getPrevTUCbf
+          // the previous part's luma CBF (TU::getPrevTUCbf)
           const bool prevCbf = t > 0 && tuLumaValid( t - 1 ) && tuCbf( t - 1, 0 );
           cbfY               = cbfComp( 0, prevCbf, true );
         }
@@ -548,6 +579,8 @@ void transformUnit( int t, int idx, int trDepth, bool areaCbValid, inout CuCtx c
   }
   g_cu.planeCbf |= ( tuCbf( t, 0 ) ? 1 : 0 ) | ( tuCbf( t, 1 ) ? 2 : 0 ) | ( tuCbf( t, 2 ) ? 4 : 0 );
 
+  // A TU with a coded block (or of a CU larger than 64): the delta QP and the chroma QP offset, once per quantization
+  // group, the joint Cb-Cr mode, then the residual coding of each coded block
   const bool lumaOnly  = g_chromaFormat == 0 || !tuChromaValid( t );
   const bool cbfLuma   = tuCbf( t, 0 );
   const bool cbfChroma = lumaOnly ? false : ( cbfCb || cbfCr );
@@ -594,7 +627,8 @@ void transformUnit( int t, int idx, int trDepth, bool areaCbValid, inout CuCtx c
 // LFNST's and MTS's indices
 // --------------------------------------------------------------------------------------------------------------------
 
-// CABACReader::residual_lfnst_mode
+// Parses an intra CU's lfnst_idx (CABACReader::residual_lfnst_mode) when its size, its tools and what its residual
+// coding found allow LFNST
 void residualLfnstMode( inout CuCtx ctx )
 {
   if( !tool( kToolLfnst ) || !cuIsIntra() )
@@ -604,7 +638,7 @@ void residualLfnstMode( inout CuCtx ctx )
   const int chIdx = cuIsSepTree() && g_cu.chType == 1 ? 1 : 0;
   if( g_cu.isp != 0 )
   {
-    // CU::canUseLfnstWithISP
+    // ISP's parts must be at least 4x4 (CU::canUseLfnstWithISP)
     const bool horizontal = g_cu.isp == HOR_INTRA_SUBPARTITIONS;
     const int  tw         = horizontal ? g_cu.lw : ispSplitDim( g_cu.lw, g_cu.lh, false );
     const int  th         = horizontal ? ispSplitDim( g_cu.lw, g_cu.lh, true ) : g_cu.lh;
@@ -656,11 +690,12 @@ void residualLfnstMode( inout CuCtx ctx )
   g_cu.lfnst = idx;
 }
 
-// CABACReader::mts_idx
+// Parses mts_idx (CABACReader::mts_idx) into the luma MTS index of the CU's first TU, when MTS is allowed and the
+// residual coding found the coefficients it needs
 void mtsIdx( inout CuCtx ctx )
 {
   int mts = tuMts( 0, 0 );
-  // CU::isMTSAllowed
+  // whether the CU allows MTS (CU::isMTSAllowed)
   const int tsMax   = 1 << g_log2MaxTs;
   bool      allowed = g_cu.chType == 0;
   allowed = allowed && ( cuIsIntra() ? tool( kToolMtsIntra ) : ( tool( kToolMtsInter ) && cuIsInter() ) );
@@ -689,51 +724,65 @@ void mtsIdx( inout CuCtx ctx )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// the residual coding (CoeffCodingContext, residual_coding, residual_codingTS)
+// The residual coding (CoeffCodingContext, residual_coding, residual_codingTS)
 // --------------------------------------------------------------------------------------------------------------------
 
 
-groupshared int  s_coef[4096];   // the block's levels: absolute (the regular coding) or signed (transform skip's)
-groupshared uint s_tpl[1024];    // CtxTpl, a byte a position: the sum of absolute levels | the positions << 5
-groupshared uint s_out[1024];    // the block's levels to write: position | level << 16
-groupshared uint s_final[2048];  // the block's levels as written, 2 a word (int16)
-// (s_coef, s_tpl and s_final zero between blocks: cleared where a block left them, after it)
-groupshared int  s_sigPos[16];   // the subblock's significant positions, in decoding order
-groupshared int  s_gt1Pos[16];
+// The coded block being parsed. Positions in it are raster positions with the block's width as the row stride.
+groupshared int  s_coef[4096];   // its levels: absolute (regular coding) or signed (transform skip)
+// CtxTpl, a byte per position: the sum of the absolute first-pass levels in the position's template | the number of
+// nonzero ones << 5
+groupshared uint s_tpl[1024];
+groupshared uint s_out[1024];    // its levels to write, in decoding order: position | level << 16
+groupshared uint s_final[2048];  // its levels at their positions, as int16, 2 per word, for writeLevels
+// (s_coef, s_tpl and s_final are zero whenever a block starts: after each block, writeLevels clears what it set)
+groupshared int  s_sigPos[16];   // the current group's nonzero positions, in decoding order
+groupshared int  s_gt1Pos[16];   // the current group's positions with a level greater than 1, in decoding order
 
-static int g_outCount;
+static int g_outCount;   // the levels in s_out
 
+// vvdec's CoeffCodingContext: the coded block's sizes and scans, its context sets, and the current coefficient group
 struct Cctx
 {
   int  comp, chType, width, height, log2W, log2H;
+  // The coefficient groups: their log2 size, and their number across and down the zero-out area (32 x 32 at most)
   int  log2CGW, log2CGH, log2CGSize, widthInGroups, heightInGroups;
   int  maxNumCoeff, maxLog2TrRange;
   bool signHiding;
-  int  innerOff, cgOff, subBase;   // the groups' scan in s_scanTab, the group's, the current group's first position
+  // Where the scan inside a group (innerOff) and the scan of the groups (cgOff) start in s_scanTab, and the block
+  // position of the current group's top-left coefficient (subBase)
+  int  innerOff, cgOff, subBase;
+  // last_sig_coeff's contexts and limits
   int  ctxLastX, ctxLastY, maxLastPosX, maxLastPosY, lastOffsetX, lastOffsetY, lastShiftX, lastShiftY;
   int  scanPosLast;
+  // The current group: its index in the groups' scan, its raster index among the groups and its column and row in
+  // groups, its first and last scan positions
   int  subSetId, subSetPos, subSetPosX, subSetPosY, minSubPos, maxSubPos;
-  int  sigGroupCtxId, sigGroupCtxIdTS;
-  int  tmplCpSum1, tmplCpDiag;
+  int  sigGroupCtxId, sigGroupCtxIdTS;   // the contexts of the group's coded_sub_block_flag: regular, transform skip
+  int  tmplCpSum1, tmplCpDiag;           // what sigCtxIdAbs found in the template, for ctxOffsetAbs
+  // The first contexts of the significance flags' sets (one per dependent quantization state set), of the parity
+  // flags, and of the greater-than flags (vvdec's m_gtxFlagCtxSet[0], used for the greater-than-3 flag, and [1], used
+  // for the greater-than-1 flag)
   int  sigFlagCtx0, sigFlagCtx1, sigFlagCtx2, parFlagCtx, gtx0Ctx, gtx1Ctx;
-  uint sigGroups0, sigGroups1;   // m_sigCoeffGroupFlag
+  uint sigGroups0, sigGroups1;   // m_sigCoeffGroupFlag: the coded_sub_block_flags of the 64 groups, a bit each
   bool bdpcm;
-  int  regBinLimit;
-  bool ts;
-  int  numCtxBins;
+  int  regBinLimit;              // the context-coded bins the regular coding may still use in the block
+  bool ts;                       // transform skip
+  int  numCtxBins;               // the context-coded bins the transform skip coding may still use
 };
 
 static Cctx g_cc;
 
 
-// the position in the block of a scan position of the current group (vvdec's g_scanOrder[SCAN_GROUPED_4x4]: the
-// groups in their diagonal scan, each group's positions in its own)
+// The block position of scan position scanPos, which lies in the current group. vvdec's g_scanOrder[SCAN_GROUPED_4x4]
+// scans the groups diagonally and, within each group, its positions diagonally; this reads both scans from s_scanTab.
 int blockPos( int scanPos )
 {
   const int inner = int( uni( s_scanTab[g_cc.innerOff + ( scanPos & ( ( 1 << g_cc.log2CGSize ) - 1 ) )] ) & 0xffffu );
   return g_cc.subBase + ( inner >> g_cc.log2CGW ) * g_cc.width + ( inner & ( ( 1 << g_cc.log2CGW ) - 1 ) );
 }
 
+// The template byte of position pos (CtxTpl)
 uint tplGet( int pos )
 {
   return ( uni( s_tpl[pos >> 2] ) >> uint( ( pos & 3 ) * 8 ) ) & 0xffu;
@@ -744,11 +793,13 @@ void tplAdd( int pos, uint v )
   s_tpl[pos >> 2] += v << uint( ( pos & 3 ) * 8 );
 }
 
+// The coded_sub_block_flag of the group at raster index pos among the groups
 bool sigGroup( int pos )
 {
   return ( ( pos < 32 ? g_cc.sigGroups0 >> uint( pos ) : g_cc.sigGroups1 >> uint( pos - 32 ) ) & 1u ) != 0;
 }
 
+// Sets the current group's coded_sub_block_flag (CoeffCodingContext::setSigGroup)
 void setSigGroup()
 {
   const int pos = g_cc.subSetPos;
@@ -762,7 +813,8 @@ void setSigGroup()
   }
 }
 
-// TU::getTbAreaAfterCoefZeroOut
+// The block's area left after the zero-out (TU::getTbAreaAfterCoefZeroOut): 32 x 32 at most, and sides of 32 count
+// as 16 for luma with an MTS kernel, or with SBT when the SPS enables MTS
 int tbAreaAfterCoefZeroOut( int t, int comp, int w, int h )
 {
   if( comp == 0 && ( tuMts( t, comp ) > MTS_SKIP || ( tool( kToolMts ) && g_cu.sbtInfo != 0 && w <= 32 && h <= 32 ) ) )
@@ -773,7 +825,9 @@ int tbAreaAfterCoefZeroOut( int t, int comp, int w, int h )
   return min( 32, w ) * min( 32, h );
 }
 
-// CoeffCodingContext's constructor, with residual_coding's clearing of the block's levels and templates
+// Sets g_cc up for TU t's block of component comp, as CoeffCodingContext's constructor does, and empties s_out.
+// (vvdec's residual_coding and the constructor also clear the block's levels and templates; here s_coef and s_tpl are
+// already zero, as writeLevels clears them after each block.)
 void initCctx( int t, int comp, bool signHide )
 {
   const int4 b      = tuBlock( t, comp );
@@ -830,6 +884,7 @@ void initCctx( int t, int comp, bool signHide )
   g_outCount        = 0;
 }
 
+// Zeroes s_coef, s_tpl and s_final when the workgroup starts; writeLevels keeps them zero between blocks from then on
 void clearResidualMemory()
 {
   for( int i = g_lane; i < 4096; i += 32 )
@@ -847,7 +902,8 @@ void clearResidualMemory()
   GroupMemoryBarrierWithGroupSync();
 }
 
-// CoeffCodingContext::initSubblock
+// Makes group subSetId (its index in the groups' scan) the current group and works out the contexts of its
+// coded_sub_block_flag from the flags of the groups next to it (CoeffCodingContext::initSubblock)
 void initSubblock( int subSetId )
 {
   g_cc.subSetId   = subSetId;
@@ -870,6 +926,8 @@ void initSubblock( int subSetId )
   }
 }
 
+// The context of sig_coeff_flag at blkPos, from its template and the dependent quantization state
+// (CoeffCodingContext::sigCtxIdAbs); keeps the template's values for ctxOffsetAbs
 int sigCtxIdAbs( int blkPos, int state )
 {
   const int posY   = blkPos >> g_cc.log2W;
@@ -889,6 +947,8 @@ int sigCtxIdAbs( int blkPos, int state )
   return ( set == 0 ? g_cc.sigFlagCtx0 : ( set == 1 ? g_cc.sigFlagCtx1 : g_cc.sigFlagCtx2 ) ) + ctxOfs;
 }
 
+// Records the level the first pass decoded at blkPos, and adds it to the templates that contain blkPos: those of the
+// positions one and two to its left, one and two above it, and above-left of it (CoeffCodingContext::absVal1stPass)
 void absVal1stPass( int blkPos, int absLevel1 )
 {
   s_coef[blkPos] = absLevel1;
@@ -917,6 +977,8 @@ void absVal1stPass( int blkPos, int absLevel1 )
   }
 }
 
+// The context offset of the greater-than and parity flags at the position sigCtxIdAbs last looked at
+// (CoeffCodingContext::ctxOffsetAbs)
 int ctxOffsetAbs()
 {
   int offset = 0;
@@ -929,6 +991,9 @@ int ctxOffsetAbs()
   return offset;
 }
 
+// The sum of the levels in blkPos's template (the positions one and two to its right, one and two below it, and
+// below-right of it), less 5 * baseLevel, clipped to 0..31 (CoeffCodingContext::templateAbsSum); it picks the Rice
+// parameter
 int templateAbsSum( int blkPos, int baseLevel )
 {
   const int posY = blkPos >> g_cc.log2W;
@@ -964,13 +1029,15 @@ int templateAbsSum( int blkPos, int baseLevel )
   return max( min( sum - 5 * baseLevel, 31 ), 0 );
 }
 
-// CABACReader::last_sig_coeff
+// Parses the last significant position (CABACReader::last_sig_coeff: its x and y prefixes, then their suffixes) and
+// returns its scan position
 int lastSigCoeff( int comp )
 {
   int posLastX    = 0;
   int posLastY    = 0;
   int maxLastPosX = g_cc.maxLastPosX;
   int maxLastPosY = g_cc.maxLastPosY;
+  // (with SBT and MTS on, a luma side of 32 keeps only its first 16 positions)
   if( comp == 0 && tool( kToolMts ) && g_cu.sbtInfo != 0 && g_cc.width <= 32 && g_cc.height <= 32 )
   {
     maxLastPosX = g_cc.width == 32 ? kGroupIdx[15] : maxLastPosX;
@@ -1010,14 +1077,18 @@ int lastSigCoeff( int comp )
     }
     posLastY = kMinInGroup[posLastY] + int( temp );
   }
-  // the inverse scan: the group's index in the groups' scan, the position's in the group's
+  // The scan position from the inverse scans: the scan index of the position's group among the groups, times the
+  // group size, plus the scan index of the position within its group
   const int cgRaster    = ( posLastY >> g_cc.log2CGH ) * g_cc.widthInGroups + ( posLastX >> g_cc.log2CGW );
   const int innerRaster = ( posLastY & ( ( 1 << g_cc.log2CGH ) - 1 ) ) * ( 1 << g_cc.log2CGW ) + ( posLastX & ( ( 1 << g_cc.log2CGW ) - 1 ) );
   const int scanPos     = int( uni( s_scanTab[g_cc.cgOff + cgRaster] ) >> 16 ) << g_cc.log2CGSize | int( uni( s_scanTab[g_cc.innerOff + innerRaster] ) >> 16 );
   return min( scanPos, g_cc.maxNumCoeff - 1 );
 }
 
-// CABACReader::residual_coding_subblock: the subblock's levels appended to s_out
+// Parses the current coefficient group of a regular (not transform skip) block and appends its nonzero levels to
+// s_out (CABACReader::residual_coding_subblock). state is dependent quantization's state, carried from group to
+// group; stateTransTab is its transition table (0 without dependent quantization). Returns the number of nonzero
+// levels.
 int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
 {
   const int  minSubPos   = g_cc.minSubPos;
@@ -1035,6 +1106,8 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
   }
   setSigGroup();
 
+  // First pass, while the budget of context-coded bins lasts: sig_coeff_flag, abs_level_gtx_flag[0] (greater than 1),
+  // par_level_flag and abs_level_gtx_flag[1] (greater than 3)
   const int inferSigPos = nextSigPos != g_cc.scanPosLast ? ( g_cc.subSetId != 0 ? minSubPos : -1 ) : nextSigPos;
   int       firstNZPos  = nextSigPos;
   int       lastNZPos   = -1;
@@ -1089,7 +1162,7 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
   }
   g_cc.regBinLimit = remRegBins;
 
-  // the Rice codes of the levels past 3
+  // Second pass: abs_remainder, a Rice code, of the levels the first pass found greater than 3
   for( int k = 0; k < numGt1; k++, gt2Mask >>= 1 )
   {
     if( ( gt2Mask & 1u ) != 0 )
@@ -1101,7 +1174,7 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
       s_coef[pos] += rem << 1;
     }
   }
-  // the levels coded in bypass
+  // The positions the first pass did not reach: their whole levels in bypass bins (dec_abs_level)
   for( ; nextSigPos >= minSubPos; nextSigPos-- )
   {
     const int sub1   = ( state >> 1 ) & 1;
@@ -1122,7 +1195,8 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
       lastNZPos  = max( lastNZPos, nextSigPos );
     }
   }
-  // the signs (the last one hidden: the levels' parity)
+  // The signs. With sign data hiding, when the group's first and last nonzero positions are at least SBH_THRESHOLD
+  // apart, the last level's sign is not coded: the parity of the sum of the absolute levels gives it.
   const bool hide     = g_cc.signHiding && lastNZPos - firstNZPos >= SBH_THRESHOLD;
   const int  numSigns = hide ? numNonZero - 1 : numNonZero;
   uint       signs    = decodeBinsEP( numSigns );
@@ -1135,7 +1209,9 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
     }
     signs = ( signs << 1 ) + uint( sumAbs & 1 );
   }
-  // the levels (dependent quantization's: 2 q - parity), the first decoded the highest bit
+  // The signed levels into s_out. With dependent quantization a level q is stored as 2 * |q|, minus 1 when the
+  // quantizer's state at its position was 2 or 3 (the bits of stateVal), as vvdec stores it. The first level decoded
+  // has the highest bit in signs and stateVal.
   for( int j = 0; j < numNonZero; j++ )
   {
     const int  pos = uni( s_sigPos[j] );
@@ -1149,12 +1225,15 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
   return numNonZero;
 }
 
-// TS's contexts
+// Transform skip's contexts and level mapping look at the levels left of and above a position, which vvdec names the
+// right and below ones (rightPixel, belowPixel). coefAt is the level dx positions to the left and dy rows above.
 int coefAt( int blkPos, int dx, int dy )
 {
   return uni( s_coef[blkPos - dx - dy * g_cc.width] );
 }
 
+// The context of transform skip's sig_coeff_flag: how many of the two neighbours are nonzero
+// (CoeffCodingContext::sigCtxIdAbsTS)
 int sigCtxIdAbsTS( int blkPos )
 {
   const int posY = blkPos >> g_cc.log2W;
@@ -1171,6 +1250,7 @@ int sigCtxIdAbsTS( int blkPos )
   return CTX_TsSigFlag + numPos;
 }
 
+// The context of transform skip's coeff_sign_flag, from the neighbours' signs (CoeffCodingContext::signCtxIdAbsTS)
 int signCtxIdAbsTS( int blkPos, bool bdpcm )
 {
   const int posY      = blkPos >> g_cc.log2W;
@@ -1197,6 +1277,7 @@ int signCtxIdAbsTS( int blkPos, bool bdpcm )
   return CTX_TsResidualSign + signCtx;
 }
 
+// The context of transform skip's greater-than-1 flag (CoeffCodingContext::lrg1CtxIdAbsTS)
 int lrg1CtxIdAbsTS( int blkPos, bool bdpcm )
 {
   const int posY   = blkPos >> g_cc.log2W;
@@ -1220,7 +1301,9 @@ int lrg1CtxIdAbsTS( int blkPos, bool bdpcm )
   return CTX_TsLrg1Flag + numPos;
 }
 
-// CoeffCodingContext::decDeriveModCoeff
+// Transform skip's level mapping (CoeffCodingContext::decDeriveModCoeff). With pred1 the larger of the two
+// neighbours' absolute levels, a coded absolute level of 1 stands for pred1, the coded levels 2 to pred1 for one less,
+// and the others for themselves.
 int decDeriveModCoeff( int rightPixel, int belowPixel, int absCoeff )
 {
   if( absCoeff == 0 )
@@ -1235,10 +1318,12 @@ int decDeriveModCoeff( int rightPixel, int belowPixel, int absCoeff )
   return absCoeff - ( absCoeff <= pred1 ? 1 : 0 );
 }
 
-// CABACReader::residual_coding_subblockTS
+// Parses the current coefficient group of a transform skip block, in forward scan order, and appends its nonzero
+// levels to s_out (CABACReader::residual_coding_subblockTS); maxX and maxY grow to the largest x and y of a nonzero
+// level
 void residualCodingSubblockTS( inout int maxX, inout int maxY )
 {
-  const int lastPos     = g_cc.maxSubPos;   // vvdec's minSubPos
+  const int lastPos     = g_cc.maxSubPos;   // (vvdec's code names this minSubPos)
   const int firstSigPos = g_cc.minSubPos;
   int       nextSigPos  = firstSigPos;
   uint      signPattern = 0;
@@ -1254,6 +1339,8 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
   }
   setSigGroup();
 
+  // First pass, while the budget of context-coded bins lasts: sig_coeff_flag, coeff_sign_flag, abs_level_gtx_flag[0]
+  // and par_level_flag
   const int inferSigPos     = lastPos;
   int       numNonZero      = 0;
   int       lastScanPosPass1 = -1;
@@ -1286,7 +1373,7 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
     }
     lastScanPosPass1 = nextSigPos;
   }
-  // the greater-than flags
+  // Second pass, while the budget lasts: the greater-than flags abs_level_gtx_flag[1..4]
   for( int scanPos = firstSigPos; scanPos <= lastPos && g_cc.numCtxBins >= 4; scanPos++ )
   {
     const int pos    = blockPos( scanPos );
@@ -1309,7 +1396,9 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
     s_coef[pos]      = tcoeff;
     lastScanPosPass2 = scanPos;
   }
-  // the Rice codes
+  // Third pass: abs_remainder (Rice parameter 1); the positions the first pass did not reach get their whole level
+  // and their sign in bypass bins. Then the level mapping (decDeriveModCoeff), without BDPCM, of the positions the
+  // first pass reached.
   for( int scanPos = firstSigPos; scanPos <= lastPos; scanPos++ )
   {
     const int pos       = blockPos( scanPos );
@@ -1344,7 +1433,7 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
     }
     s_coef[pos] = tcoeff;
   }
-  // the levels
+  // The signed levels: into s_coef (the contexts of the later groups read them) and s_out, and the largest x and y
   for( int k = 0; k < numNonZero; k++ )
   {
     const int pos      = uni( s_sigPos[k] );
@@ -1359,8 +1448,10 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
   }
 }
 
-// the block's levels (s_out) to the planes of levels, over [0, w) x [0, h) of the block (the rest of it zero); then
-// the shared memory the block used cleared
+// Writes the block's levels (s_out) into the plane of levels of component comp, over the rectangle [0, w) x [0, h) of
+// block b, zeros included (w is at most 32). Every level outside the rectangle is zero and is not written: the
+// transforms read no further than the rectangle. Then clears the shared memory that the block used. (writeLevelsBody
+// does the work; this wrapper times it for PROFILE.)
 void writeLevels( int comp, int4 b, int w, int h )
 {
   PROF_BEGIN( levelsStart );
@@ -1376,9 +1467,9 @@ void writeLevelsBody( int comp, int4 b, int w, int h )
   const bool inside = b.x + w <= pw && b.y + h <= ph;
   if( !inside )
   {
-    g_error = true;   // (a block off the planes)
+    g_error = true;   // (a block off the planes: give up the substream)
   }
-  // the levels into s_final at their positions (the threads write the same)
+  // Put the levels into s_final at their positions (every thread makes the same writes)
   for( int i = 0; i < g_outCount; i++ )
   {
     const uint e   = s_out[i];
@@ -1387,6 +1478,7 @@ void writeLevelsBody( int comp, int4 b, int w, int h )
     s_final[pos >> 1] = ( s_final[pos >> 1] & ~( 0xffffu << sh ) ) | ( ( e >> 16 ) << sh );
   }
   GroupMemoryBarrierWithGroupSync();
+  // Each thread writes one column of the rectangle (its lane's)
   if( inside )
   {
     for( int u = g_lane; u < h << 5; u += 32 )
@@ -1415,7 +1507,8 @@ void writeLevelsBody( int comp, int4 b, int w, int h )
     }
   }
   GroupMemoryBarrierWithGroupSync();
-  // cleared where the block left values: its levels, their templates' neighbours
+  // Clear what the block set: s_final and s_coef at its levels' positions, and the s_tpl words of the templates its
+  // levels were added to (absVal1stPass)
   const int wb = g_cc.width;
   for( int i = 0; i < g_outCount; i++ )
   {
@@ -1449,7 +1542,8 @@ void writeLevelsBody( int comp, int4 b, int w, int h )
   GroupMemoryBarrierWithGroupSync();
 }
 
-// CABACReader::ts_flag, TU::isTSAllowed
+// Parses transform_skip_flag of TU t's component comp, when TU::isTSAllowed allows it (CABACReader::ts_flag), and
+// stores it as the component's MTS index; BDPCM implies transform skip
 void tsFlag( int t, int comp )
 {
   int        ts      = ( ( g_cu.bdpcmL != 0 && comp == 0 ) || ( g_cu.bdpcmC != 0 && comp != 0 ) ) ? 1 : ( tuMts( t, comp ) == MTS_SKIP ? 1 : 0 );
@@ -1468,7 +1562,8 @@ void tsFlag( int t, int comp )
   setTuMts( t, comp, ts != 0 ? MTS_SKIP : MTS_DCT2_DCT2 );
 }
 
-// CABACReader::residual_codingTS
+// The transform skip residual coding of TU t's block of comp (CABACReader::residual_codingTS): its groups in forward
+// order; then the levels over the whole block, and maxScanPosX / maxScanPosY (the whole block with BDPCM)
 void residualCodingTS( int t, int comp )
 {
   initCctx( t, comp, false );
@@ -1492,7 +1587,7 @@ void residualCodingTS( int t, int comp )
   writeLevels( comp, b, b.z, b.w );
 }
 
-// CABACReader::residual_coding (timed)
+// CABACReader::residual_coding of TU t's block of comp; this wrapper times residualCodingBody for PROFILE
 void residualCoding( int t, int comp, inout CuCtx ctx )
 {
   PROF_BEGIN( resStart );
@@ -1502,11 +1597,14 @@ void residualCoding( int t, int comp, inout CuCtx ctx )
   PROF_COUNT( kProfLevelsN, g_outCount );
 }
 
+// Parses transform_skip_flag, then the block's residual coding: transform skip's, or the regular one -- the last
+// position, what it means for LFNST and MTS, the groups from the last one back to the first, and the levels over the
+// rectangle of the groups that have any (the whole block with BDPCM)
 void residualCodingBody( int t, int comp, inout CuCtx ctx )
 {
   if( comp == 2 && tuJoint( t ) == 3 )
   {
-    return;
+    return;   // (joint Cb-Cr mode 3 codes only Cb's residual)
   }
   tsFlag( t, comp );
   if( tuMts( t, comp ) == MTS_SKIP && !sliceFlag( kSlTsResOff ) )
@@ -1516,6 +1614,7 @@ void residualCodingBody( int t, int comp, inout CuCtx ctx )
   }
   initCctx( t, comp, sliceFlag( kSlSignHiding ) );
   g_cc.scanPosLast = lastSigCoeff( comp );
+  // What the last position means for LFNST's and MTS's indices, which are parsed after the CU's residuals
   const bool notTs = tuMts( t, comp ) != MTS_SKIP;
   if( notTs && g_cc.height >= 4 && g_cc.width >= 4 )
   {
@@ -1541,6 +1640,8 @@ void residualCodingBody( int t, int comp, inout CuCtx ctx )
     ctx.mtsLastScanPos = true;
   }
 
+  // The groups, from the last position's back to the first, with dependent quantization's state running through them
+  // (32040 packs its state transitions, 2 bits per state and parity, as in vvdec's residual_coding)
   const int  stateTransTab  = sliceFlag( kSlDepQuant ) ? 32040 : 0;
   const bool depQuant       = sliceFlag( kSlDepQuant ) && notTs;
   int        state          = 0;
@@ -1552,6 +1653,7 @@ void residualCodingBody( int t, int comp, inout CuCtx ctx )
     initSubblock( subSetId );
     if( skipBlkPreCond )
     {
+      // (with SBT and MTS on, a luma side of 32 codes only the groups of its first 16 positions)
       if( ( g_cc.height == 32 && g_cc.subSetPosY >= ( 16 >> g_cc.log2CGH ) ) || ( g_cc.width == 32 && g_cc.subSetPosX >= ( 16 >> g_cc.log2CGW ) ) )
       {
         continue;
@@ -1568,6 +1670,8 @@ void residualCodingBody( int t, int comp, inout CuCtx ctx )
       ctx.violatesMtsCoeffConstraint = true;
     }
   }
+  // The levels over the rectangle of the groups that have any (the whole block with BDPCM), and maxScanPosX /
+  // maxScanPosY, which vvdec sets to that rectangle's last column and row (0 when only the first position is coded)
   if( g_cc.bdpcm )
   {
     maxX = g_cc.width;
