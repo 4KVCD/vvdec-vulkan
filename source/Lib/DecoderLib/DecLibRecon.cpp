@@ -456,6 +456,10 @@ void DecLibRecon::swapBufs( CodingStructure& cs )
 void DecLibRecon::decompressPicture( Picture* pcPic )
 {
   m_currDecompPic = pcPic;
+#if VVDEC_VULKAN
+  m_currDecompReleasable = false;
+#endif
+  FinishPicTaskParam& finishParam = taskFinishPic[m_taskFinishPic ^= 1];
 
   CodingStructure& cs = *pcPic->cs;
 
@@ -796,11 +800,14 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 #if VVDEC_VULKAN
   if( m_gpuFilters )
   {
-    // with the GPU, two tasks. The first queues the picture's work on the GPU,
-    // and when DMVR refines motion there, waits for that part of the work,
+    // with the GPU, three tasks. The first queues the picture's work on the
+    // GPU, and when DMVR refines motion there, waits for that part of the work,
     // which stores the refined motion for TMVP; then (gpuRefReady) the pictures
     // whose inter prediction the GPU makes can reference this one, their work
-    // queued after its. The second waits for the rest, the download included.
+    // queued after its. The second waits for the rest of the work on the
+    // compute queue: then (gpuComputeDone) the instance may take the next
+    // picture while this one downloads (releasePrevDecompressedPic: VideoQ
+    // 1080p +1.4%). The third waits for the download.
     static auto queueGpuTask = []( int tid, void* task_param )
     {
       FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
@@ -817,15 +824,21 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       // with DMVR, the GPU stores the refined motion for TMVP in the next
       // pictures in the first part (the CTU tasks stored the rest)
       const bool refine = dec->m_gpuInter && cs.picture->stillReferenced;
-      dec->m_gpuRecon->startPicture( cs, jobs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr,
-                                     cs.picture->m_bufs[PIC_RECONSTRUCTION], refine );
+      param->download   = dec->m_gpuRecon->startPicture( cs, jobs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr,
+                                                         dec->m_doALF ? &dec->m_cALF : nullptr, cs.picture->m_bufs[PIC_RECONSTRUCTION], refine );
       cs.picture->gpuCurrent = true;   // for the work queued after this
+      return true;
+    };
+    static auto computeDoneTask = []( int tid, void* task_param )
+    {
+      FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
+      param->decLib->m_gpuRecon->endCompute();
       return true;
     };
     static auto finishGpuTask = []( int tid, void* task_param )
     {
       FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( task_param );
-      param->decLib->m_gpuRecon->endPicture();
+      param->decLib->m_gpuRecon->endDownload( param->download );
       param->pic->cs->deallocTempInternals();
 
 #ifdef TRACE_ENABLE_ITT
@@ -848,12 +861,12 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       return true;
     };
 
-    taskFinishPic = FinishPicTaskParam( this, pcPic );
+    finishParam = FinishPicTaskParam( this, pcPic );
     m_gpuFiltersPrepared.clearException();
     m_gpuFiltersPrepared.lock();
     m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " filterParamsTask" )
                                         filterParamsTask,
-                                        &taskFinishPic,
+                                        &finishParam,
                                         &pcPic->m_divTasksCounter,
                                         &m_gpuFiltersPrepared,
                                         { &pcPic->parseDone } );
@@ -888,7 +901,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       m_gpuBandQueued.lock();
       m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " bandTask" )
                                           bandTask,
-                                          &taskFinishPic,
+                                          &finishParam,
                                           &pcPic->m_divTasksCounter,
                                           &m_gpuBandQueued,
                                           {},
@@ -898,18 +911,27 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     pcPic->gpuRefReady.lock();
     m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " queueGpuTask" )
                                         queueGpuTask,
-                                        &taskFinishPic,
+                                        &finishParam,
                                         &pcPic->m_divTasksCounter,
                                         &pcPic->gpuRefReady,
                                         std::move( queueBarriers ) );
+    pcPic->gpuComputeDone.clearException();
+    pcPic->gpuComputeDone.lock();
+    m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " computeDoneTask" )
+                                        computeDoneTask,
+                                        &finishParam,
+                                        &pcPic->m_divTasksCounter,
+                                        &pcPic->gpuComputeDone,
+                                        { &pcPic->gpuRefReady } );
     m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " finishPicTask" )
                                         finishGpuTask,
-                                        &taskFinishPic,
+                                        &finishParam,
                                         &pcPic->m_divTasksCounter,
                                         &pcPic->reconDone,
-                                        { &pcPic->gpuRefReady } );
+                                        { &pcPic->gpuComputeDone } );
     // from now on, the next pictures may reference this one early
-    pcPic->gpuEarlyRef = true;
+    pcPic->gpuEarlyRef     = true;
+    m_currDecompReleasable = true;
   }
   else
 #endif
@@ -936,10 +958,10 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       return true;
     };
 
-    taskFinishPic = FinishPicTaskParam( this, pcPic );
+    finishParam = FinishPicTaskParam( this, pcPic );
     m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pcPic->poc ) + " finishPicTask" )
                                         finishReconTask,
-                                        &taskFinishPic,
+                                        &finishParam,
                                         &pcPic->m_divTasksCounter,
                                         &pcPic->reconDone,
                                         { pcPic->m_ctuTaskCounter.donePtr() } );
@@ -991,6 +1013,56 @@ Picture* DecLibRecon::waitForPrevDecompressedPic()
   ITT_TASKEND( itt_domain_dec, itt_handle_waitTasks );
 
   return std::exchange( m_currDecompPic, nullptr );
+}
+
+Picture* DecLibRecon::releasePrevDecompressedPic()
+{
+#if VVDEC_VULKAN
+  // the picture's work on the GPU done but for its download: the instance is
+  // free (what the next picture's work takes from it, the picture's work
+  // there no longer needs, the download's commands aside: GpuRecon)
+  if( m_currDecompPic && m_currDecompReleasable && m_decodeThreadPool->numThreads() > 0 )
+  {
+    bool released = false;
+    try
+    {
+      const Slice*   lastSlice           = m_currDecompPic->slices.back();
+      const unsigned lastSliceLastCtuIdx = lastSlice->getCtuAddrInSlice( lastSlice->getNumCtuInSlice() - 1 );
+      CHECK( lastSliceLastCtuIdx != m_currDecompPic->cs->pcv->sizeInCtus - 1, "Picture incomplete. A slice was probably lost." );
+
+      m_currDecompPic->gpuComputeDone.wait();
+      released = !m_currDecompPic->error;
+    }
+    catch( ... )
+    {
+      // as waitForPrevDecompressedPic handles it
+    }
+    if( released )
+    {
+      return std::exchange( m_currDecompPic, nullptr );
+    }
+  }
+#endif
+  return waitForPrevDecompressedPic();
+}
+
+void DecLibRecon::waitForReleasedPic( Picture* pic )
+{
+  try
+  {
+    pic->reconDone.wait();
+  }
+  catch( ... )
+  {
+    pic->error = true;
+    pic->reconDone.setException( std::current_exception() );
+  }
+  if( pic->error || pic->reconDone.hasException() )
+  {
+    // its tasks cleared from the thread pool (not those of the instance's next
+    // picture: cleanupOnException's)
+    pic->waitForAllTasks();
+  }
 }
 
 void DecLibRecon::cleanupOnException()

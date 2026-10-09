@@ -133,6 +133,7 @@ void Picture::resetForUse( int _layerId )
   gpuEarlyRef             = false;
   gpuRefReady.clearException();
   gpuRefReady.lock();
+  gpuComputeDone.clearException();
 #endif
   isReferencePic          = false;
   progress                = Picture::init;

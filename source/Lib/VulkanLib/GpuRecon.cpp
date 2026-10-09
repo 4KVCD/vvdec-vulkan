@@ -211,11 +211,15 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
     transferCmdInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     transferCmdInfo.commandBufferCount = 1;
     VkSemaphoreCreateInfo semaphoreInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    if( vk.vkCreateCommandPool( m_ctx->device(), &transferPoolInfo, nullptr, &m_transferPool ) != VK_SUCCESS
-        || ( transferCmdInfo.commandPool = m_transferPool, vk.vkAllocateCommandBuffers( m_ctx->device(), &transferCmdInfo, &m_transferCmd ) ) != VK_SUCCESS
-        || vk.vkCreateSemaphore( m_ctx->device(), &semaphoreInfo, nullptr, &m_semaphore ) != VK_SUCCESS )
+    for( Download& download: m_downloads )
     {
-      THROW_FATAL( "Vulkan: making the copy engine's commands failed" );
+      if( vk.vkCreateCommandPool( m_ctx->device(), &transferPoolInfo, nullptr, &download.pool ) != VK_SUCCESS
+          || ( transferCmdInfo.commandPool = download.pool, vk.vkAllocateCommandBuffers( m_ctx->device(), &transferCmdInfo, &download.cmd ) ) != VK_SUCCESS
+          || vk.vkCreateSemaphore( m_ctx->device(), &semaphoreInfo, nullptr, &download.semaphore ) != VK_SUCCESS
+          || vk.vkCreateFence( m_ctx->device(), &fenceInfo, nullptr, &download.fence ) != VK_SUCCESS )
+      {
+        THROW_FATAL( "Vulkan: making the copy engine's commands failed" );
+      }
     }
   }
 
@@ -262,9 +266,12 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
     if( m_ctx->transferQueue() && m_ctx->transferTimestamps() )
     {
       queryInfo.queryCount = 2;
-      if( vk.vkCreateQueryPool( m_ctx->device(), &queryInfo, nullptr, &m_transferQueries ) != VK_SUCCESS )
+      for( Download& download: m_downloads )
       {
-        THROW_FATAL( "Vulkan: vkCreateQueryPool failed" );
+        if( vk.vkCreateQueryPool( m_ctx->device(), &queryInfo, nullptr, &download.queries ) != VK_SUCCESS )
+        {
+          THROW_FATAL( "Vulkan: vkCreateQueryPool failed" );
+        }
       }
     }
   }
@@ -277,21 +284,28 @@ GpuRecon::~GpuRecon()
   {
     vk.vkDestroyQueryPool( m_ctx->device(), m_queries, nullptr );
   }
-  if( m_transferQueries )
-  {
-    vk.vkDestroyQueryPool( m_ctx->device(), m_transferQueries, nullptr );
-  }
   if( m_bandQueries )
   {
     vk.vkDestroyQueryPool( m_ctx->device(), m_bandQueries, nullptr );
   }
-  if( m_semaphore )
+  for( Download& download: m_downloads )
   {
-    vk.vkDestroySemaphore( m_ctx->device(), m_semaphore, nullptr );
-  }
-  if( m_transferPool )
-  {
-    vk.vkDestroyCommandPool( m_ctx->device(), m_transferPool, nullptr );
+    if( download.queries )
+    {
+      vk.vkDestroyQueryPool( m_ctx->device(), download.queries, nullptr );
+    }
+    if( download.fence )
+    {
+      vk.vkDestroyFence( m_ctx->device(), download.fence, nullptr );
+    }
+    if( download.semaphore )
+    {
+      vk.vkDestroySemaphore( m_ctx->device(), download.semaphore, nullptr );
+    }
+    if( download.pool )
+    {
+      vk.vkDestroyCommandPool( m_ctx->device(), download.pool, nullptr );
+    }
   }
   if( m_fence )
   {
@@ -427,7 +441,7 @@ void GpuRecon::splitCommands()
   }
 }
 
-void GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
+int GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
 {
   const Api& vk = m_ctx->api();
 
@@ -444,37 +458,47 @@ void GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
                            nullptr, 0, nullptr );
   vk.vkEndCommandBuffer( m_cmd );
 
+  int       turn     = -1;
+  Download* download = nullptr;
   if( m_ctx->transferQueue() )
   {
-    // the copies: the picture's planes on the GPU to host memory
-    vk.vkResetCommandPool( m_ctx->device(), m_transferPool, 0 );
+    // the copies: the picture's planes on the GPU to host memory, with the
+    // download's commands whose turn it is (the other's may still run)
+    turn     = m_download;
+    download = &m_downloads[turn];
+    m_download ^= 1;
+    CHECK_FATAL( download->pending.load( std::memory_order_acquire ), "Vulkan: a download not waited for (endDownload) before its commands are reused" );
+    vk.vkResetCommandPool( m_ctx->device(), download->pool, 0 );
     VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vk.vkBeginCommandBuffer( m_transferCmd, &begin );
-    if( m_transferQueries )
+    vk.vkBeginCommandBuffer( download->cmd, &begin );
+    if( download->queries )
     {
-      vk.vkCmdResetQueryPool( m_transferCmd, m_transferQueries, 0, 2 );
-      vk.vkCmdWriteTimestamp( m_transferCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_transferQueries, 0 );
+      vk.vkCmdResetQueryPool( download->cmd, download->queries, 0, 2 );
+      vk.vkCmdWriteTimestamp( download->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, download->queries, 0 );
     }
     for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
     {
       const HostPlane* plane  = hostPlane( pic, ComponentID( comp ) );
       const GpuLayout  layout = gpuLayout( pic, ComponentID( comp ) );
       VkBufferCopy     region{ 0, layout.hostOffset, layout.size };
-      vk.vkCmdCopyBuffer( m_transferCmd, plane->twin.buffer, plane->host.buffer, 1, &region );
+      vk.vkCmdCopyBuffer( download->cmd, plane->twin.buffer, plane->host.buffer, 1, &region );
     }
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vk.vkCmdPipelineBarrier( m_transferCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
-    if( m_transferQueries )
+    vk.vkCmdPipelineBarrier( download->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+    if( download->queries )
     {
-      vk.vkCmdWriteTimestamp( m_transferCmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_transferQueries, 1 );
+      vk.vkCmdWriteTimestamp( download->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, download->queries, 1 );
     }
-    vk.vkEndCommandBuffer( m_transferCmd );
+    vk.vkEndCommandBuffer( download->cmd );
+    vk.vkResetFences( m_ctx->device(), 1, &download->fence );
+    download->pending.store( true, std::memory_order_release );
   }
 
   vk.vkResetFences( m_ctx->device(), 1, &m_fence );
-  m_ctx->submitRest( m_cmdRest, m_ctx->transferQueue() ? m_semaphore : VK_NULL_HANDLE, m_ctx->transferQueue() ? m_transferCmd : VK_NULL_HANDLE, m_fence );
+  m_ctx->submitRest( m_cmdRest, m_fence, download ? download->semaphore : VK_NULL_HANDLE, download ? download->cmd : VK_NULL_HANDLE,
+                     download ? download->fence : VK_NULL_HANDLE );
   if( waitFirst )
   {
     const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_fenceFirst, VK_TRUE, UINT64_MAX );
@@ -483,9 +507,10 @@ void GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
       THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
     }
   }
+  return turn;
 }
 
-void GpuRecon::endPicture()
+void GpuRecon::endCompute()
 {
   const Api&     vk     = m_ctx->api();
   const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_fence, VK_TRUE, UINT64_MAX );
@@ -494,13 +519,29 @@ void GpuRecon::endPicture()
     THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
   }
   readTimestamps( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - m_submitted ).count() );
-  if( m_transferQueries )
+}
+
+void GpuRecon::endDownload( int turn )
+{
+  if( turn < 0 )
+  {
+    return;
+  }
+  const Api&     vk       = m_ctx->api();
+  Download&      download = m_downloads[turn];
+  const VkResult result   = vk.vkWaitForFences( m_ctx->device(), 1, &download.fence, VK_TRUE, UINT64_MAX );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
+  }
+  if( download.queries )
   {
     uint64_t stamps[2];
-    vk.vkGetQueryPoolResults( m_ctx->device(), m_transferQueries, 0, 2, sizeof( stamps ), stamps, sizeof( uint64_t ),
+    vk.vkGetQueryPoolResults( m_ctx->device(), download.queries, 0, 2, sizeof( stamps ), stamps, sizeof( uint64_t ),
                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT );
     m_ctx->addTime( "download (copies)", double( stamps[1] - stamps[0] ) * m_ctx->timestampPeriod() * 1e-6 );
   }
+  download.pending.store( false, std::memory_order_release );
 }
 
 void GpuRecon::readTimestamps( double waited )
@@ -1506,8 +1547,8 @@ void GpuRecon::startBand( CodingStructure& cs, const PictureJobs& jobs, size_t c
   }
 }
 
-void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
-                             PelStorage& pic, bool waitFirst )
+int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
+                            PelStorage& pic, bool waitFirst )
 {
   if( m_prepared.picture != cs.picture )
   {
@@ -1602,11 +1643,12 @@ void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool 
       std::swap( hostPlane( pic, ComponentID( comp ) )->twin, m_scratch[comp] );
     }
   }
-  submitPicture( pic, waitFirst );
+  const int download = submitPicture( pic, waitFirst );
   // the scratch planes (after a swap, the picture's former ones) back to the
   // pool at once: the GPU runs the pictures' work one after the other (each
   // part begins with a barrier over all the work before it), so the work of
-  // whichever picture takes them next comes after this one's
+  // whichever picture takes them next comes after this one's (the download
+  // reads none of them)
   for( Buffer& buf: m_scratch )
   {
     m_ctx->recycle( buf );
@@ -1615,6 +1657,7 @@ void GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool 
   {
     refPic->gpuCurrent = true;   // for the work queued after this
   }
+  return download;
 }
 
 }   // namespace gpu

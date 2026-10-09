@@ -270,6 +270,9 @@ public:
   BlockingBarrier reconDone;
 #if VVDEC_VULKAN
   Barrier         gpuRefReady;
+  // its work on the GPU done but for its download (DecLibRecon: its instance
+  // may take the next picture then)
+  BlockingBarrier gpuComputeDone;
 #endif
 #if RECO_WHILE_PARSE
   std::vector<Barrier> ctuParsedBarrier;

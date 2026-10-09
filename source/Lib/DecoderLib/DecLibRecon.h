@@ -125,6 +125,9 @@ struct FinishPicTaskParam
 {
   DecLibRecon* decLib;
   Picture*     pic;
+#if VVDEC_VULKAN
+  int          download = -1;   // the picture's download on the GPU (GpuRecon::startPicture)
+#endif
 
   FinishPicTaskParam() : decLib( nullptr ), pic( nullptr ) {}
   FinishPicTaskParam( DecLibRecon* _dec, Picture* _pic ) : decLib( _dec ), pic( _pic ) {}
@@ -202,8 +205,12 @@ private:
   CommonTaskParam            commonTaskParam{ this };
   std::vector<LineTaskParam> tasksFinishMotion;
   std::vector<CtuTaskParam>  tasksCtu;
-  FinishPicTaskParam         taskFinishPic;
+  // the pictures' in turn: a picture's last tasks may still run while the
+  // next picture's are queued (releasePrevDecompressedPic)
+  FinishPicTaskParam         taskFinishPic[2];
+  int                        m_taskFinishPic = 0;
 #if VVDEC_VULKAN
+  bool                       m_currDecompReleasable = false;   // the current picture's GPU work ends with a download alone (gpuComputeDone)
   Barrier                    m_gpuFiltersPrepared;   // the picture's filter parameters for the GPU worked out (GpuRecon::prepareFilters)
   // the picture's top rows of CTUs whose residuals and inter blocks go to the
   // GPU ahead of the rest (0: none), their CTU tasks done, their jobs queued
@@ -227,6 +234,12 @@ public:
 
   void     decompressPicture( Picture* pcPic );
   Picture* waitForPrevDecompressedPic();
+  // as waitForPrevDecompressedPic, but a picture whose work on the GPU is done
+  // but for its download comes back then, not yet reconstructed: the instance
+  // may take the next picture while it downloads. waitForReleasedPic then
+  // waits for it.
+  Picture* releasePrevDecompressedPic();
+  static void waitForReleasedPic( Picture* pic );
   void     cleanupOnException();
   Picture* getCurrPic() const { return m_currDecompPic; }
   void     swapBufs( CodingStructure& cs );

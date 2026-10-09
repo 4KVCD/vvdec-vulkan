@@ -679,16 +679,16 @@ void Context::submitFirst( VkCommandBuffer first, VkFence firstDone )
   }
 }
 
-void Context::submitRest( VkCommandBuffer rest, VkSemaphore restDone, VkCommandBuffer transfer, VkFence fence )
+void Context::submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore semaphore, VkCommandBuffer transfer, VkFence transferDone )
 {
   {
     VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     info.commandBufferCount   = 1;
     info.pCommandBuffers      = &rest;
     info.signalSemaphoreCount = transfer ? 1 : 0;
-    info.pSignalSemaphores    = &restDone;
+    info.pSignalSemaphores    = &semaphore;
     std::lock_guard<std::mutex> lock( m_queueMutex );
-    const VkResult result = m_api.vkQueueSubmit( m_queue, 1, &info, transfer ? VK_NULL_HANDLE : fence );
+    const VkResult result = m_api.vkQueueSubmit( m_queue, 1, &info, restDone );
     if( result != VK_SUCCESS )
     {
       THROW_FATAL( "Vulkan: vkQueueSubmit failed (" << result << ")" );
@@ -701,10 +701,10 @@ void Context::submitRest( VkCommandBuffer rest, VkSemaphore restDone, VkCommandB
     info.commandBufferCount = 1;
     info.pCommandBuffers    = &transfer;
     info.waitSemaphoreCount = 1;
-    info.pWaitSemaphores    = &restDone;
+    info.pWaitSemaphores    = &semaphore;
     info.pWaitDstStageMask  = &stage;
     std::lock_guard<std::mutex> lock( m_transferMutex );
-    const VkResult              result = m_api.vkQueueSubmit( m_transferQueue, 1, &info, fence );
+    const VkResult              result = m_api.vkQueueSubmit( m_transferQueue, 1, &info, transferDone );
     if( result != VK_SUCCESS )
     {
       THROW_FATAL( "Vulkan: vkQueueSubmit (copies) failed (" << result << ")" );

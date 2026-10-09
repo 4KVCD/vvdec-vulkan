@@ -750,7 +750,9 @@ void DecLib::reconPicture( Picture* pcPic )
   std::advance( behind, inTurn );
   m_decLibRecon.splice( behind, m_decLibRecon, m_decLibRecon.begin() );
 
-  Picture* donePic = reconInstance->waitForPrevDecompressedPic();
+  // the instance's previous picture: with the GPU, possibly still downloading
+  // while this one starts
+  Picture* donePic = reconInstance->releasePrevDecompressedPic();
   try
   {
     reconInstance->decompressPicture( pcPic );
@@ -763,6 +765,7 @@ void DecLib::reconPicture( Picture* pcPic )
 
   if( donePic )
   {
+    DecLibRecon::waitForReleasedPic( donePic );
     finishPicture( donePic );
   }
 }

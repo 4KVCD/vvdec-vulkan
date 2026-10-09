@@ -50,6 +50,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 
 #include "GpuContext.h"
@@ -137,11 +138,17 @@ public:
   // startPicture queues the work, in two parts: the first, the residuals and
   // the inter blocks (those of the CTUs after a band startBand queued), the
   // rest. waitFirst: it returns once the first part is
-  // done, DMVR's refinements in host memory (dmvrMvCache). endPicture waits
-  // for the rest, the download of pic included.
-  void startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
+  // done, DMVR's refinements in host memory (dmvrMvCache). It returns the
+  // picture's download, for endDownload (-1: none of its own).
+  // endCompute waits for the rest (without the copy engine, the download
+  // included): the next picture's work may be recorded then, while the
+  // download runs. endDownload waits for that, before the work of the picture
+  // after the next is recorded (the downloads take turns between two sets of
+  // commands).
+  int  startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
                      PelStorage& pic, bool waitFirst );
-  void endPicture();
+  void endCompute();
+  void endDownload( int download );
 
 private:
   void     beginCommands( bool resetPool = true );
@@ -149,9 +156,9 @@ private:
   void     mark( const char* label );   // with VVDEC_GPU_PROFILE: the GPU time since the last mark counts as label
   void     splitCommands();   // the first part's commands end and go to the GPU, the rest's begin
   // the rest's commands queued, and the download of pic: on the copy engine
-  // (Context::transferQueue), after the rest's m_semaphore, else at the end of
-  // the rest
-  void     submitPicture( const PelStorage& pic, bool waitFirst );
+  // (Context::transferQueue), after the rest's semaphore (the download's
+  // returned), else at the end of the rest (-1 returned)
+  int      submitPicture( const PelStorage& pic, bool waitFirst );
   void     readTimestamps( double waited );
   // the reference pictures' planes on the GPU into m_refs (laid out as pic's);
   // uploads: those the CPU reconstructed (or filled in), to copy there first
@@ -198,13 +205,19 @@ private:
   VkCommandBuffer m_cmdRest  = VK_NULL_HANDLE;  // and the rest
   VkCommandBuffer m_cmdBand  = VK_NULL_HANDLE;  // its top band, queued ahead (startBand)
   VkFence         m_fenceFirst = VK_NULL_HANDLE;   // the first part done
-  VkFence         m_fence   = VK_NULL_HANDLE;   // all done
+  VkFence         m_fence   = VK_NULL_HANDLE;   // the rest done (without the copy engine, the download too)
   std::chrono::steady_clock::time_point m_submitted;
   VkQueryPool     m_queries = VK_NULL_HANDLE;   // the profiling timestamps
-  VkCommandPool   m_transferPool    = VK_NULL_HANDLE;   // the copy engine's commands
-  VkCommandBuffer m_transferCmd     = VK_NULL_HANDLE;
-  VkSemaphore     m_semaphore       = VK_NULL_HANDLE;   // the compute commands done, for the copies
-  VkQueryPool     m_transferQueries = VK_NULL_HANDLE;
+  struct Download                               // a picture's download on the copy engine
+  {
+    VkCommandPool     pool      = VK_NULL_HANDLE;
+    VkCommandBuffer   cmd       = VK_NULL_HANDLE;
+    VkSemaphore       semaphore = VK_NULL_HANDLE;   // the rest done, for the copies
+    VkFence           fence     = VK_NULL_HANDLE;   // the copies done
+    VkQueryPool       queries   = VK_NULL_HANDLE;
+    std::atomic<bool> pending{ false };             // queued, not yet waited for (endDownload)
+  } m_downloads[2];
+  int             m_download = 0;   // the next picture's
   const char*     m_labels[kMaxMarks];
   uint32_t        m_marks   = 0;
   uint32_t        m_gapMark = 0;   // the mark that ends the time between the picture's parts (0: none)
