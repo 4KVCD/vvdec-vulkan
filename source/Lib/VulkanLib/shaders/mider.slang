@@ -22,7 +22,7 @@
 
 struct Params
 {
-  uint*         cus;        // GpuFrontEnd.h's CuRecord: 16 words each, CTU by CTU, each CTU's in decoding order
+  uint*         cus;        // GpuFrontEnd.h's CuRecord: 32 words each, CTU by CTU, each CTU's in decoding order
   uint*         ctus;       // CtuRecord: 4 words each
   uint*         slices;     // the picture's slice table: per CTU its slice, then the SliceRecords (64 words each)
   uint*         cuMap;      // the CU (its index) at each 4x4 luma block, widthIn4 a row
@@ -42,6 +42,9 @@ struct Params
   int           maxNumMergeCand;   // the SPS's
   int           subpicOn;
   int           sps;        // the SPS's: SbTMVP 1, affine 2, the 6-parameter model 4
+  uint*         cuMapC;     // the CU at each 4x4 luma block of the chroma tree (the single tree's: the luma's)
+  int           csx;        // the chroma's subsampling
+  int           csy;
 };
 
 [[vk::push_constant]] Params pc;
@@ -87,7 +90,7 @@ struct Cu
 
 Cu loadCu( int index )
 {
-  uint* r = pc.cus + index * 16;
+  uint* r = pc.cus + index * 32;
   Cu    cu;
   cu.x        = int( r[0] & 0xffff );
   cu.y        = int( r[0] >> 16 );
@@ -113,7 +116,7 @@ int  refIdxOf( Cu cu, int list ) { return int( int8_t( ( cu.w3 >> ( 8 * list ) )
 bool affine6Of( Cu cu ) { return ( cu.flags & kAffine6 ) != 0; }
 int2 mvdOf( Cu cu, int list, int k )
 {
-  int* r = (int*) ( pc.cus + cu.index * 16 + 4 + list * 6 + k * 2 );
+  int* r = (int*) ( pc.cus + cu.index * 32 + 4 + list * 6 + k * 2 );
   return int2( r[0], r[1] );
 }
 
@@ -2412,18 +2415,35 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   {
     return;
   }
-  Cu cu = loadCu( index );
-  if( ( cu.flags & kChroma ) != 0 )
+  Cu         cu    = loadCu( index );
+  uint*      r     = pc.cus + index * 32;
+  const uint valid = r[20];
+  if( ( valid & ( 1u << 17 ) ) != 0 )
   {
-    return;
+    const int w4 = cu.w >> 2;
+    const int n  = w4 * ( cu.h >> 2 );
+    for( int i = int( local.x ); i < n; i += 64 )
+    {
+      const int y = ( cu.y >> 2 ) + i / w4;
+      const int x = ( cu.x >> 2 ) + i % w4;
+      pc.cuMap[y * pc.widthIn4 + x] = uint( index );
+    }
   }
-  const int w4 = cu.w >> 2;
-  const int n  = w4 * ( cu.h >> 2 );
-  for( int i = int( local.x ); i < n; i += 64 )
+  if( ( valid & ( 1u << 16 ) ) != 0 )
   {
-    const int y = ( cu.y >> 2 ) + i / w4;
-    const int x = ( cu.x >> 2 ) + i % w4;
-    pc.cuMap[y * pc.widthIn4 + x] = uint( index );
+    // the chroma block, in luma samples
+    const int cx = int( r[19] & 0xffff ) << pc.csx;
+    const int cy = int( r[19] >> 16 ) << pc.csy;
+    const int cw = int( r[20] & 0xff ) << pc.csx;
+    const int ch = int( ( r[20] >> 8 ) & 0xff ) << pc.csy;
+    const int w4 = max( cw >> 2, 1 );
+    const int n  = w4 * max( ch >> 2, 1 );
+    for( int i = int( local.x ); i < n; i += 64 )
+    {
+      const int y = ( cy >> 2 ) + i / w4;
+      const int x = ( cx >> 2 ) + i % w4;
+      pc.cuMapC[y * pc.widthIn4 + x] = uint( index );
+    }
   }
 }
 #else

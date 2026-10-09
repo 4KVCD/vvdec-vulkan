@@ -162,7 +162,7 @@ public:
 
   // after endCompute: the GPU's motion derivation (PictureJobs::cus) against
   // the CPU's, cpu the picture's motion as vvdec keeps it
-  void              compareMider( const CodingStructure& cs, const MotionInfo* cpu );
+  void              compareMider( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp );
   const MiderStats& miderStats() const { return m_miderStats; }
 
 private:
@@ -193,7 +193,7 @@ private:
   void          copyPlanes( const PelStorage& pic, int from, int to );
   void          transferBarrier( bool toTransfer );
   // the motion derivation of the picture's CUs (cus, per CTU), for the comparison with the CPU's
-  void          recordMider( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus );
+  void          recordMider( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus );
   // with subpictures treated as pictures: each CTU's rectangle (its subpicture's
   // or the picture's) in m_subpics, its address returned; else 0
   VkDeviceAddress subpicRects( const CodingStructure& cs );
@@ -287,11 +287,17 @@ private:
   // the motion derivation's (recordMider): the records in upload memory; the CU map, the CUs' and the 4x4
   // blocks' motion, the rows' progress in the GPU's; the 4x4 blocks' motion copied to host memory for the comparison
   Buffer          m_miderCus;
+  Buffer          m_miderTus;
   Buffer          m_miderCtus;
   Buffer          m_miderCuMap;
   Buffer          m_miderCuMotion;
   Buffer          m_miderMotion;
   Buffer          m_miderMotionHost;   // its copy, for the comparison
+  Buffer          m_miderCuMapC;
+  Buffer          m_dbCtuInfo;         // per CTU: its subpicture | loop filter across it << 16
+  Buffer          m_dbLfp;             // the deblocking's parameters (shaders/dbparams.slang)
+  Buffer          m_dbLfpHost;         // their copy, for the comparison
+  bool            m_dbRecorded = false;
   Buffer          m_miderProgress;
   MiderStats      m_miderStats;
 };

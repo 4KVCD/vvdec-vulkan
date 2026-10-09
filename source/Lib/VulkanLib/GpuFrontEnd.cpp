@@ -48,6 +48,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "GpuRecon.h"
 
 #include "CommonLib/CodingStructure.h"
+#include "CommonLib/LoopFilter.h"
 #include "CommonLib/MotionInfo.h"
 #include "CommonLib/Picture.h"
 #include "CommonLib/Slice.h"
@@ -60,7 +61,7 @@ namespace vvdec
 namespace gpu
 {
 
-void writeCuRecords( CodingStructure& cs, int ctuRsAddr, std::vector<CuRecord>& out )
+void writeCuRecords( CodingStructure& cs, int ctuRsAddr, std::vector<CuRecord>& out, std::vector<TuRecord>& tus )
 {
   for( const CodingUnit& cu: cs.traverseCUs( ctuRsAddr ) )
   {
@@ -81,7 +82,8 @@ void writeCuRecords( CodingStructure& cs, int ctuRsAddr, std::vector<CuRecord>& 
     r.w[2] = uint32_t( cu.mergeIdx() ) | uint32_t( cu.mmvdIdx & 63 ) << 3 | uint32_t( cu.geoSplitDir & 63 ) << 9 | uint32_t( cu.geoMergeIdx0() ) << 15
              | uint32_t( cu.geoMergeIdx1() ) << 18 | uint32_t( cu.imv() ) << 21 | uint32_t( cu.BcwIdx() ) << 23 | uint32_t( cu.interDir() ) << 26
              | uint32_t( cu.mvpIdx[0] & 1 ) << 28 | uint32_t( cu.mvpIdx[1] & 1 ) << 29;
-    r.w[3] = uint32_t( uint8_t( cu.refIdx[0] ) ) | uint32_t( uint8_t( cu.refIdx[1] ) ) << 8;
+    r.w[3] = uint32_t( uint8_t( cu.refIdx[0] ) ) | uint32_t( uint8_t( cu.refIdx[1] ) ) << 8 | uint32_t( uint8_t( cu.qp ) ) << 16
+             | uint32_t( uint8_t( cu.chromaQpAdj ) ) << 24;
     for( int list = 0; list < 2; list++ )
     {
       for( int k = 0; k < 3; k++ )
@@ -90,6 +92,49 @@ void writeCuRecords( CodingStructure& cs, int ctuRsAddr, std::vector<CuRecord>& 
         r.w[4 + 6 * list + 2 * k + 1] = uint32_t( cu.mv[list][k].getVer() );
       }
     }
+    // its TUs
+    const uint32_t firstTu = uint32_t( tus.size() );
+    for( const TransformUnit* next = &cu.firstTU; next; next = next->next )   // (the CU's last TU ends the chain)
+    {
+      const TransformUnit& tu = *next;
+      TuRecord             t{};
+      if( tu.blocks[COMPONENT_Y].valid() )
+      {
+        const CompArea& b = tu.blocks[COMPONENT_Y];
+        t.w[0]            = uint32_t( b.x ) | uint32_t( b.y ) << 16;
+        t.w[1]            = uint32_t( b.width ) | uint32_t( b.height ) << 8 | 1u << 16;
+      }
+      if( tu.blocks.size() > 1 && tu.blocks[COMPONENT_Cb].valid() )
+      {
+        const CompArea& b = tu.blocks[COMPONENT_Cb];
+        t.w[2]            = uint32_t( b.x ) | uint32_t( b.y ) << 16;
+        t.w[3]            = uint32_t( b.width ) | uint32_t( b.height ) << 8 | 1u << 16;
+      }
+      t.w[4] = uint32_t( tu.cbf ) | uint32_t( tu.jointCbCr ) << 3 | uint32_t( tu.mtsIdx( 0 ) ) << 5 | uint32_t( tu.mtsIdx( 1 ) ) << 8
+               | uint32_t( tu.mtsIdx( 2 ) ) << 9 | uint32_t( tu.chType() ) << 10;
+      t.w[5] = uint32_t( uint8_t( tu.chromaQp[0] ) ) | uint32_t( uint8_t( tu.chromaQp[1] ) ) << 8;
+      t.w[6] = uint32_t( tu.maxScanPosX[0] ) | uint32_t( tu.maxScanPosX[1] ) << 8 | uint32_t( tu.maxScanPosX[2] ) << 16;
+      t.w[7] = uint32_t( tu.maxScanPosY[0] ) | uint32_t( tu.maxScanPosY[1] ) << 8 | uint32_t( tu.maxScanPosY[2] ) << 16;
+      t.w[8] = uint32_t( out.size() );   // (the CU's index in its CTU's)
+      tus.push_back( t );
+    }
+    const uint32_t numTus = uint32_t( tus.size() ) - firstTu;
+    CHECK( numTus > 0xffff, "too many TUs in a CU" );
+    r.w[16] = firstTu | numTus << 16;
+    r.w[17] = uint32_t( cu.chType() ) | uint32_t( cu.treeType() ) << 1 | uint32_t( cu.modeType() ) << 3 | uint32_t( cu.ispMode() ) << 5
+              | uint32_t( cu.lfnstIdx() ) << 7 | ( cu.mipFlag() ? 1u << 9 : 0u ) | ( cu.mipTransposedFlag() ? 1u << 10 : 0u )
+              | uint32_t( cu.multiRefIdx() ) << 11 | ( cu.colorTransform() ? 1u << 13 : 0u ) | uint32_t( cu.bdpcmMode() ) << 14
+              | uint32_t( cu.bdpcmModeChroma() ) << 16 | ( cu.rootCbf() ? 1u << 18 : 0u ) | uint32_t( cu.sbtInfo() ) << 19
+              | ( cu.planeCbf( 0 ) ? 1u << 27 : 0u ) | ( cu.planeCbf( 1 ) ? 1u << 28 : 0u ) | ( cu.planeCbf( 2 ) ? 1u << 29 : 0u );
+    r.w[18] = uint32_t( uint8_t( cu.intraDir[0] ) ) | uint32_t( uint8_t( cu.intraDir[1] ) ) << 8 | uint32_t( cu.qtDepth ) << 16
+              | uint32_t( cu.depth ) << 20;
+    if( cu.blocks.size() > 1 && cu.blocks[COMPONENT_Cb].valid() )
+    {
+      const CompArea& b = cu.blocks[COMPONENT_Cb];
+      r.w[19]           = uint32_t( b.x ) | uint32_t( b.y ) << 16;
+      r.w[20]           = uint32_t( b.width ) | uint32_t( b.height ) << 8 | 1u << 16;
+    }
+    r.w[20] |= cu.blocks[COMPONENT_Y].valid() ? 1u << 17 : 0u;
     out.push_back( r );
   }
 }
@@ -109,10 +154,12 @@ static uint32_t sliceIndex( const CodingStructure& cs, const Slice* slice )
   return 0;
 }
 
-void writeCtuRecords( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, CtuRecord* out )
+void writeCtuRecords( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus,
+                      CtuRecord* out )
 {
-  const PPS& pps   = *cs.pps;
-  uint32_t   first = 0;
+  const PPS& pps     = *cs.pps;
+  uint32_t   first   = 0;
+  uint32_t   firstTu = 0;
   for( int ctu = 0; ctu < (int) cs.pcv->sizeInCtus; ctu++ )
   {
     const int  ctuX  = ctu % cs.pcv->widthInCtus;
@@ -122,8 +169,9 @@ void writeCtuRecords( const CodingStructure& cs, const std::vector<std::vector<C
     out[ctu].w[0] = first;
     out[ctu].w[1] = count | sliceIndex( cs, cs.getCtuData( ctu ).slice ) << 16;
     out[ctu].w[2] = ( pps.ctuIsTileColBd( ctuX ) ? 1u : 0u ) | pps.getTileIdx( uint32_t( ctuX ), uint32_t( ctuY ) ) << 16;
-    out[ctu].w[3] = 0;
+    out[ctu].w[3] = firstTu;
     first += count;
+    firstTu += uint32_t( tus[ctu].size() );
   }
 }
 
@@ -162,7 +210,8 @@ void writeSliceTable( const CodingStructure& cs, uint32_t* table )
     rec[1] = uint32_t( s.getNumRefIdx( REF_PIC_LIST_0 ) ) | uint32_t( s.getNumRefIdx( REF_PIC_LIST_1 ) ) << 8 | ( s.isInterB() ? 1u << 16 : 0u )
              | ( s.getCheckLDC() ? 1u << 17 : 0u ) | ( s.getColFromL0Flag() ? 1u << 18 : 0u )
              | ( s.getPicHeader()->getEnableTMVPFlag() ? 1u << 19 : 0u ) | ( s.getPicHeader()->getDisFracMMVD() ? 1u << 20 : 0u )
-             | ( hasCol ? 1u << 21 : 0u ) | ( s.isIRAP() ? 1u << 22 : 0u ) | ( s.getColRefIdx() & 15 ) << 24;
+             | ( hasCol ? 1u << 21 : 0u ) | ( s.isIRAP() ? 1u << 22 : 0u ) | ( s.getDeblockingFilterDisable() ? 1u << 23 : 0u )
+             | ( s.getColRefIdx() & 15 ) << 24;
     rec[2] = s.getPicHeader()->getMaxNumIBCMergeCand() | s.getPicHeader()->getMaxNumGeoCand() << 8 | s.getPicHeader()->getMaxNumAffineMergeCand() << 16;
     rec[3] = s.getIndependentSliceIdx();
     for( int list = 0; list < 2; list++ )
@@ -244,6 +293,41 @@ void compareMotion( const CodingStructure& cs, const int32_t* gpu, const MotionI
             }
           }
         }
+      }
+    }
+  }
+}
+
+void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const LoopFilterParam* cpu, MiderStats& stats )
+{
+  const PreCalcValues& pcv = *cs.pcv;
+  const size_t         n   = size_t( pcv.sizeInCtus ) * 2 * pcv.num4x4CtuBlks;
+  const int            per = int( pcv.num4x4CtuBlks );
+  const int            s4  = int( pcv.maxCUWidth ) >> 2;
+  for( size_t i = 0; i < n; i++ )
+  {
+    const LoopFilterParam& c = cpu[i];
+    const uint32_t         a = gpu[2 * i];
+    const uint32_t         b = gpu[2 * i + 1];
+    stats.lfpCompared++;
+    stats.lfpEdges += c.bs != 0 ? 1 : 0;
+    const bool same = int8_t( a & 0xff ) == c.qp[0] && int8_t( ( a >> 8 ) & 0xff ) == c.qp[1] && int8_t( ( a >> 16 ) & 0xff ) == c.qp[2]
+                      && uint8_t( a >> 24 ) == c.bs && uint8_t( b & 0xff ) == c.sideMaxFiltLength && uint8_t( ( b >> 8 ) & 0xff ) == c.flags;
+    if( !same )
+    {
+      stats.lfpMismatched++;
+      if( stats.lfpReported < 20 )
+      {
+        stats.lfpReported++;
+        const int ctu = int( i / ( 2 * per ) );
+        const int dir = int( ( i / per ) & 1 );
+        const int pos = int( i % per );
+        const int x   = ( ctu % int( pcv.widthInCtus ) ) * int( pcv.maxCUWidth ) + ( pos % s4 ) * 4;
+        const int y   = ( ctu / int( pcv.widthInCtus ) ) * int( pcv.maxCUHeight ) + ( pos / s4 ) * 4;
+        msg( WARNING,
+             "GPU deblocking parameters: POC %d at (%d,%d) dir %d: GPU qp %d,%d,%d bs %02x len %02x flags %02x, CPU qp %d,%d,%d bs %02x len %02x flags %02x\n",
+             cs.picture->poc, x, y, dir, int8_t( a & 0xff ), int8_t( ( a >> 8 ) & 0xff ), int8_t( ( a >> 16 ) & 0xff ), a >> 24, b & 0xff,
+             ( b >> 8 ) & 0xff, c.qp[0], c.qp[1], c.qp[2], c.bs, c.sideMaxFiltLength, c.flags );
       }
     }
   }

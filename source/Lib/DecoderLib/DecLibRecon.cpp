@@ -725,9 +725,14 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   if( m_gpuMider )
   {
     m_gpuCuRecords.resize( pcv->sizeInCtus );
+    m_gpuTuRecords.resize( pcv->sizeInCtus );
     for( auto& cus: m_gpuCuRecords )
     {
       cus.clear();
+    }
+    for( auto& tus: m_gpuTuRecords )
+    {
+      tus.clear();
     }
   }
   if( m_gpuResidual )
@@ -867,6 +872,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       jobs.edges = &dec->m_gpuEdges;
       jobs.bandCtus = size_t( dec->m_gpuBandRows ) * cs.pcv->widthInCtus;
       jobs.cus      = dec->m_gpuMider && dec->m_gpuIntra ? &dec->m_gpuCuRecords : nullptr;
+      jobs.tus      = &dec->m_gpuTuRecords;
       // with DMVR, the GPU stores the refined motion for TMVP in the next
       // pictures in the first part (the CTU tasks stored the rest)
       const bool refine = dec->m_gpuInter && cs.picture->stillReferenced;
@@ -881,7 +887,8 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       param->decLib->m_gpuRecon->endCompute();
       if( param->decLib->m_gpuMider && param->decLib->m_gpuIntra )
       {
-        param->decLib->m_gpuRecon->compareMider( *param->pic->cs, param->decLib->m_motionInfo );
+        param->decLib->m_gpuRecon->compareMider( *param->pic->cs, param->decLib->m_motionInfo,
+                                                 param->decLib->m_doDeblock ? param->decLib->m_loopFilterParam : nullptr );
       }
       return true;
     };
@@ -1192,7 +1199,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       {
         // the parse's CUs, before the derivation turns their motion vector
         // differences into motion vectors
-        gpu::writeCuRecords( cs, ctuRsAddr, decLib.m_gpuCuRecords[ctuRsAddr] );
+        gpu::writeCuRecords( cs, ctuRsAddr, decLib.m_gpuCuRecords[ctuRsAddr], decLib.m_gpuTuRecords[ctuRsAddr] );
       }
 #endif
 

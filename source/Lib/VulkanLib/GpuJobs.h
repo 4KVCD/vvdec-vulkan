@@ -392,6 +392,7 @@ struct LmcsTables
 };
 
 struct CuRecord;
+struct TuRecord;
 
 // a picture's jobs, per CTU, for the stages that run on the GPU (null: the CPU ran that stage)
 struct PictureJobs
@@ -407,6 +408,7 @@ struct PictureJobs
   // the CUs of the parse, per CTU: the GPU derives their motion too, for the
   // comparison with the CPU's (VVDEC_GPU_MIDER; GpuRecon::compareMider)
   const std::vector<std::vector<CuRecord>>* cus = nullptr;
+  const std::vector<std::vector<TuRecord>>* tus = nullptr;   // with cus: their TUs, per CTU
 };
 
 }   // namespace gpu

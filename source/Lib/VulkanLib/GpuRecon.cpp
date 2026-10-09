@@ -359,11 +359,16 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_matrices );
   m_ctx->free( m_mip );
   m_ctx->free( m_miderCus );
+  m_ctx->free( m_miderTus );
   m_ctx->free( m_miderCtus );
   m_ctx->free( m_miderCuMap );
   m_ctx->free( m_miderCuMotion );
   m_ctx->free( m_miderMotion );
   m_ctx->free( m_miderMotionHost );
+  m_ctx->free( m_miderCuMapC );
+  m_ctx->free( m_dbCtuInfo );
+  m_ctx->free( m_dbLfp );
+  m_ctx->free( m_dbLfpHost );
   m_ctx->free( m_miderProgress );
   m_ctx->free( m_lfnst );
   m_ctx->free( m_geo );
@@ -1847,8 +1852,19 @@ struct MiderPush
 {
   VkDeviceAddress cus, ctus, slices, cuMap, cuMotion, motion, progress, subpics;
   int32_t         numCus, widthInCtus, heightInCtus, log2Ctu, width, height, widthIn4, plevel, wpp, maxNumMergeCand, subpicOn, sps;
+  VkDeviceAddress cuMapC;
+  int32_t         csx, csy;
 };
-static_assert( sizeof( MiderPush ) == 112, "MiderPush: the layout of mider.slang's Params" );
+static_assert( sizeof( MiderPush ) == 128, "MiderPush: the layout of mider.slang's Params" );
+
+// shaders/dbparams.slang's push constants
+struct DbParamsPush
+{
+  VkDeviceAddress cus, tus, ctus, slices, cuMapL, cuMapC, cuMotion, motion, lfp, ctuInfo;
+  int32_t         numCus, widthInCtus, heightInCtus, log2Ctu, width, height, widthIn4, csx, csy, chroma, qpBdOffset, pass, flags;
+  int32_t         vbPosHor[4], vbPosVer[4];   // the count, then the positions
+};
+static_assert( sizeof( DbParamsPush ) == 168, "DbParamsPush: the layout of dbparams.slang's Params" );
 
 // a buffer of kind of at least size bytes
 static void ensureBuffer( Context* ctx, Buffer& buf, size_t size, MemKind kind )
@@ -1893,13 +1909,18 @@ VkDeviceAddress GpuRecon::subpicRects( const CodingStructure& cs )
   return m_subpics.addr;
 }
 
-void GpuRecon::recordMider( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus )
+void GpuRecon::recordMider( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus )
 {
   const PreCalcValues& pcv    = *cs.pcv;
   size_t               numCus = 0;
+  size_t               numTus = 0;
   for( const auto& ctu: cus )
   {
     numCus += ctu.size();
+  }
+  for( const auto& ctu: tus )
+  {
+    numTus += ctu.size();
   }
   CHECK( !cs.m_gpuSliceAllocation, "the GPU's motion derivation without the picture's slice table" );
   const int widthIn4  = int( ( pcv.lumaWidth + 3 ) >> 2 );
@@ -1910,8 +1931,10 @@ void GpuRecon::recordMider( const CodingStructure& cs, const std::vector<std::ve
   // memory: VideoQ 1080p 0.6 s a picture); the motion of the 4x4 blocks, for
   // the comparison, in host memory
   ensureBuffer( m_ctx, m_miderCus, std::max<size_t>( numCus, 1 ) * sizeof( CuRecord ), MemKind::Upload );
+  ensureBuffer( m_ctx, m_miderTus, std::max<size_t>( numTus, 1 ) * sizeof( TuRecord ), MemKind::Upload );
   ensureBuffer( m_ctx, m_miderCtus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::Upload );
   ensureBuffer( m_ctx, m_miderCuMap, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
+  ensureBuffer( m_ctx, m_miderCuMapC, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
   const size_t motionSize = size_t( pcv.sizeInCtus ) * pcv.num4x4CtuBlks * 5 * sizeof( int32_t );
   ensureBuffer( m_ctx, m_miderCuMotion, std::max<size_t>( numCus, 1 ) * 16 * sizeof( int32_t ), MemKind::Device );
   ensureBuffer( m_ctx, m_miderMotion, motionSize, MemKind::Device );
@@ -1926,7 +1949,16 @@ void GpuRecon::recordMider( const CodingStructure& cs, const std::vector<std::ve
       dst += ctu.size();
     }
   }
-  writeCtuRecords( cs, cus, reinterpret_cast<CtuRecord*>( m_miderCtus.mapped ) );
+  TuRecord* tuDst = reinterpret_cast<TuRecord*>( m_miderTus.mapped );
+  for( const auto& ctu: tus )
+  {
+    if( !ctu.empty() )
+    {
+      memcpy( tuDst, ctu.data(), ctu.size() * sizeof( TuRecord ) );
+      tuDst += ctu.size();
+    }
+  }
+  writeCtuRecords( cs, cus, tus, reinterpret_cast<CtuRecord*>( m_miderCtus.mapped ) );
 
   MiderPush push{};
   push.cus             = m_miderCus.addr;
@@ -1949,6 +1981,10 @@ void GpuRecon::recordMider( const CodingStructure& cs, const std::vector<std::ve
   push.subpics         = subpicRects( cs );
   push.subpicOn        = push.subpics != 0 ? 1 : 0;
   push.sps             = ( cs.sps->getSBTMVPEnabledFlag() ? 1 : 0 ) | ( cs.sps->getUseAffine() ? 2 : 0 ) | ( cs.sps->getUseAffineType() ? 4 : 0 );
+  const bool chroma    = isChromaEnabled( pcv.chrFormat );
+  push.cuMapC          = m_miderCuMapC.addr;
+  push.csx             = chroma ? int32_t( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  push.csy             = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
 
   const Api& vk = m_ctx->api();
   if( numCus > 0 )
@@ -1972,6 +2008,80 @@ void GpuRecon::recordMider( const CodingStructure& cs, const std::vector<std::ve
     vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &derived, 0, nullptr, 0, nullptr );
     VkBufferCopy region{ 0, 0, motionSize };
     vk.vkCmdCopyBuffer( m_cmd, m_miderMotion.buffer, m_miderMotionHost.buffer, 1, &region );
+
+    // the deblocking's parameters: zeroed (as the CTU tasks' LF_INIT has
+    // them), the luma tree's CUs, then the chroma tree's
+    const size_t lfpSize = size_t( pcv.sizeInCtus ) * 2 * pcv.num4x4CtuBlks * 2 * sizeof( uint32_t );
+    ensureBuffer( m_ctx, m_dbLfp, lfpSize, MemKind::Device );
+    ensureBuffer( m_ctx, m_dbLfpHost, lfpSize, MemKind::HostCached );
+    ensureBuffer( m_ctx, m_dbCtuInfo, pcv.sizeInCtus * sizeof( uint32_t ), MemKind::Upload );
+    uint32_t* info = reinterpret_cast<uint32_t*>( m_dbCtuInfo.mapped );
+    for( unsigned ctu = 0; ctu < pcv.sizeInCtus; ctu++ )
+    {
+      const Position pos( ( ctu % pcv.widthInCtus ) * pcv.maxCUWidth, ( ctu / pcv.widthInCtus ) * pcv.maxCUHeight );
+      const SubPic&  sub = cs.pps->getSubPicFromPos( pos );
+      info[ctu]          = sub.getSubPicIdx() | ( sub.getloopFilterAcrossSubPicEnabledFlag() ? 1u << 16 : 0u );
+    }
+    vk.vkCmdFillBuffer( m_cmd, m_dbLfp.buffer, 0, VK_WHOLE_SIZE, 0 );
+    VkMemoryBarrier toCompute{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    toCompute.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toCompute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &toCompute, 0, nullptr, 0, nullptr );
+    DbParamsPush db{};
+    db.cus          = m_miderCus.addr;
+    db.tus          = m_miderTus.addr;
+    db.ctus         = m_miderCtus.addr;
+    db.slices       = push.slices;
+    db.cuMapL       = m_miderCuMap.addr;
+    db.cuMapC       = m_miderCuMapC.addr;
+    db.cuMotion     = m_miderCuMotion.addr;
+    db.motion       = m_miderMotion.addr;
+    db.lfp          = m_dbLfp.addr;
+    db.ctuInfo      = m_dbCtuInfo.addr;
+    db.numCus       = push.numCus;
+    db.widthInCtus  = push.widthInCtus;
+    db.heightInCtus = push.heightInCtus;
+    db.log2Ctu      = push.log2Ctu;
+    db.width        = push.width;
+    db.height       = push.height;
+    db.widthIn4     = push.widthIn4;
+    db.csx          = push.csx;
+    db.csy          = push.csy;
+    db.chroma       = chroma ? 1 : 0;
+    db.qpBdOffset   = cs.sps->getQpBDOffset();
+    db.flags        = ( cs.pps->getLoopFilterAcrossSlicesEnabledFlag() ? 1 : 0 ) | ( cs.pps->getLoopFilterAcrossTilesEnabledFlag() ? 2 : 0 )
+                      | ( cs.sps->getSubPicInfoPresentFlag() ? 4 : 0 );
+    const PicHeader& ph = *cs.picHeader;
+    if( ph.getVirtualBoundariesPresentFlag() )
+    {
+      db.vbPosHor[0] = int32_t( ph.getNumHorVirtualBoundaries() );
+      db.vbPosVer[0] = int32_t( ph.getNumVerVirtualBoundaries() );
+      for( unsigned i = 0; i < ph.getNumHorVirtualBoundaries(); i++ )
+      {
+        db.vbPosHor[1 + i] = int32_t( ph.getVirtualBoundariesPosY( i ) );
+      }
+      for( unsigned i = 0; i < ph.getNumVerVirtualBoundaries(); i++ )
+      {
+        db.vbPosVer[1 + i] = int32_t( ph.getVirtualBoundariesPosX( i ) );
+      }
+    }
+    vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_dbparams ) );
+    for( int pass = 0; pass < 2; pass++ )
+    {
+      db.pass = pass;
+      vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( db ), &db );
+      const uint32_t groups = uint32_t( ( numCus + 63 ) / 64 );
+      vk.vkCmdDispatch( m_cmd, std::min<uint32_t>( groups, 1024 ), ( groups + 1023 ) / 1024, 1 );
+      computeBarrier();
+    }
+    VkMemoryBarrier params{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    params.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    params.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &params, 0, nullptr, 0, nullptr );
+    VkBufferCopy lfpRegion{ 0, 0, lfpSize };
+    vk.vkCmdCopyBuffer( m_cmd, m_dbLfp.buffer, m_dbLfpHost.buffer, 1, &lfpRegion );
+    m_dbRecorded = true;
+
     VkMemoryBarrier copied{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -1980,9 +2090,14 @@ void GpuRecon::recordMider( const CodingStructure& cs, const std::vector<std::ve
   mark( "mider" );
 }
 
-void GpuRecon::compareMider( const CodingStructure& cs, const MotionInfo* cpu )
+void GpuRecon::compareMider( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp )
 {
   compareMotion( cs, reinterpret_cast<const int32_t*>( m_miderMotionHost.mapped ), cpu, m_miderStats );
+  if( m_dbRecorded && lfp )
+  {
+    compareLfp( cs, reinterpret_cast<const uint32_t*>( m_dbLfpHost.mapped ), lfp, m_miderStats );
+  }
+  m_dbRecorded = false;
 }
 
 int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
@@ -2032,7 +2147,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   transferBarrier( false );
   if( jobs.cus )
   {
-    recordMider( cs, *jobs.cus );
+    recordMider( cs, *jobs.cus, *jobs.tus );
   }
   if( jobs.trafo )
   {

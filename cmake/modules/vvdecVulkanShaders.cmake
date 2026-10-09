@@ -21,6 +21,7 @@ set( VVDEC_GPU_SHADERS
   "filmgrain|filmgrain"
   "mider|mider"
   "mider_cumap|mider|CUMAP=1"
+  "dbparams|dbparams"
 )
 
 if( NOT VVDEC_SLANGC OR NOT EXISTS "${VVDEC_SLANGC}" )

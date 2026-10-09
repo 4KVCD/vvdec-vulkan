@@ -205,6 +205,7 @@ private:
   // and its motion is compared with the CPU's (GpuRecon::compareMider)
   bool                           m_gpuMider = false;
   std::vector<std::vector<gpu::CuRecord>> m_gpuCuRecords;   // per CTU
+  std::vector<std::vector<gpu::TuRecord>> m_gpuTuRecords;   // per CTU
 #endif
 
   CommonTaskParam            commonTaskParam{ this };

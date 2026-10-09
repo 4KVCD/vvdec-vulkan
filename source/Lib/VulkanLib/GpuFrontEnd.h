@@ -54,13 +54,14 @@ namespace vvdec
 {
 class CodingStructure;
 struct MotionInfo;
+struct LoopFilterParam;
 
 namespace gpu
 {
 
 // a CU as the parse leaves it -- before the motion derivation, which turns
 // the motion vector differences into motion vectors -- for the front end's
-// shaders (shaders/mider.slang): 16 words
+// shaders (shaders/mider.slang, dbparams.slang): 32 words
 struct CuRecord
 {
   enum Flags : uint32_t
@@ -79,24 +80,46 @@ struct CuRecord
   // w1: the luma size, width | height << 8; the prediction mode << 16 (vvdec's PredMode); the flags << 18
   // w2: merge index | MMVD index << 3 | GPM split << 9 | GPM indices << 15, << 18 | imv << 21 | BCW index << 23 |
   //     inter direction << 26 | MVP indices << 28, << 29
-  // w3: reference indices (int8_t) | << 8
+  // w3: reference indices (int8_t) | << 8; QP << 16 (int8_t); chroma QP adjustment << 24 (int8_t)
   // w4..w15: the motion vector differences as parsed: list l's k-th at w[4 + 6 * l + 2 * k], (hor, ver)
+  // w16: its first TU (in its CTU's) | their count << 16
+  // w17: chType | treeType << 1 | modeType << 3 | ISP << 5 | LFNST index << 7 | MIP << 9 | MIP transposed << 10 |
+  //      MRL index << 11 | colour transform << 13 | BDPCM luma << 14 | chroma << 16 | root CBF << 18 | SBT info
+  //      << 19 (8 bits) | the planes' CBFs << 27
+  // w18: intra direction luma (uint8_t) | chroma << 8 | QT depth << 16 | depth << 20
+  // w19: the chroma block (chroma samples), x | y << 16; w20: its width | height << 8 | chroma there << 16 |
+  //      luma there << 17
+  // w21..w31: reserved
+  uint32_t w[32];
+};
+
+// a TU of the parse: 16 words
+// w0, w1: its luma block x | y << 16, width | height << 8 | there << 16
+// w2, w3: its chroma block (chroma samples), the same
+// w4: CBFs (3 bits) | joint Cb-Cr << 3 | MTS index luma << 5 (3 bits) | Cb << 8 | Cr << 9 | chType << 10
+// w5: the chroma QPs (int8_t) | << 8
+// w6, w7: the highest scan positions, x and y, per component (a byte each)
+// w8: its CU (in its CTU's)
+// w9..w15: reserved
+struct TuRecord
+{
   uint32_t w[16];
 };
 
 // a CTU's: its first CU (the picture's CUs CTU by CTU, each CTU's in decoding
 // order), their count, its slice (the index in the picture's slices), its
 // tile and whether it begins a tile's row (the history of motion begins
-// anew): 4 words
+// anew), its first TU: 4 words
 struct CtuRecord
 {
   uint32_t w[4];
 };
 
-// the CU records of a CTU, in decoding order, appended to out
-void writeCuRecords( CodingStructure& cs, int ctuRsAddr, std::vector<CuRecord>& out );
-// the CTU records of a picture whose CUs' records are cus, CTU by CTU
-void writeCtuRecords( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, CtuRecord* out );
+// the CU and TU records of a CTU, in decoding order, appended to cus and tus
+void writeCuRecords( CodingStructure& cs, int ctuRsAddr, std::vector<CuRecord>& cus, std::vector<TuRecord>& tus );
+// the CTU records of a picture whose CUs' and TUs' records are cus and tus, CTU by CTU
+void writeCtuRecords( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus,
+                      CtuRecord* out );
 
 // a picture's slice table: per CTU its slice's index, then the slices'
 // records (64 words each: their POC, reference lists, colocated picture --
@@ -112,10 +135,16 @@ struct MiderStats
   int64_t compared   = 0;   // 4x4 blocks
   int64_t mismatched = 0;
   int64_t skipped    = 0;   // of the CUs the GPU doesn't derive yet
+  int64_t lfpCompared   = 0;   // the deblocking's parameters (4x4 blocks and directions)
+  int64_t lfpMismatched = 0;
+  int64_t lfpEdges      = 0;   // of them with a boundary strength (the CPU's)
+  int     lfpReported   = 0;
   int     reported   = 0;
 };
 // gpu: the motion of each 4x4 block as the GPU wrote it (shaders/mider.slang's), cpu: as vvdec keeps it
 void compareMotion( const CodingStructure& cs, const int32_t* gpu, const MotionInfo* cpu, MiderStats& stats );
+// gpu: the deblocking's parameters as the GPU wrote them (shaders/dbparams.slang's, 2 words each), cpu: vvdec's
+void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const LoopFilterParam* cpu, MiderStats& stats );
 
 }   // namespace gpu
 }   // namespace vvdec
