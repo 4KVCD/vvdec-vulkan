@@ -11,7 +11,8 @@
 // bytes of vvdec's LoopFilterParam (qp[3], bs, sideMaxFiltLength, flags) its
 // filter needs (GpuRecon::listEdges, GpuJobs.h Edge).
 // Per CTU, 8 bytes: deblocking disabled, then the beta and tc offsets (div 2)
-// of Y, Cb, Cr.
+// of Y, Cb, Cr. LADF (luma): the QP of an edge's 4 lines moves by the offset
+// of the interval their luma level is in (LoopFilter::deriveLADFShift).
 
 #include "common.slang"
 
@@ -35,6 +36,9 @@ struct Params
   int      scaleX;      // chroma subsampling
   int      scaleY;
   int      count;       // of edges
+  int      ladfNum;     // LADF's intervals (0: no LADF), their QP offsets, the lower bounds of all but the first
+  int      ladfOffset0, ladfOffset1, ladfOffset2, ladfOffset3, ladfOffset4;
+  int      ladfBound1, ladfBound2, ladfBound3, ladfBound4;
 };
 
 [[vk::push_constant]] Params pc;
@@ -49,6 +53,23 @@ static const int kBetaTable[64] = {
 };
 
 #define MAX_QP 63
+
+// deriveLADFShift: the QP offset of the interval the luma level is in
+int ladfShift( int level )
+{
+  const int offsets[5] = { pc.ladfOffset0, pc.ladfOffset1, pc.ladfOffset2, pc.ladfOffset3, pc.ladfOffset4 };
+  const int bounds[5]  = { 0, pc.ladfBound1, pc.ladfBound2, pc.ladfBound3, pc.ladfBound4 };
+  int       shift      = offsets[0];
+  for( int k = 1; k < pc.ladfNum; k++ )
+  {
+    if( level <= bounds[k] )
+    {
+      break;
+    }
+    shift = offsets[k];
+  }
+  return shift;
+}
 
 int ctuParam( int x, int y, int i )
 {
@@ -334,7 +355,6 @@ void main( uint3 id : SV_DispatchThreadID )
     return;
   }
 
-  const int qp               = int( int8_t( edge.y & 255 ) );
   const int sideMax          = int( ( edge.y >> 16 ) & 255 );
   const int maxFilterLengthP = ( sideMax >> 4 ) & 7;
   const int maxFilterLengthQ = sideMax & 7;
@@ -347,15 +367,7 @@ void main( uint3 id : SV_DispatchThreadID )
   }
 #endif
 
-  const int betaOffsetDiv2 = ctuParam( x, y, 1 );
-  const int tcOffsetDiv2   = ctuParam( x, y, 2 );
-  const int indexTc        = clip3( 0, MAX_QP + 2, qp + 2 * ( bs - 1 ) + tcOffsetDiv2 * 2 );
-  const int indexB         = clip3( 0, MAX_QP, qp + betaOffsetDiv2 * 2 );
-  const int tc             = tcFromTable( indexTc );
-  const int beta           = kBetaTable[indexB] << ( pc.bitDepth - 8 );
-  const int sideThreshold  = ( beta + ( beta >> 1 ) ) >> 3;
-  const int thrCut         = tc * 10;
-  const int maxVal         = ( 1 << pc.bitDepth ) - 1;
+  const int maxVal           = ( 1 << pc.bitDepth ) - 1;
 
   // all the loads at once
   uint2 v[16];
@@ -413,6 +425,21 @@ void main( uint3 id : SV_DispatchThreadID )
     l0[k] = SMP( 0, k );
     l3[k] = SMP( 3, k );
   }
+  // the edge's QP (LADF: moved by its lines' luma level, p0 and q0 of lines 0
+  // and 3), tc and beta
+  int qp = int( int8_t( edge.y & 255 ) );
+  if( pc.ladfNum > 0 )
+  {
+    qp += ladfShift( ( l0[8] + l3[8] + l0[7] + l3[7] ) >> 2 );
+  }
+  const int betaOffsetDiv2 = ctuParam( x, y, 1 );
+  const int tcOffsetDiv2   = ctuParam( x, y, 2 );
+  const int indexTc        = clip3( 0, MAX_QP + 2, qp + 2 * ( bs - 1 ) + tcOffsetDiv2 * 2 );
+  const int indexB         = clip3( 0, MAX_QP, qp + betaOffsetDiv2 * 2 );
+  const int tc             = tcFromTable( indexTc );
+  const int beta           = kBetaTable[indexB] << ( pc.bitDepth - 8 );
+  const int sideThreshold  = ( beta + ( beta >> 1 ) ) >> 3;
+  const int thrCut         = tc * 10;
   const int dp0 = abs( l0[5] - 2 * l0[6] + l0[7] );    // |p2 - 2 p1 + p0|
   const int dq0 = abs( l0[8] - 2 * l0[9] + l0[10] );   // |q0 - 2 q1 + q2|
   const int dp3 = abs( l3[5] - 2 * l3[6] + l3[7] );

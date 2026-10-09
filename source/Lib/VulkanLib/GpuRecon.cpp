@@ -993,6 +993,7 @@ struct DeblockPush
 {
   VkDeviceAddress pic0, pic1, ctus, edges;
   int32_t         stride, width, height, ctuLog2, widthInCtus, bitDepth, dir, scaleX, scaleY, count;
+  int32_t         ladfNum, ladfOffset[5], ladfBound[4];
 };
 
 // the index of the lowest bit set in v (not 0)
@@ -1070,7 +1071,7 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
 
 bool GpuRecon::filtersSupported( const CodingStructure& cs )
 {
-  return alfSupported( cs ) && saoSupported( cs ) && !cs.sps->getLadfEnabled();
+  return alfSupported( cs ) && saoSupported( cs );
 }
 
 size_t GpuRecon::deblockParamSize( const CodingStructure& cs )
@@ -1136,6 +1137,20 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
   push.bitDepth    = cs.sps->getBitDepth();
   push.scaleX      = chroma ? getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) : 0;
   push.scaleY      = chroma ? getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) : 0;
+  // LADF (the luma's): its intervals' QP offsets and lower bounds
+  const SPS& sps = *cs.sps;
+  if( sps.getLadfEnabled() )
+  {
+    push.ladfNum = sps.getLadfNumIntervals();
+    for( int k = 0; k < push.ladfNum; k++ )
+    {
+      push.ladfOffset[k] = sps.getLadfQpOffset( k );
+      if( k > 0 )
+      {
+        push.ladfBound[k - 1] = sps.getLadfIntervalLowerBound( k );
+      }
+    }
+  }
 
   for( int dir = 0; dir < 2; dir++ )
   {
