@@ -147,6 +147,9 @@ public:
   // copy queue, which waits for the rest's semaphore and signals transferDone
   void submitFirst( VkCommandBuffer first, VkFence firstDone );
   void submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore semaphore, VkCommandBuffer transfer, VkFence transferDone );
+  // other work on the compute queue (the output frames' film grain), which
+  // signals done
+  void submit( VkCommandBuffer cmd, VkFence done ) { submitFirst( cmd, done ); }
   // a queue for copies only (the GPU's copy engine), when the device has one:
   // its copies run alongside the compute queue's work. The buffers are shared
   // by both queues' families.

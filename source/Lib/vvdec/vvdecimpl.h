@@ -44,6 +44,10 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "vvdec/vvdec.h"
 #include "DecoderLib/DecLib.h"             // internal decoder
+#if VVDEC_VULKAN
+#include "VulkanLib/GpuContext.h"
+#include "VulkanLib/GpuFilmGrain.h"
+#endif
 
 namespace vvdec {
 
@@ -113,8 +117,30 @@ public:
       return 0;
     }
 
+#if VVDEC_VULKAN
+    // in host memory the GPU reaches (the film grain's output on the GPU)
+    int allocateGpuStorage( gpu::Context* gpu, size_t size )
+    {
+      if( size == 0 ){ return VVDEC_ERR_ALLOCATE; }
+      m_gpu    = gpu;
+      m_gpuBuf = gpu->alloc( size, gpu::MemKind::HostCached );
+      m_size   = size;
+      return 0;
+    }
+    VkDeviceAddress gpuAddress() const { return m_gpuBuf.addr; }
+#endif
+
     int freeStorage()
     {
+#if VVDEC_VULKAN
+      if( m_gpu )
+      {
+        m_gpu->free( m_gpuBuf );
+        m_gpu  = nullptr;
+        m_size = 0;
+        return 0;
+      }
+#endif
       if( !m_ptr ) { return VVDEC_ERR_ALLOCATE; }
       m_ptr.reset();
       m_size = 0;
@@ -123,10 +149,20 @@ public:
 
     unsigned char * getStorage()
     {
+#if VVDEC_VULKAN
+      if( m_gpu )
+      {
+        return m_gpuBuf.mapped;
+      }
+#endif
       return m_ptr.get();
     }
 
+#if VVDEC_VULKAN
+    bool isAllocated() { return !!m_ptr || m_gpu; }
+#else
     bool isAllocated() { return !!m_ptr; }
+#endif
     bool isExternAllocator() { return m_isExternAllocator; }
     void setExternAllocator() { m_isExternAllocator = true; }
 
@@ -134,6 +170,10 @@ public:
     std::unique_ptr<unsigned char[]> m_ptr               = nullptr;   // pointer to plane buffer
     size_t                           m_size              = 0;
     bool                             m_isExternAllocator = false;
+#if VVDEC_VULKAN
+    gpu::Context*                    m_gpu               = nullptr;   // the storage's: a GPU buffer (freed by freeStorage)
+    gpu::Buffer                      m_gpuBuf;
+#endif
   };
 
 public:
@@ -180,10 +220,16 @@ private:
                                      uint32_t           uiHeight,
                                      const BitDepths&   rcBitDepths,
                                      bool               bCreateStorage,
-                                     bool               origStride = false );
+                                     bool               origStride = false,
+                                     bool               gpuStorage = false );
 
   void xUpdateFGC                  ( vvdecSEI *sei );
   void xAddGrain                   ( vvdecFrame *frame );
+#if VVDEC_VULKAN
+  // the grain on the GPU: the frame's planes the picture's (cropped by
+  // confLeft, confTop), or (copied) the GPU's copy in the frame's storage
+  void xAddGrainGpu                ( vvdecFrame *frame, Picture* pcPic, int confLeft, int confTop, bool copied );
+#endif
 
   static int xRetrieveNalStartCode ( unsigned char *pB, int iZerosInStartcode );
   static int xConvertPayloadToRBSP ( const uint8_t* payload, size_t payloadLen, InputBitstream* bitstream, bool isVclNalUnit );
@@ -229,6 +275,11 @@ private:
   }                                        m_filmGrainCharacteristicsState = FgcNone;
   bool                                     m_enableFilmGrain               = false;
   std::unique_ptr<FilmGrain>               m_filmGrainSynth;
+#if VVDEC_VULKAN
+  std::unique_ptr<gpu::GpuFilmGrain>       m_gpuFilmGrain;   // made when the GPU first adds grain
+  int                                      m_grainFramesGpu                = 0;   // with the GPU: the frames given grain there
+  int                                      m_grainFramesCpu                = 0;   // and on the CPU
+#endif
 };
 
 template<class MembFunc, class... Args>

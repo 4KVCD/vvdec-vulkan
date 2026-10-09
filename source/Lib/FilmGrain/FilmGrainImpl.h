@@ -124,6 +124,15 @@ public:
   void set_depth( int depth );
   void set_chroma_subsampling( int subx, int suby );
 
+  // the synthesis' state as set, for the GPU's (VulkanLib/GpuFilmGrain)
+  const int8_t*  patterns() const { return &pattern[0][0][0][0]; }   // [2][VFGS_MAX_PATTERNS + 1][64][64]
+  const uint8_t* scaleLut( int c ) const { return sLUT[c]; }
+  const uint8_t* patternLut( int c ) const { return pLUT[c]; }
+  int            scaleShift() const { return scale_shift; }
+  int            bitShift() const { return bs; }
+  int            subX() const { return csubx; }
+  int            subY() const { return csuby; }
+
 private:
   virtual void make_grain_pattern( const void* I,
                                    int         c,

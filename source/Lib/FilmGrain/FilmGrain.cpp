@@ -791,7 +791,7 @@ void FilmGrain::updateFGC( vvdecSEIFilmGrainCharacteristics* fgc )
   //    set_seed(uint32_t seed);
 }
 
-void FilmGrain::prepareBlockSeeds( int width, int height )
+void FilmGrain::prepareBlockSeeds( int width, int height, uint32_t* blockSeeds )
 {
   m_line_seeds.resize( ( height + 15 ) / 16 );
 
@@ -814,6 +814,10 @@ void FilmGrain::prepareBlockSeeds( int width, int height )
     rnd = m_line_rnd;
     for( int x = 0; x < ( width + 15 ) / 16; ++x )
     {
+      if( blockSeeds )
+      {
+        *blockSeeds++ = rnd;   // add_grain_line's rnd for the block
+      }
       rnd = prng( rnd );
     }
   }

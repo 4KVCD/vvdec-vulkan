@@ -925,6 +925,28 @@ void GpuRecon::recordSao( const CodingStructure& cs, const Planes& src, const Pl
   mark( "sao" );
 }
 
+bool hostPictureAddresses( const PelStorage& pic, VkDeviceAddress addr[MAX_NUM_COMPONENT], int stride[MAX_NUM_COMPONENT] )
+{
+  const UserAllocator* allocator = pic.getUserAllocator();
+  if( pic.bufs.empty() || !pic.isExternAllocator() || !allocator || allocator->create != createHostPlane )
+  {
+    return false;
+  }
+  for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
+  {
+    if( !pic.getBufAllocator( comp ) )
+    {
+      return false;
+    }
+    if( addr )
+    {
+      addr[comp]   = hostPlane( pic, ComponentID( comp ) )->host.addr + planeOffset( pic, ComponentID( comp ) );
+      stride[comp] = int( pic.bufs[comp].stride );
+    }
+  }
+  return true;
+}
+
 GpuRecon::Planes GpuRecon::hostPlanes( const PelStorage& pic )
 {
   Planes planes{};

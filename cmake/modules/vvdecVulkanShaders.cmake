@@ -18,6 +18,7 @@ set( VVDEC_GPU_SHADERS
   "inter_affine|inter|AFFINE=1"
   "trafo|trafo"
   "lmcs|lmcs"
+  "filmgrain|filmgrain"
 )
 
 if( NOT VVDEC_SLANGC OR NOT EXISTS "${VVDEC_SLANGC}" )

@@ -58,6 +58,9 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "CommonLib/x86/CommonDefX86.h"
 #include "CommonLib/arm/CommonDefARM.h"
 #include "FilmGrain/FilmGrain.h"
+#if VVDEC_VULKAN
+#include "VulkanLib/GpuRecon.h"
+#endif
 
 namespace vvdec
 {
@@ -193,6 +196,13 @@ int VVDecImpl::uninit()
 
   reset();
 
+#if VVDEC_VULKAN
+  if( m_cDecLib->gpu() && m_grainFramesGpu + m_grainFramesCpu > 0 )
+  {
+    msg( INFO, "GPU: film grain of %d frames on the GPU, %d on the CPU\n", m_grainFramesGpu, m_grainFramesCpu );
+  }
+  m_gpuFilmGrain.reset();   // before the GPU context goes
+#endif
   // destroy internal classes
   m_cDecLib->destroy();
   m_cDecLib.reset();
@@ -961,6 +971,61 @@ void VVDecImpl::xAddGrain( vvdecFrame* frame )
   }
 }
 
+#if VVDEC_VULKAN
+void VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft, int confTop, bool copied )
+{
+  if( !m_gpuFilmGrain )
+  {
+    m_gpuFilmGrain = std::make_unique<gpu::GpuFilmGrain>( m_cDecLib->gpu() );
+  }
+  m_filmGrainSynth->setDepth( frame->bitDepth );
+  m_filmGrainSynth->setColorFormat( frame->colorFormat );
+  const int width  = int( frame->planes[0].width );
+  const int height = int( frame->planes[0].height );
+  m_filmGrainSynth->prepareBlockSeeds( width, height, m_gpuFilmGrain->seeds( size_t( ( width + 15 ) / 16 ) * ( ( height + 15 ) / 16 ) ) );
+
+  // from the picture (at the frame's origin) into the frame: in place, or the
+  // copy in the frame's storage
+  const PelStorage& pic = pcPic->m_bufs[PIC_RECONSTRUCTION];
+  VkDeviceAddress   addr[MAX_NUM_COMPONENT];
+  int               stride[MAX_NUM_COMPONENT];
+  gpu::hostPictureAddresses( pic, addr, stride );
+  FrameStorage* storage = nullptr;
+  if( copied )
+  {
+    auto it = m_cFrameStorageMap.find( frame->sequenceNumber );
+    CHECK( it == m_cFrameStorageMap.end(), "the film grain's frame storage is missing" );
+    storage = &it->second;
+  }
+  gpu::GpuFilmGrain::Plane src[3], dst[3];
+  for( uint32_t c = 0; c < frame->numPlanes; c++ )
+  {
+    const ComponentID compID = ComponentID( c );
+    const int         csx    = getComponentScaleX( compID, pic.chromaFormat );
+    const int         csy    = getComponentScaleY( compID, pic.chromaFormat );
+    src[c].addr      = addr[c] + ( VkDeviceAddress( confTop >> csy ) * stride[c] + ( confLeft >> csx ) ) * sizeof( Pel );
+    src[c].stride    = stride[c];
+    src[c].readWidth = int( pic.bufs[c].width ) - ( confLeft >> csx );
+    if( storage )
+    {
+      dst[c].addr   = storage->gpuAddress() + VkDeviceAddress( frame->planes[c].ptr - storage->getStorage() );
+      dst[c].stride = int( frame->planes[c].stride );
+    }
+    else
+    {
+      dst[c].addr   = src[c].addr;
+      dst[c].stride = stride[c] * int( sizeof( Pel ) );
+    }
+  }
+  m_gpuFilmGrain->apply( *m_filmGrainSynth, int( frame->numPlanes ), src, dst, int( frame->planes[0].bytesPerSample ), width, height );
+
+  if( m_filmGrainCharacteristicsState != FgcPersist )   // Not persistent
+  {
+    m_filmGrainCharacteristicsState = FgcNone;
+  }
+}
+#endif
+
 int VVDecImpl::xAddPicture( Picture* pcPic )
 {
   // copy internal picture to external (Priority PPS > SPS)
@@ -1013,6 +1078,14 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
       bCreateStorage |= m_filmGrainCharacteristicsState != FgcNone;
     }
   }
+#if VVDEC_VULKAN
+  // the grain on the GPU, where the picture lives in host memory the GPU
+  // reaches: in place, or into a copy it makes in memory it reaches too
+  const bool gpuGrain = m_enableFilmGrain && m_filmGrainCharacteristicsState != FgcNone && m_cDecLib->gpu() && !m_cUserAllocator.enabled
+                        && gpu::hostPictureAddresses( pcPic->m_bufs[PIC_RECONSTRUCTION], nullptr, nullptr );
+#else
+  const bool gpuGrain = false;
+#endif
 
   // create a brand new picture object
   vvdecFrame cFrame;
@@ -1023,7 +1096,7 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
   cFrame.ctsValid       = true;
 
   const bool origStride = m_filmGrainCharacteristicsState != FgcNone;
-  const int  ret        = xCreateFrame( cFrame, cPicBuf, uiWidth, uiHeight, bitDepths, bCreateStorage, origStride );
+  const int  ret        = xCreateFrame( cFrame, cPicBuf, uiWidth, uiHeight, bitDepths, bCreateStorage, origStride, gpuGrain );
   if( ret != VVDEC_OK )
   {
     return ret;
@@ -1041,7 +1114,11 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
     const Pel*      planeOrigin = area.buf;
     const ptrdiff_t planeOffset = ( confLeft >> csx ) + ( confTop >> csy ) * area.stride;
 
-    if( bCreateStorage )
+    if( bCreateStorage && gpuGrain )
+    {
+      // the GPU's grain makes the copy (xAddGrainGpu)
+    }
+    else if( bCreateStorage )
     {
       const unsigned int copyWidth  = area.width - ( ( confLeft + confRight ) >> csx );
       const unsigned int copyHeight = area.height - ( ( confTop + confBottom ) >> csy );
@@ -1207,6 +1284,17 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
   // Grain synthesis
   if( m_enableFilmGrain && m_filmGrainCharacteristicsState != FgcNone )
   {
+#if VVDEC_VULKAN
+    if( m_cDecLib->gpu() )
+    {
+      ( gpuGrain ? m_grainFramesGpu : m_grainFramesCpu )++;
+    }
+    if( gpuGrain )
+    {
+      xAddGrainGpu( &cFrame, pcPic, confLeft, confTop, bCreateStorage );
+    }
+    else
+#endif
     xAddGrain( &cFrame );
   }
 
@@ -1248,7 +1336,8 @@ int VVDecImpl::xCreateFrame( vvdecFrame&        rcFrame,
                              uint32_t           uiHeight,
                              const BitDepths&   rcBitDepths,
                              bool               bCreateStorage,
-                             bool               origStride )
+                             bool               origStride,
+                             bool               gpuStorage )
 {
   rcFrame.width       = uiWidth;
   rcFrame.height      = uiHeight;
@@ -1375,6 +1464,13 @@ int VVDecImpl::xCreateFrame( vvdecFrame&        rcFrame,
     }
     else
     {
+#if VVDEC_VULKAN
+      if( gpuStorage )
+      {
+        frameStorage.allocateGpuStorage( m_cDecLib->gpu(), nBufSize );
+      }
+      else
+#endif
       frameStorage.allocateStorage( nBufSize );
       rcFrame.planes[VVDEC_CT_Y].ptr = frameStorage.getStorage();
 

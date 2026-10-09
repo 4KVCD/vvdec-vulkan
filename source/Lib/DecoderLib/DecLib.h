@@ -117,6 +117,9 @@ public:
 
 
   ThreadPool& getThreadPool() { return *m_decodeThreadPool; }
+#if VVDEC_VULKAN
+  gpu::Context* gpu() const { return m_gpu; }   // null when the pictures are reconstructed on the CPU
+#endif
 
 private:
   void     reconPicture( Picture* pcPic );

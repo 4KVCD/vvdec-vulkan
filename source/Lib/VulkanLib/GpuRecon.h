@@ -75,6 +75,10 @@ namespace gpu
 // UserAllocator callbacks putting the planes of the pictures in host memory
 // the GPU reaches; each plane's allocator handle is its HostPlane (GpuRecon.cpp)
 UserAllocator hostPictureAllocator( Context* context );
+// whether a picture lives in host memory the GPU reaches (hostPictureAllocator's
+// buffers), and then (addr, stride not null) where each plane's sample (0, 0)
+// is and its stride in samples
+bool hostPictureAddresses( const PelStorage& pic, VkDeviceAddress addr[MAX_NUM_COMPONENT], int stride[MAX_NUM_COMPONENT] );
 // a reconstructed picture no picture will reference any more gives back its
 // planes on the GPU (to Context's pool); not gpuCurrent then
 void releaseTwins( Picture& pic );

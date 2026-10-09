@@ -103,7 +103,13 @@ public:
   void updateFGC( vvdecSEIFilmGrainCharacteristics* fgc );
   void setDepth( int depth ) { m_impl->set_depth( depth ); }
   void setColorFormat( vvdecColorFormat fmt );
-  void prepareBlockSeeds( int width, int height );
+  // the frame's seeds; with blockSeeds, each 16x16 block's too (a row of blocks
+  // after the other), for the GPU's synthesis
+  void prepareBlockSeeds( int width, int height, uint32_t* blockSeeds = nullptr );
+
+  // for the GPU's synthesis (VulkanLib/GpuFilmGrain)
+  const FilmGrainImpl& impl() const { return *m_impl; }
+  bool                 componentPresent( int c ) const { return fgs.comp_model_present_flag[c] != 0; }
 
   void add_grain_line( void* Y, void* U, void* V, int y, int width );
 
