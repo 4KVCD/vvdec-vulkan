@@ -83,6 +83,14 @@ struct TrafoJob
     w[5] = uint32_t( inputMaximum );
     w[6] = w[7] = 0;
   }
+  // LFNST (TrQuant::xInvLfnst): the CU's index (1, 2), the set of the block's
+  // intra mode (g_lfnstLut), whether its output is transposed, whether it
+  // makes the top-left 8x8 (the blocks at least 8x8) and whether it takes 8
+  // inputs (the blocks of 4x4 and 8x8) rather than 16
+  void setLfnst( int index, int set, bool transposed, bool block8, bool inputs8 )
+  {
+    w[6] = uint32_t( index ) | uint32_t( set ) << 2 | uint32_t( transposed ) << 4 | uint32_t( block8 ) << 5 | uint32_t( inputs8 ) << 6;
+  }
 };
 
 // one transform block of one component that the GPU predicts and

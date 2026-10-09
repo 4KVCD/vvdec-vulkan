@@ -562,7 +562,7 @@ void DecCu::xGpuTrafoJobs( CodingUnit& cu, std::vector<gpu::TrafoJob>& jobs )
       const QpParam             cQP( tu, compID );
       const Quant::DequantParam param = Quant::dequantParam( tu, compID, cQP, false );
       const bool                ts    = tu.mtsIdx( compID ) == MTS_SKIP;
-      CHECK( cu.slice->getExplicitScalingListUsed() || cu.lfnstIdx() || ( param.bdpcm && !ts ), "a residual the GPU cannot reconstruct" );
+      CHECK( cu.slice->getExplicitScalingListUsed() || ( param.bdpcm && !ts ), "a residual the GPU cannot reconstruct" );
 
       int typeHor = DCT2;
       int typeVer = DCT2;
@@ -583,6 +583,18 @@ void DecCu::xGpuTrafoJobs( CodingUnit& cu, std::vector<gpu::TrafoJob>& jobs )
       gpu::TrafoJob job;
       job.set( block.x, block.y, getLog2( block.width ), getLog2( block.height ), compID, typeHor, typeVer, flags, ict, param.maxX, param.maxY,
                param.scale, param.rightShift, param.inputMaximum );
+      // LFNST, as TrQuant::xInvLfnst picks its set and orientation (luma's
+      // only, but in a separate tree)
+      if( cu.lfnstIdx() && cu.sps->getUseLFNST() && !ts && ( CU::isSepTree( cu ) || isLuma( compID ) ) )
+      {
+        const ChannelType chType    = toChannelType( compID );
+        uint32_t          intraMode = CU::isMIP( cu, chType )                ? PLANAR_IDX
+                                      : PU::isLMCMode( cu.intraDir[chType] ) ? PU::getCoLocatedIntraLumaMode( cu )
+                                                                             : PU::getFinalIntraMode( cu, chType );
+        intraMode = m_pcTrQuant->getLFNSTIntraMode( PU::getWideAngIntraMode( tu, intraMode, compID ) );
+        job.setLfnst( cu.lfnstIdx(), g_lfnstLut[intraMode], m_pcTrQuant->getTransposeFlag( intraMode ), block.width >= 8 && block.height >= 8,
+                      ( block.width == 4 && block.height == 4 ) || ( block.width == 8 && block.height == 8 ) );
+      }
       jobs.push_back( job );
     }
   }

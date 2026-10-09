@@ -9,12 +9,14 @@
 //      | (joint Cb-Cr mode + 4) << 24                      (types: vvdec's TransType, 0 DCT-II, 1 DCT-VIII, 2 DST-VII)
 //   2: last column | last row << 8 of the levels             (the parser wrote [0, last column] x [0, last row])
 //   3: scale   4: right shift (negative: a left shift)   5: the levels' maximum
+//   6: LFNST (0: none): index (1, 2) | set << 2 | transposed << 4 | 8x8 << 5 | 8 inputs << 6
 // flags: 1 transform skip, 2 BDPCM horizontal, 4 BDPCM vertical, 8 zeros (no residual)
 //
 // The threads dequantize the levels into shared memory, run the vertical
 // transform (rounded and clipped to 16 bits) into shared memory, then the
 // horizontal one into the picture; with transform skip, each takes samples
-// (with BDPCM, rows or columns) by itself.
+// (with BDPCM, rows or columns) by itself. With LFNST, the top-left
+// coefficients first go through its matrix (TrQuant::xInvLfnst).
 
 #include "common.slang"
 
@@ -28,6 +30,7 @@ struct Params
   int16_t*  levels1;
   int16_t*  levels2;
   int16_t*  matrices;   // TrQuant's matrices, TrafoJob's order (GpuRecon.cpp)
+  int8_t*   lfnst;      // LFNST's matrices: vvdec's g_lfnst8x8, then g_lfnst4x4
   int       stride0;
   int       stride12;
   int       count;
@@ -49,6 +52,10 @@ struct Params
 // the levels there are: at most 32 x 32 (64-point transforms keep 32)
 groupshared int s_coef[32 * 32];   // [row][column]
 groupshared int s_mid[64 * 32];    // the vertical transform's output, [row][column]
+groupshared int s_lfnst[16];       // LFNST's input
+
+// LFNST's input: the top-left 4x4's coefficients in diagonal scan order (x + 4 y)
+static const int kLfnstScan[16] = { 0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15 };
 
 int16_t* planeOf( int comp )
 {
@@ -199,8 +206,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   int16_t*  mVer   = pc.matrices + matrixOffset( typeVer, log2H );
   int16_t*  mHor   = pc.matrices + matrixOffset( typeHor, log2W );
   const int shift2 = 6 + 15 - 1 - pc.bitDepth;
-  const int nx     = lastX + 1;   // the columns with levels; the others are zero
-  const int ny     = lastY + 1;
+  int       nx     = lastX + 1;   // the columns with levels; the others are zero
+  int       ny     = lastY + 1;
 
   if( width == 1 || height == 1 )
   {
@@ -228,11 +235,67 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     return;
   }
 
-  for( int s = tid; s < nx * ny; s += THREADS )
+  const uint lfnst = job[6];
+  if( lfnst != 0 )
   {
-    const int k = s / nx;
-    const int x = s - k * nx;
-    s_coef[k * 32 + x] = dequant( int( levels[k * stride + x] ), scale, rightShift, inputMaximum );
+    // xInvLfnst: the set's matrix times the top-left 4x4's coefficients (8
+    // of them for the blocks of 4x4 and 8x8) gives the top-left 4x4 (the
+    // blocks 4 wide or high), else the top-left 8x8 but its bottom-right
+    // 4x4, row by row or (transposed) column by column; the rest is zero
+    const int  index     = int( lfnst & 3 ) - 1;
+    const int  set       = int( ( lfnst >> 2 ) & 3 );
+    const bool transpose = ( lfnst & 16 ) != 0;
+    const bool block8    = ( lfnst & 32 ) != 0;
+    const int  inputs    = ( lfnst & 64 ) != 0 ? 8 : 16;
+    if( tid < 16 )
+    {
+      const int x  = kLfnstScan[tid] & 3;
+      const int y  = kLfnstScan[tid] >> 2;
+      s_lfnst[tid] = x <= lastX && y <= lastY ? dequant( int( levels[y * stride + x] ), scale, rightShift, inputMaximum ) : 0;
+    }
+    nx = min( width, 8 );
+    ny = min( height, 8 );
+    for( int s = tid; s < nx * ny; s += THREADS )
+    {
+      const int k = s / nx;
+      s_coef[k * 32 + s - k * nx] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if( tid < ( block8 ? 48 : 16 ) )
+    {
+      int8_t*       row = pc.lfnst + ( block8 ? ( ( set * 2 + index ) * 48 + tid ) * 16 : 6144 + ( ( set * 2 + index ) * 16 + tid ) * 16 );
+      int           sum = 0;
+      for( int i = 0; i < inputs; i++ )
+      {
+        sum += s_lfnst[i] * int( row[i] );
+      }
+      int x, y;
+      if( !block8 )
+      {
+        x = transpose ? tid >> 2 : tid & 3;
+        y = transpose ? tid & 3 : tid >> 2;
+      }
+      else if( tid < 32 )
+      {
+        x = transpose ? tid >> 3 : tid & 7;
+        y = transpose ? tid & 7 : tid >> 3;
+      }
+      else
+      {
+        x = transpose ? 4 + ( ( tid - 32 ) >> 2 ) : ( tid - 32 ) & 3;
+        y = transpose ? ( tid - 32 ) & 3 : 4 + ( ( tid - 32 ) >> 2 );
+      }
+      s_coef[y * 32 + x] = clip3( COEFF_MIN, COEFF_MAX, ( sum + 64 ) >> 7 );
+    }
+  }
+  else
+  {
+    for( int s = tid; s < nx * ny; s += THREADS )
+    {
+      const int k = s / nx;
+      const int x = s - k * nx;
+      s_coef[k * 32 + x] = dequant( int( levels[k * stride + x] ), scale, rightShift, inputMaximum );
+    }
   }
   GroupMemoryBarrierWithGroupSync();
 

@@ -249,6 +249,14 @@ GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
     }
   }
 
+  // LFNST's matrices, in the order of shaders/trafo.slang: 8x8, then 4x4
+  {
+    static_assert( sizeof( g_lfnst8x8 ) == 6144 && sizeof( g_lfnst4x4 ) == 2048, "LFNST's matrices are not those of shaders/trafo.slang" );
+    m_lfnst = m_ctx->alloc( sizeof( g_lfnst8x8 ) + sizeof( g_lfnst4x4 ), MemKind::Upload );
+    memcpy( m_lfnst.mapped, g_lfnst8x8, sizeof( g_lfnst8x8 ) );
+    memcpy( m_lfnst.mapped + sizeof( g_lfnst8x8 ), g_lfnst4x4, sizeof( g_lfnst4x4 ) );
+  }
+
   // MIP's matrices, in the order of shaders/intra.slang: 4x4, 8x8, 16x16
   {
     static_assert( sizeof( mipMatrix4x4 ) == 1024 && sizeof( mipMatrix8x8 ) == 1024 && sizeof( mipMatrix16x16 ) == 2688,
@@ -342,6 +350,7 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_edges );
   m_ctx->free( m_matrices );
   m_ctx->free( m_mip );
+  m_ctx->free( m_lfnst );
   for( Buffer& buf: m_scratch )
   {
     m_ctx->free( buf );
@@ -1402,13 +1411,13 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
 // the push constants of shaders/trafo.slang
 struct TrafoPush
 {
-  VkDeviceAddress jobs, plane0, plane1, plane2, levels0, levels1, levels2, matrices;
+  VkDeviceAddress jobs, plane0, plane1, plane2, levels0, levels1, levels2, matrices, lfnst;
   int32_t         stride0, stride12, count, bitDepth;
 };
 
 bool GpuRecon::residualSupported( const CodingStructure& cs )
 {
-  if( cs.sps->getBitDepth() > 10 || cs.sps->getUseLFNST() )
+  if( cs.sps->getBitDepth() > 10 )
   {
     return false;
   }
@@ -1456,6 +1465,7 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   push.levels1  = levels.addr[COMPONENT_Cb];
   push.levels2  = levels.addr[COMPONENT_Cr];
   push.matrices = m_matrices.addr;
+  push.lfnst    = m_lfnst.addr;
   push.stride0  = planes.stride[COMPONENT_Y];
   push.stride12 = planes.stride[COMPONENT_Cb];
   push.count    = int32_t( total );

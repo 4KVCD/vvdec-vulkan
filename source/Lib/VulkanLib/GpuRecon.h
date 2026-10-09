@@ -108,7 +108,7 @@ public:
   // and of the picture: no weighted prediction, no scaled references
   static bool interSupported( const CodingStructure& cs );
   // whether the GPU dequantizes and inverse transforms the residuals of the
-  // picture: 10 bits at most, no LFNST, no scaling lists
+  // picture: 10 bits at most, no scaling lists
   static bool residualSupported( const CodingStructure& cs );
 
   // the edges of a CTU the deblocking filters, with the bytes of their
@@ -247,6 +247,7 @@ private:
   Buffer          m_edges;                          // the edges the deblocking filters
   Buffer          m_matrices;                       // TrQuant's transform matrices
   Buffer          m_mip;                            // MIP's matrices
+  Buffer          m_lfnst;                          // LFNST's matrices
 };
 
 }   // namespace gpu
