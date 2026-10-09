@@ -116,6 +116,20 @@ struct Buffer
   bool valid() const { return buffer != VK_NULL_HANDLE; }
 };
 
+// The GPU path's settings from the environment variables (README.md), read once when the context is made.
+struct Options
+{
+  std::string device;                  // VVDEC_GPU_DEVICE: the index of the Vulkan device (empty: the first discrete GPU,
+                                       // else the first integrated one)
+  bool        profile       = false;   // VVDEC_GPU_PROFILE=1: the GPU time of each pass, each shader's registers
+  std::string isaDir;                  // VVDEC_GPU_ISA: with profile on AMD, where each shader's machine code is written
+  bool        async         = true;    // VVDEC_GPU_ASYNC=0: the front end on the compute queue, not an async queue
+  bool        frontEnd      = true;    // VVDEC_GPU_FRONT=0: the CPU front end drives the pictures
+  bool        frontEndCheck = false;   // VVDEC_GPU_MIDER=1: the CPU front end drives, the GPU front end is compared with it
+
+  static Options fromEnvironment();
+};
+
 class Context
 {
 public:
@@ -125,8 +139,9 @@ public:
   static Context* acquire();
   static void     release();
 
-  const Api& api() const { return m_api; }
-  VkDevice   device() const { return m_device; }
+  const Api&     api() const { return m_api; }
+  VkDevice       device() const { return m_device; }
+  const Options& options() const { return m_options; }
 
   // Allocates a buffer (throws on failure) and frees one.
   Buffer alloc( size_t size, MemKind kind );
@@ -143,6 +158,19 @@ public:
   // The compute pipeline of a shader (kShader_...), created on first use, and the layout they all share.
   VkPipeline       pipeline( int shaderId );
   VkPipelineLayout layout() const { return m_layout; }
+
+  // Vulkan objects with the settings the decoder uses. The create functions throw on failure; the destroy functions
+  // ignore null handles. (The destroy functions have distinct names because on 32-bit builds all these handle types
+  // are uint64_t.) Command pools are transient: their command buffers are recorded for one submission at a time.
+  VkCommandPool createCommandPool( uint32_t family );
+  void          allocateCommandBuffers( VkCommandPool pool, uint32_t count, VkCommandBuffer* out );
+  VkFence       createFence();
+  VkSemaphore   createSemaphore();
+  VkQueryPool   createTimestampQueries( uint32_t count );
+  void          destroyCommandPool( VkCommandPool pool );
+  void          destroyFence( VkFence fence );
+  void          destroySemaphore( VkSemaphore semaphore );
+  void          destroyQueries( VkQueryPool queries );
 
   // --- The compute queue, which all decoder instances of the process share ---
   // A picture's work is submitted in two parts. submitFirst() submits the first part, which signals firstDone.
@@ -196,6 +224,7 @@ private:
   void countMemory( MemKind kind, int64_t bytes );
 
   Api                              m_api;
+  Options                          m_options;
   VkInstance                       m_instance = VK_NULL_HANDLE;   // s_instance
   VkPhysicalDevice                 m_physical = VK_NULL_HANDLE;
   VkDevice                         m_device   = VK_NULL_HANDLE;

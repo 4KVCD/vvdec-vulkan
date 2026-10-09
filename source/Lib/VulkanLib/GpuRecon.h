@@ -41,11 +41,17 @@ POSSIBILITY OF SUCH DAMAGE.
 ------------------------------------------------------------------------------------------- */
 
 /** \file     GpuRecon.h
-    \brief    the stages of a picture's reconstruction that run on the GPU
+    \brief    Records and submits a picture's GPU work: uploads, the front end, the reconstruction passes, the in-loop
+              filters and the download
 
-    The pictures live in host memory the GPU reaches (hostPictureAllocator),
-    where vvdec's CPU code reads and writes them, and each has a twin in the
-    GPU's own memory, where the GPU finishes it and keeps it as a reference.
+    There is one GpuRecon per decoder instance. Its member functions are defined in several files, by area:
+    - GpuRecon.cpp: construction, commands and submissions, the picture's planes and tables, and the order of a
+      picture's work (startEarlyRows, startPicture);
+    - GpuReconFrontEnd.cpp: the GPU front end (motion, deblocking parameters, jobs, intra order, deblocking edges);
+    - GpuReconPrediction.cpp: the residuals, inter prediction and intra prediction;
+    - GpuReconFilters.cpp: LMCS's inverse mapping, deblocking, SAO and ALF;
+    - GpuFrontEndCheck.cpp: the check of the front end against the CPU's (VVDEC_GPU_MIDER=1).
+    README.md describes the overall flow.
 */
 
 #pragma once
@@ -54,11 +60,13 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <chrono>
 
 #include "GpuContext.h"
-#include "GpuJobs.h"
 #include "GpuFrontEnd.h"
+#include "GpuFrontEndCheck.h"
+#include "GpuJobs.h"
+#include "GpuPictureMemory.h"
 
-#include "CommonLib/Common.h"
 #include "CommonLib/Buffer.h"
+#include "CommonLib/Common.h"
 
 namespace vvdec
 {
@@ -69,22 +77,27 @@ class SampleAdaptiveOffset;
 class Mv;
 class SPS;
 struct Picture;
+struct MotionInfo;
+struct LoopFilterParam;
 
 namespace gpu
 {
 
-// UserAllocator callbacks putting the planes of the pictures in host memory
-// the GPU reaches; each plane's allocator handle is its HostPlane (GpuRecon.cpp)
-UserAllocator hostPictureAllocator( Context* context );
-// whether a picture lives in host memory the GPU reaches (hostPictureAllocator's
-// buffers), and then (addr, stride not null) where each plane's sample (0, 0)
-// is and its stride in samples
-bool hostPictureAddresses( const PelStorage& pic, VkDeviceAddress addr[MAX_NUM_COMPONENT], int stride[MAX_NUM_COMPONENT] );
-// where the GPU reaches memory from hostPictureAllocator's create (its allocator handle)
-VkDeviceAddress hostAllocationAddress( void* allocation );
-// a reconstructed picture no picture will reference any more gives back its
-// planes on the GPU (to Context's pool); not gpuCurrent then
-void releaseTwins( Picture& pic );
+// The passes whose job counts the GPU front end works out (jobs.slang, intrasort.slang, edges.slang). For pass p,
+// the front end's argument buffer holds the pass's indirect dispatch (3 words) at word 3 * p, and its job count and
+// first job at words 32 + 2 * p and 33 + 2 * p.
+enum FrontPass
+{
+  kPassTrafo            = 0,
+  kPassInter            = 1,   // inter's regular tiles
+  kPassInterBdof        = 2,   // the BDOF tiles
+  kPassInterAffine      = 3,   // the affine pairs
+  kPassIntra            = 4,   // the intra bands
+  kPassDeblockLumaVer   = 5,
+  kPassDeblockLumaHor   = 6,
+  kPassDeblockChromaVer = 7,
+  kPassDeblockChromaHor = 8,
+};
 
 class GpuRecon
 {
@@ -94,278 +107,350 @@ public:
   GpuRecon( const GpuRecon& )            = delete;
   GpuRecon& operator=( const GpuRecon& ) = delete;
 
-  // whether the GPU predicts the intra and IBC blocks of the picture: not with
-  // ACT
+  // --- What the GPU covers ---
+  // The GPU predicts the intra and IBC blocks of a picture unless it uses ACT (the adaptive colour transform).
   static bool intraSupported( const CodingStructure& cs );
   static bool intraSupported( const SPS& sps );
-  // whether the GPU predicts the inter blocks of the pictures of the sequence:
-  // what intraSupported needs, 10 bits at most
+  // The GPU predicts the inter blocks of a sequence's pictures when it predicts their intra blocks and the bit depth
+  // is at most 10.
   static bool interSupported( const SPS& sps );
-  // and of the picture (every one)
   static bool interSupported( const CodingStructure& cs );
-  // whether the GPU dequantizes and inverse transforms the residuals of the
-  // picture: 10 bits at most
+  // The GPU makes the residuals (dequantization and inverse transforms) of pictures with a bit depth of at most 10.
   static bool residualSupported( const CodingStructure& cs );
 
-  // the edges of a CTU the deblocking filters, with the bytes of their
-  // deblocking parameters the shaders need (after LF_INIT): the GPU's
-  // deblocking takes only those
-  static void      listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& edges );
-  // vvdec's DMVR MV cache of the current picture, count of them, in host memory the GPU writes
-  Mv*              dmvrMvCache( size_t count );
+  // --- Helpers for the CTU tasks (CPU front end) ---
+  // Lists the edges of a CTU that the deblocking filters, with the bytes of their deblocking parameters that
+  // deblock.slang needs (after vvdec's LF_INIT stage).
+  static void listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& edges );
+  // vvdec's cache of DMVR refinements for the current picture, with room for count, in host memory the GPU writes.
+  Mv* dmvrMvCache( size_t count );
 
-  // the parameters of the picture's filters (deblocking, SAO, ALF), worked out
-  // before its work is recorded -- a task of its own once the picture is
-  // parsed, while its CTU tasks run (else startPicture does it)
-  void prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf );
-  // the residuals (jobs.trafo) and the inter blocks (jobs.inter, from the
-  // reference pictures of jobs.refs) of the picture's first ctus CTUs queued
-  // ahead of the rest of its work: once their CTU tasks are done, while the
-  // CPU still makes the jobs of the CTUs below, the GPU starts on them.
-  // startPicture then queues the rest (jobs.bandCtus = ctus).
-  void startBand( CodingStructure& cs, const PictureJobs& jobs, size_t ctus, PelStorage& pic );
-  // the rest of the picture in pic, on top of what the CPU reconstructed: the
-  // residuals of jobs.trafo, the inter blocks of jobs.inter, from the
-  // reference pictures of jobs.refs, the intra and IBC blocks of jobs.intra,
-  // then the in-loop filters: deblocking (when deblock), SAO (when sao is
-  // given), ALF with CC-ALF (when alf is given); the result stays on the GPU as
-  // a reference (the picture is gpuCurrent then) and comes back to pic.
-  // startPicture queues the work, in two parts: the first, the residuals and
-  // the inter blocks (those of the CTUs after a band startBand queued), the
-  // rest. waitFirst: it returns once the first part is
-  // done, DMVR's refinements in host memory (dmvrMvCache). It returns the
-  // picture's download, for endDownload (-1: none of its own).
-  // endCompute waits for the rest (without the copy engine, the download
-  // included): the next picture's work may be recorded then, while the
-  // download runs. endDownload waits for that, before the work of the picture
-  // after the next is recorded (the downloads take turns between two sets of
-  // commands).
-  int  startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
-                     PelStorage& pic, bool waitFirst );
-  // the picture whose work comes next, when the GPU predicts its intra
-  // blocks; set before its work is recorded (its band's too), once the
-  // instance's picture before is done. LMCS (tables: null without it): its
-  // luma predicted and reconstructed in the mapped domain, inter's luma
-  // forward-mapped, the chroma residuals scaled (tables->chroma), then the
-  // luma mapped back before the in-loop filters. defer: inter keeps some of
-  // its predictions aside, for intra jobs to finish (LMCS's chroma scaling,
-  // CIIP). scalingMatrices: the picture's dequantisation matrices of its
-  // explicit scaling list (TrQuant::getDequantCoeffBuf, scalingCount of them;
-  // null without)
+  // --- A picture's work, in the order of the calls ---
+  // Sets up the picture whose work comes next, once the instance's previous picture is done. tables: the picture's
+  // LMCS tables (null without LMCS). With LMCS, the luma is predicted and reconstructed in the mapped domain, inter's
+  // luma prediction is forward-mapped, the chroma residuals are scaled (tables->chroma), and the luma is mapped back
+  // before the in-loop filters. defer: inter prediction keeps some predictions aside for intra jobs to finish
+  // (LMCS's chroma scaling, CIIP). scalingMatrices: the dequantization matrices of the picture's explicit scaling
+  // lists (TrQuant::getDequantCoeffBuf, scalingCount values; null without).
   void setPicture( const PelStorage& pic, const LmcsTables* tables, bool defer, const int* scalingMatrices = nullptr, size_t scalingCount = 0 );
+  // For the GPU front end's jobs: where each explicit scaling list's dequantization matrix starts among the
+  // picture's (Quant::getDequantCoeff), plus one, per list (6), log2 width and log2 height (0..6); 0 where none.
+  void setDequantOffsets( const std::vector<uint32_t>& offsets ) { m_dequantOffsets = offsets; }
+  // Works out the parameters of the picture's in-loop filters (deblocking, SAO, ALF). This runs as a task of its
+  // own once the picture is parsed, while its CTU tasks run; startPicture calls it if that task did not run.
+  void prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf );
+  // CPU front end only: submits the residuals (jobs.trafo) and inter blocks (jobs.inter) of the picture's first ctus
+  // CTUs, the early rows, as soon as their CTU tasks are done, while the CPU still works on the rows below.
+  // startPicture then submits the rest (with jobs.earlyCtus = ctus).
+  void startEarlyRows( CodingStructure& cs, const PictureJobs& jobs, size_t ctus, PelStorage& pic );
+  // Records and submits the picture's work on top of what the CPU reconstructed in pic: the residuals, inter
+  // prediction, intra and IBC prediction, then the in-loop filters (deblocking with deblock, SAO when sao is given,
+  // ALF and CC-ALF when alf is given). The result stays on the GPU as a reference picture (the picture is then
+  // gpuCurrent) and is downloaded to pic. The work is submitted in two parts (see README.md): the first part (the
+  // residuals and inter blocks) and the rest. With waitFirst, returns once the first part is done, with DMVR's
+  // refinements in dmvrMvCache. Returns the picture's download for endDownload (-1: none of its own).
+  int startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
+                    PelStorage& pic, bool waitFirst );
+  // Waits for the rest of the picture's work (without a copy queue, for its download too). The next picture's work
+  // may be recorded after this, while the download runs.
   void endCompute();
+  // Waits for a picture's download. The downloads take turns between two sets of commands, so this must be called
+  // before the work of the picture after the next one is recorded.
   void endDownload( int download );
 
-  // after endCompute: the GPU's motion derivation (PictureJobs::cus) against
-  // the CPU's, cpu the picture's motion as vvdec keeps it
-  void              compareMider( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp, const PictureJobs* jobs );
-  // where each explicit scaling list's dequantisation matrix begins among the picture's (Quant::getDequantCoeff),
-  // + 1, per list (6), log2 width and height (0..6), 0 where none: for the GPU's jobs
-  void              setDequantOffsets( const std::vector<uint32_t>& offsets ) { m_dequantOffsets = offsets; }
-  const MiderStats& miderStats() const { return m_miderStats; }
+  // --- The check of the GPU front end (VVDEC_GPU_MIDER=1; GpuFrontEndCheck.cpp) ---
+  // After endCompute, compares the GPU front end's results with the CPU's: cpu is the picture's motion as vvdec
+  // keeps it, lfp its deblocking parameters, jobs the CTU tasks' jobs and edges.
+  void                 compareFrontEnd( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp, const PictureJobs* jobs );
+  const FrontEndStats& frontEndStats() const { return m_check.stats; }
 
 private:
-  void     beginCommands( bool resetPool = true );
-  void     computeBarrier();
-  void     mark( const char* label );   // with VVDEC_GPU_PROFILE: the GPU time since the last mark counts as label
-  void     splitCommands();   // the first part's commands end and go to the GPU, the rest's begin
-  // the rest's commands queued, and the download of pic: on the copy engine
-  // (Context::transferQueue), after the rest's semaphore (the download's
-  // returned), else at the end of the rest (-1 returned)
-  int      submitPicture( const PelStorage& pic, bool waitFirst );
-  void     readTimestamps( double waited );
-  // the reference pictures' planes on the GPU into m_refs (laid out as pic's);
-  // uploads: those the CPU reconstructed (or filled in), to copy there first
-  void     writeRefTable( const CodingStructure& cs, const RefTable& refs, const PelStorage& pic, std::vector<const Picture*>& uploads );
-  uint8_t* params( size_t size );   // the host-visible parameter buffer, at least size bytes
-
-  // the planes of a picture as the shaders see them
+  // The planes of a picture as the shaders see them: each component's sample (0, 0) and stride, in samples.
   struct Planes
   {
     VkDeviceAddress addr[MAX_NUM_COMPONENT];
     int32_t         stride[MAX_NUM_COMPONENT];
   };
+  // Where a picture's planes are, for copyPlanes: in host memory, in the twin, or in the scratch planes.
   enum { kHost, kTwin, kScratch };
-  Planes        hostPlanes( const PelStorage& pic );     // the picture in host memory
-  Planes        twinPlanes( const PelStorage& pic );     // the picture on the GPU (its memory made when missing)
-  Planes        scratchPlanes( const PelStorage& pic );  // GPU memory laid out as pic's buffers (from the pool)
-  void          copyPlanes( const PelStorage& pic, int from, int to );
-  void          transferBarrier( bool toTransfer );
-  // the motion derivation of the picture's CUs (cus, per CTU), for the comparison with the CPU's
-  void          recordMider( const CodingStructure& cs, const PictureJobs& jobs );
-  // the GPU's jobs of the picture (shaders/jobs.slang), for the comparison with the CTU tasks' (jobs)
-  void          recordJobs( const CodingStructure& cs, const PictureJobs& jobs, VkDeviceAddress slices );
-  // the deblocking's edge lists on the GPU (shaders/edges.slang), for the comparison with the CTU tasks' (jobs.edges)
-  void          recordEdges( const CodingStructure& cs, const PictureJobs& jobs, VkDeviceAddress slices );
-  // with subpictures treated as pictures: each CTU's rectangle (its subpicture's
-  // or the picture's) in m_subpics, its address returned; else 0
-  VkDeviceAddress subpicRects( const CodingStructure& cs );
 
+  // --- Commands and submissions (GpuRecon.cpp) ---
+  // Begins recording m_cmd. With resetPool, the command pool is reset first, and the commands start with a barrier
+  // over the work submitted before.
+  void beginCommands( bool resetPool = true );
+  void beginOneTime( VkCommandBuffer cmd );   // begins recording cmd for a single submission
+  // Ends the first part's commands and submits them, then begins the rest's.
+  void splitCommands();
+  // Ends and submits the rest's commands, and the download of pic: on the copy queue after the rest's semaphore
+  // (the download's turn is returned), or at the end of the rest (-1 is returned). With waitFirst, waits for the
+  // first part to finish.
+  int  submitPicture( const PelStorage& pic, bool waitFirst );
+  // Records the download of pic on the copy queue into the commands of the download whose turn it is.
+  void recordDownload( const PelStorage& pic, int turn );
+  // VVDEC_GPU_PROFILE=1: the GPU time since the previous mark counts as label's.
+  void mark( const char* label );
+  // VVDEC_GPU_PROFILE=1: adds up the picture's marks; waited is how long the CPU waited for the GPU, in ms.
+  void readTimestamps( double waited );
+
+  // Barriers between the commands recorded into m_cmd (or cmd)
+  void memoryBarrier( VkCommandBuffer cmd, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess );
+  void memoryBarrier( VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess );
+  void fullBarrier();                // all earlier writes visible to all later commands
+  void computeBarrier();             // compute shaders' writes visible to later compute shaders
+  void transferToComputeBarrier();   // the writes of copies and fills visible to later compute shaders
+  void computeToTransferBarrier();   // compute shaders' writes visible to later copies
+  void hostReadBarrier();            // compute shaders' and copies' writes visible to the CPU
+  void indirectBarrier();            // the front end's dispatch arguments and job counts visible to the passes
+
+  // Dispatches: bind() binds a shader's pipeline (kShader_...), pushConstants() sets its push constants.
+  void bind( int shader );
+  void pushConstants( const void* data, size_t size );
+  template<class Push>
+  void pushConstants( const Push& push )
+  {
+    pushConstants( &push, sizeof( Push ) );
+  }
+  void dispatchGroups( uint32_t groupsX, uint32_t groupsY = 1 );
+  void dispatchJobs( size_t count );         // one workgroup per job, in rows of 32768 workgroups
+  void dispatchIndirect( FrontPass pass );   // with the front end's dispatch arguments for pass
+  // Binds shader, sets push and dispatches groupsX x groupsY workgroups.
+  template<class Push>
+  void dispatch( int shader, const Push& push, uint32_t groupsX, uint32_t groupsY = 1 )
+  {
+    bind( shader );
+    pushConstants( push );
+    dispatchGroups( groupsX, groupsY );
+  }
+  // The address of a pass's job count in the front end's argument buffer (FrontPass)
+  VkDeviceAddress frontEndCount( FrontPass pass ) const;
+
+  // --- The picture's planes, tables and parameters (GpuRecon.cpp) ---
+  Planes   hostPlanes( const PelStorage& pic );      // the picture in host memory
+  Planes   twinPlanes( const PelStorage& pic );      // the picture on the GPU (its twin is allocated when missing)
+  Planes   scratchPlanes( const PelStorage& pic );   // scratch planes laid out as pic's (from the pool)
+  void     copyPlanes( const PelStorage& pic, int from, int to );
+  // Writes the reference table into m_refs: the reference pictures' planes on the GPU, laid out as pic's. Appends
+  // to uploads the reference pictures the CPU reconstructed (or filled in), which must be copied to the GPU first.
+  void     writeRefTable( const CodingStructure& cs, const RefTable& refs, const PelStorage& pic, std::vector<const Picture*>& uploads );
+  // With subpictures treated as pictures: writes each CTU's rectangle (its subpicture's or the picture's) into
+  // m_subpics and returns its address. Otherwise returns 0.
+  VkDeviceAddress subpicRects( const CodingStructure& cs );
+  // The upload buffer of the in-loop filters' parameters, with room for size bytes. It holds the deblocking
+  // parameters, then ALF's, SAO's and LMCS's (prepareFilters); these return where each starts on the GPU.
+  uint8_t*        params( size_t size );
+  VkDeviceAddress deblockParams() const { return m_params.addr; }
+  VkDeviceAddress alfParams() const { return m_params.addr + m_prepared.dbSize; }
+  VkDeviceAddress saoParams() const { return m_params.addr + m_prepared.dbSize + m_prepared.alfSize; }
+  VkDeviceAddress lmcsParams() const { return m_params.addr + m_prepared.dbSize + m_prepared.alfSize + m_prepared.saoSize; }
+
+  // --- The order of a picture's work (GpuRecon.cpp) ---
+  // The first part: the picture's planes uploaded (when the CPU made the residuals), the front end (without the
+  // async queue), the residuals and inter prediction.
+  void recordFirstPart( const CodingStructure& cs, const PictureJobs& jobs, const PelStorage& pic, const Planes& planes, bool frontEndAsync );
+  // The in-loop filters, from planes (the picture's twin) on: deblocking in place, then SAO and ALF, each from one
+  // set of planes to the other (the twin and the scratch planes). Returns whether the result ended in the scratch
+  // planes.
+  bool recordInLoopFilters( const CodingStructure& cs, const PictureJobs& jobs, const PelStorage& pic, const Planes& planes, bool alf );
+
+  // --- The GPU front end (GpuReconFrontEnd.cpp) ---
+  // Records the front end on the async compute queue, in two submissions: part 1 (motion and jobs), which the
+  // picture's first part waits for, and part 2 (intra order, deblocking parameters and edges), which its rest waits
+  // for. Part 1 waits for the first parts of the picture's colocated pictures.
+  void recordFrontEndAsync( const CodingStructure& cs, const PictureJobs& jobs );
+  // Ends and submits the front end's part 1 and begins part 2 (recordJobs calls it after the jobs).
+  void splitFrontEnd();
+  // Records the whole front end into m_cmd: the records uploaded, the motion derivation, the colocated motion, the
+  // jobs, the intra order, the deblocking parameters and edges. In the check mode (without m_useFrontEnd), the
+  // results are also copied to host memory for compareFrontEnd.
+  void recordFrontEnd( const CodingStructure& cs, const PictureJobs& jobs );
+  size_t uploadRecords( const CodingStructure& cs, const PictureJobs& jobs );   // returns the picture's CU count
+  void   recordMotion( const CodingStructure& cs, size_t numCus );
+  void   recordColMotion( const CodingStructure& cs );
+  void   recordDeblockParams( const CodingStructure& cs, size_t numCus );
+  void   recordJobs( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );
+  void   allocateJobBuffers( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );
+  void   recordIntraOrder( const PictureJobs& jobs );
+  void   copyJobsForCheck( const PictureJobs& jobs );
+  void   recordEdges( const CodingStructure& cs, const PictureJobs& jobs );
+
+  // --- Reconstruction (GpuReconPrediction.cpp) ---
+  // The residuals: the coefficient levels from levels (the picture in host memory, where the parse left them), the
+  // residuals into planes. Without the front end, the jobs of CTUs ctuBegin .. ctuEnd - 1 are uploaded into buf.
+  void recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
+                    const Planes& levels, const Planes& planes );
+  // Inter prediction into planes. Without the front end, the jobs of CTUs ctuBegin .. ctuEnd - 1 are uploaded into
+  // buf: the regular tiles, then BDOF's, then the affine pairs, each set run by its own shader variant.
+  void recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
+                    const Planes& planes );
+  struct InterCounts
+  {
+    size_t regular = 0, bdof = 0, affine = 0;   // affine counts jobs: two per affine tile
+  };
+  InterCounts uploadInterJobs( const std::vector<std::vector<InterJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf );
+  // Intra and IBC prediction in dependency waves, in place in planes: with the front end, its bands in wave order;
+  // otherwise the CTU tasks' jobs, cut into bands and sorted by wave here.
+  void   recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes );
+  size_t uploadIntraJobs( const std::vector<std::vector<IntraJob>>& jobs );   // returns the number of bands
+
+  // --- The in-loop filters (GpuReconFilters.cpp) ---
   static size_t deblockParamSize( const CodingStructure& cs );
   static size_t alfParamSize( const CodingStructure& cs );
   static size_t saoParamSize( const CodingStructure& cs );
-  bool          prepareDeblock( const CodingStructure& cs, uint8_t* params );   // false: no slice deblocks
-  bool          prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alf, uint8_t* params );   // true: a CTU has boundaries
-  bool          prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8_t* params );   // false: no CTU uses SAO
-  void          recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params, const std::vector<EdgeLists>& edges );
-  void          recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes );
-  // the jobs of the CTUs ctuBegin .. ctuEnd - 1, copied into buf
-  void          recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
-                             const Planes& planes );
-  // the levels from the planes of levels (the picture in host memory, where the parser left them), the residuals to planes
-  void          recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
-                             const Planes& levels, const Planes& planes );
-  void          recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
-  void          recordLmcs( const CodingStructure& cs, const Planes& planes, VkDeviceAddress ctus );   // the inverse mapping
-  void          recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
+  bool prepareDeblock( const CodingStructure& cs, uint8_t* params );                              // returns false when no slice deblocks
+  bool prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alf, uint8_t* params );   // returns true when a CTU has boundaries
+  bool prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8_t* params );             // returns false when no CTU uses SAO
+  // LMCS's inverse luma mapping, in place; ctus: per CTU, whether its slice uses LMCS
+  void recordLmcs( const CodingStructure& cs, const Planes& planes, VkDeviceAddress ctus );
+  // Deblocking, in place. edges: the CPU front end's edge lists per CTU (unused with the GPU front end).
+  void recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params, const std::vector<EdgeLists>& edges );
+  void uploadCpuEdges( const std::vector<EdgeLists>& edges, size_t first[5] );   // first: each list's first edge, then the total
+  void recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
+  void recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
 
-  static constexpr uint32_t kMaxMarks = 64;
-  static constexpr uint32_t kBandMarks = 8;
+  // --- State ---
+  static constexpr uint32_t kMaxMarks       = 64;   // profiling marks per picture
+  static constexpr uint32_t kEarlyRowsMarks = 8;    // and in the early rows' submission
 
-  Context*        m_ctx;
-  VkCommandPool   m_pool    = VK_NULL_HANDLE;
-  VkCommandBuffer m_cmd     = VK_NULL_HANDLE;   // the one being recorded: m_cmdBand, m_cmdFirst or m_cmdRest
-  VkCommandBuffer m_cmdFirst = VK_NULL_HANDLE;  // a picture's first part
-  VkCommandBuffer m_cmdRest  = VK_NULL_HANDLE;  // and the rest
-  // with the async compute queue: the picture's front end there (recordFront), the semaphore the picture's first
-  // part waits for; the timeline value of the first part (submitFirst's)
-  void            recordFront( const CodingStructure& cs, const PictureJobs& jobs );
-  VkCommandPool   m_poolFront  = VK_NULL_HANDLE;
-  int             m_asyncQueue = 0;                // (Context::takeAsyncQueue's)
-  VkCommandBuffer m_cmdFront   = VK_NULL_HANDLE;   // its first submission (the motion, the jobs)
-  VkCommandBuffer m_cmdFront2  = VK_NULL_HANDLE;   // and its second (intra's waves and order, the deblocking's)
-  VkSemaphore     m_frontDone  = VK_NULL_HANDLE;
-  VkSemaphore     m_frontDone2 = VK_NULL_HANDLE;
-  VkSemaphore     m_waitFront  = VK_NULL_HANDLE;   // the next first part's to wait for
-  VkSemaphore     m_waitFront2 = VK_NULL_HANDLE;   // and the next rest's
-  uint64_t        m_firstValue = 0;
-  uint64_t        m_frontWait  = 0;                // the front end's first submission's (the colocated pictures' first parts)
-  bool            m_frontSplit = false;            // recordJobs ends the first submission after the jobs (splitFront)
-  void            splitFront();
-  VkCommandBuffer m_cmdBand  = VK_NULL_HANDLE;  // its top band, queued ahead (startBand)
-  VkFence         m_fenceFirst = VK_NULL_HANDLE;   // the first part done
-  VkFence         m_fence   = VK_NULL_HANDLE;   // the rest done (without the copy engine, the download too)
-  std::chrono::steady_clock::time_point m_submitted;
-  VkQueryPool     m_queries = VK_NULL_HANDLE;   // the profiling timestamps
-  struct Download                               // a picture's download on the copy engine
+  Context* m_ctx;
+
+  // The compute queue's commands
+  VkCommandPool   m_pool         = VK_NULL_HANDLE;
+  VkCommandBuffer m_cmd          = VK_NULL_HANDLE;   // the command buffer being recorded
+  VkCommandBuffer m_cmdFirst     = VK_NULL_HANDLE;   // the picture's first part
+  VkCommandBuffer m_cmdRest      = VK_NULL_HANDLE;   // its rest
+  VkCommandBuffer m_cmdEarlyRows = VK_NULL_HANDLE;   // its early rows, submitted ahead (startEarlyRows)
+  VkFence         m_fenceFirst   = VK_NULL_HANDLE;   // signalled when the first part is done
+  VkFence         m_fence        = VK_NULL_HANDLE;   // signalled when the rest is done (without a copy queue, the download too)
+  uint64_t        m_firstValue   = 0;                // the timeline value the first part signals (Context::submitFirst)
+  std::chrono::steady_clock::time_point m_submitted;   // when the first part was submitted
+
+  // The front end on an async compute queue (recordFrontEndAsync), in two submissions
+  VkCommandPool   m_poolFrontEnd  = VK_NULL_HANDLE;
+  int             m_asyncQueue    = 0;                // which async queue (Context::takeAsyncQueue)
+  VkCommandBuffer m_cmdFrontEnd1  = VK_NULL_HANDLE;   // part 1: motion and jobs
+  VkCommandBuffer m_cmdFrontEnd2  = VK_NULL_HANDLE;   // part 2: intra order, deblocking parameters and edges
+  VkSemaphore     m_frontEnd1Done = VK_NULL_HANDLE;
+  VkSemaphore     m_frontEnd2Done = VK_NULL_HANDLE;
+  VkSemaphore     m_waitFrontEnd1 = VK_NULL_HANDLE;   // what the next first part waits for (part 1's semaphore)
+  VkSemaphore     m_waitFrontEnd2 = VK_NULL_HANDLE;   // what the next rest waits for (part 2's semaphore)
+  uint64_t        m_frontEndWait  = 0;                // the timeline value part 1 waits for: the colocated pictures' first parts
+  bool            m_splitFrontEnd = false;            // recordJobs ends part 1 after the jobs (splitFrontEnd)
+
+  // The downloads on the copy queue: two sets of commands that take turns
+  struct Download
   {
     VkCommandPool     pool      = VK_NULL_HANDLE;
     VkCommandBuffer   cmd       = VK_NULL_HANDLE;
-    VkSemaphore       semaphore = VK_NULL_HANDLE;   // the rest done, for the copies
-    VkFence           fence     = VK_NULL_HANDLE;   // the copies done
+    VkSemaphore       semaphore = VK_NULL_HANDLE;   // signalled by the rest, for the copies
+    VkFence           fence     = VK_NULL_HANDLE;   // signalled when the copies are done
     VkQueryPool       queries   = VK_NULL_HANDLE;
-    std::atomic<bool> pending{ false };             // queued, not yet waited for (endDownload)
+    std::atomic<bool> pending{ false };             // submitted, and not yet waited for (endDownload)
   } m_downloads[2];
-  int             m_download = 0;   // the next picture's
-  const char*     m_labels[kMaxMarks];
-  uint32_t        m_marks   = 0;
-  uint32_t        m_gapMark = 0;   // the mark that ends the time between the picture's parts (0: none)
-  VkQueryPool     m_bandQueries = VK_NULL_HANDLE;   // the band's profiling timestamps, its marks counted as the rest's
-  const char*     m_bandLabels[kBandMarks];
-  uint32_t        m_bandMarks = 0;
-  struct Prepared                  // prepareFilters' results
+  int m_download = 0;   // the next picture's turn
+
+  // Profiling (VVDEC_GPU_PROFILE=1): timestamps after the passes
+  VkQueryPool m_queries = VK_NULL_HANDLE;
+  const char* m_labels[kMaxMarks];
+  uint32_t    m_marks   = 0;
+  uint32_t    m_gapMark = 0;                         // the mark that ends the time between the picture's parts (0: none)
+  VkQueryPool m_earlyRowsQueries = VK_NULL_HANDLE;   // the early rows'; their passes count with the rest's of the same name
+  const char* m_earlyRowsLabels[kEarlyRowsMarks];
+  uint32_t    m_earlyRowsMarks = 0;
+
+  // The picture
+  bool m_useFrontEnd   = false;   // the passes take their jobs from the GPU front end (PictureJobs::useFrontEnd)
+  bool m_frontEndTrafo = false;   // and the front end makes the residual jobs (PictureJobs::frontEndTrafo)
+  bool m_frontEndInter = false;   // and the inter jobs (PictureJobs::frontEndInter)
+  struct Prepared                 // prepareFilters' results
   {
-    const Picture* picture = nullptr;
-    bool           deblock = false, sao = false;
-    bool           alfBounds = false;   // ALF's BOUNDS variants (a CTU split, or clipped)
+    const Picture* picture   = nullptr;
+    bool           deblock   = false, sao = false;
+    bool           alfBounds = false;   // ALF's BOUNDS variants are needed (a CTU is split or clipped)
     size_t         dbSize = 0, alfSize = 0, saoSize = 0, lmcsSize = 0;
   } m_prepared;
-  // the buffers the CPU only writes, in order, and the shaders read -- the
-  // filters' parameters, the reference table, the jobs, the edges, the
-  // transform matrices -- are MemKind::Upload: in the GPU's own memory where
-  // the BAR allows (VideoQ 4K: the GPU's time a picture -1%; the CPU's
-  // write-combined copies of the jobs no slower)
-  Buffer          m_params;
-  Buffer          m_refs;                           // the reference table: the reference pictures' planes on the GPU
-  Buffer          m_scratch[MAX_NUM_COMPONENT];     // a picture's worth of GPU memory (SAO's or ALF's output), from the pool while its work is recorded
-  Buffer          m_dmvr;                           // DMVR's refinements
-  Buffer          m_intraJobs;                      // the intra jobs of a picture, wave by wave, then what each waits for
-  Buffer          m_intraSync;                      // shaders/intra.slang's counts of the jobs taken and done
-  Buffer          m_interJobs;
-  Buffer          m_trafoJobs;
-  Buffer          m_bandInterJobs;                  // the top band's
-  Buffer          m_bandTrafoJobs;
-  Buffer          m_edges;                          // the edges the deblocking filters
-  Buffer          m_matrices;                       // TrQuant's transform matrices
-  Buffer          m_mip;                            // MIP's matrices
-  Buffer          m_lfnst;                          // LFNST's matrices
-  Buffer          m_geo;                            // GPM's masks of weights
-  // LMCS (setPicture): its tables (the forward and inverse luma mappings,
-  // int16, the chroma scales, int32); the planes inter's predictions are
-  // kept aside in (LMCS's chroma scaling, CIIP)
-  bool            m_lmcsOn    = false;
-  size_t          m_lmcsCount = 0;                  // the values a table
-  Buffer          m_lmcs;
-  Buffer          m_defer;
-  Planes          m_deferPlanes{};
-  // the dequantisation matrices of explicit scaling lists (setPicture), a byte a factor
-  bool            m_scalingOn = false;
-  Buffer          m_scaling;
-  Buffer          m_subpics;   // subpictures treated as pictures: each CTU's rectangle (recordInter)
-  // the motion derivation's (recordMider): the records in upload memory; the CU map, the CUs' and the 4x4
-  // blocks' motion, the rows' progress in the GPU's; the 4x4 blocks' motion copied to host memory for the comparison
-  Buffer          m_miderCus;
-  Buffer          m_miderTus;
-  Buffer          m_miderCtus;
-  Buffer          m_miderCuMap;
-  Buffer          m_miderCuMotion;
-  Buffer          m_miderMotion;
-  Buffer          m_miderMotionHost;   // its copy, for the comparison
-  Buffer          m_miderCuMapC;
-  Buffer          m_dbCtuInfo;         // per CTU: its subpicture | loop filter across it << 16
-  Buffer          m_dbLfp;             // the deblocking's parameters (shaders/dbparams.slang)
-  Buffer          m_dbLfpHost;         // their copy, for the comparison
-  bool            m_dbRecorded = false;
-  // the job building's (recordJobs)
-  Buffer                m_jobTables;
-  Buffer                m_jobSlices;
-  Buffer                m_jobScaling;
-  Buffer                m_jobCounts;
-  Buffer                m_jobBlocks;
-  Buffer                m_jobBlocksHost;
-  Buffer                m_jobOut[3];
-  Buffer                m_jobOutHost[3];
-  Buffer                m_jobWaves;
-  Buffer                m_jobProgress;
-  // the front end's arguments: per pass i an indirect dispatch at word 3 i, its jobs' count and first job at 32 + 2 i
-  // (0 the residuals', 1 inter's regular jobs, 2 BDOF's, 3 the affine pairs, 4 intra's bands, 5..8 the deblocking's
-  // edges: luma vertical, horizontal, chroma vertical, horizontal)
-  Buffer                m_frontArgs;
-  bool                  m_front      = false;   // the picture's front end on the GPU drives it (PictureJobs::front)
-  bool                  m_frontTrafo = false;
-  bool                  m_frontInter = false;
-  void                  recordIntraFront( const CodingStructure& cs, const Planes& planes );
-  FrontCapacities       m_frontCaps;   // the picture's (recordMider)
-  void                  indirectBarrier();
-  void                  recordColMotion( const CodingStructure& cs );
-  size_t                m_jobCap[3]      = { 0, 0, 0 };
-  int                   m_jobBlockCount  = 0;
-  bool                  m_jobsRecorded   = false;
-  std::vector<uint32_t> m_dequantOffsets;
-  // the edge lists' (recordEdges)
-  Buffer                m_edgeCounts;
-  Buffer                m_edgeLists;
-  Buffer                m_edgeListsHost;
-  Buffer                m_edgeOut;
-  Buffer                m_edgeOutHost;
-  size_t                m_edgeCap        = 0;
-  // intra's order's (recordJobs)
-  Buffer                m_isKeys;        // the jobs' indices, twice (the radix sort's buffers)
-  Buffer                m_isHist;
-  Buffer                m_isBandAt;
-  Buffer                m_isBandSums;
-  Buffer                m_isWaveFirst;
-  Buffer                m_isSorted;
-  Buffer                m_isWaits;
-  Buffer                m_isFlags;
-  Buffer                m_isSortedHost;
-  Buffer                m_isWaitsHost;
-  Buffer                m_isInfoHost;    // the bands' count, the flags
-  size_t                m_isCap          = 0;
-  int                   m_isBlocks       = 0;
-  bool                  m_edgesRecorded  = false;
-  Buffer          m_miderProgress;
-  MiderStats      m_miderStats;
+  std::vector<uint32_t> m_dequantOffsets;   // setDequantOffsets
+  // LMCS (setPicture): its tables (the forward and inverse luma mappings, int16_t, then the chroma scales, int32_t)
+  bool   m_lmcsOn    = false;
+  size_t m_lmcsCount = 0;   // the entries of a table
+  Buffer m_lmcs;
+  // The planes inter prediction keeps some predictions aside in, for intra jobs (LMCS's chroma scaling, CIIP)
+  Buffer m_defer;
+  Planes m_deferPlanes{};
+  // The dequantization matrices of explicit scaling lists (setPicture), a byte per factor
+  bool   m_scalingOn = false;
+  Buffer m_scaling;
+
+  // Buffers. Those the CPU writes once, in order, and the shaders only read (the parameters, the reference table,
+  // the jobs, the edges, the tables) are MemKind::Upload: in the GPU's own memory when the BAR allows it (VideoQ 4K:
+  // the GPU's time per picture -1%; the CPU's write-combined copies of the jobs are no slower).
+  Buffer m_params;                       // the in-loop filters' parameters (params())
+  Buffer m_refs;                         // the reference table: the reference pictures' planes on the GPU
+  Buffer m_scratch[MAX_NUM_COMPONENT];   // a picture's worth of GPU memory for SAO's or ALF's output, from the pool while its work is recorded
+  Buffer m_dmvr;                         // DMVR's refinements (dmvrMvCache)
+  Buffer m_intraSync;                    // intra.slang's counts of the jobs taken and done
+  Buffer m_subpics;                      // subpictures treated as pictures: each CTU's rectangle (subpicRects)
+
+  // The constant tables the shaders read, uploaded once
+  struct Tables
+  {
+    Buffer transform;    // TrQuant's transform matrices (trafo.slang)
+    Buffer lfnst;        // LFNST's matrices (trafo.slang)
+    Buffer mip;          // MIP's matrices (intra.slang)
+    Buffer geoWeights;   // GPM's weight masks, g_globalGeoWeights (inter.slang)
+  } m_tables;
+
+  // The CPU front end's jobs and edges, uploaded per picture
+  struct CpuJobs
+  {
+    Buffer trafo;
+    Buffer inter;
+    Buffer intra;        // the bands in wave order, then each band's wait (recordIntra)
+    Buffer earlyTrafo;   // the early rows'
+    Buffer earlyInter;
+    Buffer edges;        // the deblocking edges, list after list
+  } m_cpuJobs;
+
+  // The GPU front end's buffers (GpuReconFrontEnd.cpp). The records are uploaded; the rest is GPU memory.
+  struct FrontEndBuffers
+  {
+    Buffer cus, tus, ctus;   // the parse's records (GpuFrontEnd.h)
+    // Motion derivation (mider.slang): per 4x4 block, its CU in the luma tree and in the chroma tree; per CU, its
+    // motion; per 4x4 block, its motion (5 words); per CTU row, its progress
+    Buffer cuMapLuma, cuMapChroma, cuMotion, motion, rowProgress;
+    // Deblocking parameters (dbparams.slang): per CTU, its subpicture's index | whether loop filtering crosses the
+    // subpicture's boundaries << 16; per 4x4 block and direction, the parameters (2 words)
+    Buffer ctuInfo, lfp;
+    // Jobs (jobs.slang): its tables (writeJobTables); the slices' words (writeJobSlices); the scaling lists' matrix
+    // offsets; per CU, its job counts; per block of 256 CUs, their sums, then the totals; the job lists (residual,
+    // inter, intra); each 4x4 block's wave; each CTU row's progress
+    Buffer jobTables, jobSlices, jobScaling, jobCounts, jobBlocks, jobs[3], waveMap, jobProgress;
+    size_t jobCapacity[3] = { 0, 0, 0 };   // the room of the job lists, in jobs
+    int    jobBlockCount  = 0;
+    Buffer args;   // the passes' indirect dispatch arguments and job counts (FrontPass)
+    // Intra order (intrasort.slang): a radix sort of the intra jobs by wave (the keys, two halves, and the
+    // histograms), then the jobs cut into bands (each job's first band, the blocks' band sums, each wave's first
+    // band), the bands in wave order with each band's wait, and flags (a wave past 65535)
+    Buffer sortKeys, sortHistogram, bandAt, bandSums, waveFirst, sortedBands, bandWaits, sortFlags;
+    size_t sortCapacity = 0;   // the room for bands
+    int    sortBlocks   = 0;   // blocks of 1024 jobs
+    // Deblocking edges (edges.slang): per CTU, its edge counts; the four lists' first edge and count; the edges
+    Buffer edgeCounts, edgeLists, edges;
+    size_t edgeCapacity = 0;
+    FrontCapacities capacities;   // the picture's (frontCapacities)
+
+    void release( Context* ctx );
+  } m_frontEnd;
+
+  // The front end's results copied to host memory for the check (VVDEC_GPU_MIDER=1; GpuFrontEndCheck.cpp), and
+  // whether the picture recorded each copy
+  struct FrontEndCheck
+  {
+    Buffer        motion, lfp, jobBlocks, jobs[3], sortedBands, bandWaits, sortInfo, edges, edgeLists;
+    bool          lfpRecorded = false, jobsRecorded = false, edgesRecorded = false;
+    FrontEndStats stats;
+
+    void release( Context* ctx );
+  } m_check;
 };
 
 }   // namespace gpu

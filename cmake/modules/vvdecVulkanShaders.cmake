@@ -1,7 +1,8 @@
 # The Vulkan shaders of source/Lib/VulkanLib: each entry of VVDEC_GPU_SHADERS is
 # "name|file|DEFINE=value|...", compiled from shaders/<file>.slang with slangc
 # (VVDEC_SLANGC) to SPIR-V, and all of them embedded in the header
-# ${VVDEC_GPU_INCLUDE_DIR}/vvdec_gpu/GpuShaders.h (target vvdec_gpu_shaders).
+# ${VVDEC_GPU_INCLUDE_DIR}/vvdec_gpu/GpuShaders.h, with their ids in GpuShaderIds.h
+# next to it (target vvdec_gpu_shaders).
 
 set( VVDEC_GPU_SHADERS
   "alf_luma|alf|CHROMA=0"
@@ -40,6 +41,7 @@ set( _shader_dir        "${CMAKE_CURRENT_LIST_DIR}/../../source/Lib/VulkanLib/sh
 set( _spirv_dir         "${CMAKE_BINARY_DIR}/vvdec_gpu/spirv" )
 set( VVDEC_GPU_INCLUDE_DIR "${CMAKE_BINARY_DIR}/vvdec_gpu/include" )
 set( _header            "${VVDEC_GPU_INCLUDE_DIR}/vvdec_gpu/GpuShaders.h" )
+set( _ids_header        "${VVDEC_GPU_INCLUDE_DIR}/vvdec_gpu/GpuShaderIds.h" )
 
 file( GLOB _shader_sources CONFIGURE_DEPENDS "${_shader_dir}/*.slang" )
 file( MAKE_DIRECTORY "${_spirv_dir}" "${VVDEC_GPU_INCLUDE_DIR}/vvdec_gpu" )
@@ -70,10 +72,10 @@ foreach( _entry IN LISTS VVDEC_GPU_SHADERS )
 endforeach()
 
 string( REPLACE ";" "," _names_argument "${_names}" )
-add_custom_command( OUTPUT  "${_header}"
+add_custom_command( OUTPUT  "${_header}" "${_ids_header}"
                     COMMAND "${CMAKE_COMMAND}" "-DOUTPUT=${_header}" "-DNAMES=${_names_argument}" "-DDIR=${_spirv_dir}"
                             -P "${CMAKE_CURRENT_LIST_DIR}/vvdecEmbedSpirv.cmake"
                     DEPENDS ${_spirv_files} "${CMAKE_CURRENT_LIST_DIR}/vvdecEmbedSpirv.cmake"
                     COMMENT "Embedding the shaders"
                     VERBATIM )
-add_custom_target( vvdec_gpu_shaders DEPENDS "${_header}" )
+add_custom_target( vvdec_gpu_shaders DEPENDS "${_header}" "${_ids_header}" )

@@ -261,43 +261,43 @@ void DecLib::destroy()
          "GPU: residuals of %d pictures on the GPU, %d on the CPU; inter prediction of %d on the GPU, %d on the CPU; intra prediction of %d on the GPU, "
          "%d on the CPU; in-loop filters of %d on the GPU, %d on the CPU\n",
          residualGpu, residualCpu, interGpu, interCpu, intraGpu, intraCpu, filtersGpu, filtersCpu );
-    gpu::MiderStats mider;
-    bool            miderOn = false;
+    gpu::FrontEndStats check;
+    bool               checkOn = false;
     for( auto& dec: m_decLibRecon )
     {
-      if( const gpu::MiderStats* s = dec.miderStats() )
+      if( const gpu::FrontEndStats* s = dec.frontEndStats() )
       {
-        miderOn = true;
-        mider.pictures += s->pictures;
-        mider.compared += s->compared;
-        mider.mismatched += s->mismatched;
-        mider.lfpCompared += s->lfpCompared;
-        mider.lfpMismatched += s->lfpMismatched;
-        mider.lfpEdges += s->lfpEdges;
+        checkOn = true;
+        check.pictures += s->pictures;
+        check.compared += s->compared;
+        check.mismatched += s->mismatched;
+        check.lfpCompared += s->lfpCompared;
+        check.lfpMismatched += s->lfpMismatched;
+        check.lfpEdges += s->lfpEdges;
         for( int k = 0; k < 3; k++ )
         {
-          mider.jobsCompared[k] += s->jobsCompared[k];
-          mider.jobsMismatched[k] += s->jobsMismatched[k];
+          check.jobsCompared[k] += s->jobsCompared[k];
+          check.jobsMismatched[k] += s->jobsMismatched[k];
         }
-        mider.edgesCompared += s->edgesCompared;
-        mider.sortedCompared += s->sortedCompared;
-        mider.sortedMismatched += s->sortedMismatched;
-        mider.edgesMismatched += s->edgesMismatched;
+        check.edgesCompared += s->edgesCompared;
+        check.sortedCompared += s->sortedCompared;
+        check.sortedMismatched += s->sortedMismatched;
+        check.edgesMismatched += s->edgesMismatched;
       }
     }
-    if( miderOn )
+    if( checkOn )
     {
       msg( INFO, "GPU: motion derivation (VVDEC_GPU_MIDER) of %lld pictures: %lld 4x4 blocks compared with the CPU's, %lld differ\n",
-           (long long) mider.pictures, (long long) mider.compared, (long long) mider.mismatched );
+           (long long) check.pictures, (long long) check.compared, (long long) check.mismatched );
       msg( INFO, "GPU: deblocking parameters (VVDEC_GPU_MIDER): %lld compared with the CPU's (%lld with a boundary strength), %lld differ\n",
-           (long long) mider.lfpCompared, (long long) mider.lfpEdges, (long long) mider.lfpMismatched );
+           (long long) check.lfpCompared, (long long) check.lfpEdges, (long long) check.lfpMismatched );
       msg( INFO, "GPU: jobs (VVDEC_GPU_MIDER): residuals' %lld compared with the CPU's, %lld differ; inter's %lld, %lld; intra's %lld, %lld\n",
-           (long long) mider.jobsCompared[0], (long long) mider.jobsMismatched[0], (long long) mider.jobsCompared[1],
-           (long long) mider.jobsMismatched[1], (long long) mider.jobsCompared[2], (long long) mider.jobsMismatched[2] );
-      msg( INFO, "GPU: deblocking edges (VVDEC_GPU_MIDER): %lld compared with the CPU's, %lld differ\n", (long long) mider.edgesCompared,
-           (long long) mider.edgesMismatched );
-      msg( INFO, "GPU: intra's order (VVDEC_GPU_MIDER): %lld bands compared with the CPU's, %lld differ\n", (long long) mider.sortedCompared,
-           (long long) mider.sortedMismatched );
+           (long long) check.jobsCompared[0], (long long) check.jobsMismatched[0], (long long) check.jobsCompared[1],
+           (long long) check.jobsMismatched[1], (long long) check.jobsCompared[2], (long long) check.jobsMismatched[2] );
+      msg( INFO, "GPU: deblocking edges (VVDEC_GPU_MIDER): %lld compared with the CPU's, %lld differ\n", (long long) check.edgesCompared,
+           (long long) check.edgesMismatched );
+      msg( INFO, "GPU: intra's order (VVDEC_GPU_MIDER): %lld bands compared with the CPU's, %lld differ\n", (long long) check.sortedCompared,
+           (long long) check.sortedMismatched );
     }
   }
 #endif
@@ -767,8 +767,8 @@ void DecLib::reconPicture( Picture* pcPic )
   // than with two), and with the GPU's front end all pictures do: a picture's
   // front end waits for its colocated picture's first part, more pictures in
   // flight keep the GPU busy (VideoQ 1080p +9%, peak commit +140 MB).
-  static const bool gpuFront = DecLibRecon::gpuFrontRequested();
-  if( m_gpu && pcPic->lumaSize().area() <= 1920 * 1088 && !gpuFront )
+  const bool gpuFrontEnd = m_gpu && m_gpu->options().frontEnd && !m_gpu->options().frontEndCheck;
+  if( m_gpu && pcPic->lumaSize().area() <= 1920 * 1088 && !gpuFrontEnd )
   {
     inTurn = std::min<size_t>( inTurn, 2 );
   }

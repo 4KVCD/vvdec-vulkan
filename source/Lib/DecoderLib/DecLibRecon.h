@@ -98,7 +98,7 @@ struct CommonTaskParam
   bool                     gpuIntra     = false;  // the GPU predicts the intra and IBC blocks: the CTU tasks make its jobs
   bool                     gpuInter     = false;  // and the inter blocks
   bool                     gpuResidual  = false;  // and the residuals
-  bool                     gpuFront     = false;  // the GPU's front end drives the picture: the CTU tasks only parse
+  bool                     gpuFrontEnd  = false;  // the GPU's front end drives the picture: the CTU tasks only parse
 
   explicit CommonTaskParam( DecLibRecon* dec ) : decLib( *dec ) {}
   void reset( CodingStructure& cs, TaskType ctuStartState, int tasksPerLine, bool doALF, bool doSAO, bool doDeblock, bool gpuIntra, bool gpuInter,
@@ -181,41 +181,41 @@ private:
   bool                 m_doDeblock = true;
 
 #if VVDEC_VULKAN
+  // --- The GPU path ---
   gpu::Context*                  m_gpu = nullptr;   // the Vulkan device, when the pictures are reconstructed on the GPU
-  std::unique_ptr<gpu::GpuRecon> m_gpuRecon;        // then, from the instance's first picture on
-  bool                           m_gpuFilters = false;   // the current picture's in-loop filters run on the GPU
-  bool                           m_gpuIntra   = false;   // and its intra and IBC blocks
-  bool                           m_gpuInter   = false;   // and its inter blocks
-  bool                           m_gpuResidual = false;  // and its residuals
-  gpu::WaveMap                   m_waveMap;
-  std::vector<std::vector<gpu::IntraJob>> m_gpuIntraJobs;   // per CTU
-  std::vector<std::vector<gpu::InterJob>> m_gpuInterJobs;   // per CTU
-  std::vector<std::vector<gpu::TrafoJob>> m_gpuTrafoJobs;   // per CTU
-  std::vector<gpu::EdgeLists>    m_gpuEdges;               // per CTU: the edges the GPU deblocks
-  gpu::RefTable                  m_refTable;               // the reference pictures of the current picture
-  gpu::LmcsTables                m_lmcsTables;             // the current picture's LMCS (Reshape::gpuTables)
-  int                            m_filterPicturesGpu = 0;
-  int                            m_filterPicturesCpu = 0;
-  int                            m_intraPicturesGpu  = 0;
-  int                            m_intraPicturesCpu  = 0;
-  int                            m_interPicturesGpu  = 0;
-  int                            m_interPicturesCpu  = 0;
-  int                            m_residualPicturesGpu = 0;
-  int                            m_residualPicturesCpu = 0;
-  // VVDEC_GPU_MIDER=1: the GPU derives the motion too, from the parse's CUs,
-  // and its motion is compared with the CPU's (GpuRecon::compareMider)
-  bool                           m_gpuMider = false;
-  // the GPU's front end drives the pictures (all their stages on the GPU; VVDEC_GPU_FRONT=0: not): the CTU tasks parse and
-  // write the records, the GPU does the rest
-  bool                           m_gpuFrontOn = false;
-public:
-  // the GPU's front end as the environment asks for it: on, unless VVDEC_GPU_FRONT=0 or the motion derivation in
-  // shadow (VVDEC_GPU_MIDER=1)
-  static bool gpuFrontRequested();
-private:
-  bool                           m_gpuFront   = false;   // this picture's
-  std::vector<std::vector<gpu::CuRecord>> m_gpuCuRecords;   // per CTU
-  std::vector<std::vector<gpu::TuRecord>> m_gpuTuRecords;   // per CTU
+  std::unique_ptr<gpu::GpuRecon> m_gpuRecon;        // made with the instance's first picture
+  // VVDEC_GPU_MIDER=1: the CPU front end drives the pictures, and the GPU front end runs beside it on the same
+  // records, to be compared with it (GpuRecon::compareFrontEnd)
+  bool m_gpuFrontEndCheck = false;
+  // the GPU front end drives the pictures (unless VVDEC_GPU_FRONT=0 or VVDEC_GPU_MIDER=1): the CTU tasks only parse
+  // and write the records, and the GPU does the rest
+  bool m_gpuFrontEndRequested = false;
+  // which of the current picture's passes run on the GPU (setUpGpuPicture)
+  bool m_gpuFilters  = false;   // its in-loop filters
+  bool m_gpuIntra    = false;   // and its intra and IBC blocks
+  bool m_gpuInter    = false;   // and its inter blocks
+  bool m_gpuResidual = false;   // and its residuals
+  bool m_gpuFrontEnd = false;   // and its front end
+  // what the CTU tasks write for the GPU, per CTU: the parse's records (for the GPU front end), or the jobs and the
+  // deblocking edges (CPU front end)
+  std::vector<std::vector<gpu::CuRecord>> m_gpuCuRecords;
+  std::vector<std::vector<gpu::TuRecord>> m_gpuTuRecords;
+  std::vector<std::vector<gpu::TrafoJob>> m_gpuTrafoJobs;
+  std::vector<std::vector<gpu::InterJob>> m_gpuInterJobs;
+  std::vector<std::vector<gpu::IntraJob>> m_gpuIntraJobs;
+  std::vector<gpu::EdgeLists>             m_gpuEdges;
+  gpu::WaveMap                            m_waveMap;      // the intra jobs' waves (CPU front end)
+  gpu::RefTable                           m_refTable;     // the current picture's reference pictures
+  gpu::LmcsTables                         m_lmcsTables;   // the current picture's LMCS (Reshape::gpuTables)
+  // how many pictures had each pass on the GPU and on the CPU (DecLib prints them at the end)
+  int m_filterPicturesGpu   = 0;
+  int m_filterPicturesCpu   = 0;
+  int m_intraPicturesGpu    = 0;
+  int m_intraPicturesCpu    = 0;
+  int m_interPicturesGpu    = 0;
+  int m_interPicturesCpu    = 0;
+  int m_residualPicturesGpu = 0;
+  int m_residualPicturesCpu = 0;
 #endif
 
   CommonTaskParam            commonTaskParam{ this };
@@ -228,11 +228,11 @@ private:
 #if VVDEC_VULKAN
   bool                       m_currDecompReleasable = false;   // the current picture's GPU work ends with a download alone (gpuComputeDone)
   Barrier                    m_gpuFiltersPrepared;   // the picture's filter parameters for the GPU worked out (GpuRecon::prepareFilters)
-  // the picture's top rows of CTUs whose residuals and inter blocks go to the
-  // GPU ahead of the rest (0: none), their CTU tasks done, their jobs queued
-  int                        m_gpuBandRows = 0;
-  std::atomic<bool>          m_gpuBandDone{ false };
-  Barrier                    m_gpuBandQueued;
+  // the picture's early rows: the top CTU rows whose residuals and inter blocks go to the GPU ahead of the rest
+  // (0: none), whether their CTU tasks are done, and whether their jobs are submitted
+  int                        m_gpuEarlyRows = 0;
+  std::atomic<bool>          m_gpuEarlyRowsDone{ false };
+  Barrier                    m_gpuEarlyRowsQueued;
 #endif
   CBarrierVec                picBarriers;
 
@@ -268,7 +268,7 @@ public:
   int      interPicturesCpu()  const { return m_interPicturesCpu; }
   int      residualPicturesGpu() const { return m_residualPicturesGpu; }
   int      residualPicturesCpu() const { return m_residualPicturesCpu; }
-  const gpu::MiderStats* miderStats() const { return m_gpuMider && m_gpuRecon ? &m_gpuRecon->miderStats() : nullptr; }
+  const gpu::FrontEndStats* frontEndStats() const { return m_gpuFrontEndCheck && m_gpuRecon ? &m_gpuRecon->frontEndStats() : nullptr; }
 #endif
 
 
@@ -278,6 +278,29 @@ private:
 
   template<bool checkReadyState=false>
   static bool ctuTask( int tid, void* task_param );
+
+#if VVDEC_VULKAN
+  // --- The GPU path ---
+  // Decides which of the picture's passes run on the GPU (m_gpuFilters, m_gpuIntra, m_gpuInter, m_gpuResidual) and
+  // hands GpuRecon the picture's LMCS tables and scaling lists.
+  void setUpGpuPicture( Picture* pic, bool isIntra );
+  // Whether the CTU tasks wait for a reference picture the GPU reconstructs only until it can be referenced (its
+  // barriers are then added to picBarriers) rather than for its border extension.
+  bool waitForGpuReference( Picture* refPic, bool gpuFrontEnd );
+  // Empties the lists the CTU tasks write for the GPU (records, jobs, edges) and makes the reference table.
+  void resetGpuJobLists( Picture* pic );
+  // Adds the picture's GPU tasks to the thread pool (README.md).
+  void addGpuTasks( Picture* pic, FinishPicTaskParam& finishParam );
+  // The picture's jobs for GpuRecon::startPicture
+  gpu::PictureJobs gpuPictureJobs( const CodingStructure& cs ) const;
+  // The GPU tasks
+  static bool filterParamsTask( int tid, void* taskParam );
+  static bool earlyRowsReady( int tid, void* taskParam );
+  static bool earlyRowsTask( int tid, void* taskParam );
+  static bool queueGpuTask( int tid, void* taskParam );
+  static bool computeDoneTask( int tid, void* taskParam );
+  static bool finishGpuTask( int tid, void* taskParam );
+#endif
 };
 
 }

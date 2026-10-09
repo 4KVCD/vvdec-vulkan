@@ -403,20 +403,20 @@ struct PictureJobs
   const std::vector<std::vector<IntraJob>>* intra = nullptr;
   const RefTable*                           refs  = nullptr;   // with inter
   const std::vector<EdgeLists>*             edges = nullptr;   // per CTU, with deblocking
-  // The early rows (CPU front end): the first bandCtus CTUs, whose residuals and inter blocks went to the GPU ahead
-  // of the rest (GpuRecon::startBand).
-  size_t                                    bandCtus = 0;
+  // The early rows (CPU front end): the first earlyCtus CTUs, whose residuals and inter blocks went to the GPU ahead
+  // of the rest (GpuRecon::startEarlyRows).
+  size_t                                    earlyCtus = 0;
   // The parse's CU and TU records, per CTU (GpuFrontEnd.h). The GPU front end works from them: it drives the picture
   // with front, and without it runs beside the CPU front end for the comparison (VVDEC_GPU_MIDER=1;
-  // GpuRecon::compareMider).
+  // GpuRecon::compareFrontEnd).
   const std::vector<std::vector<CuRecord>>* cus = nullptr;
   const std::vector<std::vector<TuRecord>>* tus = nullptr;
   // The GPU front end drives the picture: from cus and tus it derives the motion, the deblocking parameters and
-  // edges, and the jobs (the residuals' with frontTrafo, inter's with frontInter). trafo, inter, intra and edges are
-  // then unused.
-  bool                                      front      = false;
-  bool                                      frontTrafo = false;
-  bool                                      frontInter = false;
+  // edges, and the jobs (the residual jobs with frontEndTrafo, the inter jobs with frontEndInter). trafo, inter,
+  // intra and edges are then unused.
+  bool                                      useFrontEnd   = false;
+  bool                                      frontEndTrafo = false;
+  bool                                      frontEndInter = false;
 };
 
 }   // namespace gpu

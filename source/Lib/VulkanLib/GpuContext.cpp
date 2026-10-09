@@ -103,8 +103,22 @@ void Context::release()
   }
 }
 
+Options Options::fromEnvironment()
+{
+  const auto value = []( const char* name ) -> const char* { return getenv( name ); };
+  Options    options;
+  options.device        = value( "VVDEC_GPU_DEVICE" ) ? value( "VVDEC_GPU_DEVICE" ) : "";
+  options.profile       = value( "VVDEC_GPU_PROFILE" ) && atoi( value( "VVDEC_GPU_PROFILE" ) ) != 0;
+  options.isaDir        = value( "VVDEC_GPU_ISA" ) ? value( "VVDEC_GPU_ISA" ) : "";
+  options.async         = !( value( "VVDEC_GPU_ASYNC" ) && atoi( value( "VVDEC_GPU_ASYNC" ) ) == 0 );
+  options.frontEnd      = !( value( "VVDEC_GPU_FRONT" ) && atoi( value( "VVDEC_GPU_FRONT" ) ) == 0 );
+  options.frontEndCheck = value( "VVDEC_GPU_MIDER" ) && atoi( value( "VVDEC_GPU_MIDER" ) ) != 0;
+  return options;
+}
+
 bool Context::init()
 {
+  m_options = Options::fromEnvironment();
 #ifdef _WIN32
   if( !s_library )
   {
@@ -168,9 +182,10 @@ bool Context::init()
   // VVDEC_GPU_DEVICE picks a device by its index; otherwise the first discrete
   // GPU, then the first integrated one, then the first device
   int chosen = -1;
-  if( const char* index = getenv( "VVDEC_GPU_DEVICE" ) )
+  if( !m_options.device.empty() )
   {
-    chosen = atoi( index );
+    const char* index = m_options.device.c_str();
+    chosen            = atoi( index );
     if( chosen < 0 || chosen >= (int) devices.size() )
     {
       msg( WARNING, "Vulkan: VVDEC_GPU_DEVICE=%s is not a device index\n", index );
@@ -251,8 +266,7 @@ bool Context::init()
 
   // and a family for compute only (an async compute engine), with timestamps: the GPU's front end there runs
   // alongside the compute queue's work (VVDEC_GPU_ASYNC=0: not)
-  const char* async = getenv( "VVDEC_GPU_ASYNC" );
-  for( uint32_t i = 0; i < count && m_asyncFamily == UINT32_MAX && features12.timelineSemaphore && !( async && atoi( async ) == 0 ); i++ )
+  for( uint32_t i = 0; i < count && m_asyncFamily == UINT32_MAX && features12.timelineSemaphore && m_options.async; i++ )
   {
     if( i != m_queueFamily && ( families[i].queueFlags & VK_QUEUE_COMPUTE_BIT ) && !( families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT )
         && families[i].timestampValidBits )
@@ -305,8 +319,7 @@ bool Context::init()
 
   // VVDEC_GPU_PROFILE=1: the GPU time of the passes, and with
   // VK_AMD_shader_info the registers and memory each shader takes
-  const char* profile = getenv( "VVDEC_GPU_PROFILE" );
-  m_profiling         = profile && atoi( profile ) != 0;
+  m_profiling = m_options.profile;
   const char* shaderInfo = "VK_AMD_shader_info";
   bool        hasShaderInfo = false;
   if( m_profiling )
@@ -693,8 +706,9 @@ VkPipeline Context::pipeline( int shaderId )
            stats.resourceUsage.scratchMemUsageInBytes );
     }
     // VVDEC_GPU_ISA=<directory>: the shader's machine code to <directory>/<name>.isa
-    if( const char* dir = getenv( "VVDEC_GPU_ISA" ) )
+    if( !m_options.isaDir.empty() )
     {
+      const char* dir = m_options.isaDir.c_str();
       size_t textSize = 0;
       if( m_getShaderInfo( m_device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &textSize, nullptr ) == VK_SUCCESS )
       {
@@ -818,6 +832,98 @@ void Context::submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore se
     {
       THROW_FATAL( "Vulkan: vkQueueSubmit (copies) failed (" << result << ")" );
     }
+  }
+}
+
+VkCommandPool Context::createCommandPool( uint32_t family )
+{
+  VkCommandPoolCreateInfo info{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+  info.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  info.queueFamilyIndex = family;
+  VkCommandPool pool    = VK_NULL_HANDLE;
+  if( m_api.vkCreateCommandPool( m_device, &info, nullptr, &pool ) != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkCreateCommandPool failed" );
+  }
+  return pool;
+}
+
+void Context::allocateCommandBuffers( VkCommandPool pool, uint32_t count, VkCommandBuffer* out )
+{
+  VkCommandBufferAllocateInfo info{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+  info.commandPool        = pool;
+  info.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  info.commandBufferCount = count;
+  if( m_api.vkAllocateCommandBuffers( m_device, &info, out ) != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkAllocateCommandBuffers failed" );
+  }
+}
+
+VkFence Context::createFence()
+{
+  VkFenceCreateInfo info{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+  VkFence           fence = VK_NULL_HANDLE;
+  if( m_api.vkCreateFence( m_device, &info, nullptr, &fence ) != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkCreateFence failed" );
+  }
+  return fence;
+}
+
+VkSemaphore Context::createSemaphore()
+{
+  VkSemaphoreCreateInfo info{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+  VkSemaphore           semaphore = VK_NULL_HANDLE;
+  if( m_api.vkCreateSemaphore( m_device, &info, nullptr, &semaphore ) != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkCreateSemaphore failed" );
+  }
+  return semaphore;
+}
+
+VkQueryPool Context::createTimestampQueries( uint32_t count )
+{
+  VkQueryPoolCreateInfo info{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+  info.queryType      = VK_QUERY_TYPE_TIMESTAMP;
+  info.queryCount     = count;
+  VkQueryPool queries = VK_NULL_HANDLE;
+  if( m_api.vkCreateQueryPool( m_device, &info, nullptr, &queries ) != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkCreateQueryPool failed" );
+  }
+  return queries;
+}
+
+void Context::destroyCommandPool( VkCommandPool pool )
+{
+  if( pool )
+  {
+    m_api.vkDestroyCommandPool( m_device, pool, nullptr );
+  }
+}
+
+void Context::destroyFence( VkFence fence )
+{
+  if( fence )
+  {
+    m_api.vkDestroyFence( m_device, fence, nullptr );
+  }
+}
+
+void Context::destroySemaphore( VkSemaphore semaphore )
+{
+  if( semaphore )
+  {
+    m_api.vkDestroySemaphore( m_device, semaphore, nullptr );
+  }
+}
+
+void Context::destroyQueries( VkQueryPool queries )
+{
+  if( queries )
+  {
+    m_api.vkDestroyQueryPool( m_device, queries, nullptr );
   }
 }
 

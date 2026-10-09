@@ -46,7 +46,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "GpuFilmGrain.h"
 
-#include "vvdec_gpu/GpuShaders.h"
+#include "vvdec_gpu/GpuShaderIds.h"
 
 #include "CommonLib/CommonDef.h"
 #include "FilmGrain/FilmGrain.h"
@@ -72,35 +72,16 @@ static_assert( sizeof( FilmGrainPush ) == 88, "FilmGrainPush: the layout of film
 
 GpuFilmGrain::GpuFilmGrain( Context* ctx ) : m_ctx( ctx )
 {
-  const Api& vk = m_ctx->api();
-  VkCommandPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-  poolInfo.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-  poolInfo.queueFamilyIndex = m_ctx->queueFamily();
-  if( vk.vkCreateCommandPool( m_ctx->device(), &poolInfo, nullptr, &m_pool ) != VK_SUCCESS )
-  {
-    THROW_FATAL( "Vulkan: vkCreateCommandPool failed" );
-  }
-  VkCommandBufferAllocateInfo cmdInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-  cmdInfo.commandPool        = m_pool;
-  cmdInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cmdInfo.commandBufferCount = 1;
-  if( vk.vkAllocateCommandBuffers( m_ctx->device(), &cmdInfo, &m_cmd ) != VK_SUCCESS )
-  {
-    THROW_FATAL( "Vulkan: vkAllocateCommandBuffers failed" );
-  }
-  VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-  if( vk.vkCreateFence( m_ctx->device(), &fenceInfo, nullptr, &m_fence ) != VK_SUCCESS )
-  {
-    THROW_FATAL( "Vulkan: vkCreateFence failed" );
-  }
+  m_pool = m_ctx->createCommandPool( m_ctx->queueFamily() );
+  m_ctx->allocateCommandBuffers( m_pool, 1, &m_cmd );
+  m_fence  = m_ctx->createFence();
   m_tables = m_ctx->alloc( kTableBytes, MemKind::Upload );
 }
 
 GpuFilmGrain::~GpuFilmGrain()
 {
-  const Api& vk = m_ctx->api();
-  vk.vkDestroyFence( m_ctx->device(), m_fence, nullptr );
-  vk.vkDestroyCommandPool( m_ctx->device(), m_pool, nullptr );
+  m_ctx->destroyFence( m_fence );
+  m_ctx->destroyCommandPool( m_pool );
   m_ctx->free( m_tables );
   m_ctx->free( m_seeds );
 }

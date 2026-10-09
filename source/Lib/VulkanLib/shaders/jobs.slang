@@ -15,8 +15,8 @@
 //          left at 0).
 // 3 WAVES: sets each intra job's wave, in decoding order: one above the
 //          highest wave of the samples the job reads, where inter's samples
-//          are wave 0 (GpuJobs.h's WaveMap). One lane per CTU row; the rows
-//          run as a wavefront, as vvdec's CTU tasks run them.
+//          are wave 0 (GpuJobs.h's WaveMap). One 32-thread workgroup per CTU
+//          row; the rows run as a wavefront, as vvdec's CTU tasks run them.
 //
 // There are five lists: 0 the residual jobs, 1 inter's regular jobs, 2 the
 // intra jobs, 3 inter's BDOF jobs, 4 inter's affine pairs. Inter's three lists
@@ -1733,45 +1733,6 @@ uint* waveRow( int c, int j )
   return pc.waveMap + c * planeSize + j * waveWidth( c );
 }
 
-// WaveMap::maxIn: the highest wave in the rectangle (in component c's samples), clipped to the picture
-int waveMaxIn( int c, int x, int y, int width, int height )
-{
-  if( x + width <= 0 || y + height <= 0 )
-  {
-    return 0;
-  }
-  const int x0 = max( x, 0 ) >> waveShiftX( c );
-  const int y0 = max( y, 0 ) >> waveShiftY( c );
-  const int x1 = min( ( x + width - 1 ) >> waveShiftX( c ), waveWidth( c ) - 1 );
-  const int y1 = min( ( y + height - 1 ) >> waveShiftY( c ), waveHeight( c ) - 1 );
-  int       wave = 0;
-  for( int j = y0; j <= y1; j++ )
-  {
-    uint* row = waveRow( c, j );
-    for( int i = x0; i <= x1; i++ )
-    {
-      wave = max( wave, int( row[i] ) );
-    }
-  }
-  return wave;
-}
-
-void waveSet( int c, int x, int y, int width, int height, int wave )
-{
-  const int x0 = x >> waveShiftX( c );
-  const int y0 = y >> waveShiftY( c );
-  const int x1 = min( ( x + width - 1 ) >> waveShiftX( c ), waveWidth( c ) - 1 );
-  const int y1 = min( ( y + height - 1 ) >> waveShiftY( c ), waveHeight( c ) - 1 );
-  for( int j = y0; j <= y1; j++ )
-  {
-    uint* row = waveRow( c, j );
-    for( int i = x0; i <= x1; i++ )
-    {
-      row[i] = uint( wave );
-    }
-  }
-}
-
 // WaveMap::maxIn computed by the 32 threads of a row's workgroup (lane is the calling thread's), each thread taking
 // every 32nd unit; every thread gets the highest wave in the rectangle.
 int waveMaxInP( int c, int x, int y, int width, int height, int lane )
@@ -1796,6 +1757,7 @@ int waveMaxInP( int c, int x, int y, int width, int height, int lane )
   return WaveActiveMax( wave );
 }
 
+// WaveMap::set by the 32 threads of a row's workgroup, each thread taking every 32nd unit.
 void waveSetP( int c, int x, int y, int width, int height, int wave, int lane )
 {
   const int x0   = x >> waveShiftX( c );
@@ -1883,79 +1845,6 @@ void jobWaveP( uint* job, int lane )
     job[7] = uint( wave + 1 );
   }
   waveSetP( c, x, y, w, h, wave + 1, lane );
-}
-
-// Sets a job's wave to one above the highest wave of the samples it reads.
-void jobWave( uint* job )
-{
-  const int  x     = int( job[0] & 0xffff );
-  const int  y     = int( job[0] >> 16 );
-  const int  w     = int( job[1] & 0xff );
-  const int  h     = int( ( job[1] >> 8 ) & 0xff );
-  const int  c     = int( ( job[1] >> 16 ) & 0xff );
-  const int  kind  = int( job[1] >> 24 );
-  const uint flags = ( job[2] >> 8 ) & 0xff;
-  int        wave  = 0;
-  if( kind == kIntraIbc )
-  {
-    const int bvx = int( int16_t( job[6] & 0xffff ) );
-    const int bvy = int( int16_t( job[6] >> 16 ) );
-    wave          = waveMaxIn( c, x + bvx, y + bvy, w, h );
-  }
-  else if( kind != kIntraLmcs )
-  {
-    if( ( flags & kIntraIsp ) != 0 )
-    {
-      // ISP: the CU's references for the first sub-partition; for the later ones, the row above and the column to
-      // the left, each longer than the block's by the CU's width (height)
-      const int cx    = int( job[4] & 0xffff );
-      const int cy    = int( job[4] >> 16 );
-      const int cw    = int( job[5] & 0xff );
-      const int ch    = int( ( job[5] >> 8 ) & 0xff );
-      const int split = int( ( job[5] >> 16 ) & 3 );
-      int       px = x, pw = w;
-      if( split == 2 && ( ( cw == 8 && ch > 4 ) || cw == 4 ) )
-      {
-        px = cx + ( ( x - cx ) & ~3 );
-        pw = 4;
-      }
-      const bool first   = px == cx && y == cy;
-      const int  x0      = first ? cx : px;
-      const int  y0      = first ? cy : y;
-      const int  topLen  = first ? 2 * cw : cw + pw;
-      const int  leftLen = first ? 2 * ch : ch + h;
-      wave               = max( waveMaxIn( 0, x0 - 1, y0 - 1, topLen + 1, 1 ), waveMaxIn( 0, x0 - 1, y0, 1, leftLen ) );
-    }
-    else
-    {
-      const int refLine = int( job[2] >> 24 );
-      wave = max( waveMaxIn( c, x - 1 - refLine, y - 1 - refLine, 2 * w + 1 + refLine, 1 ), waveMaxIn( c, x - 1 - refLine, y - refLine, 1, 2 * h + refLine ) );
-    }
-  }
-  // LMCS's chroma scale reads the luma left of and above the CU at the VPDU's top-left
-  if( ( job[9] & 1 ) != 0 )
-  {
-    const int ax    = int( job[8] & 0xffff );
-    const int ay    = int( job[8] >> 16 );
-    const int count = 1 << ( ( job[9] >> 4 ) & 15 );
-    if( ( job[9] & 2 ) != 0 )
-    {
-      wave = max( wave, waveMaxIn( 0, ax - 1, ay, 1, count ) );
-    }
-    if( ( job[9] & 4 ) != 0 )
-    {
-      wave = max( wave, waveMaxIn( 0, ax, ay - 1, count, 1 ) );
-    }
-  }
-  if( kind == kIntraCclm )
-  {
-    // (no further right than the CTU to the right of the block's CTU, as in DecCu)
-    const int lx    = x << pc.csx, ly = y << pc.csy, lw = w << pc.csx, lh = h << pc.csy;
-    const int right = ( ( lx >> pc.log2Ctu ) + 2 ) << pc.log2Ctu;
-    wave            = max( wave, waveMaxIn( 0, lx - 4, ly - 4, min( 2 * lw + 8, right - ( lx - 4 ) ), 2 * lh + 8 ) );
-  }
-  job[7] = uint( wave + 1 );
-  waveSet( c, x, y, w, h, wave + 1 );
 }
 
 // --------------------------------------------------------------------------------------------------------------------

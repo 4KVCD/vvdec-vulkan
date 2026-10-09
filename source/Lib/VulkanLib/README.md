@@ -20,7 +20,7 @@ The path is chosen per picture in `DecLibRecon::decompressPicture`.
 3. **CPU only**. Used for a picture with a feature the GPU path does not cover, and with `--gpu 0`.
 
 `VVDEC_GPU_MIDER=1` runs path 2 and the GPU front end side by side, and compares the GPU's motion, deblocking
-parameters, job lists and edges with the CPU's (`GpuRecon::compareMider`). It is a debugging aid.
+parameters, job lists and edges with the CPU's (`GpuRecon::compareFrontEnd`). It is a debugging aid.
 
 ## A picture's journey (path 1)
 
@@ -67,8 +67,8 @@ output frames, not to the reference pictures.
 - **waves**: groups of intra jobs that may run at the same time; a job's wave is one more than the highest wave
   of the blocks it reads from.
 - **intra bands**: intra blocks split into strips of 256 samples, the unit of work of `intra.slang`.
-- **early rows** ("band" in some names): with the CPU front end, the top half of a picture's CTU rows, whose
-  residuals and inter blocks are submitted before the CPU finishes the rest (`GpuRecon::startBand`).
+- **early rows**: with the CPU front end, the top half of a picture's CTU rows, whose residuals and inter blocks
+  are submitted before the CPU finishes the rest (`GpuRecon::startEarlyRows`).
 - **deferred predictions**: inter predictions kept aside for an intra job to finish (LMCS chroma scaling, CIIP).
 
 ## Environment variables
@@ -86,9 +86,18 @@ output frames, not to the reference pictures.
 ## Files
 
 - `GpuContext.*`: the Vulkan device, its queues, memory allocation and the shaders' pipelines.
-- `GpuRecon.*`: records and submits a picture's GPU work, from the uploads to the download.
-- `GpuFrontEnd.*`: the CU, TU and CTU records the CPU writes for the GPU front end, and the comparisons with the
-  CPU's results used by `VVDEC_GPU_MIDER=1`.
+- `GpuPictureMemory.*`: the pictures' planes in host memory the GPU can reach, and their twins on the GPU.
+- `GpuRecon.h`: `GpuRecon`, which records and submits a picture's GPU work, from the uploads to the download. Its
+  functions are defined by area:
+  - `GpuRecon.cpp`: construction, commands and submissions, the picture's planes and tables, and the order of a
+    picture's work;
+  - `GpuReconFrontEnd.cpp`: the GPU front end;
+  - `GpuReconPrediction.cpp`: the residuals, inter prediction and intra prediction;
+  - `GpuReconFilters.cpp`: LMCS's inverse mapping, deblocking, SAO and ALF;
+  - `GpuFrontEndCheck.*`: the comparison of the GPU front end with the CPU's (`VVDEC_GPU_MIDER=1`).
+- `GpuFrontEnd.*`: the CU, TU and CTU records the CPU writes for the GPU front end, and the tables its shaders read.
 - `GpuJobs.h`: the job structures shared by the CPU and the shaders.
 - `GpuFilmGrain.*`: film grain synthesis on the output frames.
-- `shaders/*.slang`: one file per pass (some with variants, see `cmake/modules/vvdecVulkanShaders.cmake`).
+- `shaders/*.slang`: one file per pass (some with variants, see `cmake/modules/vvdecVulkanShaders.cmake`). The build
+  embeds their SPIR-V in the generated `vvdec_gpu/GpuShaders.h`, which only `GpuContext.cpp` includes; the other
+  files name shaders through `vvdec_gpu/GpuShaderIds.h`.

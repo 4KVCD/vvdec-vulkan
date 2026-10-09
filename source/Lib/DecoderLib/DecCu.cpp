@@ -560,346 +560,374 @@ static bool gpuBdof( const CodingUnit& cu )
   return !slice.getRefPic( REF_PIC_LIST_0, cu.refIdx[0] )->isRefScaled( cu.pps ) && !slice.getRefPic( REF_PIC_LIST_1, cu.refIdx[1] )->isRefScaled( cu.pps );
 }
 
+// The residual of an inter CU. The GPU adds it where a component has one; within such a component, the transform
+// blocks without a residual must hold zeros, which the GPU writes when it makes the residuals (zero jobs into
+// trafoJobs), and which are cleared here otherwise. Returns the flags of the components with a residual
+// (InterJob::kResidualY and on, or with LMCS's chroma scaling InterJob::kDeferCb and on).
+static int gpuInterResidual( CodingUnit& cu, bool lmcsChroma, std::vector<gpu::TrafoJob>* trafoJobs )
+{
+  int flags = 0;
+  if( !cu.rootCbf() )
+  {
+    return flags;
+  }
+  for( int c = 0; c < getNumberValidComponents( cu.chromaFormat ); c++ )
+  {
+    const ComponentID compID = ComponentID( c );
+    if( !cu.planeCbf( compID ) )
+    {
+      continue;
+    }
+    if( !cu.ciipFlag() )
+    {
+      flags |= lmcsChroma && isChroma( compID ) ? gpu::InterJob::kDeferCb << ( c - 1 ) : gpu::InterJob::kResidualY << c;
+    }
+    for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
+    {
+      if( tu.blocks[compID].valid() && !TU::getCbf( tu, compID ) && !( isChroma( compID ) && tu.jointCbCr ) )
+      {
+        const CompArea& block = tu.blocks[compID];
+        if( trafoJobs )
+        {
+          // in blocks of powers of two (SBT's transform units without a residual are 3/4 of the CU: 12, 24 or 48 luma
+          // samples)
+          for( int y = 0; y < int( block.height ); y += 1 << getLog2( block.height - y ) )
+          {
+            for( int x = 0; x < int( block.width ); x += 1 << getLog2( block.width - x ) )
+            {
+              gpu::TrafoJob job;
+              job.set( block.x + x, block.y + y, getLog2( block.width - x ), getLog2( block.height - y ), compID, 0, 0, gpu::TrafoJob::kZero, 0,
+                       0, 0, 0, 0, 0 );
+              trafoJobs->push_back( job );
+            }
+          }
+        }
+        else
+        {
+          cu.cs->getRecoBuf( block ).fill( 0 );
+        }
+      }
+    }
+  }
+  return flags;
+}
+
+// The tiles of a block that motionCompensation predicts with one motion: the CU, or SbTMVP's sub-PUs joined where
+// their motion is the same (xSubPuMC; subPu), each with its own clip of the motion, in tiles of up to 16x16 (DMVR's
+// subblocks). flags: what all the CU's tiles share.
+static void gpuInterBlockJobs( CodingUnit& cu, int flags, const gpu::RefTable& refs, int bx, int by, int bw, int bh, const int8_t refIdx[2],
+                               const Mv mv[2], bool subPu, std::vector<gpu::InterJob>& jobs )
+{
+  const Slice& slice  = *cu.slice;
+  int          bflags = flags;
+  int          ref[2] = { 0, 0 };
+  for( int list = 0; list < 2; list++ )
+  {
+    if( refIdx[list] >= 0 )
+    {
+      bflags    |= list == 0 ? gpu::InterJob::kL0 : gpu::InterJob::kL1;
+      ref[list]  = refs.slot( slice.getRefPic( RefPicList( list ), refIdx[list] ) );
+    }
+  }
+  // As motionCompensation chooses: BDOF and DMVR (not for sub-PUs, nor from scaled references: motionCompensation's
+  // refIsScaled); otherwise the same motion twice is a uni-prediction (xCheckIdenticalMotion); then BCW's weights
+  // (not with CIIP).
+  const bool dmvr = !subPu && PU::checkDMVRCondition( cu ) && !( refIdx[0] >= 0 && slice.getRefPic( REF_PIC_LIST_0, refIdx[0] )->isRefScaled( cu.pps ) )
+                    && !( refIdx[1] >= 0 && slice.getRefPic( REF_PIC_LIST_1, refIdx[1] )->isRefScaled( cu.pps ) );
+  const bool bi   = refIdx[0] >= 0 && refIdx[1] >= 0;
+  if( !subPu && gpuBdof( cu ) )
+  {
+    bflags |= gpu::InterJob::kBdof;
+  }
+  if( dmvr )
+  {
+    cu.setDmvrCondition( true );
+    bflags |= gpu::InterJob::kDmvr;
+  }
+  else if( bi && slice.isInterB() && !cu.pps->getWPBiPred()
+           && slice.getRefPOC( REF_PIC_LIST_0, refIdx[0] ) == slice.getRefPOC( REF_PIC_LIST_1, refIdx[1] ) && mv[0] == mv[1] )
+  {
+    bflags &= ~gpu::InterJob::kL1;
+  }
+  const bool bcw = ( bflags & gpu::InterJob::kL1 ) && ( bflags & gpu::InterJob::kL0 ) && cu.BcwIdx() != BCW_DEFAULT && !cu.ciipFlag();
+
+  const int tileW = std::min( bw, DMVR_SUBCU_WIDTH );
+  const int tileH = std::min( bh, DMVR_SUBCU_HEIGHT );
+  int       num   = 0;
+  for( int y = by; y < by + bh; y += tileH )
+  {
+    for( int x = bx; x < bx + bw; x += tileW, num++ )
+    {
+      gpu::InterJob job;
+      job.set( x, y, tileW, tileH, bflags, mv[0].hor, mv[0].ver, mv[1].hor, mv[1].ver, bx, by, ref[0], ref[1],
+               dmvr ? int( cu.mvdL0SubPuOff ) + num : 0 );
+      job.setClipWidth( bw );
+      if( bcw )
+      {
+        job.setBcw( getBcwWeight( g_BcwInternBcw[cu.BcwIdx()], REF_PIC_LIST_1 ) );
+      }
+      gpuWp( cu, refIdx, bflags, job );
+      jobs.push_back( job );
+    }
+  }
+}
+
+// A GPM CU's tiles (motionCompensationGeo): each partition is a uni-prediction (at 14 bits) from its own list's
+// reference and motion, and the two are blended by the mask of the split's angle.
+static void gpuGeoJobs( const CodingUnit& cu, int flags, const gpu::RefTable& refs, std::vector<gpu::InterJob>& jobs )
+{
+  const Slice&  slice = *cu.slice;
+  const int     dir0  = cu.interDirrefIdxGeo0() >> 4;
+  const int     dir1  = cu.interDirrefIdxGeo1() >> 4;
+  const int     ref0  = refs.slot( slice.getRefPic( RefPicList( dir0 - 1 ), cu.interDirrefIdxGeo0() & 15 ) );
+  const int     ref1  = refs.slot( slice.getRefPic( RefPicList( dir1 - 1 ), cu.interDirrefIdxGeo1() & 15 ) );
+  const Mv&     mv0   = cu.mv[0][1];
+  const Mv&     mv1   = cu.mv[1][1];
+  const uint8_t split = cu.geoSplitDir;
+  const int     angle = g_GeoParams[split][0];
+  const int     wIdx  = getLog2( cu.lwidth() ) - GEO_MIN_CU_LOG2;
+  const int     hIdx  = getLog2( cu.lheight() ) - GEO_MIN_CU_LOG2;
+  for( int y = cu.ly(); y < cu.ly() + int( cu.lheight() ); y += 16 )
+  {
+    for( int x = cu.lx(); x < cu.lx() + int( cu.lwidth() ); x += 16 )
+    {
+      gpu::InterJob job;
+      job.set( x, y, std::min<int>( 16, cu.lwidth() ), std::min<int>( 16, cu.lheight() ), flags | gpu::InterJob::kL0 | gpu::InterJob::kL1,
+               mv0.hor, mv0.ver, mv1.hor, mv1.ver, cu.lx(), cu.ly(), ref0, ref1, 0 );
+      job.setClipWidth( cu.lwidth() );
+      job.setGeo( g_angle2mask[angle], g_angle2mirror[angle], g_weightOffset[split][hIdx][wIdx][0], g_weightOffset[split][hIdx][wIdx][1] );
+      jobs.push_back( job );
+    }
+  }
+}
+
+// An affine CU's tiles (xPredAffineBlk): 4x4 subblocks with motion of their own, refined by PROF. The same motion
+// twice is a uni-prediction (xCheckIdenticalMotion). Each tile takes two jobs (InterJob::setAffine).
+static void gpuAffineJobs( const CodingUnit& cu, int flags, const gpu::RefTable& refs, std::vector<gpu::InterJob>& jobs )
+{
+  const Slice& slice  = *cu.slice;
+  int          aflags = flags;
+  int          ref[2] = { 0, 0 };
+  for( int list = 0; list < 2; list++ )
+  {
+    if( cu.refIdx[list] >= 0 )
+    {
+      aflags    |= list == 0 ? gpu::InterJob::kL0 : gpu::InterJob::kL1;
+      ref[list]  = refs.slot( slice.getRefPic( RefPicList( list ), cu.refIdx[list] ) );
+    }
+  }
+  if( cu.refIdx[0] >= 0 && cu.refIdx[1] >= 0 && slice.isInterB() && !cu.pps->getWPBiPred()
+      && slice.getRefPOC( REF_PIC_LIST_0, cu.refIdx[0] ) == slice.getRefPOC( REF_PIC_LIST_1, cu.refIdx[1] ) && cu.mv[0][0] == cu.mv[1][0]
+      && cu.mv[0][1] == cu.mv[1][1] && ( cu.affineType() == AFFINEMODEL_4PARAM || cu.mv[0][2] == cu.mv[1][2] ) )
+  {
+    aflags &= ~gpu::InterJob::kL1;
+  }
+  const bool bcw = ( aflags & gpu::InterJob::kL0 ) && ( aflags & gpu::InterJob::kL1 ) && cu.BcwIdx() != BCW_DEFAULT;
+
+  // per list: whether PROF refines it, whether its motion spreads too far, and the affine model's parameters
+  bool prof[2]      = { false, false };
+  bool spread[2]    = { false, false };
+  int  params[2][6] = {};
+  for( int list = 0; list < 2; list++ )
+  {
+    if( cu.refIdx[list] < 0 )
+    {
+      continue;
+    }
+    const int shift = MAX_CU_DEPTH;
+    const Mv& affLT = cu.mv[list][0];
+    const Mv& affRT = cu.mv[list][1];
+    const Mv& affLB = cu.mv[list][2];
+    const int dHorX = ( affRT - affLT ).getHor() * ( 1 << ( shift - getLog2( cu.lwidth() ) ) );
+    const int dHorY = ( affRT - affLT ).getVer() * ( 1 << ( shift - getLog2( cu.lwidth() ) ) );
+    const int dVerX = cu.affineType() == AFFINEMODEL_6PARAM ? ( affLB - affLT ).getHor() * ( 1 << ( shift - getLog2( cu.lheight() ) ) ) : -dHorY;
+    const int dVerY = cu.affineType() == AFFINEMODEL_6PARAM ? ( affLB - affLT ).getVer() * ( 1 << ( shift - getLog2( cu.lheight() ) ) ) : dHorX;
+    spread[list] = InterPrediction::isSubblockVectorSpreadOverLimit( dHorX, dHorY, dVerX, dVerY, cu.interDir() );
+    prof[list]   = cu.sps->getUsePROF() && !cu.cs->picHeader->getDisProfFlag()
+                 && !( ( cu.affineType() == AFFINEMODEL_6PARAM && affLT == affRT && affLT == affLB ) || ( cu.affineType() == AFFINEMODEL_4PARAM && affLT == affRT ) )
+                 && !spread[list] && !slice.getRefPic( RefPicList( list ), cu.refIdx[list] )->isRefScaled( cu.pps );
+    const int p[6] = { affLT.getHor() * ( 1 << shift ), affLT.getVer() * ( 1 << shift ), dHorX, dHorY, dVerX, dVerY };
+    std::copy( p, p + 6, params[list] );
+  }
+
+  for( int y = cu.ly(); y < cu.ly() + int( cu.lheight() ); y += 16 )
+  {
+    for( int x = cu.lx(); x < cu.lx() + int( cu.lwidth() ); x += 16 )
+    {
+      gpu::InterJob job, next;
+      job.set( x, y, std::min<int>( 16, cu.lwidth() ), std::min<int>( 16, cu.lheight() ), aflags | gpu::InterJob::kAffine, 0, 0, 0, 0, cu.lx(),
+               cu.ly(), ref[0], ref[1], 0 );
+      if( bcw )
+      {
+        job.setBcw( getBcwWeight( g_BcwInternBcw[cu.BcwIdx()], REF_PIC_LIST_1 ) );
+      }
+      const int8_t refIdx[2] = { int8_t( cu.refIdx[0] ), int8_t( cu.refIdx[1] ) };
+      gpuWp( cu, refIdx, aflags, job );
+      next.set( 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 );
+      gpu::InterJob::setAffine( job, next, cu.lwidth(), cu.lheight(), prof, spread, params );
+      jobs.push_back( job );
+      jobs.push_back( next );
+    }
+  }
+}
+
+// An SbTMVP CU's tiles (xSubPuMC): the sub-PUs, joined along the CU's longer side where their motion is the same.
+// A joined run that is longer than 16 samples but not a multiple of 16 is split into its multiple of 16 and the rest.
+static void gpuSbTmvpJobs( CodingUnit& cu, int flags, const gpu::RefTable& refs, std::vector<gpu::InterJob>& jobs )
+{
+  const Slice&   slice       = *cu.slice;
+  const Position puPos       = cu.lumaPos();
+  const Size     puSize      = cu.lumaSize();
+  const int      numPartLine = std::max<SizeType>( puSize.width >> ATMVP_SUB_BLOCK_SIZE, 1u );
+  const int      numPartCol  = std::max<SizeType>( puSize.height >> ATMVP_SUB_BLOCK_SIZE, 1u );
+  const int      puHeight    = numPartCol == 1 ? puSize.height : 1 << ATMVP_SUB_BLOCK_SIZE;
+  const int      puWidth     = numPartLine == 1 ? puSize.width : 1 << ATMVP_SUB_BLOCK_SIZE;
+  const bool     verMC       = puSize.height > puSize.width;
+  const int      fstStart    = !verMC ? puPos.y : puPos.x;
+  const int      secStart    = !verMC ? puPos.x : puPos.y;
+  const int      fstEnd      = !verMC ? puPos.y + puSize.height : puPos.x + puSize.width;
+  const int      secEnd      = !verMC ? puPos.x + puSize.width : puPos.y + puSize.height;
+  const int      fstStep     = !verMC ? puHeight : puWidth;
+  const int      secStep     = !verMC ? puWidth : puHeight;
+  const bool     scaled      = slice.getRefPic( REF_PIC_LIST_0, 0 )->isRefScaled( cu.pps )
+                               || ( slice.getSliceType() == B_SLICE ? slice.getRefPic( REF_PIC_LIST_1, 0 )->isRefScaled( cu.pps ) : false );
+  for( int fstDim = fstStart; fstDim < fstEnd; fstDim += fstStep )
+  {
+    for( int secDim = secStart; secDim < secEnd; secDim += secStep )
+    {
+      int               x      = !verMC ? secDim : fstDim;
+      int               y      = !verMC ? fstDim : secDim;
+      const MotionInfo& curMi  = cu.getMotionInfo( Position{ x, y } );
+      int               length = secStep;
+      int               later  = secDim + secStep;
+      while( later < secEnd )
+      {
+        const MotionInfo& laterMi = !verMC ? cu.getMotionInfo( Position{ later, fstDim } ) : cu.getMotionInfo( Position{ fstDim, later } );
+        if( !scaled && laterMi == curMi )
+        {
+          length += secStep;
+        }
+        else
+        {
+          break;
+        }
+        later += secStep;
+      }
+      int dx = !verMC ? length : puWidth;
+      int dy = !verMC ? puHeight : length;
+      if( !verMC && ( dx & 15 ) && dx > 16 )
+      {
+        const int dxPart = dx & ~15;
+        gpuInterBlockJobs( cu, flags, refs, x, y, dxPart, dy, curMi.miRefIdx, curMi.mv, true, jobs );
+        x  += dxPart;
+        dx -= dxPart;
+      }
+      else if( verMC && ( dy & 15 ) && dy > 16 )
+      {
+        const int dyPart = dy & ~15;
+        gpuInterBlockJobs( cu, flags, refs, x, y, dx, dyPart, curMi.miRefIdx, curMi.mv, true, jobs );
+        y  += dyPart;
+        dy -= dyPart;
+      }
+      gpuInterBlockJobs( cu, flags, refs, x, y, dx, dy, curMi.miRefIdx, curMi.mv, true, jobs );
+      secDim = later - secStep;
+    }
+  }
+}
+
+// The chroma that inter prediction kept aside for LMCS's chroma residual scaling (flags: its InterJob::kDeferCb
+// bits): an intra job per transform block (in blocks of powers of two) adds the residual to the prediction, scaled
+// where finishLMCSAndReco scales it, once the luma the scale comes from is there.
+static void gpuLmcsChromaJobs( CodingUnit& cu, int flags, std::vector<gpu::IntraJob>& intraJobs, gpu::WaveMap& waves )
+{
+  for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
+  {
+    for( int c = COMPONENT_Cb; c <= COMPONENT_Cr; c++ )
+    {
+      const ComponentID compID = ComponentID( c );
+      const CompArea&   block  = tu.blocks[compID];
+      if( !( flags & ( gpu::InterJob::kDeferCb << ( c - 1 ) ) ) || !block.valid() )
+      {
+        continue;
+      }
+      // (in blocks of powers of two: SBT's transform units without a residual are 3/4 of the CU, the scaled ones
+      // powers of two)
+      const bool scaled = ( TU::getCbf( tu, compID ) || tu.jointCbCr ) && block.area() > 4;
+      for( int y = 0; y < int( block.height ); y += 1 << getLog2( block.height - y ) )
+      {
+        for( int x = 0; x < int( block.width ); x += 1 << getLog2( block.width - x ) )
+        {
+          const int     bw = 1 << getLog2( block.width - x );
+          const int     bh = 1 << getLog2( block.height - y );
+          gpu::IntraJob job;
+          job.set( block.x + x, block.y + y, bw, bh, compID, gpu::IntraJob::kLmcs, 0, gpu::IntraJob::kResidual, 0 );
+          int wave = 0;
+          if( scaled )
+          {
+            wave = gpuLmcsChroma( cu, tu.blocks[COMPONENT_Y].pos(), job, waves );
+          }
+          job.setWave( wave + 1 );
+          waves.set( compID, block.x + x, block.y + y, bw, bh, wave + 1 );
+          intraJobs.push_back( job );
+        }
+      }
+    }
+  }
+}
+
 void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs, std::vector<gpu::TrafoJob>* trafoJobs,
                            std::vector<gpu::IntraJob>& intraJobs, gpu::WaveMap& waves )
 {
-  const Slice& slice = *cu.slice;
-  // what all the CU's blocks share: AMVR's half-sample filter, LMCS, the
-  // residual, CIIP
+  // What all the CU's tiles share: AMVR's half-sample filter, LMCS, the residual, CIIP.
   int flags = 0;
   if( cu.imv() == IMV_HPEL )
   {
     flags |= gpu::InterJob::kHalfPel;
   }
-
-  // LMCS: the luma prediction forward-mapped (rspBufFwd); with its chroma
-  // residual scaling, a chroma component with a residual is finished by
-  // intra jobs once the luma its scale comes from is there
-  // (finishLMCSAndReco): inter keeps its prediction aside
+  // LMCS: the luma prediction is forward-mapped (rspBufFwd). With LMCS's chroma residual scaling, a chroma component
+  // with a residual is finished by intra jobs once the luma its scale comes from is there (finishLMCSAndReco), so
+  // inter prediction keeps its prediction aside.
   const PicHeader& picHeader  = *cu.cs->picHeader;
-  const bool       lmcs       = slice.getLmcsEnabledFlag() && picHeader.getLmcsEnabledFlag();
+  const bool       lmcs       = cu.slice->getLmcsEnabledFlag() && picHeader.getLmcsEnabledFlag();
   const bool       lmcsChroma = lmcs && picHeader.getLmcsChromaResidualScaleFlag() && cu.rootCbf();
   if( lmcs )
   {
     flags |= gpu::InterJob::kLumaMap;
   }
-
-  // the residual: the GPU adds it where a component has one; inside such a
-  // component, the transform blocks without one are cleared, by the GPU when
-  // it makes the residuals (trafoJobs), else here
-  if( cu.rootCbf() )
-  {
-    for( int c = 0; c < getNumberValidComponents( cu.chromaFormat ); c++ )
-    {
-      const ComponentID compID = ComponentID( c );
-      if( !cu.planeCbf( compID ) )
-      {
-        continue;
-      }
-      if( !cu.ciipFlag() )
-      {
-        flags |= lmcsChroma && isChroma( compID ) ? gpu::InterJob::kDeferCb << ( c - 1 ) : gpu::InterJob::kResidualY << c;
-      }
-      for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
-      {
-        if( tu.blocks[compID].valid() && !TU::getCbf( tu, compID ) && !( isChroma( compID ) && tu.jointCbCr ) )
-        {
-          const CompArea& block = tu.blocks[compID];
-          if( trafoJobs )
-          {
-            // in blocks of powers of two (SBT's transform units without the
-            // residual are 3/4 of the CU: 12, 24, 48 luma samples)
-            for( int y = 0; y < int( block.height ); y += 1 << getLog2( block.height - y ) )
-            {
-              for( int x = 0; x < int( block.width ); x += 1 << getLog2( block.width - x ) )
-              {
-                gpu::TrafoJob job;
-                job.set( block.x + x, block.y + y, getLog2( block.width - x ), getLog2( block.height - y ), compID, 0, 0, gpu::TrafoJob::kZero, 0,
-                         0, 0, 0, 0, 0 );
-                trafoJobs->push_back( job );
-              }
-            }
-          }
-          else
-          {
-            cu.cs->getRecoBuf( block ).fill( 0 );
-          }
-        }
-      }
-    }
-  }
-
-  // CIIP: inter's prediction kept aside, all of it, for the blend with
-  // planar's (xGpuCiipJobs)
+  flags |= gpuInterResidual( cu, lmcsChroma, trafoJobs );
+  // CIIP: the whole inter prediction is kept aside for the blend with planar's (xGpuCiipJobs)
   if( cu.ciipFlag() )
   {
     flags |= gpu::InterJob::kDeferY | gpu::InterJob::kDeferCb | gpu::InterJob::kDeferCb << 1;
   }
 
-  // the blocks motionCompensation predicts with one motion each: the CU, or
-  // SbTMVP's sub-PUs joined where their motion is the same (xSubPuMC), each
-  // with its own clip of the motion, in tiles of up to 16 x 16 (DMVR's
-  // subblocks)
-  const auto mcBlock = [&]( int bx, int by, int bw, int bh, const int8_t refIdx[2], const Mv mv[2], bool subPu )
-  {
-    int bflags = flags;
-    int ref[2] = { 0, 0 };
-    for( int list = 0; list < 2; list++ )
-    {
-      if( refIdx[list] >= 0 )
-      {
-        bflags    |= list == 0 ? gpu::InterJob::kL0 : gpu::InterJob::kL1;
-        ref[list]  = refs.slot( slice.getRefPic( RefPicList( list ), refIdx[list] ) );
-      }
-    }
-    // as motionCompensation chooses: BDOF and DMVR (not for sub-PUs), else
-    // the same motion twice is a uni-prediction (xCheckIdenticalMotion), else
-    // BCW's weights (not with CIIP)
-    // (not from scaled references: motionCompensation's refIsScaled)
-    const bool dmvr = !subPu && PU::checkDMVRCondition( cu ) && !( refIdx[0] >= 0 && slice.getRefPic( REF_PIC_LIST_0, refIdx[0] )->isRefScaled( cu.pps ) )
-                      && !( refIdx[1] >= 0 && slice.getRefPic( REF_PIC_LIST_1, refIdx[1] )->isRefScaled( cu.pps ) );
-    const bool bi   = refIdx[0] >= 0 && refIdx[1] >= 0;
-    if( !subPu && gpuBdof( cu ) )
-    {
-      bflags |= gpu::InterJob::kBdof;
-    }
-    if( dmvr )
-    {
-      cu.setDmvrCondition( true );
-      bflags |= gpu::InterJob::kDmvr;
-    }
-    else if( bi && slice.isInterB() && !cu.pps->getWPBiPred()
-             && slice.getRefPOC( REF_PIC_LIST_0, refIdx[0] ) == slice.getRefPOC( REF_PIC_LIST_1, refIdx[1] ) && mv[0] == mv[1] )
-    {
-      bflags &= ~gpu::InterJob::kL1;
-    }
-    const bool bcw = ( bflags & gpu::InterJob::kL1 ) && ( bflags & gpu::InterJob::kL0 ) && cu.BcwIdx() != BCW_DEFAULT && !cu.ciipFlag();
-
-    const int tileW = std::min( bw, DMVR_SUBCU_WIDTH );
-    const int tileH = std::min( bh, DMVR_SUBCU_HEIGHT );
-    int       num   = 0;
-    for( int y = by; y < by + bh; y += tileH )
-    {
-      for( int x = bx; x < bx + bw; x += tileW, num++ )
-      {
-        gpu::InterJob job;
-        job.set( x, y, tileW, tileH, bflags, mv[0].hor, mv[0].ver, mv[1].hor, mv[1].ver, bx, by, ref[0], ref[1],
-                 dmvr ? int( cu.mvdL0SubPuOff ) + num : 0 );
-        job.setClipWidth( bw );
-        if( bcw )
-        {
-          job.setBcw( getBcwWeight( g_BcwInternBcw[cu.BcwIdx()], REF_PIC_LIST_1 ) );
-        }
-        gpuWp( cu, refIdx, bflags, job );
-        jobs.push_back( job );
-      }
-    }
-  };
-
+  // the tiles, as motionCompensation predicts the CU
   if( cu.geoFlag() )
   {
-    // motionCompensationGeo: each partition a uni-prediction (14-bit), from
-    // its own list's reference and motion, then blended by the mask of the
-    // split's angle
-    const int     dir0    = cu.interDirrefIdxGeo0() >> 4;
-    const int     dir1    = cu.interDirrefIdxGeo1() >> 4;
-    const int     ref0    = refs.slot( slice.getRefPic( RefPicList( dir0 - 1 ), cu.interDirrefIdxGeo0() & 15 ) );
-    const int     ref1    = refs.slot( slice.getRefPic( RefPicList( dir1 - 1 ), cu.interDirrefIdxGeo1() & 15 ) );
-    const Mv&     mv0     = cu.mv[0][1];
-    const Mv&     mv1     = cu.mv[1][1];
-    const uint8_t split   = cu.geoSplitDir;
-    const int     angle   = g_GeoParams[split][0];
-    const int     wIdx    = getLog2( cu.lwidth() ) - GEO_MIN_CU_LOG2;
-    const int     hIdx    = getLog2( cu.lheight() ) - GEO_MIN_CU_LOG2;
-    for( int y = cu.ly(); y < cu.ly() + int( cu.lheight() ); y += 16 )
-    {
-      for( int x = cu.lx(); x < cu.lx() + int( cu.lwidth() ); x += 16 )
-      {
-        gpu::InterJob job;
-        job.set( x, y, std::min<int>( 16, cu.lwidth() ), std::min<int>( 16, cu.lheight() ), flags | gpu::InterJob::kL0 | gpu::InterJob::kL1,
-                 mv0.hor, mv0.ver, mv1.hor, mv1.ver, cu.lx(), cu.ly(), ref0, ref1, 0 );
-        job.setClipWidth( cu.lwidth() );
-        job.setGeo( g_angle2mask[angle], g_angle2mirror[angle], g_weightOffset[split][hIdx][wIdx][0], g_weightOffset[split][hIdx][wIdx][1] );
-        jobs.push_back( job );
-      }
-    }
+    gpuGeoJobs( cu, flags, refs, jobs );
   }
-  // (SbTMVP's CUs are subblock merge CUs: affine ones, by their flag)
-  else if( cu.affineFlag() && cu.mergeType() != MRG_TYPE_SUBPU_ATMVP )
+  else if( cu.affineFlag() && cu.mergeType() != MRG_TYPE_SUBPU_ATMVP )   // (SbTMVP's CUs are subblock merge CUs, so affine by their flag)
   {
-    // xPredAffineBlk: 4x4 subblocks with motion of their own, refined by PROF;
-    // the same motion twice is a uni-prediction (xCheckIdenticalMotion)
-    int aflags = flags;
-    int ref[2] = { 0, 0 };
-    for( int list = 0; list < 2; list++ )
-    {
-      if( cu.refIdx[list] >= 0 )
-      {
-        aflags    |= list == 0 ? gpu::InterJob::kL0 : gpu::InterJob::kL1;
-        ref[list]  = refs.slot( slice.getRefPic( RefPicList( list ), cu.refIdx[list] ) );
-      }
-    }
-    if( cu.refIdx[0] >= 0 && cu.refIdx[1] >= 0 && slice.isInterB() && !cu.pps->getWPBiPred()
-        && slice.getRefPOC( REF_PIC_LIST_0, cu.refIdx[0] ) == slice.getRefPOC( REF_PIC_LIST_1, cu.refIdx[1] ) && cu.mv[0][0] == cu.mv[1][0]
-        && cu.mv[0][1] == cu.mv[1][1] && ( cu.affineType() == AFFINEMODEL_4PARAM || cu.mv[0][2] == cu.mv[1][2] ) )
-    {
-      aflags &= ~gpu::InterJob::kL1;
-    }
-    const bool bcw = ( aflags & gpu::InterJob::kL0 ) && ( aflags & gpu::InterJob::kL1 ) && cu.BcwIdx() != BCW_DEFAULT;
-
-    bool prof[2]      = { false, false };
-    bool spread[2]    = { false, false };
-    int  params[2][6] = {};
-    for( int list = 0; list < 2; list++ )
-    {
-      if( cu.refIdx[list] < 0 )
-      {
-        continue;
-      }
-      const int shift = MAX_CU_DEPTH;
-      const Mv& affLT = cu.mv[list][0];
-      const Mv& affRT = cu.mv[list][1];
-      const Mv& affLB = cu.mv[list][2];
-      const int dHorX = ( affRT - affLT ).getHor() * ( 1 << ( shift - getLog2( cu.lwidth() ) ) );
-      const int dHorY = ( affRT - affLT ).getVer() * ( 1 << ( shift - getLog2( cu.lwidth() ) ) );
-      const int dVerX = cu.affineType() == AFFINEMODEL_6PARAM ? ( affLB - affLT ).getHor() * ( 1 << ( shift - getLog2( cu.lheight() ) ) ) : -dHorY;
-      const int dVerY = cu.affineType() == AFFINEMODEL_6PARAM ? ( affLB - affLT ).getVer() * ( 1 << ( shift - getLog2( cu.lheight() ) ) ) : dHorX;
-      spread[list] = InterPrediction::isSubblockVectorSpreadOverLimit( dHorX, dHorY, dVerX, dVerY, cu.interDir() );
-      prof[list]   = cu.sps->getUsePROF() && !cu.cs->picHeader->getDisProfFlag()
-                   && !( ( cu.affineType() == AFFINEMODEL_6PARAM && affLT == affRT && affLT == affLB ) || ( cu.affineType() == AFFINEMODEL_4PARAM && affLT == affRT ) )
-                   && !spread[list] && !slice.getRefPic( RefPicList( list ), cu.refIdx[list] )->isRefScaled( cu.pps );
-      const int p[6] = { affLT.getHor() * ( 1 << shift ), affLT.getVer() * ( 1 << shift ), dHorX, dHorY, dVerX, dVerY };
-      std::copy( p, p + 6, params[list] );
-    }
-
-    for( int y = cu.ly(); y < cu.ly() + int( cu.lheight() ); y += 16 )
-    {
-      for( int x = cu.lx(); x < cu.lx() + int( cu.lwidth() ); x += 16 )
-      {
-        gpu::InterJob job, next;
-        job.set( x, y, std::min<int>( 16, cu.lwidth() ), std::min<int>( 16, cu.lheight() ), aflags | gpu::InterJob::kAffine, 0, 0, 0, 0, cu.lx(),
-                 cu.ly(), ref[0], ref[1], 0 );
-        if( bcw )
-        {
-          job.setBcw( getBcwWeight( g_BcwInternBcw[cu.BcwIdx()], REF_PIC_LIST_1 ) );
-        }
-        const int8_t refIdx[2] = { int8_t( cu.refIdx[0] ), int8_t( cu.refIdx[1] ) };
-        gpuWp( cu, refIdx, aflags, job );
-        next.set( 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 );
-        gpu::InterJob::setAffine( job, next, cu.lwidth(), cu.lheight(), prof, spread, params );
-        jobs.push_back( job );
-        jobs.push_back( next );
-      }
-    }
+    gpuAffineJobs( cu, flags, refs, jobs );
   }
   else if( cu.mergeType() == MRG_TYPE_SUBPU_ATMVP )
   {
-    const Position puPos       = cu.lumaPos();
-    const Size     puSize      = cu.lumaSize();
-    const int      numPartLine = std::max<SizeType>( puSize.width >> ATMVP_SUB_BLOCK_SIZE, 1u );
-    const int      numPartCol  = std::max<SizeType>( puSize.height >> ATMVP_SUB_BLOCK_SIZE, 1u );
-    const int      puHeight    = numPartCol == 1 ? puSize.height : 1 << ATMVP_SUB_BLOCK_SIZE;
-    const int      puWidth     = numPartLine == 1 ? puSize.width : 1 << ATMVP_SUB_BLOCK_SIZE;
-    const bool     verMC       = puSize.height > puSize.width;
-    const int      fstStart    = !verMC ? puPos.y : puPos.x;
-    const int      secStart    = !verMC ? puPos.x : puPos.y;
-    const int      fstEnd      = !verMC ? puPos.y + puSize.height : puPos.x + puSize.width;
-    const int      secEnd      = !verMC ? puPos.x + puSize.width : puPos.y + puSize.height;
-    const int      fstStep     = !verMC ? puHeight : puWidth;
-    const int      secStep     = !verMC ? puWidth : puHeight;
-    const bool     scaled      = slice.getRefPic( REF_PIC_LIST_0, 0 )->isRefScaled( cu.pps )
-                                 || ( slice.getSliceType() == B_SLICE ? slice.getRefPic( REF_PIC_LIST_1, 0 )->isRefScaled( cu.pps ) : false );
-    for( int fstDim = fstStart; fstDim < fstEnd; fstDim += fstStep )
-    {
-      for( int secDim = secStart; secDim < secEnd; secDim += secStep )
-      {
-        int               x     = !verMC ? secDim : fstDim;
-        int               y     = !verMC ? fstDim : secDim;
-        const MotionInfo& curMi = cu.getMotionInfo( Position{ x, y } );
-        int               length = secStep;
-        int               later  = secDim + secStep;
-        while( later < secEnd )
-        {
-          const MotionInfo& laterMi = !verMC ? cu.getMotionInfo( Position{ later, fstDim } ) : cu.getMotionInfo( Position{ fstDim, later } );
-          if( !scaled && laterMi == curMi )
-          {
-            length += secStep;
-          }
-          else
-          {
-            break;
-          }
-          later += secStep;
-        }
-        int dx = !verMC ? length : puWidth;
-        int dy = !verMC ? puHeight : length;
-        if( !verMC && ( dx & 15 ) && dx > 16 )
-        {
-          const int dxPart = dx & ~15;
-          mcBlock( x, y, dxPart, dy, curMi.miRefIdx, curMi.mv, true );
-          x  += dxPart;
-          dx -= dxPart;
-        }
-        else if( verMC && ( dy & 15 ) && dy > 16 )
-        {
-          const int dyPart = dy & ~15;
-          mcBlock( x, y, dx, dyPart, curMi.miRefIdx, curMi.mv, true );
-          y  += dyPart;
-          dy -= dyPart;
-        }
-        mcBlock( x, y, dx, dy, curMi.miRefIdx, curMi.mv, true );
-        secDim = later - secStep;
-      }
-    }
+    gpuSbTmvpJobs( cu, flags, refs, jobs );
   }
   else
   {
     const int8_t refIdx[2] = { int8_t( cu.refIdx[0] ), int8_t( cu.refIdx[1] ) };
     const Mv     mv[2]     = { cu.mv[0][0], cu.mv[1][0] };
-    mcBlock( cu.lx(), cu.ly(), cu.lwidth(), cu.lheight(), refIdx, mv, false );
+    gpuInterBlockJobs( cu, flags, refs, cu.lx(), cu.ly(), cu.lwidth(), cu.lheight(), refIdx, mv, false, jobs );
   }
 
   if( cu.ciipFlag() )
   {
     xGpuCiipJobs( cu, intraJobs, waves, lmcsChroma );
   }
-  // the chroma kept aside: each transform block's prediction plus its
-  // residual, scaled where finishLMCSAndReco scales it
   else if( flags & ( gpu::InterJob::kDeferCb | gpu::InterJob::kDeferCb << 1 ) )
   {
-    for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
-    {
-      for( int c = COMPONENT_Cb; c <= COMPONENT_Cr; c++ )
-      {
-        const ComponentID compID = ComponentID( c );
-        const CompArea&   block  = tu.blocks[compID];
-        if( !( flags & ( gpu::InterJob::kDeferCb << ( c - 1 ) ) ) || !block.valid() )
-        {
-          continue;
-        }
-        // (in blocks of powers of two: SBT's transform units without the
-        // residual are 3/4 of the CU, the scaled ones powers of two)
-        const bool scaled = ( TU::getCbf( tu, compID ) || tu.jointCbCr ) && block.area() > 4;
-        for( int y = 0; y < int( block.height ); y += 1 << getLog2( block.height - y ) )
-        {
-          for( int x = 0; x < int( block.width ); x += 1 << getLog2( block.width - x ) )
-          {
-            const int     bw = 1 << getLog2( block.width - x );
-            const int     bh = 1 << getLog2( block.height - y );
-            gpu::IntraJob job;
-            job.set( block.x + x, block.y + y, bw, bh, compID, gpu::IntraJob::kLmcs, 0, gpu::IntraJob::kResidual, 0 );
-            int wave = 0;
-            if( scaled )
-            {
-              wave = gpuLmcsChroma( cu, tu.blocks[COMPONENT_Y].pos(), job, waves );
-            }
-            job.setWave( wave + 1 );
-            waves.set( compID, block.x + x, block.y + y, bw, bh, wave + 1 );
-            intraJobs.push_back( job );
-          }
-        }
-      }
-    }
+    gpuLmcsChromaJobs( cu, flags, intraJobs, waves );
   }
 }
 

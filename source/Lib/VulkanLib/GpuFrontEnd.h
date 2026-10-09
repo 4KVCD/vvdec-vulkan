@@ -41,7 +41,7 @@ POSSIBILITY OF SUCH DAMAGE.
 ------------------------------------------------------------------------------------------- */
 
 /** \file     GpuFrontEnd.h
-    \brief    The records the CPU's parse writes for the GPU's front end, and the checks of the front end's results
+    \brief    The records the CPU's parse writes for the GPU's front end, and the tables its shaders read
 
     With the GPU front end, the CPU's CTU tasks only parse. For every CU, TU and CTU they write a fixed-size record
     of words that the front end's shaders read (mider.slang, dbparams.slang, jobs.slang). The records hold what the
@@ -60,8 +60,6 @@ POSSIBILITY OF SUCH DAMAGE.
 namespace vvdec
 {
 class CodingStructure;
-struct MotionInfo;
-struct LoopFilterParam;
 
 namespace gpu
 {
@@ -159,43 +157,6 @@ void writeJobTables( uint32_t* out );
 // w[64 + 3 * (16 * list + refIdx) + component]: weighted prediction's weight (int16_t), offset (int8_t, bits 16..23)
 //     and log2 denominator (from bit 24)
 void writeJobSlices( const CodingStructure& cs, const RefTable& refs, uint32_t* out );
-
-// --- Checks of the GPU's front end against the CPU's results (VVDEC_GPU_MIDER=1) ---
-
-struct MiderStats
-{
-  int64_t pictures   = 0;
-  int64_t compared   = 0;   // motion: 4x4 blocks compared
-  int64_t mismatched = 0;
-  int64_t lfpCompared   = 0;   // deblocking parameters: 4x4 blocks and directions compared
-  int64_t lfpMismatched = 0;
-  int64_t lfpEdges      = 0;   // the compared ones the CPU gave a boundary strength
-  int     lfpReported   = 0;
-  int     reported   = 0;
-  int64_t jobsCompared[3]   = { 0, 0, 0 };   // jobs (DecCu's xGpu*Jobs vs jobs.slang): residual, inter, intra
-  int64_t jobsMismatched[3] = { 0, 0, 0 };
-  int     jobsReported      = 0;
-  int64_t sortedCompared    = 0;   // intra bands in wave order (GpuRecon::recordIntra vs intrasort.slang)
-  int64_t sortedMismatched  = 0;
-  int64_t edgesCompared     = 0;   // deblocking edges (GpuRecon::listEdges vs edges.slang)
-  int64_t edgesMismatched   = 0;
-  int     edgesReported     = 0;
-};
-// Compares the motion of each 4x4 block as the GPU wrote it (mider.slang's layout) with vvdec's MotionInfo.
-void compareMotion( const CodingStructure& cs, const int32_t* gpu, const MotionInfo* cpu, MiderStats& stats );
-// Compares the deblocking parameters as the GPU wrote them (dbparams.slang's, 2 words each) with vvdec's.
-void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const LoopFilterParam* cpu, MiderStats& stats );
-// Compares one of the GPU's job lists (count jobs) with the CTU tasks' (list 0: residual, 1: inter, 2: intra).
-template<typename Job>
-void compareJobs( const CodingStructure& cs, int list, const uint32_t* gpu, size_t count, const std::vector<std::vector<Job>>& cpu, MiderStats& stats );
-// Compares the intra bands in wave order as the GPU made them (12 words each, with each band's wait; count bands)
-// with the CTU tasks' jobs, which recordIntra puts into that order.
-void compareSorted( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* waits, size_t count, const std::vector<std::vector<IntraJob>>& cpu,
-                    MiderStats& stats );
-// Compares the deblocking edges the GPU listed (2 words each; lists: each list's first edge and count) with the
-// CTU tasks' lists.
-void compareEdges( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* lists, size_t capacity, const std::vector<EdgeLists>& cpu,
-                   MiderStats& stats );
 
 }   // namespace gpu
 }   // namespace vvdec
