@@ -522,11 +522,7 @@ static bool gpuBdof( const CodingUnit& cu )
 void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs, std::vector<gpu::TrafoJob>* trafoJobs,
                            std::vector<gpu::IntraJob>& intraJobs, gpu::WaveMap& waves )
 {
-  // (SbTMVP's CUs are subblock merge CUs: affine ones, by their flag; with
-  // affine off, so are the subblock merge list's zero candidates
-  // (getAffineMergeCand's padding): their motion zero everywhere, the same as
-  // a translational block's, without DMVR or BDOF)
-  CHECK( ( cu.affineFlag() && cu.mergeType() != MRG_TYPE_SUBPU_ATMVP && cu.sps->getUseAffine() ) || cu.geoFlag(), "an inter tool the GPU lacks" );
+  CHECK( cu.geoFlag(), "an inter tool the GPU lacks" );
 
   const Slice& slice = *cu.slice;
   // what all the CU's blocks share: AMVR's half-sample filter, LMCS, the
@@ -657,7 +653,73 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
     }
   };
 
-  if( cu.mergeType() == MRG_TYPE_SUBPU_ATMVP )
+  // (SbTMVP's CUs are subblock merge CUs: affine ones, by their flag)
+  if( cu.affineFlag() && cu.mergeType() != MRG_TYPE_SUBPU_ATMVP )
+  {
+    // xPredAffineBlk: 4x4 subblocks with motion of their own, refined by PROF;
+    // the same motion twice is a uni-prediction (xCheckIdenticalMotion)
+    int aflags = flags;
+    int ref[2] = { 0, 0 };
+    for( int list = 0; list < 2; list++ )
+    {
+      if( cu.refIdx[list] >= 0 )
+      {
+        aflags    |= list == 0 ? gpu::InterJob::kL0 : gpu::InterJob::kL1;
+        ref[list]  = refs.slot( slice.getRefPic( RefPicList( list ), cu.refIdx[list] ) );
+      }
+    }
+    if( cu.refIdx[0] >= 0 && cu.refIdx[1] >= 0 && slice.isInterB() && !cu.pps->getWPBiPred()
+        && slice.getRefPOC( REF_PIC_LIST_0, cu.refIdx[0] ) == slice.getRefPOC( REF_PIC_LIST_1, cu.refIdx[1] ) && cu.mv[0][0] == cu.mv[1][0]
+        && cu.mv[0][1] == cu.mv[1][1] && ( cu.affineType() == AFFINEMODEL_4PARAM || cu.mv[0][2] == cu.mv[1][2] ) )
+    {
+      aflags &= ~gpu::InterJob::kL1;
+    }
+    const bool bcw = ( aflags & gpu::InterJob::kL0 ) && ( aflags & gpu::InterJob::kL1 ) && cu.BcwIdx() != BCW_DEFAULT;
+
+    bool prof[2]      = { false, false };
+    bool spread[2]    = { false, false };
+    int  params[2][6] = {};
+    for( int list = 0; list < 2; list++ )
+    {
+      if( cu.refIdx[list] < 0 )
+      {
+        continue;
+      }
+      const int shift = MAX_CU_DEPTH;
+      const Mv& affLT = cu.mv[list][0];
+      const Mv& affRT = cu.mv[list][1];
+      const Mv& affLB = cu.mv[list][2];
+      const int dHorX = ( affRT - affLT ).getHor() * ( 1 << ( shift - getLog2( cu.lwidth() ) ) );
+      const int dHorY = ( affRT - affLT ).getVer() * ( 1 << ( shift - getLog2( cu.lwidth() ) ) );
+      const int dVerX = cu.affineType() == AFFINEMODEL_6PARAM ? ( affLB - affLT ).getHor() * ( 1 << ( shift - getLog2( cu.lheight() ) ) ) : -dHorY;
+      const int dVerY = cu.affineType() == AFFINEMODEL_6PARAM ? ( affLB - affLT ).getVer() * ( 1 << ( shift - getLog2( cu.lheight() ) ) ) : dHorX;
+      spread[list] = InterPrediction::isSubblockVectorSpreadOverLimit( dHorX, dHorY, dVerX, dVerY, cu.interDir() );
+      prof[list]   = cu.sps->getUsePROF() && !cu.cs->picHeader->getDisProfFlag()
+                   && !( ( cu.affineType() == AFFINEMODEL_6PARAM && affLT == affRT && affLT == affLB ) || ( cu.affineType() == AFFINEMODEL_4PARAM && affLT == affRT ) )
+                   && !spread[list] && !slice.getRefPic( RefPicList( list ), cu.refIdx[list] )->isRefScaled( cu.pps );
+      const int p[6] = { affLT.getHor() * ( 1 << shift ), affLT.getVer() * ( 1 << shift ), dHorX, dHorY, dVerX, dVerY };
+      std::copy( p, p + 6, params[list] );
+    }
+
+    for( int y = cu.ly(); y < cu.ly() + int( cu.lheight() ); y += 16 )
+    {
+      for( int x = cu.lx(); x < cu.lx() + int( cu.lwidth() ); x += 16 )
+      {
+        gpu::InterJob job, next;
+        job.set( x, y, std::min<int>( 16, cu.lwidth() ), std::min<int>( 16, cu.lheight() ), aflags | gpu::InterJob::kAffine, 0, 0, 0, 0, cu.lx(),
+                 cu.ly(), ref[0], ref[1], 0 );
+        if( bcw )
+        {
+          job.setBcw( getBcwWeight( g_BcwInternBcw[cu.BcwIdx()], REF_PIC_LIST_1 ) );
+        }
+        next.set( 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 );
+        gpu::InterJob::setAffine( job, next, cu.lwidth(), cu.lheight(), prof, spread, params );
+        jobs.push_back( job );
+        jobs.push_back( next );
+      }
+    }
+  }
+  else if( cu.mergeType() == MRG_TYPE_SUBPU_ATMVP )
   {
     const Position puPos       = cu.lumaPos();
     const Size     puSize      = cu.lumaSize();

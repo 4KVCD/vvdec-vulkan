@@ -179,6 +179,8 @@ struct InterJob
     kDeferY    = 1024, // CIIP: so for the luma too (with kDeferCb and Cr), for kind IntraJob::kCiip
     kBcw       = 2048, // BCW: the bi-prediction weighted (setBcw)
     kBdof      = 4096, // BDOF (with DMVR: where its cost leaves it on), in the dispatch of the inter_bdof variant
+    kAffine    = 8192, // an affine CU's tile: this job and the next make an affine job (setAffine), for the inter_affine
+                       // variant
   };
 
   uint32_t w[12];
@@ -202,6 +204,27 @@ struct InterJob
   {
     w[1] |= uint32_t( kBcw ) << 16;
     w[7] |= uint32_t( weight1 + 2 ) << 16;
+  }
+
+  // an affine tile, as two jobs (shaders/inter.slang's AFFINE variant reads
+  // them as one of 24 words): this one the tile (set, kAffine, the CU at
+  // w[6]) and, at w[2..5], each list's base motion; the next one the CU's
+  // size, whether PROF refines each list and whether its motion spreads too
+  // far (one motion for all then), and each list's steps across and down:
+  // the subblocks' motion as setAllAffineMv works it out (all << 7)
+  static void setAffine( InterJob& job, InterJob& next, int cuWidth, int cuHeight, const bool prof[2], const bool spread[2], const int params[2][6] )
+  {
+    job.w[2]  = uint32_t( params[0][0] );
+    job.w[3]  = uint32_t( params[0][1] );
+    job.w[4]  = uint32_t( params[1][0] );
+    job.w[5]  = uint32_t( params[1][1] );
+    next.w[0] = uint32_t( cuWidth ) | uint32_t( cuHeight ) << 8 | uint32_t( prof[0] ) << 16 | uint32_t( prof[1] ) << 17
+                | uint32_t( spread[0] ) << 18 | uint32_t( spread[1] ) << 19;
+    for( int k = 0; k < 4; k++ )
+    {
+      next.w[1 + k] = uint32_t( params[0][2 + k] );
+      next.w[5 + k] = uint32_t( params[1][2 + k] );
+    }
   }
 };
 

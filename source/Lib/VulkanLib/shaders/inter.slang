@@ -15,7 +15,8 @@
 // flags: 1 L0, 2 L1, 4 DMVR, 8 AMVR half-sample filter, 16/32/64 residual in Y/Cb/Cr, 128 LMCS's forward mapping of
 // the luma prediction, 256/512 (LMCS's chroma scaling, CIIP) the Cb/Cr prediction kept aside (defer1/2), the residual
 // left in the picture for intra.slang's kind 5 or 6, 1024 (CIIP) so the luma's too (defer0), 2048 BCW's weights,
-// 4096 BDOF (the variant built with BDOF=1 takes those tiles)
+// 4096 BDOF (the variant built with BDOF=1 takes those tiles), 8192 an affine tile (the variant built with AFFINE=1
+// takes those, two jobs each: see affineMain)
 
 #include "common.slang"
 
@@ -67,6 +68,9 @@ struct Params
 #define FLAG_BDOF 4096
 #ifndef BDOF
 #define BDOF 0
+#endif
+#ifndef AFFINE
+#define AFFINE 0
 #endif
 
 // the average of a bi-prediction's two 14-bit predictions (addAvg), or with
@@ -1252,6 +1256,389 @@ void bdofApply( int tid, int w, int h, out int result[PER_THREAD] )
 }
 #endif
 
+#if AFFINE
+// --------------------------------------------------------------------------------------------------------------------
+// Affine motion (xPredAffineBlk): each 4x4 subblock of the tile with motion of its own, worked out from the CU's
+// base motion and its steps across and down as setAllAffineMv does (the motion buffer's); the luma with the 6-tap
+// filter vvdec takes for 4x4 blocks, refined by PROF; a chroma 4x4 (8x8 luma) with the average of the motion of its
+// top-left and bottom-right luma subblocks. A job of 24 words (InterJob::setAffine):
+//   0: x | y << 16 of the tile (luma)     1: width | height << 8 | flags << 16 (an InterJob's)
+//   2, 3: L0's base motion (x, y; << 7)   4, 5: L1's       6: x | y << 16 of the CU
+//   7: L0 reference | L1 reference << 8 | BCW's L1 weight + 2 << 16
+//   12: the CU's width | height << 8 | PROF L0 << 16 | PROF L1 << 17 | spread L0 << 18 | spread L1 << 19
+//   13..16: L0's steps (across x, y, down x, y; << 7)   17..20: L1's
+// --------------------------------------------------------------------------------------------------------------------
+static const int kLuma4x4[128] = {
+   0, 0,   0, 64,  0,   0,  0,  0,
+   0, 1,  -3, 63,  4,  -2,  1,  0,
+   0, 1,  -5, 62,  8,  -3,  1,  0,
+   0, 2,  -8, 60, 13,  -4,  1,  0,
+   0, 3, -10, 58, 17,  -5,  1,  0,
+   0, 3, -11, 52, 26,  -8,  2,  0,
+   0, 2,  -9, 47, 31, -10,  3,  0,
+   0, 3, -11, 45, 34, -10,  3,  0,
+   0, 3, -11, 40, 40, -11,  3,  0,
+   0, 3, -10, 34, 45, -11,  3,  0,
+   0, 3, -10, 31, 47,  -9,  2,  0,
+   0, 2,  -8, 26, 52, -11,  3,  0,
+   0, 1,  -5, 17, 58, -10,  3,  0,
+   0, 1,  -4, 13, 60,  -8,  2,  0,
+   0, 1,  -3,  8, 62,  -5,  1,  0,
+   0, 1,  -2,  4, 63,  -3,  1,  0
+};
+groupshared int16_t s_ext[16 * 36];   // PROF: a list's 4x4 predictions with their borders, 6 x 6 each
+
+int roundAffine( int v, int shift )
+{
+  return ( v + ( 1 << ( shift - 1 ) ) - ( v >= 0 ? 1 : 0 ) ) >> shift;
+}
+
+// the motion of the CU's luma subblock (sx, sy)
+int2 affineMv( uint job[24], int list, int sx, int sy, int cw, int ch, bool spread )
+{
+  const int2 base = int2( int( job[2 + 2 * list] ), int( job[3 + 2 * list] ) );
+  const int  at   = 13 + 4 * list;
+  const int2 hor  = int2( int( job[at] ), int( job[at + 1] ) );
+  const int2 ver  = int2( int( job[at + 2] ), int( job[at + 3] ) );
+  const int2 pos  = spread ? int2( cw >> 1, ch >> 1 ) : int2( 2 + 4 * sx, 2 + 4 * sy );
+  const int2 v    = base + hor * pos.x + ver * pos.y;
+  return clipStorage( int2( roundAffine( v.x, 7 ), roundAffine( v.y, 7 ) ) );
+}
+
+// a list's luma of the tile: the thread's samples t = tid + THREADS k, 14-bit (bi-prediction, PROF) else final
+void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, int cuX, int cuY, int cw, int ch, bool spread, bool prof, bool bi,
+                 out int pred[PER_THREAD] )
+{
+  int16_t*  ref      = refPlane( int( ( job[7] >> ( 8 * list ) ) & 255 ), 0 );
+  const int nsx      = w >> 2;
+  const int nsb      = nsx * ( h >> 2 );
+  const int ox       = ( x - cuX ) >> 2;   // the tile's first subblock in the CU
+  const int oy       = ( y - cuY ) >> 2;
+  const int headRoom = max( 2, 14 - pc.bitDepth );
+  const int maxVal   = ( 1 << pc.bitDepth ) - 1;
+  const bool hi      = bi || prof;
+  const int log2W    = log2Int( w );
+
+  // each subblock's reference samples, 11 x 11 from 3 before its integer position
+  for( int s = tid; s < nsb * 121; s += THREADS )
+  {
+    const int  sb = s / 121;
+    const int  r  = ( s % 121 ) / 11;
+    const int  c  = s % 11;
+    const int  sx = sb % nsx;
+    const int  sy = sb / nsx;
+    const int2 mv = clipMv( affineMv( job, list, ox + sx, oy + sy, cw, ch, spread ), cuX, cuY );
+    s_pool[s]     = int16_t( refAt( ref, 0, cuX + 4 * ( ox + sx ) + ( mv.x >> 4 ) - 3 + c, cuY + 4 * ( oy + sy ) + ( mv.y >> 4 ) - 3 + r ) );
+  }
+  GroupMemoryBarrierWithGroupSync();
+  for( int k = 0; k < PER_THREAD; k++ )
+  {
+    const int t = tid + THREADS * k;
+    pred[k]     = 0;
+    if( t >= w * h )
+    {
+      continue;
+    }
+    const int  i     = t & ( w - 1 );
+    const int  j     = t >> log2W;
+    const int  sb    = ( j >> 2 ) * nsx + ( i >> 2 );
+    const int  u     = i & 3;
+    const int  v     = j & 3;
+    const int2 mv    = clipMv( affineMv( job, list, ox + ( i >> 2 ), oy + ( j >> 2 ), cw, ch, spread ), cuX, cuY );
+    const int  xFrac = mv.x & 15;
+    const int  yFrac = mv.y & 15;
+    const int  at    = sb * 121;
+    if( xFrac == 0 && yFrac == 0 )
+    {
+      const int s0 = int( s_pool[at + ( v + 3 ) * 11 + u + 3] );
+      pred[k]      = hi ? s0 * ( 1 << headRoom ) - IF_INTERNAL_OFFS : s0;
+    }
+    else if( xFrac != 0 && yFrac != 0 )
+    {
+      const int shift1  = 6 - headRoom;
+      const int offset1 = -IF_INTERNAL_OFFS * ( 1 << shift1 );
+      int       sum     = 0;
+      for( int r = 0; r < 8; r++ )
+      {
+        int hs = 0;
+        for( int c = 0; c < 8; c++ )
+        {
+          hs += kLuma4x4[xFrac * 8 + c] * int( s_pool[at + ( v + r ) * 11 + u + c] );
+        }
+        sum += kLuma4x4[yFrac * 8 + r] * ( ( hs + offset1 ) >> shift1 );
+      }
+      pred[k] = hi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
+    }
+    else
+    {
+      const int shiftV = hi ? 6 - headRoom : 6;
+      const int offset = hi ? -IF_INTERNAL_OFFS * ( 1 << shiftV ) : 32;
+      int       sum    = 0;
+      for( int c = 0; c < 8; c++ )
+      {
+        sum += yFrac != 0 ? kLuma4x4[yFrac * 8 + c] * int( s_pool[at + ( v + c ) * 11 + u + 3] )
+                          : kLuma4x4[xFrac * 8 + c] * int( s_pool[at + ( v + 3 ) * 11 + u + c] );
+      }
+      const int r = ( sum + offset ) >> shiftV;
+      pred[k]     = hi ? r : clip3( 0, maxVal, r );
+    }
+  }
+  if( prof )
+  {
+    // PROF: each 4x4 with a border from the reference's samples nearest its motion (in the window), the gradients
+    // inside, each sample moved along them by its offset from the subblock's motion (dMvScaleHor / Ver)
+    for( int k = 0; k < PER_THREAD; k++ )
+    {
+      const int t = tid + THREADS * k;
+      if( t < w * h )
+      {
+        const int i = t & ( w - 1 );
+        const int j = t >> log2W;
+        s_ext[( ( j >> 2 ) * nsx + ( i >> 2 ) ) * 36 + ( ( j & 3 ) + 1 ) * 6 + ( i & 3 ) + 1] = int16_t( pred[k] );
+      }
+    }
+    for( int s = tid; s < nsb * 20; s += THREADS )
+    {
+      const int sb = s / 20;
+      const int r  = s % 20;
+      int       bx, by;
+      if( r < 6 )
+      {
+        bx = r - 1;
+        by = -1;
+      }
+      else if( r < 12 )
+      {
+        bx = r - 7;
+        by = 4;
+      }
+      else if( r < 16 )
+      {
+        bx = -1;
+        by = r - 12;
+      }
+      else
+      {
+        bx = 4;
+        by = r - 16;
+      }
+      const int2 mv = clipMv( affineMv( job, list, ox + sb % nsx, oy + sb / nsx, cw, ch, spread ), cuX, cuY );
+      const int  sm = int( s_pool[sb * 121 + ( by + ( ( mv.y & 15 ) >> 3 ) + 3 ) * 11 + bx + ( ( mv.x & 15 ) >> 3 ) + 3] );
+      s_ext[sb * 36 + ( by + 1 ) * 6 + bx + 1] = int16_t( sm * ( 1 << headRoom ) - IF_INTERNAL_OFFS );
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const int at      = 13 + 4 * list;
+    const int quadHX  = int( job[at] ) * 4;
+    const int quadHY  = int( job[at + 1] ) * 4;
+    const int quadVX  = int( job[at + 2] ) * 4;
+    const int quadVY  = int( job[at + 3] ) * 4;
+    const int d0H     = ( ( int( job[at] ) + int( job[at + 2] ) ) * 2 ) - ( ( quadHX + quadVX ) * 2 );
+    const int d0V     = ( ( int( job[at + 1] ) + int( job[at + 3] ) ) * 2 ) - ( ( quadHY + quadVY ) * 2 );
+    const int limit   = 1 << max( pc.bitDepth + 1, 13 );
+    const int offset  = ( 1 << ( headRoom - 1 ) ) + IF_INTERNAL_OFFS;
+    for( int k = 0; k < PER_THREAD; k++ )
+    {
+      const int t = tid + THREADS * k;
+      if( t < w * h )
+      {
+        const int i   = t & ( w - 1 );
+        const int j   = t >> log2W;
+        const int u   = i & 3;
+        const int v   = j & 3;
+        const int e   = ( ( j >> 2 ) * nsx + ( i >> 2 ) ) * 36 + ( v + 1 ) * 6 + u + 1;
+        const int gx  = ( int( s_ext[e + 1] ) >> 6 ) - ( int( s_ext[e - 1] ) >> 6 );
+        const int gy  = ( int( s_ext[e + 6] ) >> 6 ) - ( int( s_ext[e - 6] ) >> 6 );
+        const int dmH = clamp( roundAffine( d0H + u * quadHX + v * quadVX, 8 ), -31, 31 );
+        const int dmV = clamp( roundAffine( d0V + u * quadHY + v * quadVY, 8 ), -31, 31 );
+        const int dI  = clamp( dmH * gx + dmV * gy, -limit, limit - 1 );
+        const int val = int( int16_t( pred[k] + dI ) );
+        pred[k]       = bi ? val : clip3( 0, maxVal, ( val + offset ) >> headRoom );
+      }
+    }
+  }
+  GroupMemoryBarrierWithGroupSync();   // before the next writes to the shared memory
+}
+
+// a list's chroma of the tile: the thread's sample tid of each component, 14-bit (bi-prediction) else final
+void affineChroma( int tid, uint job[24], int list, int x, int y, int w, int h, int cuX, int cuY, int cw, int ch, bool spread, bool bi,
+                   out int pred[2] )
+{
+  const int slot     = int( ( job[7] >> ( 8 * list ) ) & 255 );
+  const int cw2      = w >> 1;   // the tile's chroma
+  const int ch2      = h >> 1;
+  const int ncx      = cw2 >> 2;   // its chroma subblocks
+  const int ncb      = ncx * ( ch2 >> 2 );
+  const int ocx      = ( x - cuX ) >> 3;   // the tile's first chroma subblock in the CU
+  const int ocy      = ( y - cuY ) >> 3;
+  const int headRoom = max( 2, 14 - pc.bitDepth );
+  const int maxVal   = ( 1 << pc.bitDepth ) - 1;
+
+  // each chroma subblock's motion: the sum of its top-left and bottom-right luma subblocks' rounded, clipped; its
+  // reference samples, 7 x 7 from 1 before its integer position, for each component
+  for( int s = tid; s < 2 * ncb * 49; s += THREADS )
+  {
+    const int  comp = 1 + s / ( ncb * 49 );
+    const int  rem  = s % ( ncb * 49 );
+    const int  cb   = rem / 49;
+    const int  r    = ( rem % 49 ) / 7;
+    const int  c    = rem % 7;
+    const int  csx  = ocx + cb % ncx;
+    const int  csy  = ocy + cb / ncx;
+    const int2 sum  = affineMv( job, list, 2 * csx, 2 * csy, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, 2 * csy + 1, cw, ch, spread );
+    const int2 mv   = clipMv( int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) ), cuX, cuY );
+    s_pool[s]       = int16_t( refAt( refPlane( slot, comp ), comp, ( cuX >> 1 ) + 4 * csx + ( mv.x >> 5 ) - 1 + c, ( cuY >> 1 ) + 4 * csy + ( mv.y >> 5 ) - 1 + r ) );
+  }
+  GroupMemoryBarrierWithGroupSync();
+  for( int comp = 1; comp <= 2; comp++ )
+  {
+    pred[comp - 1] = 0;
+    if( tid >= cw2 * ch2 )
+    {
+      continue;
+    }
+    const int  i     = tid % cw2;
+    const int  j     = tid / cw2;
+    const int  cb    = ( j >> 2 ) * ncx + ( i >> 2 );
+    const int  csx   = ocx + ( i >> 2 );
+    const int  csy   = ocy + ( j >> 2 );
+    const int2 sum   = affineMv( job, list, 2 * csx, 2 * csy, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, 2 * csy + 1, cw, ch, spread );
+    const int2 mv    = clipMv( int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) ), cuX, cuY );
+    const int  xFrac = mv.x & 31;
+    const int  yFrac = mv.y & 31;
+    const int  at    = ( comp - 1 ) * ncb * 49 + cb * 49;
+    const int  u     = i & 3;
+    const int  v     = j & 3;
+    int        val;
+    if( xFrac == 0 && yFrac == 0 )
+    {
+      const int s0 = int( s_pool[at + ( v + 1 ) * 7 + u + 1] );
+      val          = bi ? s0 * ( 1 << headRoom ) - IF_INTERNAL_OFFS : s0;
+    }
+    else if( xFrac != 0 && yFrac != 0 )
+    {
+      const int shift1  = 6 - headRoom;
+      const int offset1 = -IF_INTERNAL_OFFS * ( 1 << shift1 );
+      int       sum2    = 0;
+      for( int r = 0; r < 4; r++ )
+      {
+        int hs = 0;
+        for( int c = 0; c < 4; c++ )
+        {
+          hs += kChroma[xFrac * 4 + c] * int( s_pool[at + ( v + r ) * 7 + u + c] );
+        }
+        sum2 += kChroma[yFrac * 4 + r] * ( ( hs + offset1 ) >> shift1 );
+      }
+      val = bi ? sum2 >> 6 : clip3( 0, maxVal, ( sum2 + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
+    }
+    else
+    {
+      const int shiftV = bi ? 6 - headRoom : 6;
+      const int offset = bi ? -IF_INTERNAL_OFFS * ( 1 << shiftV ) : 32;
+      int       sum2   = 0;
+      for( int c = 0; c < 4; c++ )
+      {
+        sum2 += yFrac != 0 ? kChroma[yFrac * 4 + c] * int( s_pool[at + ( v + c ) * 7 + u + 1] )
+                           : kChroma[xFrac * 4 + c] * int( s_pool[at + ( v + 1 ) * 7 + u + c] );
+      }
+      const int r = ( sum2 + offset ) >> shiftV;
+      val         = bi ? r : clip3( 0, maxVal, r );
+    }
+    pred[comp - 1] = val;
+  }
+  GroupMemoryBarrierWithGroupSync();
+}
+
+void affineMain( int tid, int index )
+{
+  uint job[24];
+  [unroll]
+  for( int k = 0; k < 6; k++ )
+  {
+    const uint4 q    = *(uint4*)( pc.jobs + index * 24 + 4 * k );
+    job[4 * k]       = q.x;
+    job[4 * k + 1]   = q.y;
+    job[4 * k + 2]   = q.z;
+    job[4 * k + 3]   = q.w;
+  }
+  const int  x      = int( job[0] & 0xffff );
+  const int  y      = int( job[0] >> 16 );
+  const int  w      = int( job[1] & 255 );
+  const int  h      = int( ( job[1] >> 8 ) & 255 );
+  const int  flags  = int( job[1] >> 16 );
+  const int  cuX    = int( job[6] & 0xffff );
+  const int  cuY    = int( job[6] >> 16 );
+  const int  bcwW1  = int( ( job[7] >> 16 ) & 15 ) - 2;
+  const int  cw     = int( job[12] & 255 );
+  const int  ch     = int( ( job[12] >> 8 ) & 255 );
+  const bool bi     = ( flags & ( FLAG_L0 | FLAG_L1 ) ) == ( FLAG_L0 | FLAG_L1 );
+  const int  maxVal = ( 1 << pc.bitDepth ) - 1;
+
+  int pred0[PER_THREAD], pred1[PER_THREAD];
+  int predC0[2], predC1[2];
+  for( int list = 0; list < 2; list++ )
+  {
+    if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) == 0 )
+    {
+      continue;
+    }
+    const bool prof   = ( ( job[12] >> ( 16 + list ) ) & 1 ) != 0;
+    const bool spread = ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
+    int        p[PER_THREAD];
+    int        c[2];
+    affineLuma( tid, job, list, x, y, w, h, cuX, cuY, cw, ch, spread, prof, bi, p );
+    affineChroma( tid, job, list, x, y, w, h, cuX, cuY, cw, ch, spread, bi, c );
+    if( list == 0 || ( flags & FLAG_L0 ) == 0 )
+    {
+      pred0  = p;
+      predC0 = c;
+    }
+    else
+    {
+      pred1  = p;
+      predC1 = c;
+    }
+  }
+
+  // the averages (BCW's weights), LMCS's mapping, the residuals added, written
+  const int shiftNum = max( 2, 14 - pc.bitDepth ) + 1;
+  const int offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
+  const int log2W    = log2Int( w );
+  for( int k = 0; k < PER_THREAD; k++ )
+  {
+    const int t = tid + THREADS * k;
+    if( t < w * h )
+    {
+      const int at = ( y + ( t >> log2W ) ) * pc.stride0 + x + ( t & ( w - 1 ) );
+      int       v  = bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k];
+      if( ( flags & FLAG_LUMA_MAP ) != 0 )
+      {
+        v = int( pc.lmcsFwd[v] );
+      }
+      if( ( flags & FLAG_RES_Y ) != 0 )
+      {
+        v = clip3( 0, maxVal, v + int( pc.dst0[at] ) );
+      }
+      ( ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0 )[at] = int16_t( v );
+    }
+  }
+  for( int comp = 1; comp <= 2; comp++ )
+  {
+    const int cw2 = w >> 1;
+    if( tid < cw2 * ( h >> 1 ) )
+    {
+      int16_t*  dst = comp == 1 ? pc.dst1 : pc.dst2;
+      const int at  = ( ( y >> 1 ) + tid / cw2 ) * pc.stride12 + ( x >> 1 ) + tid % cw2;
+      int       v   = bi ? biAverage( predC0[comp - 1], predC1[comp - 1], flags, bcwW1, shiftNum, offset, maxVal ) : predC0[comp - 1];
+      if( ( flags & ( FLAG_RES_Y << comp ) ) != 0 )
+      {
+        v = clip3( 0, maxVal, v + int( dst[at] ) );
+      }
+      ( ( flags & ( FLAG_DEFER_CB << ( comp - 1 ) ) ) != 0 ? ( comp == 1 ? pc.defer1 : pc.defer2 ) : dst )[at] = int16_t( v );
+    }
+  }
+}
+#endif
+
 [shader( "compute" )]
 [numthreads( THREADS, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
@@ -1262,6 +1649,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     return;   // the whole workgroup
   }
   const int  tid   = int( local.x );
+#if AFFINE
+  affineMain( tid, index );
+  return;
+#endif
   uint*      job   = pc.jobs + index * 12;
   const int  x     = int( job[0] & 0xffff );
   const int  y     = int( job[0] >> 16 );

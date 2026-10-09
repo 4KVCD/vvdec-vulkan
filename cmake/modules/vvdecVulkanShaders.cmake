@@ -13,6 +13,7 @@ set( VVDEC_GPU_SHADERS
   "intra|intra"
   "inter|inter"
   "inter_bdof|inter|BDOF=1"
+  "inter_affine|inter|AFFINE=1"
   "trafo|trafo"
   "lmcs|lmcs"
 )

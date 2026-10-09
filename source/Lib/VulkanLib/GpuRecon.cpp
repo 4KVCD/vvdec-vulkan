@@ -1310,7 +1310,7 @@ static_assert( sizeof( ColocatedMotionInfo ) == 20 && offsetof( ColocatedMotionI
 
 bool GpuRecon::interSupported( const SPS& sps )
 {
-  return intraSupported( sps ) && sps.getBitDepth() <= 10 && !sps.getUseAffine() && !sps.getUseGeo() && !sps.getSubPicInfoPresentFlag();
+  return intraSupported( sps ) && sps.getBitDepth() <= 10 && !sps.getUseGeo() && !sps.getSubPicInfoPresentFlag();
 }
 
 bool GpuRecon::interSupported( const CodingStructure& cs )
@@ -1365,29 +1365,44 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
     m_ctx->free( buf );
     buf = m_ctx->alloc( size * 2, MemKind::Upload );
   }
-  // the BDOF tiles after the others, for a dispatch of the inter_bdof variant
-  // of their own (BDOF's code would slow the others down)
-  size_t bdofs = 0;
+  // the BDOF tiles after the others, then the affine ones (two jobs each),
+  // for dispatches of the inter_bdof and inter_affine variants of their own
+  // (their code would slow the others down)
+  size_t bdofs = 0, affines = 0;
   for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
   {
-    for( const InterJob& job: jobs[ctu] )
+    for( size_t i = 0; i < jobs[ctu].size(); i++ )
     {
-      bdofs += ( job.w[1] >> 16 ) & InterJob::kBdof ? 1 : 0;
+      const uint32_t flags = jobs[ctu][i].w[1] >> 16;
+      bdofs   += flags & InterJob::kBdof ? 1 : 0;
+      affines += flags & InterJob::kAffine ? 2 : 0;
+      i       += flags & InterJob::kAffine ? 1 : 0;
     }
   }
-  InterJob* all  = reinterpret_cast<InterJob*>( buf.mapped );
-  InterJob* bdof = all + ( total - bdofs );
+  const size_t regular = total - bdofs - affines;
+  InterJob*    all     = reinterpret_cast<InterJob*>( buf.mapped );
+  InterJob*    bdof    = all + regular;
+  InterJob*    affine  = bdof + bdofs;
   for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
   {
-    if( bdofs == 0 )
+    if( bdofs + affines == 0 )
     {
       memcpy( all, jobs[ctu].data(), jobs[ctu].size() * sizeof( InterJob ) );
       all += jobs[ctu].size();
       continue;
     }
-    for( const InterJob& job: jobs[ctu] )
+    for( size_t i = 0; i < jobs[ctu].size(); i++ )
     {
-      *( ( job.w[1] >> 16 ) & InterJob::kBdof ? bdof++ : all++ ) = job;
+      const uint32_t flags = jobs[ctu][i].w[1] >> 16;
+      if( flags & InterJob::kAffine )
+      {
+        *affine++ = jobs[ctu][i];
+        *affine++ = jobs[ctu][++i];
+      }
+      else
+      {
+        *( flags & InterJob::kBdof ? bdof++ : all++ ) = jobs[ctu][i];
+      }
     }
   }
 
@@ -1415,7 +1430,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   push.num8x8      = int32_t( pcv.num8x8CtuBlks );
   push.stride0   = planes.stride[COMPONENT_Y];
   push.stride12  = planes.stride[COMPONENT_Cb];
-  push.count     = int32_t( total - bdofs );
+  push.count     = int32_t( regular );
   push.picWidth  = pcv.lumaWidth;
   push.picHeight = pcv.lumaHeight;
   push.ctuSize   = pcv.maxCUWidth;
@@ -1437,21 +1452,29 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   }
 
   const Api& vk = m_ctx->api();
-  if( total > bdofs )
+  if( regular > 0 )
   {
     vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_inter ) );
     vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
     // a workgroup per job, in rows of 32768 (shaders/inter.slang)
-    vk.vkCmdDispatch( m_cmd, uint32_t( std::min<size_t>( total - bdofs, 32768 ) ), uint32_t( ( total - bdofs + 32767 ) / 32768 ), 1 );
+    vk.vkCmdDispatch( m_cmd, uint32_t( std::min<size_t>( regular, 32768 ) ), uint32_t( ( regular + 32767 ) / 32768 ), 1 );
   }
+  // (the tiles of the dispatches apart: no barriers between them)
   if( bdofs > 0 )
   {
-    // (the tiles of the two dispatches apart: no barrier between them)
-    push.jobs  = buf.addr + ( total - bdofs ) * sizeof( InterJob );
+    push.jobs  = buf.addr + regular * sizeof( InterJob );
     push.count = int32_t( bdofs );
     vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_inter_bdof ) );
     vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
     vk.vkCmdDispatch( m_cmd, uint32_t( std::min<size_t>( bdofs, 32768 ) ), uint32_t( ( bdofs + 32767 ) / 32768 ), 1 );
+  }
+  if( affines > 0 )
+  {
+    push.jobs  = buf.addr + ( regular + bdofs ) * sizeof( InterJob );
+    push.count = int32_t( affines / 2 );
+    vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_inter_affine ) );
+    vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+    vk.vkCmdDispatch( m_cmd, uint32_t( std::min<size_t>( affines / 2, 32768 ) ), uint32_t( ( affines / 2 + 32767 ) / 32768 ), 1 );
   }
   mark( "inter" );
 }
