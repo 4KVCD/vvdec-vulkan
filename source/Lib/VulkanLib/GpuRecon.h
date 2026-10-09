@@ -98,7 +98,7 @@ public:
   // whether the GPU predicts the inter blocks of the pictures of the sequence:
   // what intraSupported needs, 10 bits at most
   static bool interSupported( const SPS& sps );
-  // and of the picture: no scaled references (RPR)
+  // and of the picture (every one)
   static bool interSupported( const CodingStructure& cs );
   // whether the GPU dequantizes and inverse transforms the residuals of the
   // picture: 10 bits at most
@@ -165,7 +165,7 @@ private:
   void     readTimestamps( double waited );
   // the reference pictures' planes on the GPU into m_refs (laid out as pic's);
   // uploads: those the CPU reconstructed (or filled in), to copy there first
-  void     writeRefTable( const RefTable& refs, const PelStorage& pic, std::vector<const Picture*>& uploads );
+  void     writeRefTable( const CodingStructure& cs, const RefTable& refs, const PelStorage& pic, std::vector<const Picture*>& uploads );
   uint8_t* params( size_t size );   // the host-visible parameter buffer, at least size bytes
 
   // the planes of a picture as the shaders see them

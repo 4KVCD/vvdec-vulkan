@@ -650,7 +650,9 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
     // as motionCompensation chooses: BDOF and DMVR (not for sub-PUs), else
     // the same motion twice is a uni-prediction (xCheckIdenticalMotion), else
     // BCW's weights (not with CIIP)
-    const bool dmvr = !subPu && PU::checkDMVRCondition( cu );
+    // (not from scaled references: motionCompensation's refIsScaled)
+    const bool dmvr = !subPu && PU::checkDMVRCondition( cu ) && !( refIdx[0] >= 0 && slice.getRefPic( REF_PIC_LIST_0, refIdx[0] )->isRefScaled( cu.pps ) )
+                      && !( refIdx[1] >= 0 && slice.getRefPic( REF_PIC_LIST_1, refIdx[1] )->isRefScaled( cu.pps ) );
     const bool bi   = refIdx[0] >= 0 && refIdx[1] >= 0;
     if( !subPu && gpuBdof( cu ) )
     {

@@ -1332,7 +1332,7 @@ struct InterPush
 {
   VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion, lmcsFwd, defer0, defer1, defer2, geo, subpics;
   int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth, ctuLog2, widthInCtus, num8x8, wide, scaleX, scaleY, numComp, wrapSps,
-                  wrapPps, wrapOffset, subpicOn;
+                  wrapPps, wrapOffset, subpicOn, curWinLeft, curWinTop, horColloc, verColloc;
 };
 // the colocated motion as shaders/inter.slang writes DMVR's refinements into it
 static_assert( sizeof( ColocatedMotionInfo ) == 20 && offsetof( ColocatedMotionInfo, mv ) == 0 && sizeof( Mv ) == 8,
@@ -1345,24 +1345,7 @@ bool GpuRecon::interSupported( const SPS& sps )
 
 bool GpuRecon::interSupported( const CodingStructure& cs )
 {
-  if( !interSupported( *cs.sps ) )
-  {
-    return false;
-  }
-  for( const Slice* slice: cs.picture->slices )
-  {
-    for( int list = 0; list < 2; list++ )
-    {
-      for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ); refIdx++ )
-      {
-        if( slice->getRefPic( RefPicList( list ), refIdx )->isRefScaled( cs.pps.get() ) )
-        {
-          return false;
-        }
-      }
-    }
-  }
-  return true;
+  return interSupported( *cs.sps );
 }
 
 Mv* GpuRecon::dmvrMvCache( size_t count )
@@ -1507,8 +1490,26 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
     }
     push.subpics = m_subpics.addr;
   }
-  // (tile16's reads keep to the picture)
-  push.wide = pcv.chrFormat == CHROMA_420 && !push.wrapSps && !push.subpicOn ? 1 : 0;
+  // RPR: the picture's scaling window, its chroma's siting; a scaled
+  // reference anywhere
+  const Window& window = pps.getScalingWindow();
+  push.curWinLeft      = window.getWindowLeftOffset() * SPS::getWinUnitX( cs.sps->getChromaFormatIdc() );
+  push.curWinTop       = window.getWindowTopOffset() * SPS::getWinUnitY( cs.sps->getChromaFormatIdc() );
+  push.horColloc       = cs.sps->getHorCollocatedChromaFlag() ? 1 : 0;
+  push.verColloc       = cs.sps->getVerCollocatedChromaFlag() ? 1 : 0;
+  bool scaled          = false;
+  for( const Slice* slice: cs.picture->slices )
+  {
+    for( int list = 0; list < 2; list++ )
+    {
+      for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ); refIdx++ )
+      {
+        scaled |= slice->getRefPic( RefPicList( list ), refIdx )->isRefScaled( &pps );
+      }
+    }
+  }
+  // (tile16's reads keep to the picture, from references of its size)
+  push.wide = pcv.chrFormat == CHROMA_420 && !push.wrapSps && !push.subpicOn && !scaled ? 1 : 0;
   for( int comp = 0; comp < (int) cs.picture->m_bufs[PIC_RECONSTRUCTION].bufs.size(); comp++ )
   {
     const PelStorage& pic    = cs.picture->m_bufs[PIC_RECONSTRUCTION];
@@ -1720,26 +1721,58 @@ void GpuRecon::recordLmcs( const CodingStructure& cs, const Planes& planes, VkDe
   mark( "lmcs" );
 }
 
-void GpuRecon::writeRefTable( const RefTable& refs, const PelStorage& pic, std::vector<const Picture*>& uploads )
+// a reference picture as shaders/inter.slang takes it (RefPlanes)
+struct RefEntry
 {
-  const size_t size = std::max<size_t>( refs.pictures().size(), 1 ) * 4 * sizeof( VkDeviceAddress );
+  VkDeviceAddress y, cb, cr;
+  uint32_t        size, strides;
+  int32_t         ratioX, ratioY, winLeft, winTop, scaled, unused[3];
+};
+static_assert( sizeof( RefEntry ) == 64, "the reference table laid out differently from shaders/inter.slang's" );
+
+void GpuRecon::writeRefTable( const CodingStructure& cs, const RefTable& refs, const PelStorage& pic, std::vector<const Picture*>& uploads )
+{
+  const size_t size = std::max<size_t>( refs.pictures().size(), 1 ) * sizeof( RefEntry );
   if( m_refs.size < size )
   {
     m_ctx->free( m_refs );
     m_refs = m_ctx->alloc( std::max<size_t>( size, 1024 ), MemKind::Upload );
   }
-  VkDeviceAddress* table = reinterpret_cast<VkDeviceAddress*>( m_refs.mapped );
+  RefEntry* table = reinterpret_cast<RefEntry*>( m_refs.mapped );
   for( const void* ref: refs.pictures() )
   {
     const Picture* refPic = static_cast<const Picture*>( ref );
     const Planes   planes = twinPlanes( refPic->m_bufs[PIC_RECONSTRUCTION] );
-    table[0]              = planes.addr[COMPONENT_Y];
-    table[1]              = planes.addr[COMPONENT_Cb];
-    table[2]              = planes.addr[COMPONENT_Cr];
-    table[3]              = 0;
-    CHECK( planes.stride[COMPONENT_Y] != pic.bufs[COMPONENT_Y].stride || planes.stride[COMPONENT_Cb] != pic.bufs[COMPONENT_Cb].stride,
+    RefEntry       entry{};
+    entry.y       = planes.addr[COMPONENT_Y];
+    entry.cb      = planes.addr[COMPONENT_Cb];
+    entry.cr      = planes.addr[COMPONENT_Cr];
+    entry.size    = uint32_t( refPic->lwidth() ) | uint32_t( refPic->lheight() ) << 16;
+    entry.strides = uint32_t( planes.stride[COMPONENT_Y] ) | uint32_t( planes.stride[COMPONENT_Cb] ) << 16;
+    // RPR: the scaling ratio of the slices' reference (the picture's own for
+    // every slice), the reference's scaling window (xPredInterBlkRPR)
+    entry.scaled = refPic->isRefScaled( cs.pps.get() ) ? 1 : 0;
+    entry.ratioX = entry.ratioY = 1 << SCALE_RATIO_BITS;
+    for( const Slice* slice: cs.picture->slices )
+    {
+      for( int list = 0; list < 2; list++ )
+      {
+        for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ); refIdx++ )
+        {
+          if( slice->getRefPic( RefPicList( list ), refIdx ) == refPic )
+          {
+            entry.ratioX = slice->getScalingRatio( RefPicList( list ), refIdx ).first;
+            entry.ratioY = slice->getScalingRatio( RefPicList( list ), refIdx ).second;
+          }
+        }
+      }
+    }
+    const Window& window = refPic->slices[0]->getPPS()->getScalingWindow();
+    entry.winLeft        = window.getWindowLeftOffset() * SPS::getWinUnitX( cs.sps->getChromaFormatIdc() );
+    entry.winTop         = window.getWindowTopOffset() * SPS::getWinUnitY( cs.sps->getChromaFormatIdc() );
+    CHECK( !entry.scaled && ( planes.stride[COMPONENT_Y] != pic.bufs[COMPONENT_Y].stride || planes.stride[COMPONENT_Cb] != pic.bufs[COMPONENT_Cb].stride ),
            "Vulkan: a reference picture laid out differently" );
-    table += 4;
+    *table++ = entry;
     if( !refPic->gpuCurrent )
     {
       uploads.push_back( refPic );
@@ -1753,7 +1786,7 @@ void GpuRecon::startBand( CodingStructure& cs, const PictureJobs& jobs, size_t c
   std::vector<const Picture*> uploads;
   if( jobs.inter )
   {
-    writeRefTable( *jobs.refs, pic, uploads );
+    writeRefTable( cs, *jobs.refs, pic, uploads );
   }
 
   // the band's commands (the pool reset: the instance's previous picture is
@@ -1813,7 +1846,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   std::vector<const Picture*> uploads;
   if( jobs.inter && !band )
   {
-    writeRefTable( *jobs.refs, pic, uploads );
+    writeRefTable( cs, *jobs.refs, pic, uploads );
   }
   if( !band )
   {

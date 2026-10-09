@@ -22,12 +22,24 @@
 
 #include "common.slang"
 
+// a reference picture (GpuRecon::writeRefTable): its planes; for RPR its size,
+// strides, scaling ratio (SCALE_RATIO_BITS: 1 << 14 is 1x) and scaling
+// window's offset (luma samples), whether it is scaled (Picture::isRefScaled)
 struct RefPlanes
 {
   int16_t* y;
   int16_t* cb;
   int16_t* cr;
-  int16_t* unused;
+  uint     size;      // luma: width | height << 16
+  uint     strides;   // luma | chroma << 16
+  int      ratioX;
+  int      ratioY;
+  int      winLeft;
+  int      winTop;
+  int      scaled;
+  int      unused0;
+  int      unused1;
+  int      unused2;
 };
 
 struct Params
@@ -65,6 +77,10 @@ struct Params
   int        wrapPps;     // wraparound copy of the reference; the PPS's, which wraps the copy's margins by wrapOffset
   int        wrapOffset;  // (luma samples; 0 without the PPS's) and decides where DMVR and affine read
   int        subpicOn;    // subpictures treated as pictures: subpics
+  int        curWinLeft;  // RPR: the picture's scaling window offset (luma samples), its chroma's siting (the SPS's
+  int        curWinTop;   // collocated flags)
+  int        horColloc;
+  int        verColloc;
 };
 
 [[vk::push_constant]] Params pc;
@@ -172,6 +188,292 @@ static const int kChroma[128] = {
   -2, 16, 54, -4,  -2, 15, 55, -4,  -2, 14, 56, -4,  -2, 12, 57, -3,  -2, 10, 58, -2,  -1,  7, 60, -2,   0,  4, 62, -2,   0,  2, 63, -1
 };
 static const int16_t kBilinear[32] = { 16, 0, 15, 1, 14, 2, 13, 3, 12, 4, 11, 5, 10, 6, 9, 7, 8, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+// the 6-tap luma filter vvdec takes for 4x4 blocks (affine's), and RPR's
+// (InterpolationFilter's m_lumaFilterRPR1, 2: past 1.25x and 1.75x; the
+// affine ones; the chroma ones)
+static const int kLuma4x4[128] = {
+   0, 0,   0, 64,  0,   0,  0,  0,
+   0, 1,  -3, 63,  4,  -2,  1,  0,
+   0, 1,  -5, 62,  8,  -3,  1,  0,
+   0, 2,  -8, 60, 13,  -4,  1,  0,
+   0, 3, -10, 58, 17,  -5,  1,  0,
+   0, 3, -11, 52, 26,  -8,  2,  0,
+   0, 2,  -9, 47, 31, -10,  3,  0,
+   0, 3, -11, 45, 34, -10,  3,  0,
+   0, 3, -11, 40, 40, -11,  3,  0,
+   0, 3, -10, 34, 45, -11,  3,  0,
+   0, 3, -10, 31, 47,  -9,  2,  0,
+   0, 2,  -8, 26, 52, -11,  3,  0,
+   0, 1,  -5, 17, 58, -10,  3,  0,
+   0, 1,  -4, 13, 60,  -8,  2,  0,
+   0, 1,  -3,  8, 62,  -5,  1,  0,
+   0, 1,  -2,  4, 63,  -3,  1,  0
+};
+static const int kLumaRPR1[128] = {
+   -1,  -5,  17,  42,  17,  -5,  -1,   0,
+    0,  -5,  15,  41,  19,  -5,  -1,   0,
+    0,  -5,  13,  40,  21,  -4,  -1,   0,
+    0,  -5,  11,  39,  24,  -4,  -2,   1,
+    0,  -5,   9,  38,  26,  -3,  -2,   1,
+    0,  -5,   7,  38,  28,  -2,  -3,   1,
+    1,  -5,   5,  36,  30,  -1,  -3,   1,
+    1,  -4,   3,  35,  32,   0,  -4,   1,
+    1,  -4,   2,  33,  33,   2,  -4,   1,
+    1,  -4,   0,  32,  35,   3,  -4,   1,
+    1,  -3,  -1,  30,  36,   5,  -5,   1,
+    1,  -3,  -2,  28,  38,   7,  -5,   0,
+    1,  -2,  -3,  26,  38,   9,  -5,   0,
+    1,  -2,  -4,  24,  39,  11,  -5,   0,
+    0,  -1,  -4,  21,  40,  13,  -5,   0,
+    0,  -1,  -5,  19,  41,  15,  -5,   0
+};
+static const int kLumaRPR2[128] = {
+   -4,   2,  20,  28,  20,   2,  -4,   0,
+   -4,   0,  19,  29,  21,   5,  -4,  -2,
+   -4,  -1,  18,  29,  22,   6,  -4,  -2,
+   -4,  -1,  16,  29,  23,   7,  -4,  -2,
+   -4,  -1,  16,  28,  24,   7,  -4,  -2,
+   -4,  -1,  14,  28,  25,   8,  -4,  -2,
+   -3,  -3,  14,  27,  26,   9,  -3,  -3,
+   -3,  -1,  12,  28,  25,  10,  -4,  -3,
+   -3,  -3,  11,  27,  27,  11,  -3,  -3,
+   -3,  -4,  10,  25,  28,  12,  -1,  -3,
+   -3,  -3,   9,  26,  27,  14,  -3,  -3,
+   -2,  -4,   8,  25,  28,  14,  -1,  -4,
+   -2,  -4,   7,  24,  28,  16,  -1,  -4,
+   -2,  -4,   7,  23,  29,  16,  -1,  -4,
+   -2,  -4,   6,  22,  29,  18,  -1,  -4,
+   -2,  -4,   5,  21,  29,  19,   0,  -4
+};
+static const int kAffineLumaRPR1[128] = {
+    0,  -6,  17,  42,  17,  -5,  -1,   0,
+    0,  -5,  15,  41,  19,  -5,  -1,   0,
+    0,  -5,  13,  40,  21,  -4,  -1,   0,
+    0,  -5,  11,  39,  24,  -4,  -1,   0,
+    0,  -5,   9,  38,  26,  -3,  -1,   0,
+    0,  -5,   7,  38,  28,  -2,  -2,   0,
+    0,  -4,   5,  36,  30,  -1,  -2,   0,
+    0,  -3,   3,  35,  32,   0,  -3,   0,
+    0,  -3,   2,  33,  33,   2,  -3,   0,
+    0,  -3,   0,  32,  35,   3,  -3,   0,
+    0,  -2,  -1,  30,  36,   5,  -4,   0,
+    0,  -2,  -2,  28,  38,   7,  -5,   0,
+    0,  -1,  -3,  26,  38,   9,  -5,   0,
+    0,  -1,  -4,  24,  39,  11,  -5,   0,
+    0,  -1,  -4,  21,  40,  13,  -5,   0,
+    0,  -1,  -5,  19,  41,  15,  -5,   0
+};
+static const int kAffineLumaRPR2[128] = {
+    0,  -2,  20,  28,  20,   2,  -4,   0,
+    0,  -4,  19,  29,  21,   5,  -6,   0,
+    0,  -5,  18,  29,  22,   6,  -6,   0,
+    0,  -5,  16,  29,  23,   7,  -6,   0,
+    0,  -5,  16,  28,  24,   7,  -6,   0,
+    0,  -5,  14,  28,  25,   8,  -6,   0,
+    0,  -6,  14,  27,  26,   9,  -6,   0,
+    0,  -4,  12,  28,  25,  10,  -7,   0,
+    0,  -6,  11,  27,  27,  11,  -6,   0,
+    0,  -7,  10,  25,  28,  12,  -4,   0,
+    0,  -6,   9,  26,  27,  14,  -6,   0,
+    0,  -6,   8,  25,  28,  14,  -5,   0,
+    0,  -6,   7,  24,  28,  16,  -5,   0,
+    0,  -6,   7,  23,  29,  16,  -5,   0,
+    0,  -6,   6,  22,  29,  18,  -5,   0,
+    0,  -6,   5,  21,  29,  19,  -4,   0
+};
+static const int kChromaRPR1[128] = {
+   12,  40,  12,   0,
+   11,  40,  13,   0,
+   10,  40,  15,  -1,
+    9,  40,  16,  -1,
+    8,  40,  17,  -1,
+    8,  39,  18,  -1,
+    7,  39,  19,  -1,
+    6,  38,  21,  -1,
+    5,  38,  22,  -1,
+    4,  38,  23,  -1,
+    4,  37,  24,  -1,
+    3,  36,  25,   0,
+    3,  35,  26,   0,
+    2,  34,  28,   0,
+    2,  33,  29,   0,
+    1,  33,  30,   0,
+    1,  31,  31,   1,
+    0,  30,  33,   1,
+    0,  29,  33,   2,
+    0,  28,  34,   2,
+    0,  26,  35,   3,
+    0,  25,  36,   3,
+   -1,  24,  37,   4,
+   -1,  23,  38,   4,
+   -1,  22,  38,   5,
+   -1,  21,  38,   6,
+   -1,  19,  39,   7,
+   -1,  18,  39,   8,
+   -1,  17,  40,   8,
+   -1,  16,  40,   9,
+   -1,  15,  40,  10,
+    0,  13,  40,  11
+};
+static const int kChromaRPR2[128] = {
+   17,  30,  17,   0,
+   17,  30,  18,  -1,
+   16,  30,  18,   0,
+   16,  30,  18,   0,
+   15,  30,  18,   1,
+   14,  30,  18,   2,
+   13,  29,  19,   3,
+   13,  29,  19,   3,
+   12,  29,  20,   3,
+   11,  28,  21,   4,
+   10,  28,  22,   4,
+   10,  27,  22,   5,
+    9,  27,  23,   5,
+    9,  26,  24,   5,
+    8,  26,  24,   6,
+    7,  26,  25,   6,
+    7,  25,  25,   7,
+    6,  25,  26,   7,
+    6,  24,  26,   8,
+    5,  24,  26,   9,
+    5,  23,  27,   9,
+    5,  22,  27,  10,
+    4,  22,  28,  10,
+    4,  21,  28,  11,
+    3,  20,  29,  12,
+    3,  19,  29,  13,
+    3,  19,  29,  13,
+    2,  18,  30,  14,
+    1,  18,  30,  15,
+    0,  18,  30,  16,
+    0,  18,  30,  16,
+   -1,  18,  30,  17
+};
+
+// RPR's filter taps (InterpolationFilter::filterHor, filterVer, by filter
+// index): luma 0 the regular filter (its half-sample one with hpel), 2 the 4x4
+// one, 3, 4 the RPR ones, 5, 6 affine's RPR ones; chroma 3, 4 the RPR ones,
+// else the regular; phase: luma's 16ths, chroma's 32nds
+int rprCoeff( int comp, int filter, int phase, bool hpel, int k )
+{
+  if( comp == 0 )
+  {
+    if( filter == 0 )
+    {
+      return ( hpel && phase == 8 ) ? kLumaHpel[k] : kLuma[phase * 8 + k];
+    }
+    if( filter == 2 )
+    {
+      return kLuma4x4[phase * 8 + k];
+    }
+    if( filter == 3 )
+    {
+      return kLumaRPR1[phase * 8 + k];
+    }
+    if( filter == 4 )
+    {
+      return kLumaRPR2[phase * 8 + k];
+    }
+    return filter == 5 ? kAffineLumaRPR1[phase * 8 + k] : kAffineLumaRPR2[phase * 8 + k];
+  }
+  if( filter == 3 )
+  {
+    return kChromaRPR1[phase * 4 + k];
+  }
+  if( filter == 4 )
+  {
+    return kChromaRPR2[phase * 4 + k];
+  }
+  return kChroma[phase * 4 + k];
+}
+
+// xPredInterBlkRPR: the sample (col, row) of the block at (bx, by) (samples
+// of component comp) predicted from the scaled reference r (plane p) by mv
+// (1/16 luma, not clipped): its position in the reference from the scaling
+// ratio and the scaling windows, the 2-D filter of the filter index (affine's
+// 2) or the stronger ones past 1.25x and 1.75x, each tap's sample clamped into
+// the reference (its border extension); the half-sample filter only at 1x;
+// bi: the 14-bit intermediate, else the final value
+int rprSample( RefPlanes r, int16_t* p, int comp, int bx, int by, int col, int row, int2 mv, bool bi, bool hpel, int filterIndex )
+{
+  const int sx     = comp == 0 ? 0 : pc.scaleX;
+  const int sy     = comp == 0 ? 0 : pc.scaleY;
+  const int refW   = int( r.size & 0xffffu ) >> sx;
+  const int refH   = int( r.size >> 16 ) >> sy;
+  const int stride = comp == 0 ? int( r.strides & 0xffffu ) : int( r.strides >> 16 );
+  const int one    = 1 << 14;   // SCALE_1X
+  const int thr1   = one * 5 / 4;
+  const int thr2   = one * 7 / 4;
+  int       xFilter = r.ratioX > thr2 ? 4 : ( r.ratioX > thr1 ? 3 : filterIndex );
+  int       yFilter = r.ratioY > thr2 ? 4 : ( r.ratioY > thr1 ? 3 : filterIndex );
+  if( comp == 0 && filterIndex == 2 )
+  {
+    xFilter += r.ratioX > thr1 ? 2 : 0;
+    yFilter += r.ratioY > thr1 ? 2 : 0;
+  }
+
+  // the block's position in the reference, in 1 / 1024 samples
+  const int posX = ( ( bx << sx ) - pc.curWinLeft ) >> sx;
+  const int posY = ( ( by << sy ) - pc.curWinTop ) >> sy;
+  const int addX = comp == 0 ? 0 : ( 1 - pc.horColloc ) * 8 * ( r.ratioX - one );
+  const int addY = comp == 0 ? 0 : ( 1 - pc.verColloc ) * 8 * ( r.ratioY - one );
+  int64_t   x0   = ( ( int64_t( posX ) << ( 4 + sx ) ) + int64_t( mv.x ) ) * int64_t( r.ratioX ) + int64_t( addX );
+  int64_t   y0   = ( ( int64_t( posY ) << ( 4 + sy ) ) + int64_t( mv.y ) ) * int64_t( r.ratioY ) + int64_t( addY );
+  const int64_t rx = ( ( x0 < 0 ? -x0 : x0 ) + ( int64_t( 1 ) << ( 7 + sx ) ) ) >> ( 8 + sx );
+  const int64_t ry = ( ( y0 < 0 ? -y0 : y0 ) + ( int64_t( 1 ) << ( 7 + sy ) ) ) >> ( 8 + sy );
+  x0 = ( x0 < 0 ? -rx : rx ) + ( int64_t( r.winLeft ) << ( 10 - sx ) );
+  y0 = ( y0 < 0 ? -ry : ry ) + ( int64_t( r.winTop ) << ( 10 - sy ) );
+
+  // the sample's: the integer position, the phase
+  const int px    = int( x0 ) + col * ( ( r.ratioX + 8 ) >> 4 ) + ( 1 << ( 5 - sx ) );
+  const int py    = int( y0 ) + row * ( ( r.ratioY + 8 ) >> 4 ) + ( 1 << ( 5 - sy ) );
+  const int xInt  = px >> 10;
+  const int yInt  = py >> 10;
+  const int xFrac = ( px >> ( 6 - sx ) ) & ( ( 16 << sx ) - 1 );
+  const int yFrac = ( py >> ( 6 - sy ) ) & ( ( 16 << sy ) - 1 );
+  const int xPhase = comp == 0 ? xFrac : xFrac << ( 1 - sx );
+  const int yPhase = comp == 0 ? yFrac : yFrac << ( 1 - sy );
+  const bool hpelX = hpel && r.ratioX == one;
+  const bool hpelY = hpel && r.ratioY == one;
+
+  const int taps     = comp == 0 ? 8 : 4;
+  const int half     = taps / 2 - 1;
+  const int headRoom = max( 2, 14 - pc.bitDepth );
+  const int shift1   = 6 - headRoom;
+  const int offset1  = -IF_INTERNAL_OFFS * ( 1 << shift1 );
+  int       sum      = 0;
+  for( int t = 0; t < taps; t++ )
+  {
+    const int yy = clamp( yInt - half + t, 0, refH - 1 );
+    int       h  = 0;
+    for( int k = 0; k < taps; k++ )
+    {
+      h += rprCoeff( comp, xFilter, xPhase, hpelX, k ) * int( p[yy * stride + clamp( xInt - half + k, 0, refW - 1 )] );
+    }
+    sum += rprCoeff( comp, yFilter, yPhase, hpelY, t ) * ( ( h + offset1 ) >> shift1 );
+  }
+  const int maxVal = ( 1 << pc.bitDepth ) - 1;
+  return bi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
+}
+
+// the samples of a w x h tile, (ox, oy) into the block at (bx, by) that
+// xPredInterBlkRPR predicts as a whole (the CU, SbTMVP's joined sub-PUs: its
+// positions step from the block's origin), from a scaled reference
+// (rprSample), the thread's: t = tid + THREADS k
+void rprBlock( int tid, int slot, int comp, int bx, int by, int ox, int oy, int w, int h, int2 mv, bool bi, bool hpel, inout int out[PER_THREAD] )
+{
+  const RefPlanes r     = pc.refs[slot];
+  int16_t*        p     = comp == 0 ? r.y : ( comp == 1 ? r.cb : r.cr );
+  const int       log2W = firstbithigh( uint( w ) );
+  for( int k = 0; k < PER_THREAD; k++ )
+  {
+    const int t = tid + THREADS * k;
+    if( t < w * h )
+    {
+      out[k] = rprSample( r, p, comp, bx, by, ox + ( t & ( w - 1 ) ), oy + ( t >> log2W ), mv, bi, hpel, 0 );
+    }
+  }
+}
 
 // shared by the workgroup: the reference samples a block's filter reads, the
 // horizontal pass of a 2-D filter; DMVR's bilinear predictions, its SADs and
@@ -1391,24 +1693,6 @@ void bdofApply( int tid, int w, int h, out int result[PER_THREAD] )
 //   12: the CU's width | height << 8 | PROF L0 << 16 | PROF L1 << 17 | spread L0 << 18 | spread L1 << 19
 //   13..16: L0's steps (across x, y, down x, y; << 7)   17..20: L1's
 // --------------------------------------------------------------------------------------------------------------------
-static const int kLuma4x4[128] = {
-   0, 0,   0, 64,  0,   0,  0,  0,
-   0, 1,  -3, 63,  4,  -2,  1,  0,
-   0, 1,  -5, 62,  8,  -3,  1,  0,
-   0, 2,  -8, 60, 13,  -4,  1,  0,
-   0, 3, -10, 58, 17,  -5,  1,  0,
-   0, 3, -11, 52, 26,  -8,  2,  0,
-   0, 2,  -9, 47, 31, -10,  3,  0,
-   0, 3, -11, 45, 34, -10,  3,  0,
-   0, 3, -11, 40, 40, -11,  3,  0,
-   0, 3, -10, 34, 45, -11,  3,  0,
-   0, 3, -10, 31, 47,  -9,  2,  0,
-   0, 2,  -8, 26, 52, -11,  3,  0,
-   0, 1,  -5, 17, 58, -10,  3,  0,
-   0, 1,  -4, 13, 60,  -8,  2,  0,
-   0, 1,  -3,  8, 62,  -5,  1,  0,
-   0, 1,  -2,  4, 63,  -3,  1,  0
-};
 groupshared int16_t s_ext[16 * 36];   // PROF: a list's 4x4 predictions with their borders, 6 x 6 each
 
 int roundAffine( int v, int shift )
@@ -1451,10 +1735,44 @@ int2 affineMv( uint job[24], int list, int sx, int sy, int cw, int ch, bool spre
 }
 
 // a list's luma of the tile: the thread's samples t = tid + THREADS k, 14-bit (bi-prediction, PROF) else final
+// a scaled reference's affine subblock motion (xPredAffineBlk): clipped into
+// the picture's extension around the CU, no wraparound
+int2 affineClipScaled( int2 mv, int cuX, int cuY )
+{
+  const int horMax = ( pc.picWidth + 8 - cuX - 1 ) * 16;
+  const int horMin = ( -pc.ctuSize - 8 - cuX + 1 ) * 16;
+  const int verMax = ( pc.picHeight + 8 - cuY - 1 ) * 16;
+  const int verMin = ( -pc.ctuSize - 8 - cuY + 1 ) * 16;
+  return int2( min( horMax, max( horMin, mv.x ) ), min( verMax, max( verMin, mv.y ) ) );
+}
+
 void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, int cuX, int cuY, int cw, int ch, bool spread, bool prof, bool bi,
                  out int pred[PER_THREAD] )
 {
-  int16_t*  ref      = refPlane( int( ( job[7] >> ( 8 * list ) ) & 255 ), 0 );
+  const int slot = int( ( job[7] >> ( 8 * list ) ) & 255 );
+  if( pc.refs[slot].scaled != 0 )
+  {
+    // a scaled reference (RPR): each 4x4 by xPredInterBlkRPR with filter
+    // index 2, no PROF
+    const RefPlanes r     = pc.refs[slot];
+    const int       log2T = firstbithigh( uint( w ) );
+    for( int k = 0; k < PER_THREAD; k++ )
+    {
+      const int t = tid + THREADS * k;
+      pred[k]     = 0;
+      if( t < w * h )
+      {
+        const int  i  = t & ( w - 1 );
+        const int  j  = t >> log2T;
+        const int  sx = ( ( x - cuX ) >> 2 ) + ( i >> 2 );
+        const int  sy = ( ( y - cuY ) >> 2 ) + ( j >> 2 );
+        const int2 mv = affineClipScaled( affineMv( job, list, sx, sy, cw, ch, spread ), cuX, cuY );
+        pred[k]       = rprSample( r, r.y, 0, cuX + 4 * sx, cuY + 4 * sy, i & 3, j & 3, mv, bi, false, 2 );
+      }
+    }
+    return;
+  }
+  int16_t*  ref      = refPlane( slot, 0 );
   const int nsx      = w >> 2;
   const int nsb      = nsx * ( h >> 2 );
   const int ox       = ( x - cuX ) >> 2;   // the tile's first subblock in the CU
@@ -1630,7 +1948,42 @@ int2 affineChromaMv( uint job[24], int list, int csx, int csy, int cw, int ch, b
 void affineChroma( int tid, uint job[24], int list, int comp, int x, int y, int w, int h, int cuX, int cuY, int cw, int ch, bool spread,
                    bool bi, out int pred[PER_THREAD] )
 {
-  int16_t*  ref      = refPlane( int( ( job[7] >> ( 8 * list ) ) & 255 ), comp );
+  const int slot = int( ( job[7] >> ( 8 * list ) ) & 255 );
+  if( pc.refs[slot].scaled != 0 )
+  {
+    // a scaled reference (RPR): each chroma 4x4 by xPredInterBlkRPR with
+    // filter index 2, its motion clipped as the luma's
+    const RefPlanes r     = pc.refs[slot];
+    const int       tw    = w >> pc.scaleX;
+    const int       log2T = firstbithigh( uint( tw ) );
+    for( int k = 0; k < PER_THREAD; k++ )
+    {
+      const int t = tid + THREADS * k;
+      pred[k]     = 0;
+      if( t < tw * ( h >> pc.scaleY ) )
+      {
+        const int i   = t & ( tw - 1 );
+        const int j   = t >> log2T;
+        const int csx = ( ( ( x - cuX ) >> pc.scaleX ) >> 2 ) + ( i >> 2 );
+        const int csy = ( ( ( y - cuY ) >> pc.scaleY ) >> 2 ) + ( j >> 2 );
+        int2      mv;
+        if( pc.scaleX == 0 )
+        {
+          mv = affineMv( job, list, csx, csy, cw, ch, spread );
+        }
+        else
+        {
+          const int  ly  = csy << pc.scaleY;
+          const int2 sum = affineMv( job, list, 2 * csx, ly, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, ly + pc.scaleY, cw, ch, spread );
+          mv             = int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) );
+        }
+        mv      = affineClipScaled( mv, cuX, cuY );
+        pred[k] = rprSample( r, comp == 1 ? r.cb : r.cr, comp, ( cuX >> pc.scaleX ) + 4 * csx, ( cuY >> pc.scaleY ) + 4 * csy, i & 3, j & 3, mv, bi, false, 2 );
+      }
+    }
+    return;
+  }
+  int16_t*  ref      = refPlane( slot, comp );
   const int sx       = pc.scaleX;
   const int sy       = pc.scaleY;
   const int tw       = w >> sx;   // the tile's chroma
@@ -2062,7 +2415,13 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       // (weighted prediction: from the 14-bit predictions, a uni-prediction's too)
       const bool hi = bi || ( flags & FLAG_WP ) != 0;
       int        pred[PER_THREAD];
-      if( comp == 0 )
+      if( pc.refs[slot].scaled != 0 )
+      {
+        // a scaled reference (RPR): the motion not clipped (xPredInterUni),
+        // the samples one by one (no DMVR, no BDOF), positioned from the CU's
+        rprBlock( tid, slot, comp, cuX >> sx, cuY >> sy, bx - ( cuX >> sx ), by - ( cuY >> sy ), bw, bh, mv, hi, hpel, pred );
+      }
+      else if( comp == 0 )
       {
         predictBlock<8>( tid, slot, comp, bx, by, bw, bh, clipped, hi, hpel, windowed, window, base, wrap, pred );
       }
