@@ -102,6 +102,7 @@ struct IntraJob
     kResidual      = 1,   // the picture holds the block's residual
     kFiltered      = 2,   // the [1 2 1]-filtered references
     kMipTransposed = 4,
+    kIsp           = 8,   // a luma sub-partition of an ISP CU (setIsp)
   };
 
   uint32_t w[8];
@@ -122,6 +123,15 @@ struct IntraJob
     w[5] = uint32_t( actualTop ) | uint32_t( actualLeft ) << 16;
   }
   void setBlockVector( int x, int y ) { w[6] = uint32_t( uint16_t( int16_t( x ) ) ) | uint32_t( uint16_t( int16_t( y ) ) ) << 16; }
+  // ISP: the CU (luma samples), its split (vvdec's ISPType: 1 horizontal, 2
+  // vertical) and whether the neighbours left of and above the sub-partition's
+  // prediction block are there (initIntraPatternChTypeISP's isLeftAvail and
+  // isAboveAvail); the neighbours' units (setNeighbors) are the CU's
+  void setIsp( int cuX, int cuY, int cuWidth, int cuHeight, int split, bool leftAvail, bool aboveAvail )
+  {
+    w[4] = uint32_t( cuX ) | uint32_t( cuY ) << 16;
+    w[5] = uint32_t( cuWidth ) | uint32_t( cuHeight ) << 8 | uint32_t( split ) << 16 | uint32_t( leftAvail ) << 18 | uint32_t( aboveAvail ) << 19;
+  }
   void setWave( int wave ) { w[7] = uint32_t( wave ); }
   int  wave() const { return int( w[7] ); }
   int  width() const { return int( w[1] & 255 ); }

@@ -202,6 +202,32 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int nx     = lastX + 1;   // the columns with levels; the others are zero
   const int ny     = lastY + 1;
 
+  if( width == 1 || height == 1 )
+  {
+    // xIT's 1-D transforms (ISP's sub-partitions a sample wide or high): one
+    // rounding, by a bit more than the 2-D's second
+    const bool ver   = width == 1;
+    const int  n     = ver ? height : width;
+    const int  count = ver ? ny : nx;
+    int16_t*   m     = ver ? mVer : mHor;
+    const int  shift = shift2 + 1;
+    for( int s = tid; s < n; s += THREADS )
+    {
+      int sum = 0;
+      for( int k = 0; k < count; k++ )
+      {
+        sum += dequant( int( levels[ver ? k * stride : k] ), scale, rightShift, inputMaximum ) * int( m[k * n + s] );
+      }
+      const int r = clip3( COEFF_MIN, COEFF_MAX, ( sum + ( 1 << ( shift - 1 ) ) ) >> shift );
+      block[ver ? s * stride : s] = int16_t( r );
+      if( ict != 0 )
+      {
+        other[ver ? s * stride : s] = int16_t( jointResidual( ict, r ) );
+      }
+    }
+    return;
+  }
+
   for( int s = tid; s < nx * ny; s += THREADS )
   {
     const int k = s / nx;

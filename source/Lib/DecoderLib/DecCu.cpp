@@ -324,14 +324,26 @@ void DecCu::xGpuIntraJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu
         kind = gpu::IntraJob::kCclm;
       }
 
+      // ISP: a luma sub-partition, predicted from references
+      // initIntraPatternChTypeISP fills for the whole CU (as a block of its
+      // size) once, then from the sub-partition before
+      const bool isp = isLuma( compID ) && cu.ispMode() != NOT_INTRA_SUBPARTITIONS;
+
       int units[3];
-      m_pcIntraPred->getNeighborUnits( tu, area, units );
+      if( isp )
+      {
+        m_pcIntraPred->getNeighborUnits( cu.firstTU, cu.Y(), units );
+      }
+      else
+      {
+        m_pcIntraPred->getNeighborUnits( tu, area, units );
+      }
 
       if( TU::getCbf( tu, compID ) || ( isChroma( compID ) && tu.jointCbCr ) )
       {
         flags |= gpu::IntraJob::kResidual;
       }
-      if( kind == gpu::IntraJob::kAngular && isLuma( compID ) && IntraPrediction::useFilteredIntraRefSamples( compID, cu, tu ) )
+      if( kind == gpu::IntraJob::kAngular && isLuma( compID ) && !isp && IntraPrediction::useFilteredIntraRefSamples( compID, cu, tu ) )
       {
         flags |= gpu::IntraJob::kFiltered;
       }
@@ -341,14 +353,47 @@ void DecCu::xGpuIntraJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu
 
       gpu::IntraJob job;
       job.set( area.x, area.y, area.width, area.height, compID, kind,
-               kind == gpu::IntraJob::kAngular || kind == gpu::IntraJob::kMip ? jobMode : 0, flags, bdpcm, refLine );
+               kind == gpu::IntraJob::kAngular || kind == gpu::IntraJob::kMip ? jobMode : 0, flags | ( isp ? gpu::IntraJob::kIsp : 0 ), bdpcm,
+               refLine );
       job.setNeighbors( units[0], units[1], units[2] );
 
-      // what the block reads: its references (the row above with the
-      // above-right samples, the column to the left with the below-left ones,
-      // refLine further out), for CCLM also the luma at and around the block
-      int wave = std::max( waves.maxIn( compID, area.x - 1 - refLine, area.y - 1 - refLine, 2 * area.width + 1 + refLine, 1 ),
-                           waves.maxIn( compID, area.x - 1 - refLine, area.y - refLine, 1, 2 * area.height + refLine ) );
+      int wave = 0;
+      if( isp )
+      {
+        // the block predicted: a vertical split's sub-partitions 1 or 2
+        // samples wide share a block 4 wide (its first predicts it)
+        const CompArea& cuArea = cu.Y();
+        CompArea        pred   = area;
+        if( CU::isPredRegDiffFromTB( cu, compID ) )
+        {
+          pred.x     = cuArea.x + ( ( area.x - cuArea.x ) & ~( PRED_REG_MIN_WIDTH - 1 ) );
+          pred.width = PRED_REG_MIN_WIDTH;
+        }
+        const Position         posLT      = pred.pos();
+        const CodingStructure& cs         = *cu.cs;
+        const bool             leftAvail  = nullptr != cs.getCURestricted( posLT.offset( -1, 0 ), cu, CH_L, posLT.x == cu.lx() ? cu.left : &cu );
+        const bool             aboveAvail = nullptr != cs.getCURestricted( posLT.offset( 0, -1 ), cu, CH_L, posLT.y == cu.ly() ? cu.left : &cu );
+        job.setIsp( cuArea.x, cuArea.y, cuArea.width, cuArea.height, cu.ispMode(), leftAvail, aboveAvail );
+
+        // what it reads: the CU's references for the first, else the row above
+        // and the column to the left, the CU's width (height) longer than the
+        // block's (and what the first read, before it)
+        const bool first   = pred.x == cuArea.x && pred.y == cuArea.y;
+        const int  x       = first ? cuArea.x : pred.x;
+        const int  y       = first ? cuArea.y : pred.y;
+        const int  topLen  = first ? 2 * cuArea.width : cuArea.width + pred.width;
+        const int  leftLen = first ? 2 * cuArea.height : cuArea.height + pred.height;
+        wave = std::max( waves.maxIn( compID, x - 1, y - 1, topLen + 1, 1 ), waves.maxIn( compID, x - 1, y, 1, leftLen ) );
+      }
+      else
+      {
+        // what the block reads: its references (the row above with the
+        // above-right samples, the column to the left with the below-left
+        // ones, refLine further out), for CCLM also the luma at and around the
+        // block
+        wave = std::max( waves.maxIn( compID, area.x - 1 - refLine, area.y - 1 - refLine, 2 * area.width + 1 + refLine, 1 ),
+                         waves.maxIn( compID, area.x - 1 - refLine, area.y - refLine, 1, 2 * area.height + refLine ) );
+      }
       if( kind == gpu::IntraJob::kCclm )
       {
         const IntraPrediction::LmAvailability lm = IntraPrediction::getLmAvailability( cu, area );

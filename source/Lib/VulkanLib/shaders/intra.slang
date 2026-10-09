@@ -23,10 +23,12 @@
 //   1: width | height << 8 | component << 16 | kind << 24   (kind: 0 planar/DC/angular, 1 BDPCM, 2 CCLM, 3 IBC,
 //      4 MIP)
 //   2: mode | flags << 8 | bdpcm direction << 16 | reference line << 24   (flags: 1 residual, 2 filtered references,
-//      4 MIP transposed; the reference line: MRL's, 0 .. 2)
-//   3: top-left units | above units << 8 | left units << 16  (the reference samples available)
+//      4 MIP transposed, 8 ISP; the reference line: MRL's, 0 .. 2)
+//   3: top-left units | above units << 8 | left units << 16  (the reference samples available; ISP: the CU's)
 //   4: CCLM: luma above units | luma left units << 8 | bAbove << 16 | bLeft << 17 | aboveAvail << 18 | leftAvail << 19 | lm mode << 24
+//      ISP: the CU's x | y << 16
 //   5: CCLM: actual top template samples | actual left << 16
+//      ISP: the CU's width | height << 8 | split << 16 (1 horizontal, 2 vertical) | left there << 18 | above there << 19
 //   6: IBC: block vector x | y << 16 (int16, samples of the component)
 //   7: the rows of the block this workgroup makes: first | count << 16, at
 //      most 256 samples (on the CPU: the block's wave)
@@ -131,83 +133,182 @@ struct References
   int l[3];
 };
 
-References loadReferences( int tid, int comp, int x0, int y0, int w, int h, int nTL, int nAbove, int nLeft, int r )
+// a block's xFillReferenceSamples: the block, its references' lengths (the
+// row above, the column to the left), the reference line and the units of
+// neighbours there
+struct RefFill
 {
-  const int predSize    = w << 1;
-  const int predHSize   = h << 1;
-  const int unitW       = comp == 0 ? 4 : ( 4 >> pc.scaleX );
-  const int unitH       = comp == 0 ? 4 : ( 4 >> pc.scaleY );
-  const int totalUnits  = predSize / unitW + predHSize / unitH + 1;
-  const int numNeighbor = nTL + nAbove + nLeft;
-  const int tmpA        = min( nAbove * unitW, predSize );
-  const int tmpL        = min( nLeft * unitH, predHSize );
-  const int dc          = 1 << ( pc.bitDepth - 1 );
-  const bool all        = numNeighbor == totalUnits;
-  const int  rowY       = y0 - 1 - r;   // the reference row
-  const int  colX       = x0 - 1 - r;   // the reference column
-  // the sample the corner and missing parts take when only some neighbours
-  // are there: the left: the corner if the top-left is there, else the left
-  // column's first; no left: the row above's first
-  const int2 pad = nLeft > 0 ? ( nTL != 0 ? int2( x0 - 1, rowY ) : int2( colX, y0 ) ) : int2( x0, rowY );
+  int  comp;
+  int  x0, y0;
+  int  predSize, predHSize;
+  int  r;
+  int  nTL, nAbove, nLeft;
+  int  tmpA, tmpL;   // the samples there above and to the left
+  bool none, all;
+  int2 pad;          // what the corner and the missing parts take when only some neighbours are there
+};
 
+RefFill refFill( int comp, int x0, int y0, int predSize, int predHSize, int nTL, int nAbove, int nLeft, int r )
+{
+  RefFill f;
+  f.comp       = comp;
+  f.x0         = x0;
+  f.y0         = y0;
+  f.predSize   = predSize;
+  f.predHSize  = predHSize;
+  f.r          = r;
+  f.nTL        = nTL;
+  f.nAbove     = nAbove;
+  f.nLeft      = nLeft;
+  const int unitW = comp == 0 ? 4 : ( 4 >> pc.scaleX );
+  const int unitH = comp == 0 ? 4 : ( 4 >> pc.scaleY );
+  f.tmpA       = min( nAbove * unitW, predSize );
+  f.tmpL       = min( nLeft * unitH, predHSize );
+  f.none       = nTL + nAbove + nLeft == 0;
+  f.all        = nTL + nAbove + nLeft == predSize / unitW + predHSize / unitH + 1;
+  // the left: the corner if the top-left is there, else the left column's
+  // first; no left: the row above's first
+  f.pad = nLeft > 0 ? ( nTL != 0 ? int2( x0 - 1, y0 - 1 - r ) : int2( x0 - 1 - r, y0 ) ) : int2( x0, y0 - 1 - r );
+  return f;
+}
+
+// the sample element j of t takes (of the row y0 - 1 - r)
+int2 topSource( RefFill f, int j )
+{
+  const int rowY = f.y0 - 1 - f.r;
+  const int colX = f.x0 - 1 - f.r;
+  if( f.all )
+  {
+    return int2( colX + j, rowY );
+  }
+  if( j <= f.r )
+  {
+    return f.nLeft > 0 && f.nTL != 0 ? int2( colX + j, rowY ) : f.pad;
+  }
+  return f.nAbove != 0 ? int2( f.x0 + min( j - 1 - f.r, f.tmpA - 1 ), rowY ) : f.pad;
+}
+
+// the sample element i of l takes (of the column x0 - 1 - r)
+int2 leftSource( RefFill f, int i )
+{
+  const int rowY = f.y0 - 1 - f.r;
+  const int colX = f.x0 - 1 - f.r;
+  if( f.all )
+  {
+    return int2( colX, rowY + i );
+  }
+  if( f.nLeft == 0 )
+  {
+    return f.pad;
+  }
+  if( i <= f.r )
+  {
+    return f.nTL != 0 ? int2( colX, rowY + i ) : f.pad;
+  }
+  return int2( colX, f.y0 + min( i - 1 - f.r, f.tmpL - 1 ) );
+}
+
+// a reference sample's value: its source's, or the middle value with no neighbours
+int fillValue( RefFill f, int2 at )
+{
+  return f.none ? 1 << ( pc.bitDepth - 1 ) : sampleAt( f.comp, at.x, at.y );
+}
+
+References loadReferences( int tid, RefFill f )
+{
+  References refs;
+  [unroll]
+  for( int k = 0; k < 3; k++ )
+  {
+    const int j = tid + 64 * k;
+    const int i = tid + 64 * k;
+    refs.t[k]   = j <= f.predSize + f.r ? fillValue( f, topSource( f, j ) ) : 0;
+    refs.l[k]   = i <= f.predHSize + f.r ? fillValue( f, leftSource( f, i ) ) : 0;
+  }
+  return refs;
+}
+
+// initIntraPatternChTypeISP: the references of the prediction block (px, py,
+// pw x ph) of a sub-partition of an ISP CU (cx, cy, cw x ch; f: the CU's
+// own fill, as a block of its size): the CU's for its first block; after
+// that, for a horizontal split the row above (the sub-partition before, its
+// last sample repeated) and the CU's left column from that row on, for a
+// vertical split the CU's row above from that column on and the column to
+// the left (the sub-partition before, its last sample repeated). Without the
+// CU's neighbours on that side, the sub-partition before's sample next to
+// the corner stands in for them all.
+References loadReferencesIsp( int tid, RefFill f, int px, int py, int pw, int ph, int cx, int cy, int cw, int ch, bool ver, bool leftAvail,
+                              bool aboveAvail )
+{
+  const bool first = px == cx && py == cy;
   References refs;
   [unroll]
   for( int k = 0; k < 3; k++ )
   {
     const int j = tid + 64 * k;
     int2      at;
-    if( all )
+    bool      fromFill;   // of the CU's fill, else a sample of the picture
+    if( first )
     {
-      at = int2( colX + j, rowY );
+      fromFill = true;
+      at       = topSource( f, j );
     }
-    else if( j <= r )
+    else if( ver )
     {
-      at = nLeft > 0 && nTL != 0 ? int2( colX + j, rowY ) : pad;
+      fromFill = aboveAvail;
+      at       = aboveAvail ? topSource( f, px - cx + j ) : int2( px - 1, cy );
+    }
+    else if( j == 0 )
+    {
+      fromFill = leftAvail;
+      at       = leftAvail ? leftSource( f, py - cy ) : int2( cx, py - 1 );
     }
     else
     {
-      at = nAbove != 0 ? int2( x0 + min( j - 1 - r, tmpA - 1 ), rowY ) : pad;
+      fromFill = false;
+      at       = int2( cx + min( j - 1, pw - 1 ), py - 1 );
     }
-    refs.t[k] = j <= predSize + r && numNeighbor != 0 ? sampleAt( comp, at.x, at.y ) : dc;
+    refs.t[k] = j <= cw + pw ? ( fromFill ? fillValue( f, at ) : sampleAt( 0, at.x, at.y ) ) : 0;
   }
   [unroll]
   for( int k = 0; k < 3; k++ )
   {
     const int i = tid + 64 * k;
     int2      at;
-    if( all )
+    bool      fromFill;
+    if( first )
     {
-      at = int2( colX, rowY + i );
+      fromFill = true;
+      at       = leftSource( f, i );
     }
-    else if( nLeft == 0 )
+    else if( ver )
     {
-      at = pad;
-    }
-    else if( i <= r )
-    {
-      at = nTL != 0 ? int2( colX, rowY + i ) : pad;
+      fromFill = false;
+      at       = int2( px - 1, cy + min( max( i - 1, 0 ), ph - 1 ) );   // (l[0] is t[0])
     }
     else
     {
-      at = int2( colX, y0 + min( i - 1 - r, tmpL - 1 ) );
+      fromFill = leftAvail;
+      at       = leftAvail ? leftSource( f, py - cy + i ) : int2( cx, py - 1 );
     }
-    refs.l[k] = i <= predHSize + r && numNeighbor != 0 ? sampleAt( comp, at.x, at.y ) : dc;
+    refs.l[k] = i <= ch + ph ? ( fromFill ? fillValue( f, at ) : sampleAt( 0, at.x, at.y ) ) : 0;
   }
   return refs;
 }
 
-// xFillReferenceSamples' writes (l[0], the corner, is t[0])
-void storeReferences( int tid, int w, int h, int r, References refs )
+// xFillReferenceSamples' writes, t[0 .. topLast] and l[0 .. leftLast] (l[0],
+// the corner, is t[0])
+void storeReferences( int tid, int topLast, int leftLast, References refs )
 {
   [unroll]
   for( int k = 0; k < 3; k++ )
   {
     const int j = tid + 64 * k;
-    if( j <= ( w << 1 ) + r )
+    if( j <= topLast )
     {
       t[j] = refs.t[k];
     }
-    if( j <= ( h << 1 ) + r )
+    if( j <= leftLast )
     {
       l[j] = j == 0 ? refs.t[0] : refs.l[k];
     }
@@ -289,10 +390,14 @@ int refSide( Angular a, bool filtered, int k )
   return a.isVer ? refL( filtered, k ) : refT( filtered, k );
 }
 
-Angular setupAngular( int comp, int w, int h, int mode, int r )
+// (sizeW x sizeH: the size the wide-angle modes follow, topLength and
+// leftLength the references' lengths: the block's, but for ISP's: the CU's
+// size, the CU's width / height on top of the block's; ISP takes the cubic
+// filter always)
+Angular setupAngular( int comp, int w, int h, int mode, int r, int sizeW, int sizeH, int topLength, int leftLength, bool isp )
 {
   Angular a;
-  a.predMode = wideAngle( w, h, mode );
+  a.predMode = wideAngle( sizeW, sizeH, mode );
   a.isVer    = a.predMode >= DIA_IDX;
   const int angMode    = a.isVer ? a.predMode - VER_IDX : -( a.predMode - HOR_IDX );
   const int absAngMode = abs( angMode );
@@ -301,12 +406,12 @@ Angular setupAngular( int comp, int w, int h, int mode, int r )
   a.angle     = angMode < 0 ? -a.absAng : a.absAng;
   a.width     = a.isVer ? w : h;
   a.height    = a.isVer ? h : w;
-  a.refLength = a.isVer ? ( w << 1 ) : ( h << 1 );
+  a.refLength = a.isVer ? topLength : leftLength;
   a.r         = r;
   const int diff     = min( abs( a.predMode - HOR_IDX ), abs( a.predMode - VER_IDX ) );
   const int log2Size = ( log2Int( a.width ) + log2Int( a.height ) ) >> 1;
-  // the cubic filter for MRL's extra lines too, and no PDPC there
-  a.cubic = !( diff > kIntraFilterLuma[log2Size] ) || r > 0;
+  // the cubic filter for MRL's extra lines and ISP too, and no PDPC for MRL
+  a.cubic = isp || !( diff > kIntraFilterLuma[log2Size] ) || r > 0;
   const bool doPdpc = w >= 4 && h >= 4 && r == 0;
   a.pdpcScale = -1;
   a.lev       = 0;
@@ -780,10 +885,41 @@ void make( int tid, uint job[8] )
     return;   // the whole workgroup
   }
 
+  // the block the prediction covers (pw x ph, the job's block xoff samples
+  // into it), the size the wide-angle modes follow and the references'
+  // lengths: the job's block's, but for ISP's sub-partitions (flag 8): the
+  // CU's size, the CU's width (height) on top of the block's along the top
+  // (left), and for a vertical split's sub-partitions 1 or 2 samples wide a
+  // block 4 wide, predicted for them all (CU::isPredRegDiffFromTB)
+  const bool isp   = ( flags & 8 ) != 0;
+  const int  cx    = int( job[4] & 0xffff );
+  const int  cy    = int( job[4] >> 16 );
+  const int  cw    = int( job[5] & 255 );
+  const int  ch    = int( ( job[5] >> 8 ) & 255 );
+  const bool ver   = ( ( job[5] >> 16 ) & 3 ) == 2;
+  const bool region = isp && ver && ( cw == 4 || ( cw == 8 && ch > 4 ) );
+  const int  pw    = region ? 4 : w;
+  const int  ph    = h;
+  const int  xoff  = region ? ( x0 - cx ) & 3 : 0;
+  const int  sizeW = isp ? cw : pw;
+  const int  sizeH = isp ? ch : ph;
+  const int  topLength  = isp ? cw + pw : pw << 1;
+  const int  leftLength = isp ? ch + ph : ph << 1;
+
   // the reads: the references, then (while those are on their way) the
   // residual and CCLM's luma, kCubic for luma's angular modes
   const uint       nb   = job[3];
-  const References refs = loadReferences( tid, comp, x0, y0, w, h, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), refLine );
+  References       refs;
+  if( isp )
+  {
+    // the CU's fill, as a block of its size
+    const RefFill f = refFill( comp, cx, cy, cw << 1, ch << 1, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), 0 );
+    refs = loadReferencesIsp( tid, f, x0 - xoff, y0, pw, ph, cx, cy, cw, ch, ver, ( ( job[5] >> 18 ) & 1 ) != 0, ( ( job[5] >> 19 ) & 1 ) != 0 );
+  }
+  else
+  {
+    refs = loadReferences( tid, refFill( comp, x0, y0, w << 1, h << 1, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), refLine ) );
+  }
   const bool       lmAbove = ( ( job[4] >> 16 ) & 1 ) != 0;
   const bool       lmLeft  = ( ( job[4] >> 17 ) & 1 ) != 0;
   if( kind == 2 )
@@ -824,7 +960,7 @@ void make( int tid, uint job[8] )
     s_cubic[tid]      = kCubic[tid];
     s_cubic[tid + 64] = kCubic[tid + 64];
   }
-  storeReferences( tid, w, h, refLine, refs );
+  storeReferences( tid, topLength + refLine, leftLength + refLine, refs );
   GroupMemoryBarrierWithGroupSync();
 
   // per block: what the predictor needs of the references
@@ -846,13 +982,13 @@ void make( int tid, uint job[8] )
   {
     if( tid == 0 )
     {
-      s_dc = dcValue( filtered, w, h, refLine );
+      s_dc = dcValue( filtered, pw, ph, refLine );
     }
     GroupMemoryBarrierWithGroupSync();
   }
   else if( kind == 0 && mode != PLANAR_IDX )
   {
-    ang = setupAngular( comp, w, h, mode, refLine );
+    ang = setupAngular( comp, pw, ph, mode, refLine, sizeW, sizeH, topLength, leftLength, isp );
   }
   const int mipPred = mipSizeId( w, h ) < 2 ? 4 : 8;
   if( kind == 4 )
@@ -875,7 +1011,7 @@ void make( int tid, uint job[8] )
   const int3 model = s_model;
 
   const int  bdpcmDir = int( ( job[2] >> 16 ) & 255 );
-  const bool doPdpcPlanarDc = kind == 0 && ( mode == PLANAR_IDX || mode == DC_IDX ) && w >= 4 && h >= 4 && refLine == 0;
+  const bool doPdpcPlanarDc = kind == 0 && ( mode == PLANAR_IDX || mode == DC_IDX ) && pw >= 4 && ph >= 4 && refLine == 0;
 
   // the samples, from shared memory alone
   for( int i = tid; i < m; i += 64 )
@@ -897,15 +1033,15 @@ void make( int tid, uint job[8] )
     }
     else if( mode == PLANAR_IDX || mode == DC_IDX )
     {
-      v = mode == PLANAR_IDX ? predictPlanar( filtered, w, h, x, y ) : dc;
+      v = mode == PLANAR_IDX ? predictPlanar( filtered, pw, ph, x + xoff, y ) : dc;
       if( doPdpcPlanarDc )
       {
-        v = pdpcPlanarDc( filtered, w, h, x, y, v );
+        v = pdpcPlanarDc( filtered, pw, ph, x + xoff, y, v );
       }
     }
     else
     {
-      v = ang.isVer ? predictAngular( ang, comp, filtered, x, y, maxVal ) : predictAngular( ang, comp, filtered, y, x, maxVal );
+      v = ang.isVer ? predictAngular( ang, comp, filtered, x + xoff, y, maxVal ) : predictAngular( ang, comp, filtered, y, x + xoff, maxVal );
     }
     const int at = ( y0 + y ) * stride + x0 + x;
     dst[at]      = int16_t( residual ? clip3( 0, maxVal, v + int( s_res[i] ) ) : v );

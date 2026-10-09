@@ -1176,8 +1176,7 @@ bool GpuRecon::intraSupported( const CodingStructure& cs )
 
 bool GpuRecon::intraSupported( const SPS& sps )
 {
-  return sps.getChromaFormatIdc() == CHROMA_420 && !sps.getUseISP() && !sps.getUseCiip() && !sps.getUseColorTrans() && !sps.getUseReshaper()
-         && !sps.getUseWrapAround();
+  return sps.getChromaFormatIdc() == CHROMA_420 && !sps.getUseCiip() && !sps.getUseColorTrans() && !sps.getUseReshaper() && !sps.getUseWrapAround();
 }
 
 void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes )
