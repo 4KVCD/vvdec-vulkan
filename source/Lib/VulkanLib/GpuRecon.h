@@ -96,7 +96,7 @@ public:
   static bool intraSupported( const CodingStructure& cs );
   static bool intraSupported( const SPS& sps );
   // whether the GPU predicts the inter blocks of the pictures of the sequence:
-  // what intraSupported needs, 10 bits at most, no subpictures
+  // what intraSupported needs, 10 bits at most
   static bool interSupported( const SPS& sps );
   // and of the picture: no scaled references (RPR)
   static bool interSupported( const CodingStructure& cs );
@@ -266,6 +266,7 @@ private:
   // the dequantisation matrices of explicit scaling lists (setPicture), a byte a factor
   bool            m_scalingOn = false;
   Buffer          m_scaling;
+  Buffer          m_subpics;   // subpictures treated as pictures: each CTU's rectangle (recordInter)
 };
 
 }   // namespace gpu

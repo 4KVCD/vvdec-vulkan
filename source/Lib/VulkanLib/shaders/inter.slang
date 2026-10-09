@@ -44,6 +44,8 @@ struct Params
   int16_t*   defer1;
   int16_t*   defer2;
   int16_t*   geo;         // GPM's prestored masks of weights (g_globalGeoWeights), 112 x 112 each
+  uint16_t*  subpics;     // with subpicOn: per CTU, the rectangle its blocks read and clip their motion to (luma: left,
+                          // top, right, bottom, inclusive): its subpicture's, treated as a picture, else the picture's
   int        stride0;
   int        stride12;
   int        count;
@@ -62,6 +64,7 @@ struct Params
   int        wrapSps;     // wraparound (vvdec's): the SPS's, which makes clipMv wrapClipMv, motion compensation read the
   int        wrapPps;     // wraparound copy of the reference; the PPS's, which wraps the copy's margins by wrapOffset
   int        wrapOffset;  // (luma samples; 0 without the PPS's) and decides where DMVR and affine read
+  int        subpicOn;    // subpictures treated as pictures: subpics
 };
 
 [[vk::push_constant]] Params pc;
@@ -210,19 +213,42 @@ int16_t* refPlane( int slot, int comp )
   return comp == 0 ? r.y : ( comp == 1 ? r.cb : r.cr );
 }
 
-// a reference sample, its coordinates clamped into the picture: vvdec's border extension; wrap: the wraparound
-// copy's (extendPicBorderWrap): the margins left and right, as far as the wraparound offset, the picture's samples
-// that far across, then its edge's
+// the rectangle (luma, inclusive) the job's block reads and clips its motion to:
+// the picture, or its subpicture when that is treated as a picture (vvdec's
+// subpicture reference buffers, clipMvInSubpic)
+static int4 g_bounds;
+
+void setBounds( int cuX, int cuY )
+{
+  g_bounds = int4( 0, 0, pc.picWidth - 1, pc.picHeight - 1 );
+  if( pc.subpicOn != 0 )
+  {
+    uint16_t* r = pc.subpics + ( ( cuY >> pc.ctuLog2 ) * pc.widthInCtus + ( cuX >> pc.ctuLog2 ) ) * 4;
+    g_bounds    = int4( int( r[0] ), int( r[1] ), int( r[2] ), int( r[3] ) );
+  }
+}
+
+// g_bounds in the samples of component comp
+int4 boundsOf( int comp )
+{
+  const int sx = comp == 0 ? 0 : pc.scaleX;
+  const int sy = comp == 0 ? 0 : pc.scaleY;
+  return int4( g_bounds.x >> sx, g_bounds.y >> sy, ( ( g_bounds.z + 1 ) >> sx ) - 1, ( ( g_bounds.w + 1 ) >> sy ) - 1 );
+}
+
+// a reference sample, its coordinates clamped into g_bounds: vvdec's border extension (of the picture, or of the
+// subpicture's copy); wrap: the wraparound copy's (extendPicBorderWrap): the margins left and right, as far as the
+// wraparound offset, the picture's samples that far across, then its edge's
 int refAt( int16_t* p, int comp, int x, int y, bool wrap )
 {
-  const int w = comp == 0 ? pc.picWidth : pc.picWidth >> pc.scaleX;
-  const int h = comp == 0 ? pc.picHeight : pc.picHeight >> pc.scaleY;
+  const int4 b = boundsOf( comp );
   if( wrap )
   {
+    const int w      = comp == 0 ? pc.picWidth : pc.picWidth >> pc.scaleX;
     const int offset = comp == 0 ? pc.wrapOffset : pc.wrapOffset >> pc.scaleX;
     x = x < 0 ? ( -x - 1 < offset ? x + offset : 0 ) : ( x >= w ? ( x - w < offset ? x - offset : w - 1 ) : x );
   }
-  return int( p[clamp( y, 0, h - 1 ) * ( comp == 0 ? pc.stride0 : pc.stride12 ) + clamp( x, 0, w - 1 )] );
+  return int( p[clamp( y, b.y, b.w ) * ( comp == 0 ? pc.stride0 : pc.stride12 ) + clamp( x, b.x, b.z )] );
 }
 
 // with a window (DMVR's padded prefetch), the reads clamped into it first
@@ -260,8 +286,9 @@ int2 wrapClipMv( int2 mv, int x, int y, int w, out bool shifted )
   return int2( mvX, min( verMax, max( verMin, mv.y ) ) );
 }
 
-// clipMvInPic: the block at (x, y), w wide, stays near the picture; with the
-// SPS's wraparound, wrapClipMv instead
+// clipMvInPic, clipMvInSubpic: the block at (x, y), w wide, stays near
+// g_bounds (the picture, or its subpicture); with the SPS's wraparound,
+// wrapClipMv instead
 int2 clipMv( int2 mv, int x, int y, int w )
 {
   if( pc.wrapSps != 0 )
@@ -269,10 +296,10 @@ int2 clipMv( int2 mv, int x, int y, int w )
     bool shifted;
     return wrapClipMv( mv, x, y, w, shifted );
   }
-  const int horMax = ( pc.picWidth + 8 - x - 1 ) * 16;
-  const int horMin = ( -pc.ctuSize - 8 - x + 1 ) * 16;
-  const int verMax = ( pc.picHeight + 8 - y - 1 ) * 16;
-  const int verMin = ( -pc.ctuSize - 8 - y + 1 ) * 16;
+  const int horMax = ( g_bounds.z + 1 + 8 - x - 1 ) * 16;
+  const int horMin = ( -pc.ctuSize - 8 - ( x - g_bounds.x ) + 1 ) * 16;
+  const int verMax = ( g_bounds.w + 1 + 8 - y - 1 ) * 16;
+  const int verMin = ( -pc.ctuSize - 8 - ( y - g_bounds.y ) + 1 ) * 16;
   return int2( min( horMax, max( horMin, mv.x ) ), min( verMax, max( verMin, mv.y ) ) );
 }
 
@@ -324,9 +351,8 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
   const int oy = yFrac != 0 ? half : 0;
   const int rw = w + ( xFrac != 0 ? N - 1 : 0 );
   const int rh = h + ( yFrac != 0 ? N - 1 : 0 );
-  const int picW = pc.picWidth >> sx;
-  const int picH = pc.picHeight >> sy;
-  if( !windowed && baseX - ox >= 0 && baseX - ox + rw <= picW && baseY - oy >= 0 && baseY - oy + rh <= picH )
+  const int4 b = boundsOf( comp );
+  if( !windowed && baseX - ox >= b.x && baseX - ox + rw <= b.z + 1 && baseY - oy >= b.y && baseY - oy + rh <= b.w + 1 )
   {
     // inside the picture (most blocks): the samples as they are, no clamping
     const int stride = comp == 0 ? pc.stride0 : pc.stride12;
@@ -1404,10 +1430,11 @@ int2 affineClip( int2 mv, int x, int y, int w, int cuX, int cuY, out bool wrap )
     wrap               = !shifted;
     return clipped;
   }
-  const int horMax = ( pc.picWidth + 8 - cuX - 1 ) * 16;
-  const int horMin = ( -pc.ctuSize - 8 - cuX + 1 ) * 16;
-  const int verMax = ( pc.picHeight + 8 - cuY - 1 ) * 16;
-  const int verMin = ( -pc.ctuSize - 8 - cuY + 1 ) * 16;
+  // (in a subpicture treated as a picture, clipMvInSubpic's at the CU)
+  const int horMax = ( g_bounds.z + 1 + 8 - cuX - 1 ) * 16;
+  const int horMin = ( -pc.ctuSize - 8 - ( cuX - g_bounds.x ) + 1 ) * 16;
+  const int verMax = ( g_bounds.w + 1 + 8 - cuY - 1 ) * 16;
+  const int verMin = ( -pc.ctuSize - 8 - ( cuY - g_bounds.y ) + 1 ) * 16;
   return int2( min( horMax, max( horMin, mv.x ) ), min( verMax, max( verMin, mv.y ) ) );
 }
 
@@ -1709,6 +1736,7 @@ void affineMain( int tid, int index )
   const int  bcwW1  = int( ( job[7] >> 16 ) & 15 ) - 2;
   const int  cw     = int( job[12] & 255 );
   const int  ch     = int( ( job[12] >> 8 ) & 255 );
+  setBounds( cuX, cuY );
   const bool bi     = ( flags & ( FLAG_L0 | FLAG_L1 ) ) == ( FLAG_L0 | FLAG_L1 );
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
@@ -1830,6 +1858,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int  ref1  = int( ( job[7] >> 8 ) & 255 );
   const int  bcwW1 = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW
   const int  cuW   = int( job[7] >> 20 );                // the clipping block's width
+  setBounds( cuX, cuY );
   const bool hpel  = ( flags & FLAG_HPEL ) != 0;
   const bool bi    = ( flags & ( FLAG_L0 | FLAG_L1 ) ) == ( FLAG_L0 | FLAG_L1 );
   const bool dmvr  = ( flags & FLAG_DMVR ) != 0;
@@ -1855,8 +1884,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     // the samples the bilinear filters read: (w + 5) x (h + 5) from x0, y0
     const int x00 = x + ( start0.x >> 4 ), y00 = y + ( start0.y >> 4 );
     const int x01 = x + ( start1.x >> 4 ), y01 = y + ( start1.y >> 4 );
-    if( x00 >= 0 && x00 + w + 5 <= pc.picWidth && y00 >= 0 && y00 + h + 5 <= pc.picHeight && x01 >= 0 && x01 + w + 5 <= pc.picWidth && y01 >= 0
-        && y01 + h + 5 <= pc.picHeight )
+    if( x00 >= g_bounds.x && x00 + w + 5 <= g_bounds.z + 1 && y00 >= g_bounds.y && y00 + h + 5 <= g_bounds.w + 1 && x01 >= g_bounds.x
+        && x01 + w + 5 <= g_bounds.z + 1 && y01 >= g_bounds.y && y01 + h + 5 <= g_bounds.w + 1 )
     {
       // inside the picture (most subblocks): no clamping
       int16_t*  src0  = refPlane( ref0, 0 ) + y00 * pc.stride0 + x00;

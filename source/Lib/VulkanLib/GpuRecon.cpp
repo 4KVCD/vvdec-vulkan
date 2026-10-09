@@ -363,6 +363,7 @@ GpuRecon::~GpuRecon()
   m_ctx->free( m_lmcs );
   m_ctx->free( m_defer );
   m_ctx->free( m_scaling );
+  m_ctx->free( m_subpics );
   for( Buffer& buf: m_scratch )
   {
     m_ctx->free( buf );
@@ -1329,9 +1330,9 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
 // the push constants of shaders/inter.slang
 struct InterPush
 {
-  VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion, lmcsFwd, defer0, defer1, defer2, geo;
+  VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion, lmcsFwd, defer0, defer1, defer2, geo, subpics;
   int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth, ctuLog2, widthInCtus, num8x8, wide, scaleX, scaleY, numComp, wrapSps,
-                  wrapPps, wrapOffset;
+                  wrapPps, wrapOffset, subpicOn;
 };
 // the colocated motion as shaders/inter.slang writes DMVR's refinements into it
 static_assert( sizeof( ColocatedMotionInfo ) == 20 && offsetof( ColocatedMotionInfo, mv ) == 0 && sizeof( Mv ) == 8,
@@ -1339,7 +1340,7 @@ static_assert( sizeof( ColocatedMotionInfo ) == 20 && offsetof( ColocatedMotionI
 
 bool GpuRecon::interSupported( const SPS& sps )
 {
-  return intraSupported( sps ) && sps.getBitDepth() <= 10 && !sps.getSubPicInfoPresentFlag();
+  return intraSupported( sps ) && sps.getBitDepth() <= 10;
 }
 
 bool GpuRecon::interSupported( const CodingStructure& cs )
@@ -1475,7 +1476,39 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   push.wrapSps    = cs.sps->getUseWrapAround() ? 1 : 0;
   push.wrapPps    = cs.pps->getUseWrapAround() ? 1 : 0;
   push.wrapOffset = cs.pps->getUseWrapAround() ? cs.pps->getWrapAroundOffset() : 0;
-  push.wide       = pcv.chrFormat == CHROMA_420 && !push.wrapSps ? 1 : 0;
+  // subpictures treated as pictures: each CTU's rectangle (its subpicture's or
+  // the picture's), written with the picture's first jobs
+  const PPS& pps = *cs.pps;
+  for( int i = 0; pps.getNumSubPics() > 1 && i < pps.getNumSubPics(); i++ )
+  {
+    push.subpicOn |= pps.getSubPic( i ).getTreatedAsPicFlag() ? 1 : 0;
+  }
+  if( push.subpicOn )
+  {
+    const size_t size = ( size_t( pcv.sizeInCtus ) * 4 * sizeof( uint16_t ) + 255 ) & ~size_t( 255 );
+    if( ctuBegin == 0 )
+    {
+      if( m_subpics.size < size )
+      {
+        m_ctx->free( m_subpics );
+        m_subpics = m_ctx->alloc( size, MemKind::Upload );
+      }
+      uint16_t* rects = reinterpret_cast<uint16_t*>( m_subpics.mapped );
+      for( unsigned ctu = 0; ctu < pcv.sizeInCtus; ctu++ )
+      {
+        const Position pos( ( ctu % pcv.widthInCtus ) * pcv.maxCUWidth, ( ctu / pcv.widthInCtus ) * pcv.maxCUHeight );
+        const SubPic&  sub     = pps.getSubPicFromPos( pos );
+        const bool     asPic   = sub.getTreatedAsPicFlag();
+        rects[ctu * 4]         = uint16_t( asPic ? sub.getSubPicLeft() : 0 );
+        rects[ctu * 4 + 1]     = uint16_t( asPic ? sub.getSubPicTop() : 0 );
+        rects[ctu * 4 + 2]     = uint16_t( asPic ? sub.getSubPicRight() : pcv.lumaWidth - 1 );
+        rects[ctu * 4 + 3]     = uint16_t( asPic ? sub.getSubPicBottom() : pcv.lumaHeight - 1 );
+      }
+    }
+    push.subpics = m_subpics.addr;
+  }
+  // (tile16's reads keep to the picture)
+  push.wide = pcv.chrFormat == CHROMA_420 && !push.wrapSps && !push.subpicOn ? 1 : 0;
   for( int comp = 0; comp < (int) cs.picture->m_bufs[PIC_RECONSTRUCTION].bufs.size(); comp++ )
   {
     const PelStorage& pic    = cs.picture->m_bufs[PIC_RECONSTRUCTION];
