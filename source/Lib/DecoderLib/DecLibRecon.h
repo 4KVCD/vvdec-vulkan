@@ -205,7 +205,7 @@ private:
   // VVDEC_GPU_MIDER=1: the GPU derives the motion too, from the parse's CUs,
   // and its motion is compared with the CPU's (GpuRecon::compareMider)
   bool                           m_gpuMider = false;
-  // VVDEC_GPU_FRONT=1: the GPU's front end drives the pictures (all their stages on the GPU): the CTU tasks parse and
+  // the GPU's front end drives the pictures (all their stages on the GPU; VVDEC_GPU_FRONT=0: not): the CTU tasks parse and
   // write the records, the GPU does the rest
   bool                           m_gpuFrontOn = false;
   bool                           m_gpuFront   = false;   // this picture's

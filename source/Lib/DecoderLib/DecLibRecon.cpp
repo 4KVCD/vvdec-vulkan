@@ -485,7 +485,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     const char* mider = getenv( "VVDEC_GPU_MIDER" );
     m_gpuMider        = mider && atoi( mider ) != 0;
     const char* front = getenv( "VVDEC_GPU_FRONT" );
-    m_gpuFrontOn      = front && atoi( front ) != 0 && !m_gpuMider;
+    m_gpuFrontOn      = !( front && atoi( front ) == 0 ) && !m_gpuMider;
   }
 #endif
   if( !m_pcThreadResource )
