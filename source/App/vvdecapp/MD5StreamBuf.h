@@ -47,6 +47,13 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <streambuf>
 #include <array>
 #include <vector>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#if defined( _M_X64 ) || defined( __SSE4_2__ )
+#  include <nmmintrin.h>
+#  define VVDECAPP_CRC32C_INSTRUCTION 1
+#endif
 
 namespace vvdecoderapp
 {
@@ -67,6 +74,48 @@ static inline std::string MD5ToHexString(unsigned char hash[MD5_DIGEST_LENGTH])
   return result;
 }
 
+// VVDEC_FASTHASH=1: the output's CRC-32C instead of its MD5 (a test aid: fast enough to check a decode at full speed;
+// the digest is the CRC's 4 bytes, then 12 zero bytes)
+static inline bool fastHashRequested()
+{
+#ifdef _MSC_VER
+#  pragma warning( push )
+#  pragma warning( disable : 4996 )
+#endif
+  return getenv( "VVDEC_FASTHASH" ) != nullptr && atoi( getenv( "VVDEC_FASTHASH" ) ) != 0;
+#ifdef _MSC_VER
+#  pragma warning( pop )
+#endif
+}
+
+static inline uint32_t crc32c( uint32_t crc, const unsigned char* p, size_t n )
+{
+#if VVDECAPP_CRC32C_INSTRUCTION
+  uint64_t c = crc;
+  for( ; n >= 8; p += 8, n -= 8 )
+  {
+    uint64_t v;
+    memcpy( &v, p, 8 );
+    c = _mm_crc32_u64( c, v );
+  }
+  crc = uint32_t( c );
+  for( ; n > 0; p++, n-- )
+  {
+    crc = _mm_crc32_u8( crc, *p );
+  }
+#else
+  for( ; n > 0; p++, n-- )
+  {
+    crc ^= *p;
+    for( int k = 0; k < 8; k++ )
+    {
+      crc = ( crc >> 1 ) ^ ( 0x82f63b78u & ( 0u - ( crc & 1u ) ) );
+    }
+  }
+#endif
+  return crc;
+}
+
 class MD5StreamBuf : public std::streambuf
 {
 public:
@@ -78,7 +127,7 @@ public:
 
   int_type overflow(int_type ch) override
   {
-    m_md5_ctx.update( (unsigned char*)m_buffer.data(), (unsigned int)m_buffer.size() );
+    update( (unsigned char*)m_buffer.data(), m_buffer.size() );
 
     // reset start & end-pointers
     std::streambuf::setp( &m_buffer.front(), &m_buffer.back() + 1 );
@@ -89,13 +138,20 @@ public:
   {
     const auto fillLen = std::streambuf::pptr() - std::streambuf::pbase();
     if( fillLen )
-      m_md5_ctx.update( (unsigned char*)std::streambuf::pbase(), (unsigned int)fillLen );
+      update( (unsigned char*)std::streambuf::pbase(), (size_t)fillLen );
     return 0;
   }
 
   void finalize(unsigned char digest[16])
   {
     sync();
+    if( m_fast )
+    {
+      const uint32_t crc = ~m_crc;
+      memset( digest, 0, MD5_DIGEST_LENGTH );
+      memcpy( digest, &crc, sizeof( crc ) );
+      return;
+    }
     m_md5_ctx.finalize( digest);
   }
 
@@ -107,8 +163,20 @@ public:
   }
 
 private:
+  void update( const unsigned char* data, size_t size )
+  {
+    if( m_fast )
+    {
+      m_crc = crc32c( m_crc, data, size );
+      return;
+    }
+    m_md5_ctx.update( (unsigned char*)data, (unsigned int)size );
+  }
+
   vvdec::libmd5::MD5     m_md5_ctx;
   std::vector<char_type> m_buffer;
+  const bool             m_fast = fastHashRequested();
+  uint32_t               m_crc  = 0xffffffffu;
 };
 
 }   // namespace vvdecoderapp
