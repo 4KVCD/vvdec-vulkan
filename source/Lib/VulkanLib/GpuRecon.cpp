@@ -1176,7 +1176,7 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
 // the push constants of shaders/intra.slang
 struct IntraPush
 {
-  VkDeviceAddress plane0, plane1, plane2, jobs, waits, sync, mip, lmcsScale, defer1, defer2;
+  VkDeviceAddress plane0, plane1, plane2, jobs, waits, sync, mip, lmcsScale, defer0, defer1, defer2;
   int32_t         stride0, stride12, count, bitDepth, ctuLog2, scaleX, scaleY, collocated, picWidth, picHeight;
 };
 
@@ -1187,7 +1187,7 @@ bool GpuRecon::intraSupported( const CodingStructure& cs )
 
 bool GpuRecon::intraSupported( const SPS& sps )
 {
-  return sps.getChromaFormatIdc() == CHROMA_420 && !sps.getUseCiip() && !sps.getUseColorTrans() && !sps.getUseWrapAround();
+  return sps.getChromaFormatIdc() == CHROMA_420 && !sps.getUseColorTrans() && !sps.getUseWrapAround();
 }
 
 void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes )
@@ -1278,9 +1278,10 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   if( m_lmcsOn )
   {
     push.lmcsScale = m_lmcs.addr + m_lmcsCount * 2 * sizeof( int16_t );
-    push.defer1    = m_deferPlanes.addr[COMPONENT_Cb];
-    push.defer2    = m_deferPlanes.addr[COMPONENT_Cr];
   }
+  push.defer0 = m_deferPlanes.addr[COMPONENT_Y];
+  push.defer1 = m_deferPlanes.addr[COMPONENT_Cb];
+  push.defer2 = m_deferPlanes.addr[COMPONENT_Cr];
   CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
   // the counts of the jobs taken and done from zero; they and what the work
   // before wrote (the residuals, inter's predictions) visible to the jobs
@@ -1300,7 +1301,7 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
 // the push constants of shaders/inter.slang
 struct InterPush
 {
-  VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion, lmcsFwd, defer1, defer2;
+  VkDeviceAddress jobs, refs, dst0, dst1, dst2, dmvr, colMotion, lmcsFwd, defer0, defer1, defer2;
   int32_t         stride0, stride12, count, picWidth, picHeight, ctuSize, bitDepth, ctuLog2, widthInCtus, num8x8, wide;
 };
 // the colocated motion as shaders/inter.slang writes DMVR's refinements into it
@@ -1387,9 +1388,10 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   if( m_lmcsOn )
   {
     push.lmcsFwd = m_lmcs.addr;
-    push.defer1  = m_deferPlanes.addr[COMPONENT_Cb];
-    push.defer2  = m_deferPlanes.addr[COMPONENT_Cr];
   }
+  push.defer0 = m_deferPlanes.addr[COMPONENT_Y];
+  push.defer1 = m_deferPlanes.addr[COMPONENT_Cb];
+  push.defer2 = m_deferPlanes.addr[COMPONENT_Cr];
   push.ctuLog2     = getLog2( pcv.maxCUWidth );
   push.widthInCtus = pcv.widthInCtus;
   push.num8x8      = int32_t( pcv.num8x8CtuBlks );
@@ -1523,40 +1525,44 @@ void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptive
   m_prepared.picture = cs.picture;
 }
 
-void GpuRecon::setLmcs( const LmcsTables* tables, const PelStorage& pic )
+void GpuRecon::setPicture( const PelStorage& pic, const LmcsTables* tables, bool defer )
 {
+  // the instance's picture before is done: its work no more reads these
   m_lmcsOn = tables != nullptr;
-  if( !tables )
+  if( tables )
   {
-    return;
+    m_lmcsCount       = tables->fwd.size();
+    const size_t size = m_lmcsCount * ( 2 * sizeof( int16_t ) + sizeof( int32_t ) );
+    if( m_lmcs.size < size )
+    {
+      m_ctx->free( m_lmcs );
+      m_lmcs = m_ctx->alloc( size, MemKind::Upload );
+    }
+    memcpy( m_lmcs.mapped, tables->fwd.data(), m_lmcsCount * sizeof( int16_t ) );
+    memcpy( m_lmcs.mapped + m_lmcsCount * sizeof( int16_t ), tables->inv.data(), m_lmcsCount * sizeof( int16_t ) );
+    memcpy( m_lmcs.mapped + m_lmcsCount * 2 * sizeof( int16_t ), tables->chromaScale.data(), m_lmcsCount * sizeof( int32_t ) );
   }
-  // the instance's picture before is done (its work no more reads these)
-  m_lmcsCount       = tables->fwd.size();
-  const size_t size = m_lmcsCount * ( 2 * sizeof( int16_t ) + sizeof( int32_t ) );
-  if( m_lmcs.size < size )
+  if( defer )
   {
-    m_ctx->free( m_lmcs );
-    m_lmcs = m_ctx->alloc( size, MemKind::Upload );
-  }
-  memcpy( m_lmcs.mapped, tables->fwd.data(), m_lmcsCount * sizeof( int16_t ) );
-  memcpy( m_lmcs.mapped + m_lmcsCount * sizeof( int16_t ), tables->inv.data(), m_lmcsCount * sizeof( int16_t ) );
-  memcpy( m_lmcs.mapped + m_lmcsCount * 2 * sizeof( int16_t ), tables->chromaScale.data(), m_lmcsCount * sizeof( int32_t ) );
-  if( tables->chroma )
-  {
-    // the planes inter's chroma predictions are kept aside in: laid out as
-    // the picture's chroma planes (from their first sample)
-    const size_t plane = size_t( pic.bufs[COMPONENT_Cb].stride ) * pic.bufs[COMPONENT_Cb].height * sizeof( Pel );
-    CHECK( pic.bufs[COMPONENT_Cb].stride != pic.bufs[COMPONENT_Cr].stride || pic.bufs[COMPONENT_Cb].height != pic.bufs[COMPONENT_Cr].height,
-           "the chroma planes differ" );
-    if( m_defer.size < 2 * plane )
+    // the planes inter's predictions are kept aside in: laid out as the
+    // picture's planes (from their first sample)
+    size_t size = 0;
+    size_t at[MAX_NUM_COMPONENT];
+    for( size_t comp = 0; comp < pic.bufs.size(); comp++ )
+    {
+      at[comp] = size;
+      size    += ( size_t( pic.bufs[comp].stride ) * pic.bufs[comp].height * sizeof( Pel ) + 255 ) & ~size_t( 255 );
+    }
+    if( m_defer.size < size )
     {
       m_ctx->free( m_defer );
-      m_defer = m_ctx->alloc( 2 * plane, MemKind::Device );
+      m_defer = m_ctx->alloc( size, MemKind::Device );
     }
-    m_deferPlanes.addr[COMPONENT_Cb]   = m_defer.addr;
-    m_deferPlanes.addr[COMPONENT_Cr]   = m_defer.addr + plane;
-    m_deferPlanes.stride[COMPONENT_Cb] = pic.bufs[COMPONENT_Cb].stride;
-    m_deferPlanes.stride[COMPONENT_Cr] = pic.bufs[COMPONENT_Cr].stride;
+    for( size_t comp = 0; comp < pic.bufs.size(); comp++ )
+    {
+      m_deferPlanes.addr[comp]   = m_defer.addr + at[comp];
+      m_deferPlanes.stride[comp] = pic.bufs[comp].stride;
+    }
   }
 }
 

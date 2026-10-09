@@ -109,6 +109,7 @@ protected:
   void xGpuInterJobs      ( CodingUnit&      cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs, std::vector<gpu::TrafoJob>* trafoJobs,
                             std::vector<gpu::IntraJob>& intraJobs, gpu::WaveMap& waves );
   void xGpuTrafoJobs      ( CodingUnit&      cu, std::vector<gpu::TrafoJob>& jobs );
+  void xGpuCiipJobs       ( CodingUnit&      cu, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves, bool lmcsChroma );
 #endif
   void xDeriveCUMV        ( CodingUnit&      cu, MotionHist& hist );
 

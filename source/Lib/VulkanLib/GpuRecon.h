@@ -98,7 +98,7 @@ public:
   static bool filtersSupported( const CodingStructure& cs );
 
   // whether the GPU predicts the intra and IBC blocks of the picture: 4:2:0,
-  // none of the tools it lacks (CIIP, ACT, reference wraparound)
+  // none of the tools it lacks (ACT, reference wraparound)
   static bool intraSupported( const CodingStructure& cs );
   static bool intraSupported( const SPS& sps );
   // whether the GPU predicts the inter blocks of the pictures of the sequence:
@@ -146,13 +146,15 @@ public:
   // commands).
   int  startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
                      PelStorage& pic, bool waitFirst );
-  // LMCS for the picture whose work comes next, when the GPU predicts its
-  // intra blocks (tables: null without LMCS): its luma predicted and
-  // reconstructed in the mapped domain, inter's luma forward-mapped, the
-  // chroma residuals scaled (tables->chroma), then the luma mapped back
-  // before the in-loop filters. Set before the picture's work is recorded
-  // (its band's too), once the instance's picture before is done.
-  void setLmcs( const LmcsTables* tables, const PelStorage& pic );
+  // the picture whose work comes next, when the GPU predicts its intra
+  // blocks; set before its work is recorded (its band's too), once the
+  // instance's picture before is done. LMCS (tables: null without it): its
+  // luma predicted and reconstructed in the mapped domain, inter's luma
+  // forward-mapped, the chroma residuals scaled (tables->chroma), then the
+  // luma mapped back before the in-loop filters. defer: inter keeps some of
+  // its predictions aside, for intra jobs to finish (LMCS's chroma scaling,
+  // CIIP)
+  void setPicture( const PelStorage& pic, const LmcsTables* tables, bool defer );
   void endCompute();
   void endDownload( int download );
 
@@ -256,9 +258,9 @@ private:
   Buffer          m_matrices;                       // TrQuant's transform matrices
   Buffer          m_mip;                            // MIP's matrices
   Buffer          m_lfnst;                          // LFNST's matrices
-  // LMCS (setLmcs): its tables (the forward and inverse luma mappings,
-  // int16, the chroma scales, int32), and the planes inter's chroma
-  // predictions are kept aside in under its chroma scaling
+  // LMCS (setPicture): its tables (the forward and inverse luma mappings,
+  // int16, the chroma scales, int32); the planes inter's predictions are
+  // kept aside in (LMCS's chroma scaling, CIIP)
   bool            m_lmcsOn    = false;
   size_t          m_lmcsCount = 0;                  // the values a table
   Buffer          m_lmcs;

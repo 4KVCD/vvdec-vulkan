@@ -497,7 +497,7 @@ void DecCu::xGpuIbcJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::
 void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, const gpu::RefTable& refs, std::vector<gpu::TrafoJob>* trafoJobs,
                            std::vector<gpu::IntraJob>& intraJobs, gpu::WaveMap& waves )
 {
-  CHECK( cu.affineFlag() || cu.geoFlag() || cu.ciipFlag() || cu.mergeType() == MRG_TYPE_SUBPU_ATMVP, "an inter tool the GPU lacks" );
+  CHECK( cu.affineFlag() || cu.geoFlag() || cu.mergeType() == MRG_TYPE_SUBPU_ATMVP, "an inter tool the GPU lacks" );
 
   const Slice& slice = *cu.slice;
   int          flags = 0;
@@ -552,7 +552,10 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
       {
         continue;
       }
-      flags |= lmcsChroma && isChroma( compID ) ? gpu::InterJob::kDeferCb << ( c - 1 ) : gpu::InterJob::kResidualY << c;
+      if( !cu.ciipFlag() )
+      {
+        flags |= lmcsChroma && isChroma( compID ) ? gpu::InterJob::kDeferCb << ( c - 1 ) : gpu::InterJob::kResidualY << c;
+      }
       for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
       {
         if( tu.blocks[compID].valid() && !TU::getCbf( tu, compID ) && !( isChroma( compID ) && tu.jointCbCr ) )
@@ -573,6 +576,13 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
     }
   }
 
+  // CIIP: inter's prediction kept aside, all of it, for the blend with
+  // planar's (xGpuCiipJobs)
+  if( cu.ciipFlag() )
+  {
+    flags |= gpu::InterJob::kDeferY | gpu::InterJob::kDeferCb | gpu::InterJob::kDeferCb << 1;
+  }
+
   const int tileW = std::min<int>( cu.lwidth(), DMVR_SUBCU_WIDTH );
   const int tileH = std::min<int>( cu.lheight(), DMVR_SUBCU_HEIGHT );
   int       num   = 0;
@@ -587,9 +597,13 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
     }
   }
 
+  if( cu.ciipFlag() )
+  {
+    xGpuCiipJobs( cu, intraJobs, waves, lmcsChroma );
+  }
   // the chroma kept aside: each transform block's prediction plus its
   // residual, scaled where finishLMCSAndReco scales it
-  if( flags & ( gpu::InterJob::kDeferCb | gpu::InterJob::kDeferCb << 1 ) )
+  else if( flags & ( gpu::InterJob::kDeferCb | gpu::InterJob::kDeferCb << 1 ) )
   {
     for( TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
     {
@@ -613,6 +627,62 @@ void DecCu::xGpuInterJobs( CodingUnit& cu, std::vector<gpu::InterJob>& jobs, con
         intraJobs.push_back( job );
       }
     }
+  }
+}
+
+void DecCu::xGpuCiipJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::WaveMap& waves, bool lmcsChroma )
+{
+  // predBlendIntraCiip: planar's weight from whether the CUs left of the CU's
+  // bottom-left sample and above its top-right one are intra
+  const CodingUnit* cuLeft     = cu.cs->getCURestricted( cu.Y().bottomLeft().offset( -1, 0 ), cu, CHANNEL_TYPE_LUMA, cu.left );
+  const CodingUnit* cuAbove    = cu.cs->getCURestricted( cu.Y().topRight().offset( 0, -1 ), cu, CHANNEL_TYPE_LUMA, cu.above );
+  const int         wIntra     = 3 - !( cuLeft && CU::isIntra( *cuLeft ) ) - !( cuAbove && CU::isIntra( *cuAbove ) );
+  const bool        blendChroma = isChromaEnabled( cu.chromaFormat ) && cu.chromaSize().width > 2;
+
+  // a job a component of the whole CU, as predBlendIntraCiip predicts it
+  // (planar, from the CU's references; luma's [1 2 1]-filtered where
+  // useFilteredIntraRefSamples says), in its order: the reuse of the
+  // neighbourhood across the CU's components depends on it
+  for( int c = 0; c < getNumberValidComponents( cu.chromaFormat ); c++ )
+  {
+    const ComponentID compID = ComponentID( c );
+    const CompArea&   area   = cu.blocks[compID];
+    int               units[3];
+    m_pcIntraPred->getNeighborUnits( cu.firstTU, area, units );
+
+    int flags = 0;
+    if( cu.planeCbf( compID ) )
+    {
+      flags |= gpu::IntraJob::kResidual;
+    }
+    if( isLuma( compID ) && IntraPrediction::useFilteredIntraRefSamples( COMPONENT_Y, cu, cu ) )
+    {
+      flags |= gpu::IntraJob::kFiltered;
+    }
+    gpu::IntraJob job;
+    job.set( area.x, area.y, area.width, area.height, compID, gpu::IntraJob::kCiip, PLANAR_IDX, flags, 0 );
+    job.setNeighbors( units[0], units[1], units[2] );
+    job.setCiip( isLuma( compID ) || blendChroma ? wIntra : 0 );
+
+    int wave = std::max( waves.maxIn( compID, area.x - 1, area.y - 1, 2 * area.width + 1, 1 ),
+                         waves.maxIn( compID, area.x - 1, area.y, 1, 2 * area.height ) );
+    // LMCS: the chroma residual scaled (finishLMCSAndReco: a CU of CIIP lies
+    // in one VPDU, its transform units of the same size)
+    if( isChroma( compID ) && lmcsChroma && cu.firstTU.blocks[compID].area() > 4 )
+    {
+      bool residual = false;
+      for( const TransformUnit &tu : TUTraverser( &cu.firstTU, cu.lastTU->next ) )
+      {
+        residual |= TU::getCbf( tu, compID ) || tu.jointCbCr;
+      }
+      if( residual )
+      {
+        wave = std::max( wave, gpuLmcsChroma( cu, cu.firstTU.blocks[COMPONENT_Y].pos(), job, waves ) );
+      }
+    }
+    job.setWave( wave + 1 );
+    waves.set( compID, area.x, area.y, area.width, area.height, wave + 1 );
+    jobs.push_back( job );
   }
 }
 

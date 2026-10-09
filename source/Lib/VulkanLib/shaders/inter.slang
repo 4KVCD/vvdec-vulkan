@@ -12,8 +12,8 @@
 //   6: x | y << 16 of the CU               7: L0 reference | L1 reference << 8 (slots of the table)
 //   8: where DMVR's refinement goes (vvdec's DMVR MV cache)
 // flags: 1 L0, 2 L1, 4 DMVR, 8 AMVR half-sample filter, 16/32/64 residual in Y/Cb/Cr, 128 LMCS's forward mapping of
-// the luma prediction, 256/512 (LMCS's chroma scaling) the Cb/Cr prediction kept aside (defer1/2), the residual left
-// in the picture for intra.slang's kind 5
+// the luma prediction, 256/512 (LMCS's chroma scaling, CIIP) the Cb/Cr prediction kept aside (defer1/2), the residual
+// left in the picture for intra.slang's kind 5 or 6, 1024 (CIIP) so the luma's too (defer0)
 
 #include "common.slang"
 
@@ -35,7 +35,8 @@ struct Params
   int*       dmvr;        // vvdec's Mv: hor, ver
   int*       colMotion;   // the picture's colocated motion: vvdec's ColocatedMotionInfo, 5 ints
   int16_t*   lmcsFwd;     // LMCS: the forward luma mapping, a value each
-  int16_t*   defer1;      // LMCS: the chroma predictions kept aside, laid out as the chroma planes
+  int16_t*   defer0;      // LMCS, CIIP: the predictions kept aside, laid out as the planes
+  int16_t*   defer1;
   int16_t*   defer2;
   int        stride0;
   int        stride12;
@@ -59,6 +60,7 @@ struct Params
 #define FLAG_RES_Y 16
 #define FLAG_LUMA_MAP 128
 #define FLAG_DEFER_CB 256
+#define FLAG_DEFER_Y 1024
 
 #define IF_INTERNAL_OFFS 8192
 #define THREADS 64
@@ -1071,7 +1073,8 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     vy = clamp( vy + int4( lo16( resY.x ), hi16( resY.x ), lo16( resY.y ), hi16( resY.y ) ), 0, maxVal );
   }
-  *(uint2*)dstY = uint2( uint( vy.x & 0xffff ) | uint( vy.y ) << 16, uint( vy.z & 0xffff ) | uint( vy.w ) << 16 );
+  int16_t* outY = ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 + ( y + j ) * pc.stride0 + x + i0 : dstY;
+  *(uint2*)outY  = uint2( uint( vy.x & 0xffff ) | uint( vy.y ) << 16, uint( vy.z & 0xffff ) | uint( vy.w ) << 16 );
   int2 vc;
   [unroll]
   for( int o = 0; o < 2; o++ )
@@ -1283,7 +1286,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     const int  stride   = comp == 0 ? pc.stride0 : pc.stride12;
     const bool residual = ( flags & ( FLAG_RES_Y << comp ) ) != 0;
     const bool map      = comp == 0 && ( flags & FLAG_LUMA_MAP ) != 0;
-    int16_t*   out      = comp > 0 && ( flags & ( FLAG_DEFER_CB << ( comp - 1 ) ) ) != 0 ? ( comp == 1 ? pc.defer1 : pc.defer2 ) : dst;
+    const bool defer    = comp == 0 ? ( flags & FLAG_DEFER_Y ) != 0 : ( flags & ( FLAG_DEFER_CB << ( comp - 1 ) ) ) != 0;
+    int16_t*   out      = defer ? ( comp == 0 ? pc.defer0 : ( comp == 1 ? pc.defer1 : pc.defer2 ) ) : dst;
     const int  shiftNum = max( 2, 14 - pc.bitDepth ) + 1;
     const int  offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
     const int  log2W    = log2Int( bw );

@@ -516,16 +516,17 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   // reconstructed (the finish tasks)
   m_gpuFilters = m_gpuRecon && gpu::GpuRecon::filtersSupported( cs );
   // and, before the filters, the intra and IBC blocks, in waves of blocks the
-  // CTU tasks list (TaskGpuCtu). With LMCS's chroma residual scaling, the
-  // inter blocks too: the CPU's finishLMCSAndReco would read the luma the
-  // GPU makes. Not yet under LMCS, until a stream checks them: pictures with
+  // CTU tasks list (TaskGpuCtu). With LMCS's chroma residual scaling or
+  // CIIP, the inter blocks too: the CPU's finishLMCSAndReco would read the
+  // luma the GPU makes, CIIP blends the CPU's inter prediction with the GPU's
+  // intra one. Not yet under LMCS, until a stream checks them: pictures with
   // inter slices, IBC's chroma scaling (the conformance streams that have
   // them use tools not on the GPU yet)
   const bool lmcs        = cs.picHeader->getLmcsEnabledFlag();
   const bool lmcsChroma  = lmcs && cs.picHeader->getLmcsChromaResidualScaleFlag();
   const bool lmcsPending = lmcs && ( !isIntra || ( lmcsChroma && cs.sps->getIBCFlag() ) );
-  m_gpuIntra   = m_gpuFilters && gpu::GpuRecon::intraSupported( cs ) && !lmcsPending
-                 && ( isIntra || !lmcsChroma || gpu::GpuRecon::interSupported( cs ) );
+  const bool needsInter  = !isIntra && ( lmcsChroma || cs.sps->getUseCiip() );
+  m_gpuIntra   = m_gpuFilters && gpu::GpuRecon::intraSupported( cs ) && !lmcsPending && ( !needsInter || gpu::GpuRecon::interSupported( cs ) );
   // and, before those, the inter blocks, from the reference pictures on the GPU
   m_gpuInter   = m_gpuIntra && !isIntra && gpu::GpuRecon::interSupported( cs );
   // and, first of all, the residuals, when the CPU predicts nothing
@@ -545,7 +546,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
       m_pcThreadResource[0]->m_cReshaper.gpuTables( m_lmcsTables.fwd.data(), m_lmcsTables.inv.data(), m_lmcsTables.chromaScale.data() );
       m_lmcsTables.chroma = lmcsChroma;
     }
-    m_gpuRecon->setLmcs( lmcs ? &m_lmcsTables : nullptr, pcPic->m_bufs[PIC_RECONSTRUCTION] );
+    m_gpuRecon->setPicture( pcPic->m_bufs[PIC_RECONSTRUCTION], lmcs ? &m_lmcsTables : nullptr, ( lmcs && lmcsChroma ) || ( m_gpuInter && sps->getUseCiip() ) );
   }
   // the picture-sized buffers of what the CPU does itself, the filters' output
   // (SAO, ALF) and the prediction, allocated only for that (an instance's: 4K

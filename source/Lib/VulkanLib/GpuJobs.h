@@ -105,6 +105,7 @@ struct IntraJob
     kIbc     = 3,
     kMip     = 4,   // matrix-based intra prediction (the mode: the MIP mode)
     kLmcs    = 5,   // an inter CU's chroma under LMCS: its prediction (kept aside) plus its residual, scaled
+    kCiip    = 6,   // a CIIP CU's component: inter's prediction (kept aside) blended with planar's, plus the residual
   };
   enum Flags
   {
@@ -132,6 +133,9 @@ struct IntraJob
     w[5] = uint32_t( actualTop ) | uint32_t( actualLeft ) << 16;
   }
   void setBlockVector( int x, int y ) { w[6] = uint32_t( uint16_t( int16_t( x ) ) ) | uint32_t( uint16_t( int16_t( y ) ) ) << 16; }
+  // CIIP: planar's weight in the blend (predBlendIntraCiip's wIntra, 1 .. 3;
+  // 0: inter's prediction as it is)
+  void setCiip( int intraWeight ) { w[6] = uint32_t( intraWeight ); }
   // ISP: the CU (luma samples), its split (vvdec's ISPType: 1 horizontal, 2
   // vertical) and whether the neighbours left of and above the sub-partition's
   // prediction block are there (initIntraPatternChTypeISP's isLeftAvail and
@@ -172,6 +176,7 @@ struct InterJob
     kLumaMap   = 128,  // LMCS: the luma prediction forward-mapped
     kDeferCb   = 256,  // and kDeferCb << 1 for Cr, under LMCS's chroma scaling: the prediction kept aside, the
                        // residual left in the picture, for an intra job of kind IntraJob::kLmcs
+    kDeferY    = 1024, // CIIP: so for the luma too (with kDeferCb and Cr), for kind IntraJob::kCiip
   };
 
   uint32_t w[12];

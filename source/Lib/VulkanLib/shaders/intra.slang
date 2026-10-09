@@ -21,7 +21,8 @@
 // A job, 12 uints (VulkanLib/GpuJobs.h, IntraJob):
 //   0: x | y << 16                (in samples of its component)
 //   1: width | height << 8 | component << 16 | kind << 24   (kind: 0 planar/DC/angular, 1 BDPCM, 2 CCLM, 3 IBC,
-//      4 MIP, 5 an inter CU's chroma under LMCS: the prediction inter kept aside plus the residual)
+//      4 MIP, 5 an inter CU's chroma under LMCS: the prediction inter kept aside plus the residual, 6 a CIIP CU's
+//      component: inter's prediction, kept aside, blended with planar's, plus the residual)
 //   2: mode | flags << 8 | bdpcm direction << 16 | reference line << 24   (flags: 1 residual, 2 filtered references,
 //      4 MIP transposed, 8 ISP; the reference line: MRL's, 0 .. 2)
 //   3: top-left units | above units << 8 | left units << 16  (the reference samples available; ISP: the CU's)
@@ -29,7 +30,7 @@
 //      ISP: the CU's x | y << 16
 //   5: CCLM: actual top template samples | actual left << 16
 //      ISP: the CU's width | height << 8 | split << 16 (1 horizontal, 2 vertical) | left there << 18 | above there << 19
-//   6: IBC: block vector x | y << 16 (int16, samples of the component)
+//   6: IBC: block vector x | y << 16 (int16, samples of the component); CIIP: planar's weight (0 .. 3)
 //   7: the rows of the block this workgroup makes: first | count << 16, at
 //      most 256 samples (on the CPU: the block's wave)
 //   8: LMCS's chroma residual scaling: x | y << 16 of the luma CU whose
@@ -48,7 +49,8 @@ struct Params
   Atomic<uint>* sync;        // the jobs taken, the jobs done (zeroed before the dispatch)
   uint8_t*      mip;         // MIP's matrices: vvdec's mipMatrix4x4, mipMatrix8x8, mipMatrix16x16 in a row
   int*          lmcsScale;   // LMCS: the chroma residual scale of each average luma
-  int16_t*      defer1;      // LMCS: the inter CUs' chroma predictions kept aside, laid out as the chroma planes
+  int16_t*      defer0;      // LMCS, CIIP: inter's predictions kept aside, laid out as the planes
+  int16_t*      defer1;
   int16_t*      defer2;
   int           stride0;
   int           stride12;
@@ -1011,17 +1013,20 @@ void make( int tid, uint job[12] )
       s_tmpl[tid] = cclmTemplateLuma( x0, y0, job[4], picks, tid );
     }
   }
-  if( kind == 2 || residual )
+  if( kind == 2 || kind == 6 || residual )
   {
-    int luma[4];
-    int res[4];
+    // (CIIP: inter's prediction where CCLM keeps its luma)
+    int16_t* inter = comp == 0 ? pc.defer0 : ( comp == 1 ? pc.defer1 : pc.defer2 );
+    int      luma[4];
+    int      res[4];
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
       const int i = tid + 64 * k;
       const int x = ( s0 + i ) & ( w - 1 );
       const int y = ( s0 + i ) >> log2W;
-      luma[k]     = i < m && kind == 2 ? lumaDown( x0 << 1, y0 << 1, x, y, lmAbove, lmLeft ) : 0;
+      luma[k]     = i < m && kind == 2 ? lumaDown( x0 << 1, y0 << 1, x, y, lmAbove, lmLeft )
+                    : ( i < m && kind == 6 ? int( inter[( y0 + y ) * stride + x0 + x] ) : 0 );
       res[k]      = i < m && residual ? int( dst[( y0 + y ) * stride + x0 + x] ) : 0;
     }
     [unroll]
@@ -1096,7 +1101,8 @@ void make( int tid, uint job[12] )
   const int3 model = s_model;
 
   const int  bdpcmDir = int( ( job[2] >> 16 ) & 255 );
-  const bool doPdpcPlanarDc = kind == 0 && ( mode == PLANAR_IDX || mode == DC_IDX ) && pw >= 4 && ph >= 4 && refLine == 0;
+  const bool doPdpcPlanarDc = ( kind == 0 || kind == 6 ) && ( mode == PLANAR_IDX || mode == DC_IDX ) && pw >= 4 && ph >= 4 && refLine == 0;
+  const int  ciipIntra      = int( job[6] );   // CIIP: planar's weight
 
   // the samples, from shared memory alone
   for( int i = tid; i < m; i += 64 )
@@ -1127,6 +1133,11 @@ void make( int tid, uint job[12] )
     else
     {
       v = ang.isVer ? predictAngular( ang, comp, filtered, x + xoff, y, maxVal ) : predictAngular( ang, comp, filtered, y, x + xoff, maxVal );
+    }
+    if( kind == 6 )
+    {
+      // predBlendIntraCiip
+      v = ( ( 4 - ciipIntra ) * int( s_luma[i] ) + ciipIntra * v + 2 ) >> 2;
     }
     const int at = ( y0 + y ) * stride + x0 + x;
     dst[at]      = int16_t( residual ? clip3( 0, maxVal, v + ( lmcs ? lmcsResidual( int( s_res[i] ), lmcsScaling ) : int( s_res[i] ) ) ) : v );
