@@ -261,6 +261,53 @@ void DecLib::destroy()
          "GPU: residuals of %d pictures on the GPU, %d on the CPU; inter prediction of %d on the GPU, %d on the CPU; intra prediction of %d on the GPU, "
          "%d on the CPU; in-loop filters of %d on the GPU, %d on the CPU\n",
          residualGpu, residualCpu, interGpu, interCpu, intraGpu, intraCpu, filtersGpu, filtersCpu );
+    gpu::ParseStats parse;
+    bool            parseOn = false;
+    for( auto& dec: m_decLibRecon )
+    {
+      if( const gpu::ParseStats* s = dec.parseStats() )
+      {
+        parseOn = true;
+        parse.pictures += s->pictures;
+        parse.errors += s->errors;
+        parse.cusCompared += s->cusCompared;
+        parse.cusDiffer += s->cusDiffer;
+        parse.tusCompared += s->tusCompared;
+        parse.tusDiffer += s->tusDiffer;
+        parse.ctusCompared += s->ctusCompared;
+        parse.ctusDiffer += s->ctusDiffer;
+        parse.levelsCompared += s->levelsCompared;
+        parse.levelsDiffer += s->levelsDiffer;
+        parse.substreams += s->substreams;
+        parse.runs += s->runs;
+        parse.submissions += s->submissions;
+        for( int i = 0; i < 16; i++ )
+        {
+          parse.prof[i] += s->prof[i];
+        }
+      }
+    }
+    if( parseOn )
+    {
+      if( parse.prof[0] != 0 )
+      {
+        msg( INFO,
+             "GPU: parse's profile (clock cycles of the subgroup): CTUs %llu, of which CUs %llu (residuals %llu, of which levels written %llu), "
+             "records %llu, SAO/ALF %llu; in decodeBin %llu, decodeBinEP %llu; bins %llu context-coded, %llu bypass; CUs %llu, TUs %llu, coded "
+             "blocks %llu, levels %llu" "\n",
+             (unsigned long long) parse.prof[0], (unsigned long long) parse.prof[1], (unsigned long long) parse.prof[2],
+             (unsigned long long) parse.prof[3], (unsigned long long) parse.prof[4], (unsigned long long) parse.prof[5],
+             (unsigned long long) parse.prof[6], (unsigned long long) parse.prof[7], (unsigned long long) parse.prof[8],
+             (unsigned long long) parse.prof[9], (unsigned long long) parse.prof[10], (unsigned long long) parse.prof[11],
+             (unsigned long long) parse.prof[12], (unsigned long long) parse.prof[13] );
+      }
+      msg( INFO,
+           "GPU: parse (VVDEC_GPU_PARSE) of %lld pictures: CUs %lld compared with the CPU's, %lld differ; TUs %lld, %lld; CTUs (with SAO, ALF) %lld, "
+           "%lld; levels %lld, %lld; substreams %lld in %lld runs, %lld submissions" "\n",
+           (long long) parse.pictures, (long long) parse.cusCompared, (long long) parse.cusDiffer, (long long) parse.tusCompared,
+           (long long) parse.tusDiffer, (long long) parse.ctusCompared, (long long) parse.ctusDiffer, (long long) parse.levelsCompared,
+           (long long) parse.levelsDiffer, (long long) parse.substreams, (long long) parse.runs, (long long) parse.submissions );
+    }
     gpu::FrontEndStats check;
     bool               checkOn = false;
     for( auto& dec: m_decLibRecon )

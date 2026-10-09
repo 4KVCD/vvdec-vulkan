@@ -126,6 +126,7 @@ struct Options
   bool        async         = true;    // VVDEC_GPU_ASYNC=0: the front end on the compute queue, not an async queue
   bool        frontEnd      = true;    // VVDEC_GPU_FRONT=0: the CPU front end drives the pictures
   bool        frontEndCheck = false;   // VVDEC_GPU_MIDER=1: the CPU front end drives, the GPU front end is compared with it
+  bool        parse         = false;   // VVDEC_GPU_PARSE=1: the GPU parses the slice data too, compared with the CPU's parse
 
   static Options fromEnvironment();
 };
@@ -212,6 +213,7 @@ public:
   // is destroyed, with the memory in use now and at its peak: heap 0 is the GPU's own memory, heap 1 the
   // host-visible memory, in bytes.
   bool    profiling() const { return m_profiling; }
+  bool    shaderClock() const { return m_shaderClock; }   // VK_KHR_shader_clock's subgroup clock (with VVDEC_GPU_PROFILE)
   int64_t memoryNow( int heap ) const { return m_memoryNow[heap]; }
   int64_t memoryPeak( int heap ) const { return m_memoryPeak[heap]; }
   void    addTime( const char* label, double milliseconds );
@@ -272,6 +274,7 @@ private:
     long        count;
   };
   bool                             m_profiling = false;
+  bool                             m_shaderClock = false;
   std::vector<Time>                m_times;
   std::mutex                       m_timeMutex;
   std::atomic<int64_t>             m_memoryNow[2]  = { { 0 }, { 0 } };

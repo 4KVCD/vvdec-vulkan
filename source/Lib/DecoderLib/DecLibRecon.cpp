@@ -483,6 +483,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
     m_gpuRecon             = std::make_unique<gpu::GpuRecon>( m_gpu );
     m_gpuFrontEndCheck     = m_gpu->options().frontEndCheck;
     m_gpuFrontEndRequested = m_gpu->options().frontEnd && !m_gpu->options().frontEndCheck;
+    m_gpuParse             = m_gpu->options().parse && m_gpuFrontEndRequested;
   }
 #endif
   if( !m_pcThreadResource )
@@ -1599,6 +1600,7 @@ gpu::PictureJobs DecLibRecon::gpuPictureJobs( const CodingStructure& cs ) const
     jobs.useFrontEnd   = true;
     jobs.frontEndTrafo = m_gpuResidual;
     jobs.frontEndInter = m_gpuInter;
+    jobs.parse         = m_gpuParse;
   }
   return jobs;
 }
@@ -1660,6 +1662,10 @@ bool DecLibRecon::computeDoneTask( int, void* taskParam )
   FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( taskParam );
   DecLibRecon*        dec   = param->decLib;
   dec->m_gpuRecon->endCompute();
+  if( dec->m_gpuParse )
+  {
+    dec->m_gpuRecon->compareParse( *param->pic->cs, dec->m_gpuCuRecords, dec->m_gpuTuRecords );
+  }
   if( dec->m_gpuFrontEndCheck && dec->m_gpuIntra )
   {
     // the check: the GPU front end's results against the CPU's

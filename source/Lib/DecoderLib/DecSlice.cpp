@@ -55,6 +55,10 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include <vector>
 
+#if VVDEC_VULKAN
+#  include "VulkanLib/GpuParse.h"
+#endif
+
 
 namespace vvdec
 {
@@ -86,6 +90,14 @@ void DecSlice::parseSlice( Slice* slice, InputBitstream* bitstream, int threadId
   const bool     entryPointPresent = cs.sps->getEntryPointsPresentFlag();
 
   AdaptiveLoopFilter::reconstructCoeffAPSs( *slice );
+#if VVDEC_VULKAN
+  // the CTUs' SAO and ALF parameters for the comparison with the GPU's parse
+  const bool gpuCapture = gpu::parseShadowRequested();
+  if( gpuCapture && cs.m_gpuSaoAlf.size() != 7 * size_t( cs.pcv->sizeInCtus ) )
+  {
+    cs.m_gpuSaoAlf.assign( 7 * size_t( cs.pcv->sizeInCtus ), 0u );
+  }
+#endif
 
   CABACReader cabacReader;
   cabacReader.initBitstream( ppcSubstreams[0].get() );
@@ -156,6 +168,12 @@ void DecSlice::parseSlice( Slice* slice, InputBitstream* bitstream, int threadId
     ctuData.ph    = slice->getPicHeader();
 
     cabacReader.coding_tree_unit( cs, slice, ctuArea, prevQP, ctuRsAddr );
+#if VVDEC_VULKAN
+    if( gpuCapture )
+    {
+      gpu::captureSaoAlf( cs, int( ctuRsAddr ), cs.m_gpuSaoAlf.data() + 7 * size_t( ctuRsAddr ) );
+    }
+#endif
 
     if( ctuXPosInCtus == tileXPosInCtus && wavefrontsEnabled )
     {

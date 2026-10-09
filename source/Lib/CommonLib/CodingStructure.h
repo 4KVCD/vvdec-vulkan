@@ -263,6 +263,8 @@ public:
   size_t                                 m_gpuSliceTableWords = 0;
   uint32_t*                              gpuSliceTable( size_t words );   // room for words of it
   void                                   freeGpuSliceTable();
+  // VVDEC_GPU_PARSE: each CTU's SAO and ALF parameters as the CPU's parse left them (gpu::captureSaoAlf, 7 words a CTU)
+  std::vector<uint32_t>                  m_gpuSaoAlf;
 #endif
   void                                   allocColMiMap( ptrdiff_t size );
   void                                   freeColMiMap();

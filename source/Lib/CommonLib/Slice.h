@@ -2816,6 +2816,7 @@ public:
     class DecLibParser* decLibParser = nullptr;
     InputBitstream      bitstream;
     bool                clearColMotion = false;   // the picture's first slice: its task clears the colocated motion first
+    std::vector<uint8_t> gpuSliceData;            // VVDEC_GPU_PARSE: the slice data (after the header), for the GPU's parse
   } parseTaskParams;
 
   Barrier parseDone;

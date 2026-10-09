@@ -28,6 +28,10 @@ set( VVDEC_GPU_SHADERS
   "edges|edges"
   "intrasort|intrasort"
   "colmotion|colmotion"
+  "parse|parse"
+  "parse_prof|parse|PROFILE=1"
+  "parsecompact|parsecompact"
+  "parsecheck|parsecompact|CHECK=1"
 )
 
 if( NOT VVDEC_SLANGC OR NOT EXISTS "${VVDEC_SLANGC}" )

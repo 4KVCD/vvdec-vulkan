@@ -113,6 +113,7 @@ Options Options::fromEnvironment()
   options.async         = !( value( "VVDEC_GPU_ASYNC" ) && atoi( value( "VVDEC_GPU_ASYNC" ) ) == 0 );
   options.frontEnd      = !( value( "VVDEC_GPU_FRONT" ) && atoi( value( "VVDEC_GPU_FRONT" ) ) == 0 );
   options.frontEndCheck = value( "VVDEC_GPU_MIDER" ) && atoi( value( "VVDEC_GPU_MIDER" ) ) != 0;
+  options.parse         = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) != 0;
   return options;
 }
 
@@ -321,7 +322,9 @@ bool Context::init()
   // VK_AMD_shader_info the registers and memory each shader takes
   m_profiling = m_options.profile;
   const char* shaderInfo = "VK_AMD_shader_info";
+  const char* shaderClock = "VK_KHR_shader_clock";
   bool        hasShaderInfo = false;
+  bool        hasShaderClock = false;
   if( m_profiling )
   {
     uint32_t extensionCount = 0;
@@ -331,15 +334,34 @@ bool Context::init()
     for( const VkExtensionProperties& extension: extensions )
     {
       hasShaderInfo |= strcmp( extension.extensionName, shaderInfo ) == 0;
+      hasShaderClock |= strcmp( extension.extensionName, shaderClock ) == 0;
     }
+  }
+  // and the subgroup's clock, for the parse's profile (shaders/parse.slang's PROFILE)
+  VkPhysicalDeviceShaderClockFeaturesKHR enableClock{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR };
+  enableClock.shaderSubgroupClock = VK_TRUE;
+  if( hasShaderClock )
+  {
+    enableClock.pNext = enable.pNext;
+    enable.pNext      = &enableClock;
+  }
+  m_shaderClock = hasShaderClock;
+  std::vector<const char*> deviceExtensions;
+  if( hasShaderInfo )
+  {
+    deviceExtensions.push_back( shaderInfo );
+  }
+  if( hasShaderClock )
+  {
+    deviceExtensions.push_back( shaderClock );
   }
 
   VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
   deviceInfo.pNext                = &enable;
   deviceInfo.queueCreateInfoCount = numQueueInfos;
   deviceInfo.pQueueCreateInfos    = queueInfos;
-  deviceInfo.enabledExtensionCount   = hasShaderInfo ? 1 : 0;
-  deviceInfo.ppEnabledExtensionNames = hasShaderInfo ? &shaderInfo : nullptr;
+  deviceInfo.enabledExtensionCount   = uint32_t( deviceExtensions.size() );
+  deviceInfo.ppEnabledExtensionNames = deviceExtensions.empty() ? nullptr : deviceExtensions.data();
   if( m_api.vkCreateDevice( m_physical, &deviceInfo, nullptr, &m_device ) != VK_SUCCESS )
   {
     msg( WARNING, "Vulkan: creating the device on %s failed\n", props.deviceName );

@@ -63,6 +63,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "GpuFrontEnd.h"
 #include "GpuFrontEndCheck.h"
 #include "GpuJobs.h"
+#include "GpuParse.h"
 #include "GpuPictureMemory.h"
 
 #include "CommonLib/Buffer.h"
@@ -163,6 +164,12 @@ public:
   // keeps it, lfp its deblocking parameters, jobs the CTU tasks' jobs and edges.
   void                 compareFrontEnd( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp, const PictureJobs* jobs );
   const FrontEndStats& frontEndStats() const { return m_check.stats; }
+
+  // --- The check of the GPU parse (VVDEC_GPU_PARSE=1; GpuReconParse.cpp) ---
+  // After endCompute, compares the GPU's parse of the picture (PictureJobs::parse) with the CPU's: the records (cus,
+  // tus) and the SAO and ALF parameters (cs.m_gpuSaoAlf).
+  void              compareParse( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus );
+  const ParseStats& parseStats() const { return m_parse.stats; }
 
 private:
   // The planes of a picture as the shaders see them: each component's sample (0, 0) and stride, in samples.
@@ -272,6 +279,16 @@ private:
   void   recordIntraOrder( const PictureJobs& jobs );
   void   copyJobsForCheck( const PictureJobs& jobs );
   void   recordEdges( const CodingStructure& cs, const PictureJobs& jobs );
+
+  // --- The GPU parse (GpuReconParse.cpp) ---
+  // Parses the picture's slice data on the GPU in submissions of its own until every substream is parsed, then
+  // records into m_cmd the compaction of the parse's records and the check of its coefficient levels against the
+  // CPU's parse's (cpuLevels: the picture in host memory, where the CPU's parse left them).
+  void     recordParse( const CodingStructure& cs, const PictureJobs& jobs, const Planes& cpuLevels );
+  void     uploadParseInput( const CodingStructure& cs, size_t numCus, size_t numTus );
+  // Runs parse.slang (shader, with the push constants push) on the compute queue, a few dispatches per submission,
+  // until every substream is parsed or none advances any more. Returns the number of submissions.
+  uint32_t runParse( const void* push, size_t pushSize, int shader );
 
   // --- Reconstruction (GpuReconPrediction.cpp) ---
   // The residuals: the coefficient levels from levels (the picture in host memory, where the parse left them), the
@@ -440,6 +457,32 @@ private:
 
     void release( Context* ctx );
   } m_frontEnd;
+
+  // The GPU parse's buffers and commands (GpuReconParse.cpp)
+  struct ParseBuffers
+  {
+    ParseInput in;                     // the picture's inputs (buildParseInput)
+    bool       recorded = false;       // compareParse has results to compare
+    int        contexts = 0;           // parsectx.slang's context sets checked against vvdec's: 1 alike, -1 not
+    size_t     cuCap = 0, tuCap = 0;   // the room of the compacted records
+    // the inputs (upload memory)
+    Buffer bits, streams, ctuList, ctuInfo, slices, pic, scans;
+    // what the parse writes: the records in each CTU's slots, each CTU's bottom rows, the levels, the CTUs'
+    // readiness and the counters, WPP's saved contexts, per CTU its counts and SAO and ALF parameters, and each
+    // substream's state between dispatches
+    Buffer cus, tus, bottomRows, levels[MAX_NUM_COMPONENT], sync, wpp, ctuOut, state;
+    // the compacted records, their totals and the levels check's counts, for compareParse
+    Buffer outCus, outTus, outCtus, totals, check;
+    Buffer prof;   // VVDEC_GPU_PROFILE with the shader clock: parse_prof's cycle counts
+    bool   profRead = false;
+    // the parse's own commands on the compute queue
+    VkCommandPool   pool  = VK_NULL_HANDLE;
+    VkCommandBuffer cmd   = VK_NULL_HANDLE;
+    VkFence         fence = VK_NULL_HANDLE;
+    ParseStats      stats;
+
+    void release( Context* ctx );
+  } m_parse;
 
   // The front end's results copied to host memory for the check (VVDEC_GPU_MIDER=1; GpuFrontEndCheck.cpp), and
   // whether the picture recorded each copy

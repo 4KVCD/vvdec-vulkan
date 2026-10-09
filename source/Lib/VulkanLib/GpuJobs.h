@@ -417,6 +417,8 @@ struct PictureJobs
   bool                                      useFrontEnd   = false;
   bool                                      frontEndTrafo = false;
   bool                                      frontEndInter = false;
+  // VVDEC_GPU_PARSE=1: the GPU parses the picture's slice data too, compared with the CPU's parse (cus, tus)
+  bool                                      parse         = false;
 };
 
 }   // namespace gpu

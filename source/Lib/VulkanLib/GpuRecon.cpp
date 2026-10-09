@@ -220,6 +220,7 @@ GpuRecon::~GpuRecon()
   }
   m_frontEnd.release( m_ctx );
   m_check.release( m_ctx );
+  m_parse.release( m_ctx );
 }
 
 // ====================================================================================================================
@@ -942,6 +943,10 @@ void GpuRecon::recordFirstPart( const CodingStructure& cs, const PictureJobs& jo
     copyPlanes( pic, kHost, kTwin );
   }
   transferToComputeBarrier();
+  if( jobs.parse && jobs.cus )
+  {
+    recordParse( cs, jobs, hostPlanes( pic ) );
+  }
   if( jobs.cus && !frontEndAsync )
   {
     recordFrontEnd( cs, jobs );

@@ -138,6 +138,9 @@ public:
     //}
   }
   static uint8_t  getRenormBitsLPS  ( unsigned LPS )                    { return    m_RenormTable_32  [LPS>>3]; }
+  // the state and the rates as the GPU's parse keeps them (VulkanLib/GpuParse.cpp)
+  uint32_t        gpuState          ()                              const { return m_state[0] | uint32_t( m_state[1] ) << 16; }
+  uint32_t        gpuRates          ()                              const { return m_rate0 | uint32_t( m_rate1 ) << 8; }
   static uint8_t  getRenormBitsRange( unsigned range )                  { return    1; }
 private:
   uint16_t m_state[2];

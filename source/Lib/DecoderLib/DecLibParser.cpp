@@ -49,6 +49,10 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "UnitTools.h"
 #include "Utilities/ThreadPool.h"
 
+#if VVDEC_VULKAN
+#  include "VulkanLib/GpuParse.h"
+#endif
+
 #include <unordered_map>
 #include <utility>
 
@@ -991,6 +995,15 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
         pic->cs->clearColMotion();
       }
 
+#if VVDEC_VULKAN
+      // the slice data for the GPU's parse, compared with this one's
+      if( gpu::parseShadowRequested() )
+      {
+        const auto&  fifo = bitstream.getFifo();
+        const size_t at   = std::min<size_t>( bitstream.getByteLocation(), fifo.size() );
+        slice->parseTaskParams.gpuSliceData.assign( fifo.begin() + at, fifo.end() );
+      }
+#endif
       //  Decode a picture
       ITT_TASKSTART( itt_domain_prs, itt_handle_parse );
       decLib->m_cSliceDecoder.parseSlice( slice, &bitstream, threadId );
