@@ -98,8 +98,8 @@ public:
   static bool filtersSupported( const CodingStructure& cs );
 
   // whether the GPU predicts the intra and IBC blocks of the picture: 4:2:0,
-  // none of the tools it lacks (MIP, ISP, multiple reference lines, CIIP, ACT,
-  // LMCS, reference wraparound)
+  // none of the tools it lacks (MIP, ISP, CIIP, ACT, LMCS, reference
+  // wraparound)
   static bool intraSupported( const CodingStructure& cs );
   static bool intraSupported( const SPS& sps );
   // whether the GPU predicts the inter blocks of the pictures of the sequence:

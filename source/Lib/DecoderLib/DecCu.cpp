@@ -327,15 +327,18 @@ void DecCu::xGpuIntraJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu
         flags |= gpu::IntraJob::kFiltered;
       }
 
+      // the reference line (MRL: luma's lines further out)
+      const int refLine = isLuma( compID ) ? cu.multiRefIdx() : 0;
+
       gpu::IntraJob job;
-      job.set( area.x, area.y, area.width, area.height, compID, kind, kind == gpu::IntraJob::kAngular ? int( mode ) : 0, flags, bdpcm );
+      job.set( area.x, area.y, area.width, area.height, compID, kind, kind == gpu::IntraJob::kAngular ? int( mode ) : 0, flags, bdpcm, refLine );
       job.setNeighbors( units[0], units[1], units[2] );
 
       // what the block reads: its references (the row above with the
-      // above-right samples, the column to the left with the below-left ones),
-      // for CCLM also the luma at and around the block
-      int wave = std::max( waves.maxIn( compID, area.x - 1, area.y - 1, 2 * area.width + 1, 1 ),
-                           waves.maxIn( compID, area.x - 1, area.y, 1, 2 * area.height ) );
+      // above-right samples, the column to the left with the below-left ones,
+      // refLine further out), for CCLM also the luma at and around the block
+      int wave = std::max( waves.maxIn( compID, area.x - 1 - refLine, area.y - 1 - refLine, 2 * area.width + 1 + refLine, 1 ),
+                           waves.maxIn( compID, area.x - 1 - refLine, area.y - refLine, 1, 2 * area.height + refLine ) );
       if( kind == gpu::IntraJob::kCclm )
       {
         const IntraPrediction::LmAvailability lm = IntraPrediction::getLmAvailability( cu, area );

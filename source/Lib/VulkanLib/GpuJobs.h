@@ -104,11 +104,13 @@ struct IntraJob
 
   uint32_t w[8];
 
-  void set( int x, int y, int width, int height, int comp, int kind, int mode, int flags, int bdpcmDir )
+  // refLine: the reference line the block predicts from (MRL: luma's
+  // cu.multiRefIdx(), 0 .. 2)
+  void set( int x, int y, int width, int height, int comp, int kind, int mode, int flags, int bdpcmDir, int refLine = 0 )
   {
     w[0] = uint32_t( x ) | uint32_t( y ) << 16;
     w[1] = uint32_t( width ) | uint32_t( height ) << 8 | uint32_t( comp ) << 16 | uint32_t( kind ) << 24;
-    w[2] = uint32_t( mode ) | uint32_t( flags ) << 8 | uint32_t( bdpcmDir ) << 16;
+    w[2] = uint32_t( mode ) | uint32_t( flags ) << 8 | uint32_t( bdpcmDir ) << 16 | uint32_t( refLine ) << 24;
     w[3] = w[4] = w[5] = w[6] = w[7] = 0;
   }
   void setNeighbors( int topLeft, int above, int left ) { w[3] = uint32_t( topLeft ) | uint32_t( above ) << 8 | uint32_t( left ) << 16; }
