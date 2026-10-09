@@ -763,7 +763,10 @@ void GpuRecon::recordAlf( const CodingStructure& cs, const Planes& src, const Pl
   push.lumaHeight  = pcv.lumaHeight;
   push.lumaStride  = src.stride[COMPONENT_Y];
 
-  // luma
+  // luma (its shader loads and stores the rows 8 bytes at a time, from
+  // multiples of 4 samples)
+  CHECK_FATAL( src.addr[COMPONENT_Y] % 8 != 0 || src.stride[COMPONENT_Y] % 4 != 0 || dst.addr[COMPONENT_Y] % 8 != 0 || dst.stride[COMPONENT_Y] % 4 != 0,
+               "Vulkan: the luma rows are not 8-byte aligned" );
   push.src0      = src.addr[COMPONENT_Y];
   push.dst0      = dst.addr[COMPONENT_Y];
   push.coeff     = params + kAlfLumaCoeff;

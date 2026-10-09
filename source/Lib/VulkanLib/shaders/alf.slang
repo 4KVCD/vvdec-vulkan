@@ -62,17 +62,43 @@ int clipAlf( int c, int cur, int a, int b )
 
 #if CHROMA == 0
 
-// the workgroup's samples: 32 x 32 from (s_x0, s_y0) and a margin of 3, as
-// the picture's edges replicate them (vvdec's border extension)
+// the workgroup's samples: 32 x 32 from (s_x0, s_y0), with 3 rows above and
+// below and 4 samples left and right, as the picture's edges replicate them
+// (vvdec's border extension), in groups of 4 samples (8 bytes): what a 4x4
+// block's classification and filter read of a row comes as 3 groups, the
+// samples picked out of them in registers (read one at a time, a block read
+// shared memory some 600 times and waited for most reads: VideoQ 4K, ALF luma
+// 1.55 -> 1.33 ms a picture with ALF)
 #define TILE 32
-#define MARGIN 3
-#define TILE_W ( TILE + 2 * MARGIN )
-groupshared int16_t s_tile[TILE_W * TILE_W];
-static int          s_x0, s_y0;
+#define MARGIN 3                         // rows above and below
+#define GROUPS ( TILE / 4 + 2 )          // groups of 4 samples a row: the tile's and one either side
+#define TILE_H ( TILE + 2 * MARGIN )
+groupshared uint2 s_tile[TILE_H * GROUPS];
+static int        s_x0, s_y0;
 
-int px( int x, int y )
+// the samples ( bx - 4 .. bx + 7, y ) of the 4x4 block at bx (its group G of
+// the tile, the one before, the one after)
+struct Row
 {
-  return int( s_tile[( y - s_y0 + MARGIN ) * TILE_W + x - s_x0 + MARGIN] );
+  uint2 g0, g1, g2;
+
+  // sample j (a constant: the picks fold into shifts of registers)
+  int at( int j )
+  {
+    const uint2 g = j < 4 ? g0 : ( j < 8 ? g1 : g2 );
+    const uint  w = ( j & 2 ) == 0 ? g.x : g.y;
+    return int( ( j & 1 ) == 0 ? ( w & 0xffffu ) : ( w >> 16 ) );
+  }
+};
+
+Row tileRow( int y, int G )
+{
+  const int at = ( y - s_y0 + MARGIN ) * GROUPS + G;
+  Row       r;
+  r.g0 = s_tile[at - 1];
+  r.g1 = s_tile[at];
+  r.g2 = s_tile[at + 1];
+  return r;
 }
 
 static const int kTh[16] = { 0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4 };
@@ -84,10 +110,25 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
 {
   s_x0 = int( group.x ) * TILE;
   s_y0 = int( group.y ) * TILE;
-  for( int s = int( local.y * 8 + local.x ); s < TILE_W * TILE_W; s += 64 )
+  // the rows begin 8-byte aligned (GpuRecon::recordAlf), the groups too
+  for( int s = int( local.y * 8 + local.x ); s < TILE_H * GROUPS; s += 64 )
   {
-    const int r = s / TILE_W;
-    s_tile[s]   = int16_t( loadClamped( pc.src0, pc.srcStride, s_x0 - MARGIN + s - r * TILE_W, s_y0 - MARGIN + r, pc.width, pc.height ) );
+    const int r = s / GROUPS;
+    const int x = s_x0 - 4 + 4 * ( s - r * GROUPS );
+    const int y = clamp( s_y0 - MARGIN + r, 0, pc.height - 1 );
+    uint2     v;
+    if( x >= 0 && x + 3 < pc.width )
+    {
+      v = *(uint2*)( pc.src0 + y * pc.srcStride + x );
+    }
+    else
+    {
+      v.x = ( uint( loadClamped( pc.src0, pc.srcStride, x, y, pc.width, pc.height ) ) & 0xffffu )
+            | uint( loadClamped( pc.src0, pc.srcStride, x + 1, y, pc.width, pc.height ) ) << 16;
+      v.y = ( uint( loadClamped( pc.src0, pc.srcStride, x + 2, y, pc.width, pc.height ) ) & 0xffffu )
+            | uint( loadClamped( pc.src0, pc.srcStride, x + 3, y, pc.width, pc.height ) ) << 16;
+    }
+    s_tile[s] = v;
   }
   GroupMemoryBarrierWithGroupSync();
 
@@ -97,18 +138,17 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
   {
     return;
   }
+  const int G = ( bx - s_x0 ) / 4 + 1;
 
   // a CTU holds whole tiles (CTUs of 32 luma samples or more)
   const int ctu = ( by >> pc.ctuLog2 ) * pc.widthInCtus + ( bx >> pc.ctuLog2 );
   const int set = int( pc.ctus[ctu * 8 + CTU_LUMA_SET] );
   if( set == 255 )
   {
-    for( int y = by; y < by + 4; y++ )
+    [unroll]
+    for( int dy = 0; dy < 4; dy++ )
     {
-      for( int x = bx; x < bx + 4; x++ )
-      {
-        storePel( pc.dst0, pc.dstStride, x, y, px( x, y ) );
-      }
+      *(uint2*)( pc.dst0 + ( by + dy ) * pc.dstStride + bx ) = s_tile[( by + dy - s_y0 + MARGIN ) * GROUPS + G];
     }
     return;
   }
@@ -117,32 +157,42 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
   const int vbPos = vbH - 4;
   const int byVb  = by & ( vbH - 1 );
 
-  // classification: Laplacians at every other sample of the 8x8 window around the block
+  // classification: Laplacians at every other sample of the 8x8 window around
+  // the block (the rows' samples bx - 4 + j)
   int sumV = 0, sumH = 0, sumD0 = 0, sumD1 = 0;
   const int rFirst = byVb == vbPos ? 1 : 0;
   const int rLast  = byVb == vbPos - 4 ? 2 : 3;
-  for( int r = rFirst; r <= rLast; r++ )
+  [unroll]
+  for( int r = 0; r < 4; r++ )
   {
-    const int y0  = by - 2 + 2 * r;
-    int       ym1 = y0 - 1;
-    int       yp2 = y0 + 2;
-    if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos - 2 )
+    if( r >= rFirst && r <= rLast )
     {
-      yp2 = y0 + 1;
-    }
-    else if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos )
-    {
-      ym1 = y0;
-    }
-    for( int c = 0; c < 4; c++ )
-    {
-      const int x0 = bx - 2 + 2 * c;
-      const int a  = px( x0, y0 ) << 1;       // y0 (src1)
-      const int b  = px( x0 + 1, y0 + 1 ) << 1;  // y0 + 1 (src2)
-      sumV  += abs( a - px( x0, ym1 ) - px( x0, y0 + 1 ) ) + abs( b - px( x0 + 1, y0 ) - px( x0 + 1, yp2 ) );
-      sumH  += abs( a - px( x0 + 1, y0 ) - px( x0 - 1, y0 ) ) + abs( b - px( x0 + 2, y0 + 1 ) - px( x0, y0 + 1 ) );
-      sumD0 += abs( a - px( x0 - 1, ym1 ) - px( x0 + 1, y0 + 1 ) ) + abs( b - px( x0, y0 ) - px( x0 + 2, yp2 ) );
-      sumD1 += abs( a - px( x0 - 1, y0 + 1 ) - px( x0 + 1, ym1 ) ) + abs( b - px( x0, yp2 ) - px( x0 + 2, y0 ) );
+      const int y0  = by - 2 + 2 * r;
+      int       ym1 = y0 - 1;
+      int       yp2 = y0 + 2;
+      if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos - 2 )
+      {
+        yp2 = y0 + 1;
+      }
+      else if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos )
+      {
+        ym1 = y0;
+      }
+      const Row am = tileRow( ym1, G );
+      const Row a0 = tileRow( y0, G );
+      const Row a1 = tileRow( y0 + 1, G );
+      const Row ap = tileRow( yp2, G );
+      [unroll]
+      for( int c = 0; c < 4; c++ )
+      {
+        const int j0 = 2 + 2 * c;   // x0 = bx - 2 + 2 * c
+        const int a  = a0.at( j0 ) << 1;       // ( x0, y0 )
+        const int b  = a1.at( j0 + 1 ) << 1;   // ( x0 + 1, y0 + 1 )
+        sumV  += abs( a - am.at( j0 ) - a1.at( j0 ) ) + abs( b - a0.at( j0 + 1 ) - ap.at( j0 + 1 ) );
+        sumH  += abs( a - a0.at( j0 + 1 ) - a0.at( j0 - 1 ) ) + abs( b - a1.at( j0 + 2 ) - a1.at( j0 ) );
+        sumD0 += abs( a - am.at( j0 - 1 ) - a1.at( j0 + 1 ) ) + abs( b - a0.at( j0 ) - ap.at( j0 + 2 ) );
+        sumD1 += abs( a - a1.at( j0 - 1 ) - am.at( j0 + 1 ) ) + abs( b - ap.at( j0 ) - a0.at( j0 + 2 ) );
+      }
     }
   }
 
@@ -202,9 +252,13 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
     k[i] = int( pc.clip[base + i] );
   }
 
+  // the filter, a row of the block at a time: its 4 samples ( bx + i, y ) are
+  // the rows' samples j = 4 + i
   const int maxVal = ( 1 << pc.bitDepth ) - 1;
-  for( int y = by; y < by + 4; y++ )
+  [unroll]
+  for( int dy = 0; dy < 4; dy++ )
   {
+    const int y   = by + dy;
     const int yVb = y & ( vbH - 1 );
     int r1 = y + 1, r2 = y - 1, r3 = y + 2, r4 = y - 2, r5 = y + 3, r6 = y - 3;
     if( yVb < vbPos && yVb >= vbPos - 4 )
@@ -227,25 +281,36 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
     }
     const bool nearVb = yVb == vbPos - 1 || yVb == vbPos;
 
-    for( int x = bx; x < bx + 4; x++ )
+    const Row s0 = tileRow( y, G );
+    const Row s1 = tileRow( r1, G );
+    const Row s2 = tileRow( r2, G );
+    const Row s3 = tileRow( r3, G );
+    const Row s4 = tileRow( r4, G );
+    const Row s5 = tileRow( r5, G );
+    const Row s6 = tileRow( r6, G );
+    int       out[4];
+    [unroll]
+    for( int i = 0; i < 4; i++ )
     {
-      const int cur = px( x, y );
+      const int j   = 4 + i;
+      const int cur = s0.at( j );
       int sum = 0;
-      sum += c[0]  * clipAlf( k[0],  cur, px( x,     r5 ), px( x,     r6 ) );
-      sum += c[1]  * clipAlf( k[1],  cur, px( x + 1, r3 ), px( x - 1, r4 ) );
-      sum += c[2]  * clipAlf( k[2],  cur, px( x,     r3 ), px( x,     r4 ) );
-      sum += c[3]  * clipAlf( k[3],  cur, px( x - 1, r3 ), px( x + 1, r4 ) );
-      sum += c[4]  * clipAlf( k[4],  cur, px( x + 2, r1 ), px( x - 2, r2 ) );
-      sum += c[5]  * clipAlf( k[5],  cur, px( x + 1, r1 ), px( x - 1, r2 ) );
-      sum += c[6]  * clipAlf( k[6],  cur, px( x,     r1 ), px( x,     r2 ) );
-      sum += c[7]  * clipAlf( k[7],  cur, px( x - 1, r1 ), px( x + 1, r2 ) );
-      sum += c[8]  * clipAlf( k[8],  cur, px( x - 2, r1 ), px( x + 2, r2 ) );
-      sum += c[9]  * clipAlf( k[9],  cur, px( x + 3, y ),  px( x - 3, y ) );
-      sum += c[10] * clipAlf( k[10], cur, px( x + 2, y ),  px( x - 2, y ) );
-      sum += c[11] * clipAlf( k[11], cur, px( x + 1, y ),  px( x - 1, y ) );
-      sum = nearVb ? ( sum + ( 1 << 9 ) ) >> 10 : ( sum + 64 ) >> 7;
-      storePel( pc.dst0, pc.dstStride, x, y, clip3( 0, maxVal, sum + cur ) );
+      sum += c[0]  * clipAlf( k[0],  cur, s5.at( j ),     s6.at( j ) );
+      sum += c[1]  * clipAlf( k[1],  cur, s3.at( j + 1 ), s4.at( j - 1 ) );
+      sum += c[2]  * clipAlf( k[2],  cur, s3.at( j ),     s4.at( j ) );
+      sum += c[3]  * clipAlf( k[3],  cur, s3.at( j - 1 ), s4.at( j + 1 ) );
+      sum += c[4]  * clipAlf( k[4],  cur, s1.at( j + 2 ), s2.at( j - 2 ) );
+      sum += c[5]  * clipAlf( k[5],  cur, s1.at( j + 1 ), s2.at( j - 1 ) );
+      sum += c[6]  * clipAlf( k[6],  cur, s1.at( j ),     s2.at( j ) );
+      sum += c[7]  * clipAlf( k[7],  cur, s1.at( j - 1 ), s2.at( j + 1 ) );
+      sum += c[8]  * clipAlf( k[8],  cur, s1.at( j - 2 ), s2.at( j + 2 ) );
+      sum += c[9]  * clipAlf( k[9],  cur, s0.at( j + 3 ), s0.at( j - 3 ) );
+      sum += c[10] * clipAlf( k[10], cur, s0.at( j + 2 ), s0.at( j - 2 ) );
+      sum += c[11] * clipAlf( k[11], cur, s0.at( j + 1 ), s0.at( j - 1 ) );
+      sum    = nearVb ? ( sum + ( 1 << 9 ) ) >> 10 : ( sum + 64 ) >> 7;
+      out[i] = clip3( 0, maxVal, sum + cur );
     }
+    *(uint2*)( pc.dst0 + y * pc.dstStride + bx ) = uint2( uint( out[0] ) | uint( out[1] ) << 16, uint( out[2] ) | uint( out[3] ) << 16 );
   }
 }
 
