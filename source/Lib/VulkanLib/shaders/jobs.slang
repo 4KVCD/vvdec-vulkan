@@ -1768,6 +1768,117 @@ void waveSet( int c, int x, int y, int width, int height, int wave )
   }
 }
 
+// WaveMap::maxIn by the 32 threads of a row's workgroup (lane: the thread's), each a unit in turn: the highest wave in
+// the rectangle, in every thread
+int waveMaxInP( int c, int x, int y, int width, int height, int lane )
+{
+  if( x + width <= 0 || y + height <= 0 )
+  {
+    return 0;
+  }
+  const int x0   = max( x, 0 ) >> waveShiftX( c );
+  const int y0   = max( y, 0 ) >> waveShiftY( c );
+  const int x1   = min( ( x + width - 1 ) >> waveShiftX( c ), waveWidth( c ) - 1 );
+  const int y1   = min( ( y + height - 1 ) >> waveShiftY( c ), waveHeight( c ) - 1 );
+  const int cols = x1 - x0 + 1;
+  const int n    = cols > 0 && y1 >= y0 ? cols * ( y1 - y0 + 1 ) : 0;
+  int       wave = 0;
+  for( int u = lane; u < n; u += 32 )
+  {
+    const int j = y0 + u / cols;
+    wave        = max( wave, int( waveRow( c, j )[x0 + u - ( j - y0 ) * cols] ) );
+  }
+  return WaveActiveMax( wave );
+}
+
+void waveSetP( int c, int x, int y, int width, int height, int wave, int lane )
+{
+  const int x0   = x >> waveShiftX( c );
+  const int y0   = y >> waveShiftY( c );
+  const int x1   = min( ( x + width - 1 ) >> waveShiftX( c ), waveWidth( c ) - 1 );
+  const int y1   = min( ( y + height - 1 ) >> waveShiftY( c ), waveHeight( c ) - 1 );
+  const int cols = x1 - x0 + 1;
+  const int n    = cols > 0 && y1 >= y0 ? cols * ( y1 - y0 + 1 ) : 0;
+  for( int u = lane; u < n; u += 32 )
+  {
+    const int j                                       = y0 + u / cols;
+    waveRow( c, j )[x0 + u - ( j - y0 ) * cols] = uint( wave );
+  }
+}
+
+// a job's wave: one above the highest of what it reads (the row's 32 threads together)
+void jobWaveP( uint* job, int lane )
+{
+  const int  x     = int( job[0] & 0xffff );
+  const int  y     = int( job[0] >> 16 );
+  const int  w     = int( job[1] & 0xff );
+  const int  h     = int( ( job[1] >> 8 ) & 0xff );
+  const int  c     = int( ( job[1] >> 16 ) & 0xff );
+  const int  kind  = int( job[1] >> 24 );
+  const uint flags = ( job[2] >> 8 ) & 0xff;
+  int        wave  = 0;
+  if( kind == kIntraIbc )
+  {
+    const int bvx = int( int16_t( job[6] & 0xffff ) );
+    const int bvy = int( int16_t( job[6] >> 16 ) );
+    wave          = waveMaxInP( c, x + bvx, y + bvy, w, h, lane );
+  }
+  else if( kind != kIntraLmcs )
+  {
+    if( ( flags & kIntraIsp ) != 0 )
+    {
+      const int cx    = int( job[4] & 0xffff );
+      const int cy    = int( job[4] >> 16 );
+      const int cw    = int( job[5] & 0xff );
+      const int ch    = int( ( job[5] >> 8 ) & 0xff );
+      const int split = int( ( job[5] >> 16 ) & 3 );
+      int       px = x, pw = w;
+      if( split == 2 && ( ( cw == 8 && ch > 4 ) || cw == 4 ) )
+      {
+        px = cx + ( ( x - cx ) & ~3 );
+        pw = 4;
+      }
+      const bool first   = px == cx && y == cy;
+      const int  x0      = first ? cx : px;
+      const int  y0      = first ? cy : y;
+      const int  topLen  = first ? 2 * cw : cw + pw;
+      const int  leftLen = first ? 2 * ch : ch + h;
+      wave               = max( waveMaxInP( 0, x0 - 1, y0 - 1, topLen + 1, 1, lane ), waveMaxInP( 0, x0 - 1, y0, 1, leftLen, lane ) );
+    }
+    else
+    {
+      const int refLine = int( job[2] >> 24 );
+      wave = max( waveMaxInP( c, x - 1 - refLine, y - 1 - refLine, 2 * w + 1 + refLine, 1, lane ),
+                  waveMaxInP( c, x - 1 - refLine, y - refLine, 1, 2 * h + refLine, lane ) );
+    }
+  }
+  if( ( job[9] & 1 ) != 0 )
+  {
+    const int ax    = int( job[8] & 0xffff );
+    const int ay    = int( job[8] >> 16 );
+    const int count = 1 << ( ( job[9] >> 4 ) & 15 );
+    if( ( job[9] & 2 ) != 0 )
+    {
+      wave = max( wave, waveMaxInP( 0, ax - 1, ay, 1, count, lane ) );
+    }
+    if( ( job[9] & 4 ) != 0 )
+    {
+      wave = max( wave, waveMaxInP( 0, ax, ay - 1, count, 1, lane ) );
+    }
+  }
+  if( kind == kIntraCclm )
+  {
+    const int lx    = x << pc.csx, ly = y << pc.csy, lw = w << pc.csx, lh = h << pc.csy;
+    const int right = ( ( lx >> pc.log2Ctu ) + 2 ) << pc.log2Ctu;
+    wave            = max( wave, waveMaxInP( 0, lx - 4, ly - 4, min( 2 * lw + 8, right - ( lx - 4 ) ), 2 * lh + 8, lane ) );
+  }
+  if( lane == 0 )
+  {
+    job[7] = uint( wave + 1 );
+  }
+  waveSetP( c, x, y, w, h, wave + 1, lane );
+}
+
 // a job's wave: one above the highest of what it reads
 void jobWave( uint* job )
 {
@@ -1848,16 +1959,20 @@ void jobWave( uint* job )
 groupshared int s_scan[5][256];
 
 #if defined( WAVES )
-// a lane a CTU row, the rows taken in order (a count of them), the wavefront of vvdec's CTU tasks
+groupshared int s_row;
+
+// a workgroup of 32 threads a CTU row, the rows taken in order (a count of them), the wavefront of vvdec's CTU tasks
 [shader( "compute" )]
 [numthreads( 32, 1, 1 )]
 void main( uint3 local : SV_GroupThreadID )
 {
-  if( local.x != 0 )
+  const int lane = int( local.x );
+  if( lane == 0 )
   {
-    return;
+    s_row = int( pc.progress[pc.heightInCtus].add( 1u ) );
   }
-  const int row = int( pc.progress[pc.heightInCtus].add( 1u ) );
+  GroupMemoryBarrierWithGroupSync();
+  const int row = s_row;
   if( row >= pc.heightInCtus )
   {
     return;
@@ -1866,11 +1981,14 @@ void main( uint3 local : SV_GroupThreadID )
   {
     if( row > 0 )
     {
-      const uint need = uint( min( col + 2, pc.widthInCtus ) );
-      while( pc.progress[row - 1].load( MemoryOrder.Relaxed ) < need )
+      if( lane == 0 )
       {
+        const uint need = uint( min( col + 2, pc.widthInCtus ) );
+        while( pc.progress[row - 1].load( MemoryOrder.Relaxed ) < need )
+        {
+        }
       }
-      AllMemoryBarrier();
+      AllMemoryBarrierWithGroupSync();
     }
     const int ctu   = row * pc.widthInCtus + col;
     const int first = int( pc.ctus[ctu * 4] );
@@ -1885,11 +2003,16 @@ void main( uint3 local : SV_GroupThreadID )
                                          : int( pc.blocks[pc.numBlocks * kLists + 2] );
       for( int j = begin; j < min( end, pc.capIntra ); j++ )
       {
-        jobWave( pc.intra + j * 12 );
+        jobWaveP( pc.intra + j * 12, lane );
+        // (the job's units written before the next job's reads)
+        AllMemoryBarrierWithGroupSync();
       }
     }
-    AllMemoryBarrier();
-    pc.progress[row].store( uint( col + 1 ), MemoryOrder.Release );
+    AllMemoryBarrierWithGroupSync();
+    if( lane == 0 )
+    {
+      pc.progress[row].store( uint( col + 1 ), MemoryOrder.Release );
+    }
   }
 }
 #else

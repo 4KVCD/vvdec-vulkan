@@ -20,6 +20,9 @@
 
 #include "common.slang"
 
+// the thread's lane among its row's 32 (the loops over a CU's blocks take every 32nd from it)
+static int g_lane = 0;
+
 struct Params
 {
   uint*         cus;        // GpuFrontEnd.h's CuRecord: 32 words each, CTU by CTU, each CTU's in decoding order
@@ -1508,10 +1511,12 @@ bool subPuMvpCand( Cur cur, int count, bool spread )
 
   // the sub-PUs of 8x8
   const bool biRestricted = cur.cu.w + cur.cu.h <= 12;
-  for( int y = cur.cu.y; y < cur.cu.y + cur.cu.h; y += 8 )
+  const int  w8           = max( cur.cu.w >> 3, 1 );
+  for( int u = g_lane; u < w8 * max( cur.cu.h >> 3, 1 ); u += 32 )
   {
-    for( int x = cur.cu.x; x < cur.cu.x + cur.cu.w; x += 8 )
     {
+      const int  x      = cur.cu.x + ( u % w8 ) * 8;
+      const int  y      = cur.cu.y + ( u / w8 ) * 8;
       Motion     mi     = noMotion();
       const int2 colPos = clipColPos( cur, int2( x + 4 + t.x, y + 4 + t.y ) );
       bool       here   = false;
@@ -1829,19 +1834,19 @@ void setAllAffineMv( Cur cur, inout CuMotion c, int2 lt, int2 rt, int2 lb, int l
   {
     flb = clipMv18( roundAffineMv( int2( scaleHor + dHorX * ( w >> 1 ) + dVerX * ( h >> 1 ), scaleVer + dHorY * ( w >> 1 ) + dVerY * ( h >> 1 ) ), shift ) );
   }
-  for( int y = 0; y < h; y += 4 )
+  const int w4 = w >> 2;
+  for( int u = g_lane; u < w4 * ( h >> 2 ); u += 32 )
   {
-    for( int x = 0; x < w; x += 4 )
+    const int x  = ( u % w4 ) * 4;
+    const int y  = ( u / w4 ) * 4;
+    int2      mv = flb;
+    if( !spread )
     {
-      int2 mv = flb;
-      if( !spread )
-      {
-        mv = clipMv18( roundAffineMv( int2( scaleHor + dHorX * ( 2 + x ) + dVerX * ( 2 + y ), scaleVer + dHorY * ( 2 + x ) + dVerY * ( 2 + y ) ), shift ) );
-      }
-      int* mi       = motionPtr( cur.cu.x + x, cur.cu.y + y );
-      mi[2 * l]     = mv.x;
-      mi[2 * l + 1] = mv.y;
+      mv = clipMv18( roundAffineMv( int2( scaleHor + dHorX * ( 2 + x ) + dVerX * ( 2 + y ), scaleVer + dHorY * ( 2 + x ) + dVerY * ( 2 + y ) ), shift ) );
     }
+    int* mi       = motionPtr( cur.cu.x + x, cur.cu.y + y );
+    mi[2 * l]     = mv.x;
+    mi[2 * l + 1] = mv.y;
   }
   c.mv[l][0] = lt;
   c.mv[l][1] = rt;
@@ -2123,15 +2128,15 @@ void spanGeo( Cur cur, int splitDir, Motion m0, Motion m1 )
       offsetX += angle < 16 ? ( ( distance * w ) >> 3 ) : -( ( distance * w ) >> 3 );
     }
   }
-  for( int y = 0; y < h >> 2; y++ )
+  const int w4 = w >> 2;
+  for( int u = g_lane; u < w4 * ( h >> 2 ); u += 32 )
   {
-    const int lookUpY = ( ( ( 4 * y + offsetY ) * 2 ) + 5 ) * int( kDis[distY] );
-    for( int x = 0; x < w >> 2; x++ )
-    {
-      const int motionIdx = ( ( ( 4 * x + offsetX ) * 2 ) + 5 ) * int( kDis[distX] ) + lookUpY;
-      const int mask      = abs( motionIdx ) < 32 ? 2 : ( motionIdx <= 0 ? ( flip ? 0 : 1 ) : ( flip ? 1 : 0 ) );
-      storeMotionAt( cur.cu.x + 4 * x, cur.cu.y + 4 * y, mask == 2 ? bi : mask == 0 ? m0 : m1, kGpm );
-    }
+    const int x         = u % w4;
+    const int y         = u / w4;
+    const int lookUpY   = ( ( ( 4 * y + offsetY ) * 2 ) + 5 ) * int( kDis[distY] );
+    const int motionIdx = ( ( ( 4 * x + offsetX ) * 2 ) + 5 ) * int( kDis[distX] ) + lookUpY;
+    const int mask      = abs( motionIdx ) < 32 ? 2 : ( motionIdx <= 0 ? ( flip ? 0 : 1 ) : ( flip ? 1 : 0 ) );
+    storeMotionAt( cur.cu.x + 4 * x, cur.cu.y + 4 * y, mask == 2 ? bi : mask == 0 ? m0 : m1, kGpm );
   }
 }
 
@@ -2142,12 +2147,10 @@ void spanGeo( Cur cur, int splitDir, Motion m0, Motion m1 )
 // the CU's area of 4x4 blocks with one motion
 void spanMotion( Cur cur, Motion m, int kind )
 {
-  for( int y = 0; y < cur.cu.h; y += 4 )
+  const int w4 = cur.cu.w >> 2;
+  for( int u = g_lane; u < w4 * ( cur.cu.h >> 2 ); u += 32 )
   {
-    for( int x = 0; x < cur.cu.w; x += 4 )
-    {
-      storeMotionAt( cur.cu.x + x, cur.cu.y + y, m, kind );
-    }
+    storeMotionAt( cur.cu.x + ( u % w4 ) * 4, cur.cu.y + ( u / w4 ) * 4, m, kind );
   }
 }
 
@@ -2311,11 +2314,13 @@ void deriveCu( Cur cur )
   if( c.kind == kAffineCu )
   {
     // spanMotionInfo for affine: the lists' reference indices, the unused lists' motion zero
-    for( int y = 0; y < cu.h; y += 4 )
+    const int w4 = cu.w >> 2;
+    for( int u = g_lane; u < w4 * ( cu.h >> 2 ); u += 32 )
     {
-      for( int x = 0; x < cu.w; x += 4 )
       {
-        int* mi = motionPtr( cu.x + x, cu.y + y );
+        const int x  = ( u % w4 ) * 4;
+        const int y  = ( u / w4 ) * 4;
+        int*      mi = motionPtr( cu.x + x, cu.y + y );
         for( int l = 0; l < 2; l++ )
         {
           if( c.refIdx[l] < 0 )
@@ -2453,15 +2458,19 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 #else
 // a lane a CTU row: the rows taken in order (a count of them), so that a
 // row waits only for rows whose workgroups run already
+groupshared int s_row;
+
 [shader( "compute" )]
 [numthreads( 32, 1, 1 )]
 void main( uint3 local : SV_GroupThreadID )
 {
-  if( local.x != 0 )
+  g_lane = int( local.x );
+  if( g_lane == 0 )
   {
-    return;
+    s_row = int( pc.progress[pc.heightInCtus].add( 1u ) );
   }
-  const int row = int( pc.progress[pc.heightInCtus].add( 1u ) );
+  GroupMemoryBarrierWithGroupSync();
+  const int row = s_row;
   if( row >= pc.heightInCtus )
   {
     return;
@@ -2471,11 +2480,14 @@ void main( uint3 local : SV_GroupThreadID )
     // the row above past the CTU above right (or done, at the right edge)
     if( row > 0 )
     {
-      const uint need = uint( min( col + 2, pc.widthInCtus ) );
-      while( pc.progress[row - 1].load( MemoryOrder.Relaxed ) < need )
+      if( g_lane == 0 )
       {
+        const uint need = uint( min( col + 2, pc.widthInCtus ) );
+        while( pc.progress[row - 1].load( MemoryOrder.Relaxed ) < need )
+        {
+        }
       }
-      AllMemoryBarrier();
+      AllMemoryBarrierWithGroupSync();
     }
     const int ctu = row * pc.widthInCtus + col;
     if( ctuTileColStart( ctu ) )
@@ -2502,12 +2514,18 @@ void main( uint3 local : SV_GroupThreadID )
       {
         storeCuMotion( i, noCuMotion() );
         spanMotion( cur, noMotion(), kNotInter );
-        continue;
       }
-      deriveCu( cur );
+      else
+      {
+        deriveCu( cur );
+      }
+      // (the CU's blocks, each thread's, visible to all before the next CU looks them up)
+      AllMemoryBarrierWithGroupSync();
     }
-    AllMemoryBarrier();
-    pc.progress[row].store( uint( col + 1 ), MemoryOrder.Release );
+    if( g_lane == 0 )
+    {
+      pc.progress[row].store( uint( col + 1 ), MemoryOrder.Release );
+    }
   }
 }
 #endif
