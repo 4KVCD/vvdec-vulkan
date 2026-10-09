@@ -10,7 +10,9 @@
 //
 // An edge-offset sample changes only when both samples it compares with lie in
 // CTUs the filter may read (its own, or an available neighbour): that is what
-// the start and end positions of offsetBlock_core's loops amount to.
+// the start and end positions of offsetBlock_core's loops amount to. Nor where
+// it compares across a virtual boundary: on the boundary, or just before it
+// (isProcessDisabled).
 
 #include "common.slang"
 
@@ -28,6 +30,12 @@ struct Params
   int      widthInCtus;
   int      comp;
   int      bitDepth;
+  int      scaleX;     // the plane's subsampling
+  int      scaleY;
+  int      numVbVer;   // the picture's virtual boundaries (luma samples), vertical, then horizontal
+  int      numVbHor;
+  int      vbVer0, vbVer1, vbVer2;
+  int      vbHor0, vbHor1, vbHor2;
 };
 
 [[vk::push_constant]] Params pc;
@@ -35,6 +43,22 @@ struct Params
 int sgn( int v )
 {
   return v > 0 ? 1 : ( v < 0 ? -1 : 0 );
+}
+
+// whether a sample at p of the plane is on a virtual boundary of positions vb
+// (luma samples, scaled by s) or just before one
+bool onBoundary( int p, int num, int vb0, int vb1, int vb2, int s )
+{
+  const int vb[3] = { vb0, vb1, vb2 };
+  for( int i = 0; i < num; i++ )
+  {
+    const int v = vb[i] >> s;
+    if( p == v || p == v - 1 )
+    {
+      return true;
+    }
+  }
+  return false;
 }
 
 // whether the CTU holding the sample at (lx, ly), relative to this CTU of
@@ -95,8 +119,10 @@ void main( uint3 id : SV_DispatchThreadID )
     const int ly    = y - cy * pc.ctuHeight;
     const int w     = min( pc.ctuWidth, pc.width - cx * pc.ctuWidth );
     const int h     = min( pc.ctuHeight, pc.height - cy * pc.ctuHeight );
-    const int avail = int( pc.ctus[base + 2] );
-    if( readable( lx - dx, ly - dy, w, h, avail ) && readable( lx + dx, ly + dy, w, h, avail ) )
+    const int  avail    = int( pc.ctus[base + 2] );
+    const bool disabled = ( dx != 0 && onBoundary( x, pc.numVbVer, pc.vbVer0, pc.vbVer1, pc.vbVer2, pc.scaleX ) )
+                          || ( dy != 0 && onBoundary( y, pc.numVbHor, pc.vbHor0, pc.vbHor1, pc.vbHor2, pc.scaleY ) );
+    if( !disabled && readable( lx - dx, ly - dy, w, h, avail ) && readable( lx + dx, ly + dy, w, h, avail ) )
     {
       const int edge = sgn( v - loadPel( pc.src, pc.srcStride, x - dx, y - dy ) ) + sgn( v - loadPel( pc.src, pc.srcStride, x + dx, y + dy ) );
       if( edge != 0 )

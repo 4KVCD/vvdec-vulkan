@@ -6,6 +6,8 @@
 set( VVDEC_GPU_SHADERS
   "alf_luma|alf|CHROMA=0"
   "alf_chroma|alf|CHROMA=1"
+  "alf_luma_bounds|alf|CHROMA=0|BOUNDS=1"
+  "alf_chroma_bounds|alf|CHROMA=1|BOUNDS=1"
   "sao|sao"
   "deblock_luma_ver|deblock|CHROMA=0|DIR=0"
   "deblock_luma_hor|deblock|CHROMA=0|DIR=1"

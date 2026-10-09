@@ -169,19 +169,22 @@ protected:
   void _initAdaptiveLoopFilterARM();
 #endif
 
+public:
+  // (static: the GPU's ALF takes each CTU's)
+  static bool isClipOrCrossedByVirtualBoundaries( const CodingStructure& cs,
+                                                  const Area& pos,
+                                                  bool&       clipTop,
+                                                  bool&       clipBottom,
+                                                  bool&       clipLeft,
+                                                  bool&       clipRight,
+                                                  int&        numHorVirBndry,
+                                                  int&        numVerVirBndry,
+                                                  int         horVirBndryPos[],
+                                                  int         verVirBndryPos[],
+                                                  int&        rasterSliceAlfPad
+                                                  );
+
 protected:
-  bool isClipOrCrossedByVirtualBoundaries( const CodingStructure& cs,
-                                           const Area& pos,
-                                           bool&       clipTop,
-                                           bool&       clipBottom,
-                                           bool&       clipLeft,
-                                           bool&       clipRight,
-                                           int&        numHorVirBndry,
-                                           int&        numVerVirBndry,
-                                           int         horVirBndryPos[],
-                                           int         verVirBndryPos[],
-                                           int&        rasterSliceAlfPad
-                                           );
 
   static const int        m_classToFilterMapping  [NUM_FIXED_FILTER_SETS][MAX_NUM_ALF_CLASSES];
   short                   m_fixedFilterSetCoeffDec[NUM_FIXED_FILTER_SETS][MAX_NUM_ALF_TRANSPOSE_ID * MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_LUMA_COEFF];

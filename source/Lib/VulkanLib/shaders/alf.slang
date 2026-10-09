@@ -1,8 +1,13 @@
 // The adaptive loop filter (ALF) and the cross-component ALF of a picture, as
 // vvdec's AdaptiveLoopFilter does it (deriveClassificationBlk, filterBlk,
-// filterBlkCcAlf), for pictures that no slice, tile, subpicture or virtual
-// boundary splits: there the filters see the whole picture, with the samples
-// beyond its edges replicated (vvdec's border extension).
+// filterBlkCcAlf): the filters see the whole picture, with the samples beyond
+// its edges replicated (vvdec's border extension).
+//
+// BOUNDS=1, for pictures with virtual boundaries or slice, tile or subpicture
+// boundaries the loop filters must not cross (AdaptiveLoopFilter::filterCTU):
+// a CTU splits into regions at the virtual boundaries inside it, and a sample's
+// filter sees its region, the samples beyond the region's clipped sides
+// replicated (see Region); a thread reads what it needs of the picture itself.
 //
 // CHROMA=0: a thread classifies one 4x4 luma block and filters it (7x7 diamond),
 //           from the workgroup's 32x32 samples and their 3-sample margin,
@@ -12,7 +17,8 @@
 //
 // Per CTU, 8 bytes: luma filter set (255: off), chroma APS, Cb alternative
 // (255: off), Cr alternative (255: off), Cb and Cr CC-ALF filter as
-// APS * 4 + filter (255: off), 2 unused.
+// APS * 4 + filter (255: off), the CTU's boundaries (BOUNDS: clipped top 1,
+// bottom 2, left 4, right 8; rasterSliceAlfPad << 4), 1 unused.
 
 #include "common.slang"
 
@@ -22,6 +28,7 @@
 #define CTU_CR_ALT 3
 #define CTU_CC_CB 4
 #define CTU_CC_CR 5
+#define CTU_BOUNDS 6
 
 #define NUM_CLASSES 25
 #define LUMA_COEFF 13
@@ -51,6 +58,10 @@ struct Params
   int      bitDepth;
   int      scaleX;    // chroma subsampling
   int      scaleY;
+  int      numVbVer;  // BOUNDS: the picture's virtual boundaries (luma samples), vertical, then horizontal
+  int      numVbHor;
+  int      vbVer0, vbVer1, vbVer2;
+  int      vbHor0, vbHor1, vbHor2;
 };
 
 [[vk::push_constant]] Params pc;
@@ -60,7 +71,285 @@ int clipAlf( int c, int cur, int a, int b )
   return clip3( -c, c, a - cur ) + clip3( -c, c, b - cur );
 }
 
-#if CHROMA == 0
+#ifndef BOUNDS
+#define BOUNDS 0
+#endif
+
+#if BOUNDS
+// the region of its CTU a sample lies in, as filterCTU splits the CTU at the
+// virtual boundaries inside it (in luma samples; x1, y1 past the end), which of
+// its sides clip -- a virtual boundary, a slice, tile or subpicture boundary
+// without loop filtering across (the CTU's: isClipOrCrossedByVirtualBoundaries),
+// the picture's edge -- and the CTU's raster-slice corners (rasterSliceAlfPad:
+// 1 its top-left, 2 its bottom-right, for the regions there)
+struct Region
+{
+  int  x0, x1, y0, y1;
+  bool clipL, clipR, clipT, clipB;
+  int  pad;
+  int  cx0, cy0, cx1, cy1;   // the CTU
+};
+
+Region regionOf( int lx, int ly )
+{
+  const int ctuSize = 1 << pc.ctuLog2;
+  Region    r;
+  r.cx0             = ( lx >> pc.ctuLog2 ) << pc.ctuLog2;
+  r.cy0             = ( ly >> pc.ctuLog2 ) << pc.ctuLog2;
+  r.cx1             = min( r.cx0 + ctuSize, pc.lumaWidth );
+  r.cy1             = min( r.cy0 + ctuSize, pc.lumaHeight );
+  const int flags   = int( pc.ctus[( ( ly >> pc.ctuLog2 ) * pc.widthInCtus + ( lx >> pc.ctuLog2 ) ) * 8 + CTU_BOUNDS] );
+  r.x0              = r.cx0;
+  r.x1              = r.cx1;
+  r.y0              = r.cy0;
+  r.y1              = r.cy1;
+  r.clipT           = ( flags & 1 ) != 0 || r.y0 == 0;
+  r.clipB           = ( flags & 2 ) != 0 || r.y1 == pc.lumaHeight;
+  r.clipL           = ( flags & 4 ) != 0 || r.x0 == 0;
+  r.clipR           = ( flags & 8 ) != 0 || r.x1 == pc.lumaWidth;
+  const int ver[3]  = { pc.vbVer0, pc.vbVer1, pc.vbVer2 };
+  const int hor[3]  = { pc.vbHor0, pc.vbHor1, pc.vbHor2 };
+  for( int i = 0; i < pc.numVbVer; i++ )
+  {
+    const int v = ver[i];
+    if( r.cx0 < v && v < r.cx1 )
+    {
+      if( v <= lx )
+      {
+        r.x0    = max( r.x0, v );
+        r.clipL = true;
+      }
+      else
+      {
+        r.x1    = min( r.x1, v );
+        r.clipR = true;
+      }
+    }
+  }
+  for( int i = 0; i < pc.numVbHor; i++ )
+  {
+    const int v = hor[i];
+    if( r.cy0 < v && v < r.cy1 )
+    {
+      if( v <= ly )
+      {
+        r.y0    = max( r.y0, v );
+        r.clipT = true;
+      }
+      else
+      {
+        r.y1    = min( r.y1, v );
+        r.clipB = true;
+      }
+    }
+  }
+  const int pad = flags >> 4;
+  r.pad         = ( ( pad & 1 ) != 0 && r.x0 == r.cx0 && r.y0 == r.cy0 ? 1 : 0 ) | ( ( pad & 2 ) != 0 && r.x1 == r.cx1 && r.y1 == r.cy1 ? 2 : 0 );
+  return r;
+}
+
+// the region in a plane subsampled by sx, sy
+Region scaled( Region r, int sx, int sy )
+{
+  r.x0  >>= sx; r.x1  >>= sx; r.cx0 >>= sx; r.cx1 >>= sx;
+  r.y0  >>= sy; r.y1  >>= sy; r.cy0 >>= sy; r.cy1 >>= sy;
+  return r;
+}
+
+// a sample of a plane (w x h) as the filters of a sample in region r see it
+// (filterCTU's copy of the region with its margin: the raster slice's corners
+// padded from the CTU's edge column, padBorderPel; beyond the clipped sides the
+// region's edge, extendBorderPel; beyond the picture its edge)
+int fetch( int16_t* p, int stride, int x, int y, Region r, int w, int h )
+{
+  if( ( r.pad & 1 ) != 0 && x < r.cx0 && y < r.cy0 )
+  {
+    x = r.cx0;
+  }
+  if( ( r.pad & 2 ) != 0 && x >= r.cx1 && y >= r.cy1 )
+  {
+    x = r.cx1 - 1;
+  }
+  x = r.clipL ? max( x, r.x0 ) : x;
+  x = r.clipR ? min( x, r.x1 - 1 ) : x;
+  y = r.clipT ? max( y, r.y0 ) : y;
+  y = r.clipB ? min( y, r.y1 - 1 ) : y;
+  return loadClamped( p, stride, x, y, w, h );
+}
+#endif
+
+#if CHROMA == 0 && BOUNDS
+
+static const int kTh[16] = { 0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4 };
+static const int kTransposeTable[8] = { 0, 1, 0, 2, 2, 3, 1, 3 };
+
+// a thread a 4x4 luma block: its class from the Laplacians of the 2x2 cells
+// around it, then the filter, every read through its region (fetch)
+[shader( "compute" )]
+[numthreads( 8, 8, 1 )]
+void main( uint3 id : SV_DispatchThreadID )
+{
+  const int bx = int( id.x ) * 4;
+  const int by = int( id.y ) * 4;
+  if( bx >= pc.width || by >= pc.height )
+  {
+    return;
+  }
+  const int ctu = ( by >> pc.ctuLog2 ) * pc.widthInCtus + ( bx >> pc.ctuLog2 );
+  const int set = int( pc.ctus[ctu * 8 + CTU_LUMA_SET] );
+  if( set == 255 )
+  {
+    for( int dy = 0; dy < 4; dy++ )
+    {
+      for( int dx = 0; dx < 4; dx++ )
+      {
+        storePel( pc.dst0, pc.dstStride, bx + dx, by + dy, loadPel( pc.src0, pc.srcStride, bx + dx, by + dy ) );
+      }
+    }
+    return;
+  }
+  const Region rg    = regionOf( bx, by );
+  const int    vbH   = 1 << pc.ctuLog2;
+  const int    vbPos = vbH - 4;
+  const int    byVb  = by & ( vbH - 1 );
+
+  // classification: the Laplacians of the cells of the block's window, the
+  // 4x4 cells from ( bx - 2, by - 2 ), but the rows the virtual boundary hides
+  int sumV = 0, sumH = 0, sumD0 = 0, sumD1 = 0;
+  const int rFirst = byVb == vbPos ? 1 : 0;
+  const int rLast  = byVb == vbPos - 4 ? 2 : 3;
+  for( int r = rFirst; r <= rLast; r++ )
+  {
+    const int y0  = by - 2 + 2 * r;
+    int       ym1 = y0 - 1;
+    int       yp2 = y0 + 2;
+    if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos - 2 )
+    {
+      yp2 = y0 + 1;
+    }
+    else if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos )
+    {
+      ym1 = y0;
+    }
+    for( int c = 0; c < 4; c++ )
+    {
+      const int x0 = bx - 2 + 2 * c;
+#define S( X, Y ) fetch( pc.src0, pc.srcStride, X, Y, rg, pc.width, pc.height )
+      const int a = S( x0, y0 ) << 1;
+      const int b = S( x0 + 1, y0 + 1 ) << 1;
+      sumV  += abs( a - S( x0, ym1 ) - S( x0, y0 + 1 ) ) + abs( b - S( x0 + 1, y0 ) - S( x0 + 1, yp2 ) );
+      sumH  += abs( a - S( x0 + 1, y0 ) - S( x0 - 1, y0 ) ) + abs( b - S( x0 + 2, y0 + 1 ) - S( x0, y0 + 1 ) );
+      sumD0 += abs( a - S( x0 - 1, ym1 ) - S( x0 + 1, y0 + 1 ) ) + abs( b - S( x0, y0 ) - S( x0 + 2, yp2 ) );
+      sumD1 += abs( a - S( x0 - 1, y0 + 1 ) - S( x0 + 1, ym1 ) ) + abs( b - S( x0, yp2 ) - S( x0 + 2, y0 ) );
+    }
+  }
+
+  const int shift    = pc.bitDepth + 4;
+  const int tempAct  = sumV + sumH;
+  const int scale    = ( byVb == vbPos - 4 || byVb == vbPos ) ? 96 : 64;
+  const int activity = clip3( 0, 15, ( tempAct * scale ) >> shift );
+  int       classIdx = kTh[activity];
+
+  int hv1, hv0, d1, d0, dirTempHV, dirTempD;
+  if( sumV > sumH )
+  {
+    hv1 = sumV; hv0 = sumH; dirTempHV = 1;
+  }
+  else
+  {
+    hv1 = sumH; hv0 = sumV; dirTempHV = 3;
+  }
+  if( sumD0 > sumD1 )
+  {
+    d1 = sumD0; d0 = sumD1; dirTempD = 0;
+  }
+  else
+  {
+    d1 = sumD1; d0 = sumD0; dirTempD = 2;
+  }
+  int hvd1, hvd0, mainDirection, secondaryDirection;
+  // 32-bit unsigned products, wrapping as vvdec's do
+  if( uint( d1 ) * uint( hv0 ) > uint( hv1 ) * uint( d0 ) )
+  {
+    hvd1 = d1; hvd0 = d0; mainDirection = dirTempD; secondaryDirection = dirTempHV;
+  }
+  else
+  {
+    hvd1 = hv1; hvd0 = hv0; mainDirection = dirTempHV; secondaryDirection = dirTempD;
+  }
+  int directionStrength = 0;
+  if( hvd1 > 2 * hvd0 )
+  {
+    directionStrength = 1;
+  }
+  if( hvd1 * 2 > 9 * hvd0 )
+  {
+    directionStrength = 2;
+  }
+  if( directionStrength != 0 )
+  {
+    classIdx += ( ( ( mainDirection & 1 ) << 1 ) + directionStrength ) * 5;
+  }
+  const int transposeIdx = kTransposeTable[mainDirection * 2 + ( secondaryDirection >> 1 )];
+
+  const int base = set * LUMA_SET_SIZE + transposeIdx * NUM_CLASSES * LUMA_COEFF + classIdx * LUMA_COEFF;
+  int c[12], k[12];
+  for( int i = 0; i < 12; i++ )
+  {
+    c[i] = int( pc.coeff[base + i] );
+    k[i] = int( pc.clip[base + i] );
+  }
+
+  const int maxVal = ( 1 << pc.bitDepth ) - 1;
+  for( int dy = 0; dy < 4; dy++ )
+  {
+    const int y   = by + dy;
+    const int yVb = y & ( vbH - 1 );
+    int r1 = y + 1, r2 = y - 1, r3 = y + 2, r4 = y - 2, r5 = y + 3, r6 = y - 3;
+    if( yVb < vbPos && yVb >= vbPos - 4 )
+    {
+      r1 = yVb == vbPos - 1 ? y : r1;
+      r3 = yVb >= vbPos - 2 ? r1 : r3;
+      r5 = yVb >= vbPos - 3 ? r3 : r5;
+      r2 = yVb == vbPos - 1 ? y : r2;
+      r4 = yVb >= vbPos - 2 ? r2 : r4;
+      r6 = yVb >= vbPos - 3 ? r4 : r6;
+    }
+    else if( yVb >= vbPos && yVb <= vbPos + 3 )
+    {
+      r2 = yVb == vbPos ? y : r2;
+      r4 = yVb <= vbPos + 1 ? r2 : r4;
+      r6 = yVb <= vbPos + 2 ? r4 : r6;
+      r1 = yVb == vbPos ? y : r1;
+      r3 = yVb <= vbPos + 1 ? r1 : r3;
+      r5 = yVb <= vbPos + 2 ? r3 : r5;
+    }
+    const bool nearVb = yVb == vbPos - 1 || yVb == vbPos;
+    for( int dx = 0; dx < 4; dx++ )
+    {
+      const int x   = bx + dx;
+      const int cur = S( x, y );
+      int       sum = 0;
+      sum += c[0]  * clipAlf( k[0],  cur, S( x,     r5 ), S( x,     r6 ) );
+      sum += c[1]  * clipAlf( k[1],  cur, S( x + 1, r3 ), S( x - 1, r4 ) );
+      sum += c[2]  * clipAlf( k[2],  cur, S( x,     r3 ), S( x,     r4 ) );
+      sum += c[3]  * clipAlf( k[3],  cur, S( x - 1, r3 ), S( x + 1, r4 ) );
+      sum += c[4]  * clipAlf( k[4],  cur, S( x + 2, r1 ), S( x - 2, r2 ) );
+      sum += c[5]  * clipAlf( k[5],  cur, S( x + 1, r1 ), S( x - 1, r2 ) );
+      sum += c[6]  * clipAlf( k[6],  cur, S( x,     r1 ), S( x,     r2 ) );
+      sum += c[7]  * clipAlf( k[7],  cur, S( x - 1, r1 ), S( x + 1, r2 ) );
+      sum += c[8]  * clipAlf( k[8],  cur, S( x - 2, r1 ), S( x + 2, r2 ) );
+      sum += c[9]  * clipAlf( k[9],  cur, S( x + 3, y ),  S( x - 3, y ) );
+      sum += c[10] * clipAlf( k[10], cur, S( x + 2, y ),  S( x - 2, y ) );
+      sum += c[11] * clipAlf( k[11], cur, S( x + 1, y ),  S( x - 1, y ) );
+#undef S
+      sum = nearVb ? ( sum + ( 1 << 9 ) ) >> 10 : ( sum + 64 ) >> 7;
+      storePel( pc.dst0, pc.dstStride, x, y, clip3( 0, maxVal, sum + cur ) );
+    }
+  }
+}
+
+#elif CHROMA == 0
 
 // the workgroup's samples: 32 x 32 from (s_x0, s_y0), with 3 rows above and
 // below and 4 samples left and right, as the picture's edges replicate them
@@ -365,9 +654,27 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
 
 #else   // CHROMA
 
+#if BOUNDS
+static Region s_region;   // BOUNDS: the luma region of the thread's chroma block
+#endif
+
 int lumaPx( int x, int y )
 {
+#if BOUNDS
+  return fetch( pc.srcLuma, pc.lumaStride, x, y, s_region, pc.lumaWidth, pc.lumaHeight );
+#else
   return loadClamped( pc.srcLuma, pc.lumaStride, x, y, pc.lumaWidth, pc.lumaHeight );
+#endif
+}
+
+// a sample of the chroma plane src (BOUNDS: through the block's region)
+int chromaPx( int16_t* src, int x, int y )
+{
+#if BOUNDS
+  return fetch( src, pc.srcStride, x, y, scaled( s_region, pc.scaleX, pc.scaleY ), pc.width, pc.height );
+#else
+  return loadClamped( src, pc.srcStride, x, y, pc.width, pc.height );
+#endif
 }
 
 // ALF of one 4x4 block of one chroma plane into out[]
@@ -404,14 +711,14 @@ void alfChroma( int16_t* src, int bx, int by, int aps, int alt, inout int out[16
     const bool nearVb = yVb == vbPos - 1 || yVb == vbPos;
     for( int x = bx; x < bx + 4; x++ )
     {
-      const int cur = loadClamped( src, pc.srcStride, x, y, pc.width, pc.height );
+      const int cur = chromaPx( src, x, y );
       int sum = 0;
-      sum += c[0] * clipAlf( k[0], cur, loadClamped( src, pc.srcStride, x,     r3, pc.width, pc.height ), loadClamped( src, pc.srcStride, x,     r4, pc.width, pc.height ) );
-      sum += c[1] * clipAlf( k[1], cur, loadClamped( src, pc.srcStride, x + 1, r1, pc.width, pc.height ), loadClamped( src, pc.srcStride, x - 1, r2, pc.width, pc.height ) );
-      sum += c[2] * clipAlf( k[2], cur, loadClamped( src, pc.srcStride, x,     r1, pc.width, pc.height ), loadClamped( src, pc.srcStride, x,     r2, pc.width, pc.height ) );
-      sum += c[3] * clipAlf( k[3], cur, loadClamped( src, pc.srcStride, x - 1, r1, pc.width, pc.height ), loadClamped( src, pc.srcStride, x + 1, r2, pc.width, pc.height ) );
-      sum += c[4] * clipAlf( k[4], cur, loadClamped( src, pc.srcStride, x + 2, y,  pc.width, pc.height ), loadClamped( src, pc.srcStride, x - 2, y,  pc.width, pc.height ) );
-      sum += c[5] * clipAlf( k[5], cur, loadClamped( src, pc.srcStride, x + 1, y,  pc.width, pc.height ), loadClamped( src, pc.srcStride, x - 1, y,  pc.width, pc.height ) );
+      sum += c[0] * clipAlf( k[0], cur, chromaPx( src, x,     r3 ), chromaPx( src, x,     r4 ) );
+      sum += c[1] * clipAlf( k[1], cur, chromaPx( src, x + 1, r1 ), chromaPx( src, x - 1, r2 ) );
+      sum += c[2] * clipAlf( k[2], cur, chromaPx( src, x,     r1 ), chromaPx( src, x,     r2 ) );
+      sum += c[3] * clipAlf( k[3], cur, chromaPx( src, x - 1, r1 ), chromaPx( src, x + 1, r2 ) );
+      sum += c[4] * clipAlf( k[4], cur, chromaPx( src, x + 2, y ),  chromaPx( src, x - 2, y ) );
+      sum += c[5] * clipAlf( k[5], cur, chromaPx( src, x + 1, y ),  chromaPx( src, x - 1, y ) );
       sum = nearVb ? ( sum + ( 1 << 9 ) ) >> 10 : ( sum + 64 ) >> 7;
       out[( y - by ) * 4 + ( x - bx )] = clip3( 0, maxVal, sum + cur );
     }
@@ -504,6 +811,9 @@ void main( uint3 id : SV_DispatchThreadID )
   }
   const int ctu = ( ( by << pc.scaleY ) >> pc.ctuLog2 ) * pc.widthInCtus + ( ( bx << pc.scaleX ) >> pc.ctuLog2 );
   const int aps = int( pc.ctus[ctu * 8 + CTU_CHROMA_APS] );
+#if BOUNDS
+  s_region = regionOf( bx << pc.scaleX, by << pc.scaleY );
+#endif
   filterPlane( pc.src0, pc.dst0, bx, by, aps, int( pc.ctus[ctu * 8 + CTU_CB_ALT] ), int( pc.ctus[ctu * 8 + CTU_CC_CB] ), 0 );
   filterPlane( pc.src1, pc.dst1, bx, by, aps, int( pc.ctus[ctu * 8 + CTU_CR_ALT] ), int( pc.ctus[ctu * 8 + CTU_CC_CR] ), 1 );
 }

@@ -636,14 +636,38 @@ struct AlfPush
 {
   VkDeviceAddress src0, dst0, src1, dst1, srcLuma, ctus, coeff, clip, ccCoeff;
   int32_t         srcStride, dstStride, lumaStride, width, height, lumaWidth, lumaHeight, ctuLog2, widthInCtus, bitDepth, scaleX, scaleY;
+  int32_t         numVbVer, numVbHor, vbVer[3], vbHor[3];
 };
 
 // the push constants of shaders/sao.slang
 struct SaoPush
 {
   VkDeviceAddress src, dst, ctus;
-  int32_t         srcStride, dstStride, width, height, ctuWidth, ctuHeight, widthInCtus, comp, bitDepth;
+  int32_t         srcStride, dstStride, width, height, ctuWidth, ctuHeight, widthInCtus, comp, bitDepth, scaleX, scaleY;
+  int32_t         numVbVer, numVbHor, vbVer[3], vbHor[3];
 };
+
+// the picture's virtual boundaries (luma samples) into the push constants of
+// ALF or SAO
+template<class Push>
+static void setVirtualBoundaries( const PicHeader& picHeader, Push& push )
+{
+  push.numVbVer = push.numVbHor = 0;
+  if( picHeader.getVirtualBoundariesPresentFlag() )
+  {
+    push.numVbVer = int32_t( picHeader.getNumVerVirtualBoundaries() );
+    push.numVbHor = int32_t( picHeader.getNumHorVirtualBoundaries() );
+    CHECK( push.numVbVer > 3 || push.numVbHor > 3, "too many virtual boundaries" );
+    for( int i = 0; i < push.numVbVer; i++ )
+    {
+      push.vbVer[i] = int32_t( picHeader.getVirtualBoundariesPosX( i ) );
+    }
+    for( int i = 0; i < push.numVbHor; i++ )
+    {
+      push.vbHor[i] = int32_t( picHeader.getVirtualBoundariesPosY( i ) );
+    }
+  }
+}
 
 // the ALF parameters: the filter tables, luma sets [16 fixed + 8 APS][transpose][class][13],
 // chroma [APS][alternative][7], CC-ALF [APS][component][filter][8], then 8 bytes per CTU
@@ -658,44 +682,6 @@ constexpr size_t kAlfCcCoeff     = kAlfChromaClip + kAlfChromaSize * sizeof( int
 constexpr size_t kAlfCtus        = ( kAlfCcCoeff + kAlfCcSize * sizeof( int16_t ) + 255 ) & ~size_t( 255 );
 static_assert( kAlfSetSize == 4 * 25 * 13, "the layout of shaders/alf.slang" );
 
-bool GpuRecon::alfSupported( const CodingStructure& cs )
-{
-  if( cs.picHeader->getVirtualBoundariesPresentFlag() )
-  {
-    return false;
-  }
-  if( cs.sps->getSubPicInfoPresentFlag() )
-  {
-    for( int i = 0; i < cs.pps->getNumSubPics(); i++ )
-    {
-      if( !cs.pps->getSubPic( i ).getloopFilterAcrossSubPicEnabledFlag() )
-      {
-        return false;
-      }
-    }
-  }
-  if( cs.pps->getNumTiles() > 1 && !cs.pps->getLoopFilterAcrossTilesEnabledFlag() )
-  {
-    return false;
-  }
-  if( !cs.pps->getLoopFilterAcrossSlicesEnabledFlag() )
-  {
-    for( const Slice* slice: cs.picture->slices )
-    {
-      if( slice->getNumCtuInSlice() != cs.pcv->sizeInCtus )
-      {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-bool GpuRecon::saoSupported( const CodingStructure& cs )
-{
-  return !cs.picHeader->getVirtualBoundariesPresentFlag();
-}
-
 size_t GpuRecon::alfParamSize( const CodingStructure& cs )
 {
   return ( kAlfCtus + size_t( cs.pcv->sizeInCtus ) * 8 + 255 ) & ~size_t( 255 );
@@ -706,8 +692,9 @@ size_t GpuRecon::saoParamSize( const CodingStructure& cs )
   return ( size_t( cs.pcv->sizeInCtus ) * 3 * 8 * sizeof( int16_t ) + 255 ) & ~size_t( 255 );
 }
 
-void GpuRecon::prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alfFilter, uint8_t* base )
+bool GpuRecon::prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alfFilter, uint8_t* base )
 {
+  bool bounds = false;
   const PreCalcValues& pcv = *cs.pcv;
 
   int16_t* lumaCoeff   = reinterpret_cast<int16_t*>( base + kAlfLumaCoeff );
@@ -777,9 +764,19 @@ void GpuRecon::prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& 
     ctu[3] = alf.alfCtuEnableFlag[COMPONENT_Cr] ? alf.alfCtuAlternative[1] : 255;
     ctu[4] = slice->getCcAlfEnabledFlag( 1 ) && alf.ccAlfFilterControl[0] ? uint8_t( slice->getCcAlfCbApsId() * 4 + alf.ccAlfFilterControl[0] - 1 ) : 255;
     ctu[5] = slice->getCcAlfEnabledFlag( 2 ) && alf.ccAlfFilterControl[1] ? uint8_t( slice->getCcAlfCrApsId() * 4 + alf.ccAlfFilterControl[1] - 1 ) : 255;
-    ctu[6] = 0;
+    // the CTU's clipped sides (virtual boundaries on them, slice, tile and
+    // subpicture boundaries without loop filtering across), its raster-slice
+    // corners, and whether virtual boundaries split it
+    const Position pos( ( ctuIdx % pcv.widthInCtus ) * pcv.maxCUWidth, ( ctuIdx / pcv.widthInCtus ) * pcv.maxCUHeight );
+    const Area     area( pos, Size( std::min( pcv.maxCUWidth, pcv.lumaWidth - pos.x ), std::min( pcv.maxCUHeight, pcv.lumaHeight - pos.y ) ) );
+    bool           clipTop, clipBottom, clipLeft, clipRight;
+    int            numHor, numVer, horPos[3], verPos[3], rasterPad;
+    bounds |= AdaptiveLoopFilter::isClipOrCrossedByVirtualBoundaries( cs, area, clipTop, clipBottom, clipLeft, clipRight, numHor, numVer, horPos, verPos,
+                                                                      rasterPad );
+    ctu[6] = uint8_t( int( clipTop ) | int( clipBottom ) << 1 | int( clipLeft ) << 2 | int( clipRight ) << 3 | rasterPad << 4 );
     ctu[7] = 0;
   }
+  return bounds;
 }
 
 void GpuRecon::recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params )
@@ -795,6 +792,9 @@ void GpuRecon::recordAlf( const CodingStructure& cs, const Planes& src, const Pl
   push.lumaWidth   = pcv.lumaWidth;
   push.lumaHeight  = pcv.lumaHeight;
   push.lumaStride  = src.stride[COMPONENT_Y];
+  // with boundaries (prepareAlf), the BOUNDS variants
+  const bool bounds = m_prepared.alfBounds;
+  setVirtualBoundaries( *cs.picHeader, push );
 
   // luma (its shader loads and stores the rows 8 bytes at a time, from
   // multiples of 4 samples)
@@ -808,7 +808,7 @@ void GpuRecon::recordAlf( const CodingStructure& cs, const Planes& src, const Pl
   push.dstStride = dst.stride[COMPONENT_Y];
   push.width     = pcv.lumaWidth;
   push.height    = pcv.lumaHeight;
-  vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_alf_luma ) );
+  vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( bounds ? kShader_alf_luma_bounds : kShader_alf_luma ) );
   vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
   vk.vkCmdDispatch( m_cmd, ( ( push.width + 3 ) / 4 + 7 ) / 8, ( ( push.height + 3 ) / 4 + 7 ) / 8, 1 );
   mark( "alf luma" );
@@ -831,7 +831,7 @@ void GpuRecon::recordAlf( const CodingStructure& cs, const Planes& src, const Pl
     push.scaleY    = getComponentScaleY( COMPONENT_Cb, pcv.chrFormat );
     push.width     = pcv.lumaWidth >> push.scaleX;
     push.height    = pcv.lumaHeight >> push.scaleY;
-    vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_alf_chroma ) );
+    vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( bounds ? kShader_alf_chroma_bounds : kShader_alf_chroma ) );
     vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
     vk.vkCmdDispatch( m_cmd, ( ( push.width + 3 ) / 4 + 7 ) / 8, ( ( push.height + 3 ) / 4 + 7 ) / 8, 1 );
     mark( "alf chroma" );
@@ -915,6 +915,9 @@ void GpuRecon::recordSao( const CodingStructure& cs, const Planes& src, const Pl
     push.widthInCtus = pcv.widthInCtus;
     push.comp        = comp;
     push.bitDepth    = cs.sps->getBitDepth();
+    push.scaleX      = getComponentScaleX( compID, pcv.chrFormat );
+    push.scaleY      = getComponentScaleY( compID, pcv.chrFormat );
+    setVirtualBoundaries( *cs.picHeader, push );
     vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
     vk.vkCmdDispatch( m_cmd, ( push.width + 15 ) / 16, ( push.height + 15 ) / 16, 1 );
   }
@@ -1071,7 +1074,7 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
 
 bool GpuRecon::filtersSupported( const CodingStructure& cs )
 {
-  return alfSupported( cs ) && saoSupported( cs );
+  return true;
 }
 
 size_t GpuRecon::deblockParamSize( const CodingStructure& cs )
@@ -1594,10 +1597,7 @@ void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptive
   }
   m_prepared.deblock = deblock && prepareDeblock( cs, base );
   m_prepared.sao     = sao && prepareSao( cs, *sao, base + m_prepared.dbSize + m_prepared.alfSize );
-  if( alf )
-  {
-    prepareAlf( cs, *alf, base + m_prepared.dbSize );
-  }
+  m_prepared.alfBounds = alf && prepareAlf( cs, *alf, base + m_prepared.dbSize );
   m_prepared.picture = cs.picture;
 }
 

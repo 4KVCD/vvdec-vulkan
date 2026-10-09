@@ -87,28 +87,21 @@ public:
   GpuRecon( const GpuRecon& )            = delete;
   GpuRecon& operator=( const GpuRecon& ) = delete;
 
-  // whether the GPU's ALF covers the picture: no CTU of it is clipped by a
-  // slice, tile or subpicture boundary the filters may not cross, nor by a
-  // virtual boundary
-  static bool alfSupported( const CodingStructure& cs );
-  // whether the GPU's SAO covers the picture: no virtual boundaries
-  static bool saoSupported( const CodingStructure& cs );
-  // whether the GPU covers all the in-loop filters of the picture: deblocking
-  // (not with luma-adaptive QP offsets), SAO and ALF
+  // whether the GPU covers all the in-loop filters of the picture: deblocking,
+  // SAO and ALF (every picture)
   static bool filtersSupported( const CodingStructure& cs );
 
-  // whether the GPU predicts the intra and IBC blocks of the picture: 4:2:0,
-  // none of the tools it lacks (ACT, reference wraparound)
+  // whether the GPU predicts the intra and IBC blocks of the picture: not with
+  // ACT
   static bool intraSupported( const CodingStructure& cs );
   static bool intraSupported( const SPS& sps );
   // whether the GPU predicts the inter blocks of the pictures of the sequence:
-  // what intraSupported needs, 10 bits at most, none of affine, BDOF, GPM, BCW,
-  // SbTMVP, subpictures
+  // what intraSupported needs, 10 bits at most, no subpictures
   static bool interSupported( const SPS& sps );
-  // and of the picture: no weighted prediction, no scaled references
+  // and of the picture: no scaled references (RPR)
   static bool interSupported( const CodingStructure& cs );
   // whether the GPU dequantizes and inverse transforms the residuals of the
-  // picture: 10 bits at most, no scaling lists
+  // picture: 10 bits at most
   static bool residualSupported( const CodingStructure& cs );
 
   // the edges of a CTU the deblocking filters, with the bytes of their
@@ -192,7 +185,7 @@ private:
   static size_t alfParamSize( const CodingStructure& cs );
   static size_t saoParamSize( const CodingStructure& cs );
   bool          prepareDeblock( const CodingStructure& cs, uint8_t* params );   // false: no slice deblocks
-  void          prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alf, uint8_t* params );
+  bool          prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alf, uint8_t* params );   // true: a CTU has boundaries
   bool          prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8_t* params );   // false: no CTU uses SAO
   void          recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params, const std::vector<EdgeLists>& edges );
   void          recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes );
@@ -239,6 +232,7 @@ private:
   {
     const Picture* picture = nullptr;
     bool           deblock = false, sao = false;
+    bool           alfBounds = false;   // ALF's BOUNDS variants (a CTU split, or clipped)
     size_t         dbSize = 0, alfSize = 0, saoSize = 0, lmcsSize = 0;
   } m_prepared;
   // the buffers the CPU only writes, in order, and the shaders read -- the
