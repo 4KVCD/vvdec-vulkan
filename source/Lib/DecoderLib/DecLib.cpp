@@ -174,14 +174,15 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
   // 633 MB, 4K 2546 -> 2014 MB. 8 saves 60 MB more at 1080p but is slower
   // there (634 vs 657 fps).
   //
-  // With the GPU's parse ahead, 64: a picture waiting for its reconstruction holds only what the parse left (its
+  // With the GPU's parse ahead, 96: a picture waiting for its reconstruction holds only what the parse left (its
   // records and levels; stand-ins of its planes), and the window hides the long serial parse of the intra pictures
-  // (~190 ms at 1080p, ~500 ms at 4K) behind the reconstruction of the pictures before (VideoQ, 16 threads: 1080p
-  // 180.7 -> 251.6 fps, 4K 71.5 -> 97.1 fps; peak commit 724 -> 1009 MB and 1897 -> 2403 MB; the first frame 0.2 s
-  // later. 96: 5-7% faster still, for 110 / 280 MB more; 8 instances or 32 pictures parsed at a time: no faster.)
+  // (~200 ms at 1080p, ~500 ms at 4K) behind the reconstruction of the pictures before: with 64 the reconstruction
+  // still stalled at each intra picture, 80-120 ms at 1080p. (VideoQ, 16 threads, 12 pictures parsed at a time:
+  // 1080p 254.8 / 288.6 / 288.9 fps with 64 / 96 / 128, peak commit 953 / 1063 / 1193 MB; 4K 102.4 / 112.0 / 109.5
+  // fps, 2359 / 2608 / 2891 MB; the first frame 40 ms later with 96 than with 64. With 12: 1080p 180.7 fps, 4K 71.5.)
   if( m_gpu && defaultParseDelay )
   {
-    parserFrameDelay  = gpuParsesAhead( *m_gpu ) ? 64 : std::min( parserFrameDelay, 12 );
+    parserFrameDelay  = gpuParsesAhead( *m_gpu ) ? 96 : std::min( parserFrameDelay, 12 );
     m_parseFrameDelay = parserFrameDelay;
   }
 #endif
