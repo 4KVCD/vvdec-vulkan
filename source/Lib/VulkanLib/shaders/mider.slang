@@ -22,6 +22,12 @@
 
 #include "common.slang"
 
+// LITE=1: the variant for pictures whose SPS turns off GPM, affine and SbTMVP, without their code (GpuRecon picks
+// it). The common paths' code is then a fraction of the shader's, and more of it stays in the instruction cache.
+#ifndef LITE
+#  define LITE 0
+#endif
+
 // The thread's lane in its row's 32-lane workgroup; loops over a CU's blocks take every 32nd block, from this lane.
 static int g_lane = 0;
 
@@ -2388,6 +2394,7 @@ void deriveCu( Cur cur )
     return;
   }
 
+#if !LITE
   if( ( cu.flags & kMerge ) != 0 && ( cu.flags & kGeo ) != 0 )
   {
     // getGeoMergeCandidates (from the full merge list) + spanGeoMotionInfo
@@ -2496,6 +2503,7 @@ void deriveCu( Cur cur )
     storeCuMotion( cu.index, c );
     return;
   }
+#endif
 
   // Translational motion
   c.kind   = kTranslation;

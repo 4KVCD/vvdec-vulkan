@@ -366,7 +366,10 @@ void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
   pushConstants( push );
   dispatchJobs( numCus );
   computeBarrier();
-  dispatch( kShader_mider, push, uint32_t( pcv.heightInCtus ) );
+  // (the variant without GPM, affine and SbTMVP when the SPS turns them all off)
+  const SPS& sps  = *cs.sps;
+  const bool lite = !sps.getUseGeo() && !sps.getUseAffine() && !sps.getSBTMVPEnabledFlag();
+  dispatch( lite ? kShader_mider_lite : kShader_mider, push, uint32_t( pcv.heightInCtus ) );
   mark( "mider" );
   // The 4x4 blocks' motion goes into the picture's colocated motion (colmotion.slang), or in the check mode to host
   // memory.

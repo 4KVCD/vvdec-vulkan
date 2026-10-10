@@ -21,6 +21,7 @@ set( VVDEC_GPU_SHADERS
   "lmcs|lmcs"
   "filmgrain|filmgrain"
   "mider|mider"
+  "mider_lite|mider|LITE=1"
   "mider_cumap|mider|CUMAP=1"
   "dbparams|dbparams"
   "jobs|jobs"
