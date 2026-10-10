@@ -53,10 +53,12 @@ POSSIBILITY OF SUCH DAMAGE.
 
     The ParseService parses the pictures as soon as all their slices are in (DecLibParser), many pictures at a time:
     its thread records a few dispatches of every picture it is parsing into one submission on the parse queue, so
-    that their substreams run side by side, waits for it, and hands each picture whose parse is done to its
-    reconstruction (Picture::gpuParsed). The reconstruction gives the picture's slot back after recording its front
-    end (release); the slot is reused once the picture's first part, which waits for the front end's scatter, is done
-    on the GPU.
+    that their substreams run side by side, and waits for it. When a picture's parse is done, a small submission
+    on a queue of its own (Context::submitParseCopy) copies its records into buffers of their own, of their exact size
+    (a ParsedPicture: parsecompact.slang's scatter), while the next step runs; once the copy is done, the picture goes
+    to its reconstruction (Picture::gpuParsed) and its slot is free for the next picture. The reconstruction gives
+    the ParsedPicture back once the picture's GPU work is done (release), and its buffers are reused. So a picture
+    parsed ahead of its reconstruction holds only its records.
 */
 
 #pragma once
@@ -135,9 +137,7 @@ public:
   // Records into cmd the copies of the records to their places in raster order: the CU and TU records into cus and
   // tus (numCus() and numTus() of them), the CTU records into ctus. Without a barrier after them.
   void recordScatter( VkCommandBuffer cmd, VkDeviceAddress cus, VkDeviceAddress tus, VkDeviceAddress ctus ) const;
-  // the parse queue's timeline value once the parse is done (Context::submitParse), which the front end waits for
-  uint64_t parseValue() const { return m_parseValue; }
-  void     setParseValue( uint64_t value ) { m_parseValue = value; }
+  size_t   numCtus() const { return m_numCtus; }
 
   // --- For the statistics and the check (VVDEC_GPU_PARSE=1) ---
   const ParseInput& input() const { return m_in; }
@@ -150,7 +150,7 @@ public:
   const uint32_t*   totals() const { return reinterpret_cast<const uint32_t*>( m_totals.mapped ); }
 
   Picture* picture = nullptr;   // the picture parsed (ParseService)
-  bool     failed  = false;     // its parse gave up (ParseService)
+  bool     failed  = false;     // its parse gave up (GpuRecon's check, VVDEC_GPU_PARSE=1)
 
 private:
   // Makes room for at least cus and tus staged records
@@ -177,13 +177,42 @@ private:
   FrontCapacities m_caps;
   uint64_t        m_lastProgress = 0;   // the substreams' next CTUs added up, after the submission before
   uint32_t        m_stalls       = 0;   // submissions in a row without progress
-  uint64_t        m_parseValue   = 0;
   bool            m_fresh        = false;   // the counters to clear (recordClear)
+};
+
+// What the GPU's parse left of a picture once it is done (ParseService): its CU, TU and CTU records in raster order
+// (GpuFrontEnd.h's layout), in GPU memory of their own and of their exact size; its CTUs' SAO and ALF parameters; the
+// room the front end's job lists need. The picture holds it until its GPU work is done (ParseService::release).
+class ParsedPicture
+{
+public:
+  size_t                 numCus() const { return m_numCus; }
+  size_t                 numTus() const { return m_numTus; }
+  const FrontCapacities& capacities() const { return m_caps; }
+  // CTU ctu's SAO and ALF parameters, as the parse wrote them (gpu::captureSaoAlf's layout: 7 words)
+  const uint32_t*        saoAlf( int ctu ) const { return m_saoAlf.data() + size_t( ctu ) * kSaoAlfWords; }
+  VkDeviceAddress        cus() const { return m_cus.addr; }
+  VkDeviceAddress        tus() const { return m_tus.addr; }
+  VkDeviceAddress        ctus() const { return m_ctus.addr; }
+  // the parse's copies' timeline value once the records are in place (Context::submitParseCopy): the front end waits
+  // for it
+  uint64_t               parseValue() const { return m_parseValue; }
+
+  Picture* picture = nullptr;   // the picture parsed
+
+private:
+  friend class ParseService;
+  static constexpr size_t kSaoAlfWords = 7;
+  size_t                  m_numCus = 0, m_numTus = 0;
+  FrontCapacities         m_caps;
+  std::vector<uint32_t>   m_saoAlf;
+  Buffer                  m_cus, m_tus, m_ctus;
+  uint64_t                m_parseValue = 0;
 };
 
 // Sets each CTU's SAO and ALF parameters in its CTU data (CtuData::saoParam, alfParam) from the GPU's parse of the
 // picture, as the CPU's parse leaves them
-void applyParsedSaoAlf( CodingStructure& cs, const ParseSlot& parsed );
+void applyParsedSaoAlf( CodingStructure& cs, const ParsedPicture& parsed );
 
 // The GPU's parse of the pictures ahead of their reconstruction (VVDEC_GPU_PARSE=2), on the parse queue
 class ParseService
@@ -196,23 +225,29 @@ public:
   ParseService( const ParseService& )            = delete;
   ParseService& operator=( const ParseService& ) = delete;
 
-  // Parses the picture, whose slices are all in, as soon as it can: then pic->gpuParseSlot holds the result and
-  // pic->gpuParsed unlocks.
+  // Parses the picture, whose slices are all in, as soon as it can: then pic->gpuParseResult holds the result (null
+  // when the parse gave up) and pic->gpuParsed unlocks.
   void enqueue( Picture* pic );
-  // Gives a picture's slot back: it is reused once the compute queue's timeline (Context::firstPartsDone) reaches
-  // firstPartValue, the value of the picture's first part, which waits for the front end that reads the slot (0: at
-  // once).
-  void release( ParseSlot* slot, uint64_t firstPartValue );
+  // Gives a picture's parse result back once the picture's GPU work, which reads its records, is done: its buffers
+  // are reused for the pictures parsed next
+  void release( ParsedPicture* parsed );
   // What the service did so far
   ParseStats stats() const;
 
 private:
-  void       run();                                // the thread
-  ParseSlot* takeSlot();                           // a slot no picture uses, or a new one
-  void       startPicture( Picture* pic );         // its slot set up, among the pictures parsed
-  void       submitSteps();                        // one submission of all the pictures' steps, waited for
-  void       finishPictures();                     // the pictures done handed over, the others kept or restarted
-  void       handOver( ParseSlot* slot, bool failed );
+  void           run();                                    // the thread
+  ParseSlot*     takeSlot();                               // a slot no picture uses, or a new one
+  ParsedPicture* takeParsed();                             // a parse result no picture holds, or a new one
+  Buffer         takeBuffer( size_t size );                // GPU memory for records, from the bins
+  void           giveBuffer( Buffer& buf );                // back into the bins
+  void           startPicture( Picture* pic );             // its slot set up, among the pictures parsed
+  // The finished pictures' records copied (a submission on the copies' queue), then all the pictures' steps (one on
+  // the parse queue), both waited for: the copied pictures are handed over as soon as the copy is done
+  void           submit();
+  void           finishPictures();                         // the pictures done to be copied, the others kept or restarted
+  uint64_t       submitCopies();                           // the copy's submission; returns its timeline value
+  void           submitSteps();                            // the steps' submission
+  void           handOver( Picture* pic, ParsedPicture* parsed );   // (parsed null: the parse gave up)
 
   Context*                m_ctx;
   std::function<void()>   m_wakeUp;
@@ -222,14 +257,25 @@ private:
   bool                    m_stop   = false;
   bool                    m_broken = false;   // the GPU failed: every picture fails
   std::vector<Picture*>   m_waiting;                              // enqueued, not started yet
-  std::vector<std::pair<ParseSlot*, uint64_t>> m_released;        // given back, with their first part's value
+  std::vector<ParsedPicture*> m_released;                         // given back
   std::vector<std::unique_ptr<ParseSlot>>      m_slots;           // all of them (the thread's)
   std::vector<ParseSlot*> m_free;                                 // reusable (the thread's)
   std::vector<ParseSlot*> m_parsing;                              // the pictures being parsed (the thread's)
+  // the pictures parsed, whose records the next submit copies from their slots into their results (the thread's)
+  std::vector<std::pair<ParseSlot*, ParsedPicture*>> m_copying;
+  std::vector<std::unique_ptr<ParsedPicture>>        m_results;   // all of them (the thread's)
+  std::vector<ParsedPicture*>                        m_freeResults;   // reusable (the thread's)
+  // GPU memory for the results' records, kept for reuse: bin b holds buffers of 2^b bytes (64 KB at least)
+  static constexpr int kBins = 40;
+  std::vector<Buffer>  m_bins[kBins];
   size_t                  m_maxCus = 0, m_maxTus = 0;             // the most records a picture had so far
-  VkCommandPool           m_pool  = VK_NULL_HANDLE;
+  VkCommandPool           m_pool  = VK_NULL_HANDLE;   // the steps' submission
   VkCommandBuffer         m_cmd   = VK_NULL_HANDLE;
   VkFence                 m_fence = VK_NULL_HANDLE;
+  uint64_t                m_stepsValue = 0;   // the parse timeline's value of the steps submitted last
+  VkCommandPool           m_copyPool  = VK_NULL_HANDLE;   // the copy's submission
+  VkCommandBuffer         m_copyCmd   = VK_NULL_HANDLE;
+  VkFence                 m_copyFence = VK_NULL_HANDLE;
   VkDeviceAddress         m_prof  = 0;   // VVDEC_GPU_PROFILE with the shader clock: the parse's cycle counts
   Buffer                  m_profBuf;
   ParseStats              m_stats;

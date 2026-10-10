@@ -198,22 +198,25 @@ public:
   // pictures' front ends run there, alongside the compute queue's work. Each decoder instance takes its own queue
   // (takeAsyncQueue), so the front ends of different instances also run at the same time. submitFront() submits a
   // front end's commands: they wait until the compute queue's timeline semaphore reaches waitFirst (the first parts
-  // of the picture's colocated pictures) and the parse queue's reaches waitParse (the picture's parse), then signal
-  // done.
+  // of the picture's colocated pictures) and the parse's copies' reaches waitParse (the picture's parsed records in
+  // place: submitParseCopy), then signal done.
   bool     asyncQueue() const { return m_asyncFamily != UINT32_MAX; }
   uint32_t asyncFamily() const { return m_asyncFamily; }
   int      takeAsyncQueue() { return int( m_asyncNext++ % uint32_t( m_asyncCount ) ); }
   void     submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, VkSemaphore done, uint64_t waitParse = 0 );
-  // How far the compute queue's timeline semaphore is: the value of the last picture's first part done on the GPU
-  uint64_t firstPartsDone() const;
 
   // --- The parse queue ---
   // With the async compute queues, the GPU's parse of the pictures ahead of their reconstruction (VVDEC_GPU_PARSE=2;
   // ParseService) runs on a queue of its own: an async compute queue that no decoder instance takes when the family
   // has one more, else the last one. submitParse() submits the parse's commands, which signal the parse's timeline
-  // semaphore and done; the value they signal is returned, for the front ends that read what they wrote.
+  // semaphore and done; the value they signal is returned, for the copies that read what they wrote.
   bool     parseQueue() const { return m_parseQueue != VK_NULL_HANDLE; }
   uint64_t submitParse( VkCommandBuffer cmd, VkFence done );
+  // The copies of the parsed pictures' records (ParseService) run on a queue of their own, one more of the family's
+  // when it has one (else the parse queue): the parse's next steps do not wait for them. submitParseCopy() submits a
+  // copy, which waits until the parse's timeline reaches waitParse (the steps that parsed its pictures), then
+  // signals the copies' timeline semaphore and done; the value it signals is returned, for the front ends.
+  uint64_t submitParseCopy( VkCommandBuffer cmd, VkFence done, uint64_t waitParse );
   // VK_EXT_shader_subgroup_ballot: the parse shader reads a thread's value with OpSubgroupReadInvocationKHR, a
   // v_readlane on AMD (shaders/parse.slang's laneValue); without it, the parse_shuffle variant
   bool     subgroupBallot() const { return m_subgroupBallot; }
@@ -279,6 +282,12 @@ private:
   std::mutex*                      m_parseMutex    = &m_parseOwnMutex;
   VkSemaphore                      m_parseTimeline = VK_NULL_HANDLE;
   uint64_t                         m_parseValue    = 0;   // the last value signalled (guarded by *m_parseMutex)
+  // the queue of the parse's copies (one more of the async family's, or the parse queue), its lock and timeline
+  VkQueue                          m_parseCopyQueue    = VK_NULL_HANDLE;
+  std::mutex                       m_parseCopyOwnMutex;
+  std::mutex*                      m_parseCopyMutex    = &m_parseCopyOwnMutex;
+  VkSemaphore                      m_parseCopyTimeline = VK_NULL_HANDLE;
+  uint64_t                         m_parseCopyValue    = 0;   // the last value signalled (guarded by *m_parseCopyMutex)
 
   // the pipelines
   VkPipelineLayout                 m_layout    = VK_NULL_HANDLE;

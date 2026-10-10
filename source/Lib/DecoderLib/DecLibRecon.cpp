@@ -1615,8 +1615,8 @@ bool DecLibRecon::filterParamsTask( int, void* taskParam )
   if( dec->m_gpuParseDrives )
   {
     // the CTUs' SAO and ALF parameters as the GPU's parse left them (when it gave up, queueGpuTask fails the picture)
-    const gpu::ParseSlot* parsed = param->pic->gpuParseSlot;
-    if( !parsed || parsed->failed )
+    const gpu::ParsedPicture* parsed = param->pic->gpuParseResult;
+    if( !parsed )
     {
       return true;
     }
@@ -1654,15 +1654,10 @@ bool DecLibRecon::queueGpuTask( int, void* taskParam )
   FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( taskParam );
   CodingStructure&    cs    = *param->pic->cs;
   DecLibRecon*        dec   = param->decLib;
-  // With the GPU's parse: what it left (the records in its slot, the coefficient levels in the picture)
-  gpu::ParseSlot* parsed = dec->m_gpuParseDrives ? cs.picture->gpuParseSlot : nullptr;
-  if( dec->m_gpuParseDrives && ( !parsed || parsed->failed ) )
+  // With the GPU's parse: what it left (the records in the parse result, the coefficient levels in the picture)
+  gpu::ParsedPicture* parsed = dec->m_gpuParseDrives ? cs.picture->gpuParseResult : nullptr;
+  if( dec->m_gpuParseDrives && !parsed )
   {
-    if( parsed )
-    {
-      dec->m_gpuParseService->release( parsed, 0 );
-      cs.picture->gpuParseSlot = nullptr;
-    }
     THROW_RECOVERABLE( "Vulkan: the GPU parse gave up on the slice data of POC " << cs.picture->poc );
   }
   // The picture's slice table (its CTUs are parsed, so their slices are known), for the GPU's motion derivation of
@@ -1679,13 +1674,6 @@ bool DecLibRecon::queueGpuTask( int, void* taskParam )
   param->download   = dec->m_gpuRecon->startPicture( cs, jobs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr,
                                                      dec->m_doALF ? &dec->m_cALF : nullptr, cs.picture->m_bufs[PIC_RECONSTRUCTION], refine );
   cs.picture->gpuCurrent = true;   // for the work submitted after this
-  if( parsed )
-  {
-    // the slot back to the GPU's parse, for reuse once the picture's first part (after the front end that reads it)
-    // is done
-    dec->m_gpuParseService->release( parsed, cs.picture->gpuFirstValue );
-    cs.picture->gpuParseSlot = nullptr;
-  }
   return true;
 }
 
@@ -1694,6 +1682,14 @@ bool DecLibRecon::computeDoneTask( int, void* taskParam )
   FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( taskParam );
   DecLibRecon*        dec   = param->decLib;
   dec->m_gpuRecon->endCompute();
+  Picture* pic = param->pic;
+  if( pic->gpuParseResult )
+  {
+    // the parse result back to the GPU's parse: both parts of the front end read its records, and the picture's work,
+    // the second part's too, is done
+    dec->m_gpuParseService->release( pic->gpuParseResult );
+    pic->gpuParseResult = nullptr;
+  }
   if( dec->m_gpuParse )
   {
     dec->m_gpuRecon->compareParse( *param->pic->cs, dec->m_gpuCuRecords, dec->m_gpuTuRecords );

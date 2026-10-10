@@ -242,6 +242,9 @@ size_t GpuRecon::uploadRecords( const CodingStructure& cs, const PictureJobs& jo
     numTus += ctu.size();
   }
   ensureFrontEndBuffers( cs, numCus, numTus );
+  m_frontEnd.recordCus  = m_frontEnd.cus.addr;
+  m_frontEnd.recordTus  = m_frontEnd.tus.addr;
+  m_frontEnd.recordCtus = m_frontEnd.ctus.addr;
   if( m_useFrontEnd )
   {
     m_frontEnd.capacities = frontCapacities( cs, cus, tus );
@@ -274,17 +277,19 @@ size_t GpuRecon::uploadRecords( const CodingStructure& cs, const PictureJobs& jo
   return numCus;
 }
 
-size_t GpuRecon::useParsedRecords( const CodingStructure& cs, const ParseSlot& parsed )
+size_t GpuRecon::useParsedRecords( const CodingStructure& cs, const ParsedPicture& parsed )
 {
-  // the job lists' room as the parse added it up; the records in raster order, where the CPU's would be uploaded
-  ensureFrontEndBuffers( cs, parsed.numCus(), parsed.numTus() );
+  // the job lists' room as the parse added it up; the records in raster order where the parse left them (part 1
+  // waits for the parse queue's timeline value that put them there)
+  ensureFrontEndBuffers( cs, parsed.numCus(), parsed.numTus(), false );
   m_frontEnd.capacities = parsed.capacities();
-  parsed.recordScatter( m_cmd, m_frontEnd.cus.addr, m_frontEnd.tus.addr, m_frontEnd.ctus.addr );
-  computeBarrier();
+  m_frontEnd.recordCus  = parsed.cus();
+  m_frontEnd.recordTus  = parsed.tus();
+  m_frontEnd.recordCtus = parsed.ctus();
   return parsed.numCus();
 }
 
-void GpuRecon::ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, size_t numTus )
+void GpuRecon::ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, size_t numTus, bool records )
 {
   // The records: written by the CPU in order, or by the GPU's parse (its scatter). What only the GPU reads and writes
   // (the CU maps, the CUs' motion, the rows' progress) is in its own memory, where mider.slang's waits for each read
@@ -292,9 +297,12 @@ void GpuRecon::ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, 
   const PreCalcValues& pcv       = *cs.pcv;
   const int            widthIn4  = int( ( pcv.lumaWidth + 3 ) >> 2 );
   const int            heightIn4 = int( ( pcv.lumaHeight + 3 ) >> 2 );
-  ensureBuffer( m_ctx, m_frontEnd.cus, std::max<size_t>( numCus, 1 ) * sizeof( CuRecord ), MemKind::Upload );
-  ensureBuffer( m_ctx, m_frontEnd.tus, std::max<size_t>( numTus, 1 ) * sizeof( TuRecord ), MemKind::Upload );
-  ensureBuffer( m_ctx, m_frontEnd.ctus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::Upload );
+  if( records )
+  {
+    ensureBuffer( m_ctx, m_frontEnd.cus, std::max<size_t>( numCus, 1 ) * sizeof( CuRecord ), MemKind::Upload );
+    ensureBuffer( m_ctx, m_frontEnd.tus, std::max<size_t>( numTus, 1 ) * sizeof( TuRecord ), MemKind::Upload );
+    ensureBuffer( m_ctx, m_frontEnd.ctus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::Upload );
+  }
   ensureBuffer( m_ctx, m_frontEnd.cuMapLuma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
   ensureBuffer( m_ctx, m_frontEnd.cuMapChroma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
   ensureBuffer( m_ctx, m_frontEnd.cuMotion, std::max<size_t>( numCus, 1 ) * 16 * sizeof( int32_t ), MemKind::Device );
@@ -307,8 +315,8 @@ void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
   const PreCalcValues& pcv    = *cs.pcv;
   const bool           chroma = isChromaEnabled( pcv.chrFormat );
   MiderPush            push{};
-  push.cus             = m_frontEnd.cus.addr;
-  push.ctus            = m_frontEnd.ctus.addr;
+  push.cus             = m_frontEnd.recordCus;
+  push.ctus            = m_frontEnd.recordCtus;
   push.slices          = sliceTable( cs );
   push.cuMap           = m_frontEnd.cuMapLuma.addr;
   push.cuMotion        = m_frontEnd.cuMotion.addr;
@@ -398,9 +406,9 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
   transferToComputeBarrier();
 
   DbParamsPush push{};
-  push.cus          = m_frontEnd.cus.addr;
-  push.tus          = m_frontEnd.tus.addr;
-  push.ctus         = m_frontEnd.ctus.addr;
+  push.cus          = m_frontEnd.recordCus;
+  push.tus          = m_frontEnd.recordTus;
+  push.ctus         = m_frontEnd.recordCtus;
   push.slices       = sliceTable( cs );
   push.cuMapL       = m_frontEnd.cuMapLuma.addr;
   push.cuMapC       = m_frontEnd.cuMapChroma.addr;
@@ -529,9 +537,9 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, s
   const PPS&           pps    = *cs.pps;
   const bool           chroma = isChromaEnabled( pcv.chrFormat );
   JobsPush             push{};
-  push.cus          = m_frontEnd.cus.addr;
-  push.tus          = m_frontEnd.tus.addr;
-  push.ctus         = m_frontEnd.ctus.addr;
+  push.cus          = m_frontEnd.recordCus;
+  push.tus          = m_frontEnd.recordTus;
+  push.ctus         = m_frontEnd.recordCtus;
   push.slices       = sliceTable( cs );
   push.jobSlices    = m_frontEnd.jobSlices.addr;
   push.cuMapL       = m_frontEnd.cuMapLuma.addr;

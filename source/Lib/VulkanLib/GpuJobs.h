@@ -396,7 +396,7 @@ struct CuRecord;
 struct TuRecord;
 
 // A picture's jobs, per CTU, for the passes that run on the GPU (null: the CPU ran that pass).
-class ParseSlot;
+class ParsedPicture;
 
 struct PictureJobs
 {
@@ -421,9 +421,9 @@ struct PictureJobs
   bool                                      frontEndInter = false;
   // VVDEC_GPU_PARSE=1: the GPU parses the picture's slice data too, compared with the CPU's parse (cus, tus)
   bool                                      parse         = false;
-  // VVDEC_GPU_PARSE=2: the GPU parsed the picture instead of the CPU (ParseService): the front end takes its records
-  // from this slot, and cus and tus are empty
-  const ParseSlot*                          parsed        = nullptr;
+  // VVDEC_GPU_PARSE=2: the GPU parsed the picture instead of the CPU (ParseService): the front end reads its records
+  // where the parse left them, and cus and tus are empty
+  const ParsedPicture*                      parsed        = nullptr;
 };
 
 }   // namespace gpu

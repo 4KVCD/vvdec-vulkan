@@ -54,7 +54,6 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "CommonLib/Picture.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 
 namespace vvdec
@@ -78,7 +77,7 @@ static constexpr size_t   kParseTotals       = 16;        // the CUs and TUs, th
 static constexpr size_t   kGroupsPerRow      = 32768;     // the shaders take group.y as rows of 32768 workgroups
 
 // The service: each picture's dispatches in one submission (one, so that a picture is handed over as soon as it is
-// parsed), the pictures parsed at a time
+// parsed), the pictures parsed at a time; the buffers of the parse results kept for reuse, in each size
 static constexpr uint32_t kStepsPerSubmission = 1;
 static constexpr size_t   kMaxParsing         = 16;
 
@@ -240,7 +239,6 @@ void ParseSlot::clear()
   m_caps         = FrontCapacities();
   m_lastProgress = 0;
   m_stalls       = 0;
-  m_parseValue   = 0;
   failed         = false;
 }
 
@@ -455,7 +453,7 @@ static void applySaoAlf( CtuData& ctu, const uint32_t words[7] )
   a.ccAlfFilterControl[1] = uint8_t( ( alf >> 20 ) & 15 );
 }
 
-void applyParsedSaoAlf( CodingStructure& cs, const ParseSlot& parsed )
+void applyParsedSaoAlf( CodingStructure& cs, const ParsedPicture& parsed )
 {
   for( int ctu = 0; ctu < int( cs.pcv->sizeInCtus ); ctu++ )
   {
@@ -472,7 +470,10 @@ ParseService::ParseService( Context* ctx, std::function<void()> wakeUp ) : m_ctx
   CHECK( !ctx->parseQueue(), "Vulkan: the GPU parse ahead of the reconstruction needs an async compute queue" );
   m_pool = m_ctx->createCommandPool( m_ctx->asyncFamily() );
   m_ctx->allocateCommandBuffers( m_pool, 1, &m_cmd );
-  m_fence = m_ctx->createFence();
+  m_fence     = m_ctx->createFence();
+  m_copyPool  = m_ctx->createCommandPool( m_ctx->asyncFamily() );
+  m_ctx->allocateCommandBuffers( m_copyPool, 1, &m_copyCmd );
+  m_copyFence = m_ctx->createFence();
   if( m_ctx->profiling() && m_ctx->shaderClock() && m_ctx->subgroupBallot() )   // (parse_prof reads as parse does)
   {
     m_profBuf = m_ctx->alloc( 16 * sizeof( uint32_t ), MemKind::HostCached );
@@ -490,21 +491,26 @@ ParseService::~ParseService()
   }
   m_wake.notify_all();
   m_thread.join();
-  // the front ends that read the slots given back done (for a few seconds at most: a GPU that stopped never gets there)
-  uint64_t last = 0;
-  for( const auto& released: m_released )
-  {
-    last = std::max( last, released.second );
-  }
-  const auto giveUp = std::chrono::steady_clock::now() + std::chrono::seconds( 5 );
-  while( m_ctx->firstPartsDone() < last && std::chrono::steady_clock::now() < giveUp )
-  {
-    std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
-  }
   m_slots.clear();
+  for( const auto& result: m_results )
+  {
+    for( Buffer* buf: { &result->m_cus, &result->m_tus, &result->m_ctus } )
+    {
+      m_ctx->free( *buf );
+    }
+  }
+  for( auto& bin: m_bins )
+  {
+    for( Buffer& buf: bin )
+    {
+      m_ctx->free( buf );
+    }
+  }
   m_ctx->free( m_profBuf );
   m_ctx->destroyFence( m_fence );
   m_ctx->destroyCommandPool( m_pool );
+  m_ctx->destroyFence( m_copyFence );
+  m_ctx->destroyCommandPool( m_copyPool );
 }
 
 void ParseService::enqueue( Picture* pic )
@@ -517,17 +523,17 @@ void ParseService::enqueue( Picture* pic )
       m_wake.notify_one();
       return;
     }
-    pic->gpuParseSlot = nullptr;   // (fails at once)
+    pic->gpuParseResult = nullptr;   // (fails at once)
     pic->gpuParsed.unlock_nothrow();
   }
   m_wakeUp();
 }
 
-void ParseService::release( ParseSlot* slot, uint64_t firstPartValue )
+void ParseService::release( ParsedPicture* parsed )
 {
   std::lock_guard<std::mutex> lock( m_mutex );
-  slot->picture = nullptr;
-  m_released.emplace_back( slot, firstPartValue );
+  parsed->picture = nullptr;
+  m_released.push_back( parsed );
 }
 
 ParseStats ParseService::stats() const
@@ -555,7 +561,7 @@ void ParseService::run()
       std::vector<Picture*> starting;
       {
         std::unique_lock<std::mutex> lock( m_mutex );
-        m_wake.wait( lock, [&]() { return m_stop || !m_parsing.empty() || !m_waiting.empty(); } );
+        m_wake.wait( lock, [&]() { return m_stop || !m_parsing.empty() || !m_copying.empty() || !m_waiting.empty(); } );
         if( m_stop )
         {
           return;
@@ -570,9 +576,9 @@ void ParseService::run()
       {
         startPicture( pic );
       }
-      if( !m_parsing.empty() )
+      if( !m_parsing.empty() || !m_copying.empty() )
       {
-        submitSteps();
+        submit();
         finishPictures();
       }
     }
@@ -583,15 +589,20 @@ void ParseService::run()
     std::lock_guard<std::mutex> lock( m_mutex );
     for( ParseSlot* slot: m_parsing )
     {
-      slot->failed = true;
-      slot->picture->gpuParseSlot = slot;
+      slot->picture->gpuParseResult = nullptr;
       slot->picture->gpuParsed.unlock_nothrow();
     }
     m_parsing.clear();
+    for( const auto& copy: m_copying )
+    {
+      copy.first->picture->gpuParseResult = nullptr;
+      copy.first->picture->gpuParsed.unlock_nothrow();
+    }
+    m_copying.clear();
     m_broken = true;
     for( Picture* pic: m_waiting )
     {
-      pic->gpuParseSlot = nullptr;
+      pic->gpuParseResult = nullptr;
       pic->gpuParsed.unlock_nothrow();
     }
     m_waiting.clear();
@@ -601,24 +612,6 @@ void ParseService::run()
 
 ParseSlot* ParseService::takeSlot()
 {
-  // the slots given back whose pictures' first parts are done become free
-  const uint64_t done = m_ctx->firstPartsDone();
-  {
-    std::lock_guard<std::mutex> lock( m_mutex );
-    for( size_t i = 0; i < m_released.size(); )
-    {
-      if( m_released[i].second <= done )
-      {
-        m_free.push_back( m_released[i].first );
-        m_released[i] = m_released.back();
-        m_released.pop_back();
-      }
-      else
-      {
-        i++;
-      }
-    }
-  }
   if( !m_free.empty() )
   {
     ParseSlot* slot = m_free.back();
@@ -627,6 +620,60 @@ ParseSlot* ParseService::takeSlot()
   }
   m_slots.push_back( std::make_unique<ParseSlot>( m_ctx ) );
   return m_slots.back().get();
+}
+
+ParsedPicture* ParseService::takeParsed()
+{
+  // the results given back become free, their buffers back in the bins
+  {
+    std::lock_guard<std::mutex> lock( m_mutex );
+    for( ParsedPicture* result: m_released )
+    {
+      for( Buffer* buf: { &result->m_cus, &result->m_tus, &result->m_ctus } )
+      {
+        giveBuffer( *buf );
+      }
+      m_freeResults.push_back( result );
+    }
+    m_released.clear();
+  }
+  if( !m_freeResults.empty() )
+  {
+    ParsedPicture* result = m_freeResults.back();
+    m_freeResults.pop_back();
+    return result;
+  }
+  m_results.push_back( std::make_unique<ParsedPicture>() );
+  return m_results.back().get();
+}
+
+Buffer ParseService::takeBuffer( size_t size )
+{
+  int bin = 16;
+  while( ( size_t( 1 ) << bin ) < size )
+  {
+    bin++;
+  }
+  if( !m_bins[bin].empty() )
+  {
+    const Buffer buf = m_bins[bin].back();
+    m_bins[bin].pop_back();
+    return buf;
+  }
+  return m_ctx->alloc( size_t( 1 ) << bin, MemKind::Device );
+}
+
+void ParseService::giveBuffer( Buffer& buf )
+{
+  int bin = 16;
+  while( ( size_t( 1 ) << bin ) < buf.size )
+  {
+    bin++;
+  }
+  // kept, never freed: GPU memory allocated and freed costs the parse thread a fraction of a millisecond a buffer,
+  // between the steps, while the parse queue waits; the bins hold no more than were in use at once
+  m_bins[bin].push_back( buf );
+  buf = Buffer();
 }
 
 void ParseService::startPicture( Picture* pic )
@@ -648,13 +695,59 @@ void ParseService::startPicture( Picture* pic )
   const size_t ctus = pic->cs->pcv->sizeInCtus;
   if( !host || !slot->prepare( *pic->cs, levels, std::max( m_maxCus * 5 / 4, ctus * 32 ), std::max( m_maxTus * 5 / 4, ctus * 32 ) ) )
   {
-    handOver( slot, true );
+    m_free.push_back( slot );
+    {
+      std::lock_guard<std::mutex> lock( m_mutex );
+      m_stats.errors++;
+    }
+    handOver( pic, nullptr );
     return;
   }
   m_parsing.push_back( slot );
   std::lock_guard<std::mutex> lock( m_mutex );
   m_stats.pictures++;
   m_stats.substreams += slot->input().numStreams;
+}
+
+// Waits for fence, which a submission of the parse's signals (its steps' or its copies')
+static void waitFor( Context* ctx, VkFence fence )
+{
+  const VkResult result = ctx->api().vkWaitForFences( ctx->device(), 1, &fence, VK_TRUE, UINT64_MAX );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: waiting for the GPU's parse failed (" << result << ")" );
+  }
+}
+
+void ParseService::submit()
+{
+  const bool     copies    = !m_copying.empty();
+  const bool     steps     = !m_parsing.empty();
+  const uint64_t copyValue = copies ? submitCopies() : 0;
+  if( steps )
+  {
+    submitSteps();
+  }
+  if( copies )
+  {
+    // the pictures copied: to their reconstruction (whose front end waits for copyValue), their slots free for the
+    // next pictures (the steps running meanwhile do not use them)
+    waitFor( m_ctx, m_copyFence );
+    for( const auto& copy: m_copying )
+    {
+      copy.second->m_parseValue = copyValue;
+      m_free.push_back( copy.first );
+      handOver( copy.second->picture, copy.second );
+    }
+    m_copying.clear();
+  }
+  if( steps )
+  {
+    waitFor( m_ctx, m_fence );
+    std::lock_guard<std::mutex> lock( m_mutex );
+    m_stats.submissions++;
+    m_stats.parsingSum += int64_t( m_parsing.size() );
+  }
 }
 
 void ParseService::submitSteps()
@@ -686,19 +779,24 @@ void ParseService::submitSteps()
   hostReadBarrier( m_ctx, m_cmd );
   vk.vkEndCommandBuffer( m_cmd );
   vk.vkResetFences( m_ctx->device(), 1, &m_fence );
-  const uint64_t value = m_ctx->submitParse( m_cmd, m_fence );
-  const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_fence, VK_TRUE, UINT64_MAX );
-  if( result != VK_SUCCESS )
+  m_stepsValue = m_ctx->submitParse( m_cmd, m_fence );
+}
+
+uint64_t ParseService::submitCopies()
+{
+  const Api& vk = m_ctx->api();
+  vk.vkResetCommandPool( m_ctx->device(), m_copyPool, 0 );
+  VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vk.vkBeginCommandBuffer( m_copyCmd, &begin );
+  startBarrier( m_ctx, m_copyCmd );   // (what the parse wrote, visible)
+  for( const auto& copy: m_copying )
   {
-    THROW_FATAL( "Vulkan: waiting for the GPU's parse failed (" << result << ")" );
+    copy.first->recordScatter( m_copyCmd, copy.second->cus(), copy.second->tus(), copy.second->ctus() );
   }
-  for( ParseSlot* slot: m_parsing )
-  {
-    slot->setParseValue( value );
-  }
-  std::lock_guard<std::mutex> lock( m_mutex );
-  m_stats.submissions++;
-  m_stats.parsingSum += int64_t( m_parsing.size() );
+  vk.vkEndCommandBuffer( m_copyCmd );
+  vk.vkResetFences( m_ctx->device(), 1, &m_copyFence );
+  return m_ctx->submitParseCopy( m_copyCmd, m_copyFence, m_stepsValue );   // (after the steps that parsed them)
 }
 
 void ParseService::finishPictures()
@@ -722,28 +820,48 @@ void ParseService::finishPictures()
       continue;
     }
     m_parsing.erase( m_parsing.begin() + i );
-    handOver( slot, progress != ParseSlot::Progress::Done );
+    const bool failed = progress != ParseSlot::Progress::Done;
+    if( !failed )
+    {
+      // the most records a picture had: the room the next pictures' slots start with
+      m_maxCus = std::max( m_maxCus, slot->numCus() );
+      m_maxTus = std::max( m_maxTus, slot->numTus() );
+    }
+    {
+      std::lock_guard<std::mutex> lock( m_mutex );
+      m_stats.runs += slot->runs();
+      m_stats.errors += failed ? 1 : 0;
+      m_stats.maxCus = int64_t( m_maxCus );
+      m_stats.maxTus = int64_t( m_maxTus );
+    }
+    if( failed )
+    {
+      m_free.push_back( slot );
+      handOver( slot->picture, nullptr );
+      continue;
+    }
+    // parsed: its records copied into a result of their size (the next submit), then handed over
+    ParsedPicture* result = takeParsed();
+    result->picture       = slot->picture;
+    result->m_numCus      = slot->numCus();
+    result->m_numTus      = slot->numTus();
+    result->m_caps        = slot->capacities();
+    result->m_saoAlf.resize( slot->numCtus() * ParsedPicture::kSaoAlfWords );
+    for( size_t ctu = 0; ctu < slot->numCtus(); ctu++ )
+    {
+      const uint32_t* words = slot->saoAlf( int( ctu ) );
+      std::copy( words, words + ParsedPicture::kSaoAlfWords, result->m_saoAlf.begin() + ctu * ParsedPicture::kSaoAlfWords );
+    }
+    result->m_cus  = takeBuffer( std::max<size_t>( result->m_numCus, 1 ) * sizeof( CuRecord ) );
+    result->m_tus  = takeBuffer( std::max<size_t>( result->m_numTus, 1 ) * sizeof( TuRecord ) );
+    result->m_ctus = takeBuffer( slot->numCtus() * sizeof( CtuRecord ) );
+    m_copying.emplace_back( slot, result );
   }
 }
 
-void ParseService::handOver( ParseSlot* slot, bool failed )
+void ParseService::handOver( Picture* pic, ParsedPicture* parsed )
 {
-  slot->failed = failed;
-  if( !failed )
-  {
-    // the most records a picture had: the room the next pictures' slots start with
-    m_maxCus = std::max( m_maxCus, slot->numCus() );
-    m_maxTus = std::max( m_maxTus, slot->numTus() );
-  }
-  {
-    std::lock_guard<std::mutex> lock( m_mutex );
-    m_stats.runs += slot->runs();
-    m_stats.errors += failed ? 1 : 0;
-    m_stats.maxCus = int64_t( m_maxCus );
-    m_stats.maxTus = int64_t( m_maxTus );
-  }
-  Picture* pic      = slot->picture;
-  pic->gpuParseSlot = slot;
+  pic->gpuParseResult = parsed;
   pic->gpuParsed.unlock_nothrow();
   m_wakeUp();   // (the picture's tasks may wait in a sleeping thread pool)
 }

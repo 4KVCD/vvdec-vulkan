@@ -278,10 +278,11 @@ bool Context::init()
   }
 
   const float priority = 1.0f;
-  const float asyncPriorities[kMaxAsync + 1] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+  const float asyncPriorities[kMaxAsync + 2] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
   m_asyncCount = m_asyncFamily != UINT32_MAX ? int( std::min<uint32_t>( families[m_asyncFamily].queueCount, uint32_t( kMaxAsync ) ) ) : 0;
-  // the parse queue: one more of the family's when it has one (AMD's has 8)
+  // the parse queue: one more of the family's when it has one (AMD's has 8); then the parse's copies' queue, one more
   const bool ownParseQueue = m_asyncCount > 0 && families[m_asyncFamily].queueCount > uint32_t( m_asyncCount );
+  const bool ownCopyQueue  = ownParseQueue && families[m_asyncFamily].queueCount > uint32_t( m_asyncCount + 1 );
   VkDeviceQueueCreateInfo queueInfos[3] = { { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO }, { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO },
                                             { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO } };
   uint32_t numQueueInfos = 0;
@@ -290,7 +291,7 @@ bool Context::init()
     if( family != UINT32_MAX )
     {
       queueInfos[numQueueInfos].queueFamilyIndex = family;
-      queueInfos[numQueueInfos].queueCount       = family == m_asyncFamily ? uint32_t( m_asyncCount + ( ownParseQueue ? 1 : 0 ) ) : 1;
+      queueInfos[numQueueInfos].queueCount       = family == m_asyncFamily ? uint32_t( m_asyncCount + ( ownParseQueue ? 1 : 0 ) + ( ownCopyQueue ? 1 : 0 ) ) : 1;
       queueInfos[numQueueInfos].pQueuePriorities = family == m_asyncFamily ? asyncPriorities : &priority;
       numQueueInfos++;
     }
@@ -414,12 +415,22 @@ bool Context::init()
       m_parseQueue = m_asyncQueues[m_asyncCount - 1];
       m_parseMutex = &m_asyncMutexes[m_asyncCount - 1];
     }
+    if( ownCopyQueue )
+    {
+      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, uint32_t( m_asyncCount + 1 ), &m_parseCopyQueue );
+    }
+    else
+    {
+      m_parseCopyQueue = m_parseQueue;
+      m_parseCopyMutex = m_parseMutex;
+    }
     VkSemaphoreTypeCreateInfo timelineType{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
     timelineType.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkSemaphoreCreateInfo timelineInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     timelineInfo.pNext = &timelineType;
     if( m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_timeline ) != VK_SUCCESS
-        || m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_parseTimeline ) != VK_SUCCESS )
+        || m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_parseTimeline ) != VK_SUCCESS
+        || m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_parseCopyTimeline ) != VK_SUCCESS )
     {
       THROW_FATAL( "Vulkan: vkCreateSemaphore failed (the timeline semaphores)" );
     }
@@ -562,6 +573,10 @@ Context::~Context()
     if( m_parseTimeline )
     {
       m_api.vkDestroySemaphore( m_device, m_parseTimeline, nullptr );
+    }
+    if( m_parseCopyTimeline )
+    {
+      m_api.vkDestroySemaphore( m_device, m_parseCopyTimeline, nullptr );
     }
     m_api.vkDestroyDevice( m_device, nullptr );
   }
@@ -830,7 +845,7 @@ void Context::submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, V
   VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
   timeline.signalSemaphoreValueCount = 1;
   timeline.pSignalSemaphoreValues    = &signalValue;
-  // the waits: the colocated pictures' first parts, the picture's parse
+  // the waits: the colocated pictures' first parts, the picture's parsed records
   VkSemaphore waits[2];
   uint64_t    waitValues[2];
   uint32_t    numWaits = 0;
@@ -842,7 +857,7 @@ void Context::submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, V
   }
   if( waitParse > 0 )
   {
-    waits[numWaits]      = m_parseTimeline;
+    waits[numWaits]      = m_parseCopyTimeline;
     waitValues[numWaits] = waitParse;
     numWaits++;
   }
@@ -858,16 +873,6 @@ void Context::submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, V
   {
     THROW_FATAL( "Vulkan: vkQueueSubmit failed on the async compute queue (" << result << ")" );
   }
-}
-
-uint64_t Context::firstPartsDone() const
-{
-  uint64_t value = 0;
-  if( m_timeline && m_api.vkGetSemaphoreCounterValue( m_device, m_timeline, &value ) != VK_SUCCESS )
-  {
-    THROW_FATAL( "Vulkan: vkGetSemaphoreCounterValue failed" );
-  }
-  return value;
 }
 
 uint64_t Context::submitParse( VkCommandBuffer cmd, VkFence done )
@@ -887,6 +892,37 @@ uint64_t Context::submitParse( VkCommandBuffer cmd, VkFence done )
   if( result != VK_SUCCESS )
   {
     THROW_FATAL( "Vulkan: vkQueueSubmit failed on the parse queue (" << result << ")" );
+  }
+  return value;
+}
+
+uint64_t Context::submitParseCopy( VkCommandBuffer cmd, VkFence done, uint64_t waitParse )
+{
+  VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+  info.commandBufferCount = 1;
+  info.pCommandBuffers    = &cmd;
+  // the wait: the parse's steps that wrote what the copy reads (done already: the parse's thread saw them done)
+  const VkPipelineStageFlags    stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+  if( waitParse > 0 )
+  {
+    info.waitSemaphoreCount          = 1;
+    info.pWaitSemaphores             = &m_parseTimeline;
+    info.pWaitDstStageMask           = &stage;
+    timeline.waitSemaphoreValueCount = 1;
+    timeline.pWaitSemaphoreValues    = &waitParse;
+  }
+  info.signalSemaphoreCount = 1;
+  info.pSignalSemaphores    = &m_parseCopyTimeline;
+  std::lock_guard<std::mutex> lock( *m_parseCopyMutex );
+  const uint64_t              value = ++m_parseCopyValue;
+  timeline.signalSemaphoreValueCount = 1;
+  timeline.pSignalSemaphoreValues    = &value;
+  info.pNext                         = &timeline;
+  const VkResult result = m_api.vkQueueSubmit( m_parseCopyQueue, 1, &info, done );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkQueueSubmit failed on the parse's copies' queue (" << result << ")" );
   }
   return value;
 }

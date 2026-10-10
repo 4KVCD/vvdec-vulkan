@@ -72,7 +72,7 @@ struct Picture;
 #if VVDEC_VULKAN
 namespace gpu
 {
-class ParseSlot;
+class ParsedPicture;
 }
 #endif
 
@@ -228,9 +228,9 @@ public:
   bool                     gpuMotionLater  = false;
   UserAllocator*           gpuMemory       = nullptr;        // the GPU's allocator of the picture's buffers (PicListManager): its colocated motion too
   // VVDEC_GPU_PARSE=2, the GPU parses the picture (gpu::ParseService): its CTUs the parse tasks claimed so far
-  // (DecSlice::claimSlice), and once gpuParsed unlocks, what the GPU's parse left (null, or failed: it gave up)
+  // (DecSlice::claimSlice), and once gpuParsed unlocks, what the GPU's parse left (null: it gave up)
   std::atomic_int          gpuClaimedCtus  { 0 };
-  gpu::ParseSlot*          gpuParseSlot    = nullptr;
+  gpu::ParsedPicture*      gpuParseResult  = nullptr;
 #endif
   bool             isReferencePic          = false;          // mainly for setting vvdecPicAttributes::isRefPic for the library output frame
   bool             wasLost                 = false;

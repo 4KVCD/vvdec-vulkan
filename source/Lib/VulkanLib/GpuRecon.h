@@ -169,7 +169,7 @@ public:
 
   // --- The GPU parse instead of the CPU's (VVDEC_GPU_PARSE=2; GpuReconParse.cpp, GpuParseService.h) ---
   // Whether the GPU parses the picture (sps: its slices') instead of the CPU: only when the GPU front end takes it.
-  // The ParseService parses it then, and the front end takes its records from the picture's ParseSlot
+  // The ParseService parses it then, and the front end reads its records from the picture's ParsedPicture
   // (PictureJobs::parsed).
   static bool parsesPicture( const Picture& pic, const SPS& sps );
   // The same before the picture's coding structure is set up (Picture::finalInit), for a picture whose buffers
@@ -282,11 +282,12 @@ private:
   // results are also copied to host memory for compareFrontEnd.
   void recordFrontEnd( const CodingStructure& cs, const PictureJobs& jobs );
   size_t uploadRecords( const CodingStructure& cs, const PictureJobs& jobs );   // returns the picture's CU count
-  // With the GPU's parse: records the scatter of the picture's records from its parse slot into the front end's
-  // buffers. Returns the picture's CU count.
-  size_t useParsedRecords( const CodingStructure& cs, const ParseSlot& parsed );
+  // With the GPU's parse: the front end reads the picture's records where the parse left them (parsed). Returns
+  // the picture's CU count.
+  size_t useParsedRecords( const CodingStructure& cs, const ParsedPicture& parsed );
   // The front end's buffers for a picture of numCus CUs and numTus TUs
-  void   ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, size_t numTus );
+  // records: room for the records uploaded too (the CPU's parse)
+  void   ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, size_t numTus, bool records = true );
   void   recordMotion( const CodingStructure& cs, size_t numCus );
   void   recordColMotion( const CodingStructure& cs );
   void   recordDeblockParams( const CodingStructure& cs, size_t numCus );
@@ -369,7 +370,7 @@ private:
   VkSemaphore     m_waitFrontEnd1 = VK_NULL_HANDLE;   // what the next first part waits for (part 1's semaphore)
   VkSemaphore     m_waitFrontEnd2 = VK_NULL_HANDLE;   // what the next rest waits for (part 2's semaphore)
   uint64_t        m_frontEndWait  = 0;                // the timeline value part 1 waits for: the colocated pictures' first parts
-  uint64_t        m_frontEndParseWait = 0;            // the parse queue's timeline value part 1 waits for: the picture's parse
+  uint64_t        m_frontEndParseWait = 0;            // the parse's copies' timeline value part 1 waits for: the picture's records
   bool            m_splitFrontEnd = false;            // recordJobs ends part 1 after the jobs (splitFrontEnd)
 
   // The downloads on the copy queue: two sets of commands that take turns
@@ -449,7 +450,9 @@ private:
   // The GPU front end's buffers (GpuReconFrontEnd.cpp). The records are uploaded; the rest is GPU memory.
   struct FrontEndBuffers
   {
-    Buffer cus, tus, ctus;   // the parse's records (GpuFrontEnd.h)
+    Buffer cus, tus, ctus;   // the CPU parse's records (GpuFrontEnd.h), uploaded
+    // the records the front end reads: those, or where the GPU's parse left them (ParsedPicture)
+    VkDeviceAddress recordCus = 0, recordTus = 0, recordCtus = 0;
     // Motion derivation (mider.slang): per 4x4 block, its CU in the luma tree and in the chroma tree; per CU, its
     // motion; per 4x4 block, its motion (5 words); per CTU row, its progress
     Buffer cuMapLuma, cuMapChroma, cuMotion, motion, rowProgress;
