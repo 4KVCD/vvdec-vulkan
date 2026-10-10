@@ -280,7 +280,7 @@ void CodingStructure::rebindPicBufs()
   else                                                    m_rec_wrap.destroy();
 }
 
-void CodingStructure::allocTempInternals( bool cuMap )
+void CodingStructure::allocTempInternals( bool cuMap, bool colMotion )
 {
   const ptrdiff_t ctuCuMapSize    = pcv->num4x4CtuBlks;
   const ptrdiff_t ctuColMiMapSize = pcv->num8x8CtuBlks;
@@ -301,7 +301,7 @@ void CodingStructure::allocTempInternals( bool cuMap )
   }
 
   const ptrdiff_t newColMiMapSize = ctuColMiMapSize * pcv->sizeInCtus;
-  if( m_colMiMapSize != newColMiMapSize )
+  if( colMotion && m_colMiMapSize != newColMiMapSize )
   {
     allocColMiMap( newColMiMapSize );
   }
@@ -392,8 +392,43 @@ void CodingStructure::deallocTempInternals()
 
 void CodingStructure::clearColMotion()
 {
-  memset( NO_WARNING_class_memaccess( m_colMiMap ), CO_NOT_VALID, sizeof( ColocatedMotionInfo ) * m_colMiMapSize );
+  if( m_colMiMap )   // (none yet: a picture the GPU parses, whose GPU work writes it all)
+  {
+    memset( NO_WARNING_class_memaccess( m_colMiMap ), CO_NOT_VALID, sizeof( ColocatedMotionInfo ) * m_colMiMapSize );
+  }
 }
+
+#if VVDEC_VULKAN
+ptrdiff_t CodingStructure::colMotionEntries() const
+{
+  return ptrdiff_t( pcv->num8x8CtuBlks ) * pcv->sizeInCtus;
+}
+
+void CodingStructure::attachColMotion( ColocatedMotionInfo* map, void* allocation )
+{
+  CHECK( m_colMiMap, "the colocated motion attached twice" );
+  m_colMiMap        = map;
+  m_colMiAllocation = allocation;
+  m_colMiMapSize    = colMotionEntries();
+  for( size_t ctu = 0; ctu < m_ctuDataSize; ctu++ )
+  {
+    m_ctuData[ctu].colMotion = &m_colMiMap[ctu * pcv->num8x8CtuBlks];
+  }
+}
+
+void* CodingStructure::detachColMotion()
+{
+  void* allocation  = m_colMiAllocation;
+  m_colMiMap        = nullptr;
+  m_colMiAllocation = nullptr;
+  m_colMiMapSize    = 0;
+  for( size_t ctu = 0; ctu < m_ctuDataSize; ctu++ )
+  {
+    m_ctuData[ctu].colMotion = nullptr;
+  }
+  return allocation;
+}
+#endif
 
 void CodingStructure::initStructData( bool clearColMotion )
 {
@@ -443,7 +478,7 @@ void CodingStructure::initStructData( bool clearColMotion )
         m_ctuData[i].cuPtr[j] = m_cuMap ? &m_cuMap[( 2 * i + j ) * ctuCuMapSize] : nullptr;
       }
 
-      m_ctuData[i].colMotion         = &m_colMiMap[i * ctuColMiMapSize];
+      m_ctuData[i].colMotion         = m_colMiMap ? &m_colMiMap[i * ctuColMiMapSize] : nullptr;
       m_ctuData[i].predBufOffset     = i * ctuSampleSize;
       m_ctuData[i].dmvrMvCacheOffset = i * pcv->num8x8CtuBlks;
     }

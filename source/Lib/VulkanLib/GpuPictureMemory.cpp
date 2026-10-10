@@ -176,7 +176,14 @@ static void releaseStandIn( void*, void* allocator )
 
 PlanePool::PlanePool( const UserAllocator* planes ) : m_planes( planes ), m_standIns( reserveStandIn, releaseStandIn, nullptr ) {}
 
-PlanePool::~PlanePool() = default;   // (the planes kept go back to their allocator)
+PlanePool::~PlanePool()
+{
+  // (the planes kept go back to their allocator with m_free; the colocated motion too)
+  for( const ColMotion& c: m_freeColMotion )
+  {
+    m_planes->unref( m_planes->opaque, c.allocation );
+  }
+}
 
 bool PlanePool::hasPlanes( const Picture& pic ) const
 {
@@ -211,6 +218,28 @@ static bool sameLayout( const PelStorage& a, const PelStorage& b )
 void PlanePool::acquire( Picture& pic )
 {
   std::lock_guard<std::mutex> lock( m_mutex );
+  // the colocated motion, of its size from the pool, else new
+  if( pic.cs && !pic.cs->m_colMiMap && pic.cs->colMiAllocator )
+  {
+    const uint32_t bytes = uint32_t( sizeof( ColocatedMotionInfo ) * pic.cs->colMotionEntries() );
+    ColMotion      c{};
+    for( auto it = m_freeColMotion.begin(); it != m_freeColMotion.end(); ++it )
+    {
+      if( it->bytes == bytes )
+      {
+        c = *it;
+        m_freeColMotion.erase( it );
+        break;
+      }
+    }
+    if( !c.allocation )
+    {
+      c.bytes = bytes;
+      c.map   = m_planes->create( m_planes->opaque, VVDEC_CT_Y, bytes, MEMORY_ALIGN_DEF_SIZE, &c.allocation );
+      CHECK( !c.map, "no memory for the colocated motion" );
+    }
+    pic.cs->attachColMotion( static_cast<ColocatedMotionInfo*>( c.map ), c.allocation );
+  }
   if( hasPlanes( pic ) )
   {
     return;
@@ -242,6 +271,13 @@ void PlanePool::acquire( Picture& pic )
 void PlanePool::release( Picture& pic )
 {
   std::lock_guard<std::mutex> lock( m_mutex );
+  // the colocated motion back to the pool (a picture the CPU parsed has it from its set-up: from the same allocator)
+  if( pic.cs && pic.cs->m_colMiAllocation && pic.cs->colMiAllocator == m_planes )
+  {
+    const uint32_t bytes = uint32_t( sizeof( ColocatedMotionInfo ) * pic.cs->m_colMiMapSize );
+    void*          map   = pic.cs->m_colMiMap;
+    m_freeColMotion.push_back( ColMotion{ pic.cs->detachColMotion(), map, bytes } );
+  }
   if( !hasPlanes( pic ) )
   {
     return;

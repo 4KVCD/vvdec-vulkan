@@ -258,7 +258,7 @@ Picture::Picture( bool enableOpt )
   }
 }
 
-void Picture::finalInit( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache, CuMapCache* cuMapCache, const SPS *sps, const PPS *pps, const std::shared_ptr<PicHeader>& ph, const APS* const alfApss[ALF_CTB_MAX_NUM_APS], const APS* lmcsAps, const APS* scalingListAps, bool phPSupdate, bool clearColMotion, bool cuMap )
+void Picture::finalInit( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache, CuMapCache* cuMapCache, const SPS *sps, const PPS *pps, const std::shared_ptr<PicHeader>& ph, const APS* const alfApss[ALF_CTB_MAX_NUM_APS], const APS* lmcsAps, const APS* scalingListAps, bool phPSupdate, bool clearColMotion, bool cuMap, bool colMotion )
 {
   SEI_internal::deleteSEIs( seiMessageList );
   clearSliceBuffer();
@@ -308,7 +308,7 @@ void Picture::finalInit( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache,
     cs->lmcsAps = lmcsAps ? lmcsAps->getSharedPtr() : nullptr;
   }
 
-  cs->allocTempInternals( cuMap );
+  cs->allocTempInternals( cuMap, colMotion );
   cs->rebindPicBufs();
   cs->initStructData( clearColMotion );
 

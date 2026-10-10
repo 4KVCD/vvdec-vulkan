@@ -228,8 +228,9 @@ public:
   void initStructData( bool clearColMotion = true );
   void clearColMotion();
 
-  // cuMap: the CU map (a CodingUnit pointer a 4x4 block), which a picture the GPU parses never uses
-  void allocTempInternals( bool cuMap = true );
+  // cuMap: the CU map (a CodingUnit pointer a 4x4 block), which a picture the GPU parses never uses; colMotion: the
+  // colocated motion, which a picture the GPU parses gets later (attachColMotion)
+  void allocTempInternals( bool cuMap = true, bool colMotion = true );
   void deallocTempInternals();
 
   void createInternals(const UnitArea& _unit);
@@ -264,6 +265,12 @@ public:
   size_t                                 m_gpuSliceTableWords = 0;
   uint32_t*                              gpuSliceTable( size_t words );   // room for words of it
   void                                   freeGpuSliceTable();
+  // VVDEC_GPU_PARSE=2: a picture the GPU parses has its colocated motion only while its work is on the GPU
+  // (gpu::PlanePool): map, of colMotionEntries() entries, from colMiAllocator (allocation: its handle), set; or given
+  // back (the handle; null when there is none)
+  ptrdiff_t                              colMotionEntries() const;
+  void                                   attachColMotion( ColocatedMotionInfo* map, void* allocation );
+  void*                                  detachColMotion();
   // VVDEC_GPU_PARSE: each CTU's SAO and ALF parameters as the CPU's parse left them (gpu::captureSaoAlf, 7 words a CTU)
   std::vector<uint32_t>                  m_gpuSaoAlf;
 #endif

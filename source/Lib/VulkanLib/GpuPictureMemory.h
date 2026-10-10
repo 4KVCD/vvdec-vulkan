@@ -100,10 +100,12 @@ public:
 
   // The stand-ins' allocator, for the picture list's new pictures (PicListManager::setGpuPlanes)
   UserAllocator* standIns() { return &m_standIns; }
-  // Swaps planes (from the pool, or new ones) in for the picture's stand-ins; nothing when it has its planes
+  // Swaps planes (from the pool, or new ones) in for the picture's stand-ins, and gives it colocated motion (the
+  // same); nothing of what it has
   void acquire( Picture& pic );
-  // Swaps stand-ins in for the picture's planes, which go back to the pool, their twins to the GPU's pool; nothing when
-  // it has stand-ins. For a finished picture whose buffer may be reused, and a buffer used for a picture the GPU parses.
+  // Swaps stand-ins in for the picture's planes, which go back to the pool, their twins to the GPU's pool, and its
+  // colocated motion back to the pool; nothing of what it does not have. For a finished picture whose buffer may be
+  // reused, and a buffer used for a picture the GPU parses.
   void release( Picture& pic );
 
 private:
@@ -114,6 +116,14 @@ private:
   UserAllocator                            m_standIns;
   std::mutex                               m_mutex;   // (acquire and release run on the decoder's threads)
   std::vector<std::unique_ptr<PelStorage>> m_free;    // planes no picture has
+  // colocated motion no picture has (from m_planes: the pictures' colMiAllocator)
+  struct ColMotion
+  {
+    void*    allocation;
+    void*    map;
+    uint32_t bytes;
+  };
+  std::vector<ColMotion> m_freeColMotion;
 };
 
 // The HostPlane of a component of a picture whose planes come from hostPictureAllocator.
