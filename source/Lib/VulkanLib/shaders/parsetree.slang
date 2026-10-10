@@ -141,15 +141,15 @@ uint2 cuAtRestricted( int x, int y, int cur, int ch )
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// The partitioner (vvdec's Partitioner). Its stack of levels lives in shared memory (s_lv...); the rest of its state
-// (g_p) lives in each thread, the same in all threads.
+// The partitioner (vvdec's Partitioner). Its current level (g_lv) and the rest of its state (g_p) live in each thread,
+// the same in all threads; the levels below the current one wait in shared memory (s_lv...).
 // --------------------------------------------------------------------------------------------------------------------
 
 static const int kMaxLevels = 24;   // the deepest stack of levels (deeper gives up the substream)
 
-// Per level of the stack: the split that made it (CTU_LEVEL at level 0, whose one part is the CTU), the index of its
-// current part, its number of parts, the CUs above and left of its current part (setNeighborCu), its quantization
-// group flags, and the area it splits
+// Per level below the current one (as Level below): the split that made it (CTU_LEVEL at level 0, whose one part is
+// the CTU), the index of its current part, its number of parts, the CUs above and left of its current part
+// (setNeighborCu), its quantization group flags, and the area it splits
 groupshared int s_lvSplit[kMaxLevels];
 groupshared int s_lvIdx[kMaxLevels];
 groupshared int s_lvNum[kMaxLevels];
@@ -182,6 +182,46 @@ struct Part
 
 static Part g_p;
 
+// The partitioner's current level, the top of its stack, in registers (each read of shared memory is a round trip of
+// tens of cycles for the one wave that parses): the levels below it wait in shared memory (s_lv...) while its parts
+// are parsed (saveLevel when a part is split, loadLevel when its parts are done)
+struct Level
+{
+  int   split;   // the split that made the level's parts (CTU_LEVEL at the CTU)
+  int   idx;     // the current part
+  int   num;     // the parts
+  int   qg;      // qgEnable | qgChromaEnable << 1
+  int4  area;    // the area split (luma samples: x, y, w, h)
+  uint2 above;   // the CUs above and left of the current part (setNeighborCu)
+  uint2 left;
+};
+
+static Level g_lv;
+
+// Keeps the current level in shared memory as level l
+void saveLevel( int l )
+{
+  s_lvSplit[l] = g_lv.split;
+  s_lvIdx[l]   = g_lv.idx;
+  s_lvNum[l]   = g_lv.num;
+  s_lvQg[l]    = g_lv.qg;
+  s_lvArea[l]  = g_lv.area;
+  s_lvAbove[l] = g_lv.above;
+  s_lvLeft[l]  = g_lv.left;
+}
+
+// Makes level l, kept in shared memory, the current level again
+void loadLevel( int l )
+{
+  g_lv.split = uni( s_lvSplit[l] );
+  g_lv.idx   = uni( s_lvIdx[l] );
+  g_lv.num   = uni( s_lvNum[l] );
+  g_lv.qg    = uni( s_lvQg[l] );
+  g_lv.area  = int4( uni( s_lvArea[l].x ), uni( s_lvArea[l].y ), uni( s_lvArea[l].z ), uni( s_lvArea[l].w ) );
+  g_lv.above = uni( s_lvAbove[l] );
+  g_lv.left  = uni( s_lvLeft[l] );
+}
+
 // The area of part idx when area a is split with split; CTU_LEVEL's one part is a itself
 int4 partArea( int split, int idx, int4 a )
 {
@@ -213,20 +253,19 @@ int4 partArea( int split, int idx, int4 a )
 // The area of the current part (Partitioner::currArea), in luma samples
 int4 currArea()
 {
-  const int l = g_p.top;
-  return partArea( uni( s_lvSplit[l] ), uni( s_lvIdx[l] ), int4( uni( s_lvArea[l].x ), uni( s_lvArea[l].y ), uni( s_lvArea[l].z ), uni( s_lvArea[l].w ) ) );
+  return partArea( g_lv.split, g_lv.idx, g_lv.area );
 }
 
 // Whether the current part may start a quantization group for the delta QP (Partitioner::currQgEnable) and for the
 // chroma QP offsets (currQgChromaEnable)
 bool currQgEnable()
 {
-  return ( uni( s_lvQg[g_p.top] ) & 1 ) != 0;
+  return ( g_lv.qg & 1 ) != 0;
 }
 
 bool currQgChromaEnable()
 {
-  return ( uni( s_lvQg[g_p.top] ) & 2 ) != 0;
+  return ( g_lv.qg & 2 ) != 0;
 }
 
 // Partitioner::isSepTree: the current part is in a separate luma or chroma tree (the dual tree, or a local dual tree)
@@ -246,14 +285,14 @@ int stepY( int ch )
   return ch == 0 ? 1 : 1 << g_csy;
 }
 
-// Records in level l the CUs above and to the left of its current part, in the partitioner's channel type (the
-// chroma tree's for TREE_C), as vvdec's setNeighborCu does
-void setNeighborCu( int l )
+// Records in the current level the CUs above and to the left of its current part, in the partitioner's channel type
+// (the chroma tree's for TREE_C), as vvdec's setNeighborCu does
+void setNeighborCu()
 {
   const int  ch = g_p.treeType == TREE_C ? 1 : g_p.chType;
-  const int4 a  = partArea( uni( s_lvSplit[l] ), uni( s_lvIdx[l] ), int4( uni( s_lvArea[l].x ), uni( s_lvArea[l].y ), uni( s_lvArea[l].z ), uni( s_lvArea[l].w ) ) );
-  s_lvAbove[l] = cuAt( a.x, a.y - stepY( ch ), ch );
-  s_lvLeft[l]  = cuAt( a.x - stepX( ch ), a.y, ch );
+  const int4 a  = currArea();
+  g_lv.above    = cuAt( a.x, a.y - stepY( ch ), ch );
+  g_lv.left     = cuAt( a.x - stepX( ch ), a.y, ch );
 }
 
 // Sets the partitioner up for the CTU's tree of channel type chType (Partitioner::initCtu): level 0 is the CTU
@@ -268,12 +307,12 @@ void initCtu( int chType )
   g_p.chType              = chType;
   g_p.treeType            = TREE_D;
   g_p.modeType            = MODE_TYPE_ALL;
-  s_lvSplit[0]            = CTU_LEVEL;
-  s_lvIdx[0]              = 0;
-  s_lvNum[0]              = 1;
-  s_lvQg[0]               = 3;
-  s_lvArea[0]             = int4( g_ctuX << g_log2Ctu, g_ctuY << g_log2Ctu, g_ctuSize, g_ctuSize );
-  setNeighborCu( 0 );
+  g_lv.split              = CTU_LEVEL;
+  g_lv.idx                = 0;
+  g_lv.num                = 1;
+  g_lv.qg                 = 3;
+  g_lv.area               = int4( g_ctuX << g_log2Ctu, g_ctuY << g_log2Ctu, g_ctuSize, g_ctuSize );
+  setNeighborCu();
   // The partition limits, picked as vvdec does with GDR_ADJ: the luma (or single tree) limits of intra or inter
   // slices, or the dual tree chroma's
   const uint lim          = uint( sliceWord( chType == 1 && g_dualTree ? kSlPartChroma : kSlPartLuma ) );
@@ -301,11 +340,12 @@ void splitCurrArea( int split )
   bool       qgChromaEnable = currQgChromaEnable();
   const int  last           = g_p.top;
   const int  l              = last + 1;
+  saveLevel( last );   // (the current level waits below the new one; the new one starts with its neighbours)
   g_p.top                   = l;
-  s_lvSplit[l]              = split;
-  s_lvIdx[l]                = 0;
-  s_lvNum[l]                = split == CU_QUAD_SPLIT ? 4 : ( split == CU_TRIH_SPLIT || split == CU_TRIV_SPLIT ? 3 : 2 );
-  s_lvArea[l]               = area;
+  g_lv.split                = split;
+  g_lv.idx                  = 0;
+  g_lv.num                  = split == CU_QUAD_SPLIT ? 4 : ( split == CU_TRIH_SPLIT || split == CU_TRIV_SPLIT ? 3 : 2 );
+  g_lv.area                 = area;
   if( split == CU_QUAD_SPLIT )
   {
     g_p.currMtDepth = 0;
@@ -330,22 +370,19 @@ void splitCurrArea( int split )
   const uint subdiv = uint( sliceWord( kSlSubdiv ) );
   qgEnable          = qgEnable && g_p.currSubdiv <= int( subdiv & 0xffu );
   qgChromaEnable    = qgChromaEnable && g_p.currSubdiv <= int( ( subdiv >> 8 ) & 0xffu );
-  s_lvQg[l]         = ( qgEnable ? 1 : 0 ) | ( qgChromaEnable ? 2 : 0 );
-  s_lvAbove[l]      = s_lvAbove[last];
-  s_lvLeft[l]       = s_lvLeft[last];
+  g_lv.qg           = ( qgEnable ? 1 : 0 ) | ( qgChromaEnable ? 2 : 0 );
 }
 
 // Moves to the next part of the current level; returns false after its last part (Partitioner::nextPart, for the CU
 // splits)
 bool nextPart()
 {
-  const int l   = g_p.top;
-  const int idx = uni( s_lvIdx[l] ) + 1;
-  s_lvIdx[l]    = idx;
-  if( idx < uni( s_lvNum[l] ) )
+  const int idx = g_lv.idx + 1;
+  g_lv.idx      = idx;
+  if( idx < g_lv.num )
   {
-    setNeighborCu( l );
-    const int split = uni( s_lvSplit[l] );
+    setNeighborCu();
+    const int split = g_lv.split;
     if( split == CU_TRIH_SPLIT || split == CU_TRIV_SPLIT )
     {
       if( idx == 1 )
@@ -366,9 +403,10 @@ bool nextPart()
 void exitCurrSplit()
 {
   const int l         = g_p.top;
-  const int currSplit = uni( s_lvSplit[l] );
-  const int currIndex = uni( s_lvIdx[l] );
+  const int currSplit = g_lv.split;
+  const int currIndex = g_lv.idx;
   g_p.top             = l - 1;
+  loadLevel( l - 1 );
   const bool isImplicit = outsidePicture( currArea() );
   g_p.currDepth--;
   g_p.currSubdiv--;
@@ -401,7 +439,6 @@ int canSplit()
   const bool chroma = g_p.chType == 1;
   const int  cw     = area.z >> g_csx;   // the part's chroma block, which the chroma tree's limits look at
   const int  chh    = area.w >> g_csy;
-  const int  l      = g_p.top;
 
   if( g_dualTree && ( area.z > 64 || area.w > 64 ) )
   {
@@ -411,7 +448,7 @@ int canSplit()
   {
     return 1;   // no split: a local dual tree's chroma CU covers its whole area
   }
-  const int  lastSplit = uni( s_lvSplit[l] );
+  const int  lastSplit = g_lv.split;
   const bool isTrInPic = area.x + area.z <= g_width;
   const bool isBlInPic = area.y + area.w <= g_height;
   const bool isImplicit = !isBlInPic || !isTrInPic;
@@ -460,7 +497,7 @@ int canSplit()
   }
   else
   {
-    if( ( lastSplit == CU_TRIH_SPLIT || lastSplit == CU_TRIV_SPLIT ) && uni( s_lvIdx[l] ) == 1 )
+    if( ( lastSplit == CU_TRIH_SPLIT || lastSplit == CU_TRIV_SPLIT ) && g_lv.idx == 1 )
     {
       const int parlSplit = lastSplit == CU_TRIH_SPLIT ? CU_HORZ_SPLIT : CU_VERT_SPLIT;
       canBh               = parlSplit != CU_HORZ_SPLIT;
@@ -514,9 +551,8 @@ int splitCuMode()
   {
     return CU_DONT_SPLIT;
   }
-  const int  l          = g_p.top;
-  const uint2 cuLeft    = uni( s_lvLeft[l] );
-  const uint2 cuAbove   = uni( s_lvAbove[l] );
+  const uint2 cuLeft    = g_lv.left;
+  const uint2 cuAbove   = g_lv.above;
   const int  ch         = g_p.chType;
   const int4 area       = currArea();
   const int  widthCurr  = ch == 0 ? area.z : area.z >> g_csx;
@@ -626,9 +662,8 @@ int modeConstraint( int split )
   const int val = signalModeCons( split );
   if( val == 2 )
   {
-    const int l       = g_p.top;
-    const uint2 cuLeft  = uni( s_lvLeft[l] );
-    const uint2 cuAbove = uni( s_lvAbove[l] );
+    const uint2 cuLeft  = g_lv.left;
+    const uint2 cuAbove = g_lv.above;
     const int   ctxIdx  = ( ( infoValid( cuAbove ) && infoPredMode( cuAbove ) == MODE_INTRA ) || ( infoValid( cuLeft ) && infoPredMode( cuLeft ) == MODE_INTRA ) ) ? 1 : 0;
     return decodeBin( CTX_ModeConsFlag + ctxIdx ) != 0 ? MODE_TYPE_INTRA : MODE_TYPE_INTER;
   }
@@ -648,7 +683,7 @@ int splitAtDepth( int depth )
   {
     return CU_DONT_SPLIT;
   }
-  return uni( s_lvSplit[depth + 1] );
+  return depth + 1 == g_p.top ? g_lv.split : uni( s_lvSplit[depth + 1] );
 }
 
 // --------------------------------------------------------------------------------------------------------------------
@@ -778,7 +813,7 @@ void codingTree( inout CuCtx ctx )
         // chromaNotSplit: after the luma parts, the chroma of the whole area follows as one CU of the chroma tree
         g_p.chType   = 1;
         g_p.treeType = TREE_C;
-        setNeighborCu( g_p.top );
+        setNeighborCu();
         s_frame[f] = fr | 1;
         f++;
         enter = true;

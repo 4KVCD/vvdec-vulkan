@@ -152,8 +152,8 @@ bool addCu()
   cu.intraDirC = 0;
   cu.qtDepth  = g_p.currQtDepth;
   cu.depth    = g_p.currDepth;
-  cu.left     = uni( s_lvLeft[g_p.top] );
-  cu.above    = uni( s_lvAbove[g_p.top] );
+  cu.left     = g_lv.left;
+  cu.above    = g_lv.above;
   cu.dmvrOff  = 0;
   // A luma CU of at least 8x8 and 128 samples reserves room for DMVR's refinements: one per 16x16 subblock (a side
   // shorter than 16 counts as one subblock)

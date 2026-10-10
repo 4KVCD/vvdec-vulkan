@@ -364,7 +364,7 @@ void transformTree( inout CuCtx ctx )
       l  = int4( a.x + ( ( a.z * xf ) >> 2 ), a.y + ( ( a.w * yf ) >> 2 ), ( a.z * wf ) >> 2, ( a.w * hf ) >> 2 );
       cc = int4( c.x + ( ( c.z * xf ) >> 2 ), c.y + ( ( c.w * yf ) >> 2 ), ( c.z * wf ) >> 2, ( c.w * hf ) >> 2 );
     }
-    transformLeaf( l, cc, cvi, kind == 0 ? s_lvIdx[g_p.top] : i, kind == 0 ? 0 : 1, ctx );
+    transformLeaf( l, cc, cvi, kind == 0 ? g_lv.idx : i, kind == 0 ? 0 : 1, ctx );
   }
 }
 
