@@ -445,8 +445,25 @@ void printSEI( vvdecDecoder *dec, vvdecFrame *frame, std::ostream * logStream )
   }
 }
 
+// VVDEC_OUTFRAMES=N (a test aid for the Vulkan port's fast checks): the decode stops once N frames are output, without
+// flushing the rest, so that the output is the stream's first N frames in output order (-f N stops after N pictures
+// in decoding order instead). 0: no limit.
+static unsigned outFramesRequested()
+{
+#ifdef _MSC_VER
+#  pragma warning( push )
+#  pragma warning( disable : 4996 )
+#endif
+  const char* value = getenv( "VVDEC_OUTFRAMES" );
+#ifdef _MSC_VER
+#  pragma warning( pop )
+#endif
+  return value ? unsigned( atoi( value ) ) : 0;
+}
+
 int main( int argc, char* argv[] )
 {
+  const unsigned maxOutFrames = outFramesRequested();
   std::string cAppname = argv[0];
   std::size_t iPos = (int)cAppname.find_last_of("/");
   if( std::string::npos != iPos )
@@ -825,6 +842,11 @@ int main( int argc, char* argv[] )
           }
         }
 
+        if( maxOutFrames && uiFrames >= maxOutFrames )
+        {
+          break;   // (VVDEC_OUTFRAMES)
+        }
+
         if( uiFrames && params.logLevel >= VVDEC_INFO )
         {
           auto   now     = std::chrono::steady_clock::now();
@@ -841,8 +863,8 @@ int main( int argc, char* argv[] )
 
     //std::cout << "flush" << std::endl;
 
-    // flush the decoder
-    bFlushDecoder = true;
+    // flush the decoder (not with VVDEC_OUTFRAMES once its frames are out)
+    bFlushDecoder = !maxOutFrames || uiFrames < maxOutFrames;
     while( bFlushDecoder)
     {
       vvdecFrame* pcFrame = NULL;
@@ -891,6 +913,10 @@ int main( int argc, char* argv[] )
           vvdec_decoder_close( dec );
           vvdec_accessUnit_free( accessUnit );
           return -1;
+        }
+        if( maxOutFrames && uiFrames >= maxOutFrames )
+        {
+          break;   // (VVDEC_OUTFRAMES)
         }
       }
       else

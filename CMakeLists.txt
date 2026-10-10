@@ -499,6 +499,7 @@ set( VVDEC_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/source/Lib" )
 
 add_subdirectory( "source/Lib/vvdec" )
 add_subdirectory( "source/App/vvdecapp" )
+add_subdirectory( "source/App/vvdecbatch" )
 
 # enable testing with ctest
 enable_testing()
