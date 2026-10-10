@@ -24,6 +24,7 @@
 // them out for the inter, inter_bdof and inter_affine passes.
 
 #include "common.slang"
+#include "scan.slang"
 
 struct Params
 {
@@ -1859,8 +1860,6 @@ void jobWaveP( uint* job, int lane )
 // The passes
 // --------------------------------------------------------------------------------------------------------------------
 
-groupshared int s_scan[5][256];
-
 #if defined( WAVES )
 groupshared int  s_row;
 groupshared int2 s_jobRange[32];   // the intra jobs of the 32 CTUs being walked: [first, end)
@@ -1956,27 +1955,15 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         sum[k] += int( pc.blocks[b * kLists + k] );
       }
     }
-    for( int k = 0; k < kLists; k++ )
-    {
-      s_scan[k][tid] = sum[k];
-    }
-    GroupMemoryBarrierWithGroupSync();
-    if( tid < kLists )
-    {
-      int run = 0;
-      for( int i = 0; i < 256; i++ )
-      {
-        const int v       = s_scan[tid][i];
-        s_scan[tid][i]    = run;
-        run += v;
-      }
-      pc.blocks[pc.numBlocks * kLists + tid] = uint( run );
-    }
-    GroupMemoryBarrierWithGroupSync();
     int at[5];
     for( int k = 0; k < kLists; k++ )
     {
-      at[k] = s_scan[k][tid];
+      uint total;
+      at[k] = int( workgroupPrefixSum( uint( sum[k] ), tid, total ) );
+      if( tid == 0 )
+      {
+        pc.blocks[pc.numBlocks * kLists + k] = total;
+      }
     }
     for( int b = b0; b < b1; b++ )
     {
@@ -2030,26 +2017,15 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     // COUNT: store the CU's offsets within its block, and the block's totals.
     for( int k = 0; k < kLists; k++ )
     {
-      s_scan[k][tid] = index < pc.numCus ? o.n[k] : 0;
-    }
-    GroupMemoryBarrierWithGroupSync();
-    if( tid < kLists )
-    {
-      int run = 0;
-      for( int i = 0; i < 256; i++ )
+      uint       total;
+      const uint before = workgroupPrefixSum( index < pc.numCus ? uint( o.n[k] ) : 0u, tid, total );
+      if( tid == 0 )
       {
-        const int v    = s_scan[tid][i];
-        s_scan[tid][i] = run;
-        run += v;
+        pc.blocks[group.x * kLists + k] = total;
       }
-      pc.blocks[group.x * kLists + tid] = uint( run );
-    }
-    GroupMemoryBarrierWithGroupSync();
-    if( index < pc.numCus )
-    {
-      for( int k = 0; k < kLists; k++ )
+      if( index < pc.numCus )
       {
-        pc.counts[index * kLists + k] = uint( s_scan[k][tid] );
+        pc.counts[index * kLists + k] = before;
       }
     }
   }

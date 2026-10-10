@@ -11,6 +11,7 @@
 // 2 WRITE: each CTU writes its edges at its offsets.
 
 #include "common.slang"
+#include "scan.slang"
 
 struct Params
 {
@@ -36,8 +37,6 @@ struct Params
 
 uint* sliceOfCtu( int ctu ) { return pc.slices + pc.widthInCtus * pc.heightInCtus + pc.slices[ctu] * 64; }
 bool  deblockingOff( uint* s ) { return ( s[1] & ( 1u << 23 ) ) != 0; }
-
-groupshared uint s_scan[2][256];
 
 // Returns which edges a 4x4 block has in direction dir (bit 0: a luma edge, bit 1: a chroma segment) and outputs
 // their Edge words.
@@ -99,20 +98,12 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       {
         sum += pc.counts[c * 4 + l];
       }
-      s_scan[0][tid] = sum;
-      GroupMemoryBarrierWithGroupSync();
+      uint       run;
+      const uint before = workgroupPrefixSum( sum, tid, run );
       if( tid == 0 )
       {
-        uint run = 0;
-        for( int i = 0; i < 256; i++ )
-        {
-          const uint v   = s_scan[0][i];
-          s_scan[0][i]   = run;
-          run += v;
-        }
         pc.lists[l * 2]     = base;
         pc.lists[l * 2 + 1] = run;
-        s_scan[1][0]        = run;
         // The deblocking pass for this list runs one thread per edge, in workgroups of 64.
         pc.args[15 + 3 * l]     = ( run + 63 ) / 64;
         pc.args[15 + 3 * l + 1] = 1;
@@ -120,16 +111,14 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         pc.args[42 + 2 * l]     = run;
         pc.args[42 + 2 * l + 1] = base;
       }
-      GroupMemoryBarrierWithGroupSync();
-      uint at = base + s_scan[0][tid];
+      uint at = base + before;
       for( int c = c0; c < c1; c++ )
       {
         const uint v          = pc.counts[c * 4 + l];
         pc.counts[c * 4 + l]  = at;
         at += v;
       }
-      base += s_scan[1][0];
-      GroupMemoryBarrierWithGroupSync();
+      base += run;
     }
     if( tid == 0 )
     {
@@ -170,28 +159,18 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         cc += ( which[k] >> 1 ) & 1;
       }
     }
-    s_scan[0][tid] = cl;
-    s_scan[1][tid] = cc;
-    GroupMemoryBarrierWithGroupSync();
-    if( tid < 2 )
+    uint       totalL, totalC;
+    const uint beforeL = workgroupPrefixSum( cl, tid, totalL );
+    const uint beforeC = workgroupPrefixSum( cc, tid, totalC );
+    if( pc.pass == 0 && tid == 0 )
     {
-      uint run = 0;
-      for( int i = 0; i < 256; i++ )
-      {
-        const uint v   = s_scan[tid][i];
-        s_scan[tid][i] = run;
-        run += v;
-      }
-      if( pc.pass == 0 )
-      {
-        pc.counts[ctu * 4 + ( tid == 0 ? dir : 2 + dir )] = run;
-      }
+      pc.counts[ctu * 4 + dir]     = totalL;
+      pc.counts[ctu * 4 + 2 + dir] = totalC;
     }
-    GroupMemoryBarrierWithGroupSync();
     if( pc.pass == 2 )
     {
-      uint atL = pc.counts[ctu * 4 + dir] + s_scan[0][tid];
-      uint atC = pc.counts[ctu * 4 + 2 + dir] + s_scan[1][tid];
+      uint atL = pc.counts[ctu * 4 + dir] + beforeL;
+      uint atC = pc.counts[ctu * 4 + 2 + dir] + beforeC;
       for( int k = 0; k < 4; k++ )
       {
         if( ( which[k] & 1 ) != 0 )
