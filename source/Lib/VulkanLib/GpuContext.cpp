@@ -50,8 +50,10 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "vvdec_gpu/GpuShaders.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <vector>
 
 #ifdef _WIN32
@@ -61,6 +63,8 @@ POSSIBILITY OF SUCH DAMAGE.
 #  include <windows.h>
 #else
 #  include <dlfcn.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
 #endif
 
 namespace vvdec
@@ -110,6 +114,7 @@ Options Options::fromEnvironment()
   options.device        = value( "VVDEC_GPU_DEVICE" ) ? value( "VVDEC_GPU_DEVICE" ) : "";
   options.profile       = value( "VVDEC_GPU_PROFILE" ) && atoi( value( "VVDEC_GPU_PROFILE" ) ) != 0;
   options.isaDir        = value( "VVDEC_GPU_ISA" ) ? value( "VVDEC_GPU_ISA" ) : "";
+  options.pipelineCache = value( "VVDEC_GPU_CACHE" ) ? value( "VVDEC_GPU_CACHE" ) : "";
   options.async         = !( value( "VVDEC_GPU_ASYNC" ) && atoi( value( "VVDEC_GPU_ASYNC" ) ) == 0 );
   options.frontEnd      = !( value( "VVDEC_GPU_FRONT" ) && atoi( value( "VVDEC_GPU_FRONT" ) ) == 0 );
   options.frontEndCheck = value( "VVDEC_GPU_MIDER" ) && atoi( value( "VVDEC_GPU_MIDER" ) ) != 0;
@@ -155,6 +160,13 @@ bool Context::init()
     VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
     app.pApplicationName = "vvdec";
     app.apiVersion       = VK_API_VERSION_1_2;
+    // Vulkan 1.3 when the loader has it (VK_KHR_maintenance5, which the pipelines' binaries need, wants it)
+    auto     enumerateVersion = (PFN_vkEnumerateInstanceVersion) m_api.vkGetInstanceProcAddr( VK_NULL_HANDLE, "vkEnumerateInstanceVersion" );
+    uint32_t loaderVersion    = 0;
+    if( enumerateVersion && enumerateVersion( &loaderVersion ) == VK_SUCCESS && loaderVersion >= VK_API_VERSION_1_3 )
+    {
+      app.apiVersion = VK_API_VERSION_1_3;
+    }
     VkInstanceCreateInfo instanceInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     instanceInfo.pApplicationInfo = &app;
     VkInstance instance           = VK_NULL_HANDLE;
@@ -332,6 +344,11 @@ bool Context::init()
   bool        hasShaderInfo = false;
   bool        hasShaderClock = false;
   bool        hasSubgroupBallot = false;
+  // the compiled pipelines' binaries kept in a file (PipelineBinaries), unless VVDEC_GPU_CACHE=0
+  const char* maintenance5      = "VK_KHR_maintenance5";
+  const char* pipelineBinary    = "VK_KHR_pipeline_binary";
+  bool        hasMaintenance5   = false;
+  bool        hasPipelineBinary = false;
   {
     uint32_t extensionCount = 0;
     m_api.vkEnumerateDeviceExtensionProperties( m_physical, nullptr, &extensionCount, nullptr );
@@ -342,6 +359,8 @@ bool Context::init()
       hasShaderInfo |= m_profiling && strcmp( extension.extensionName, shaderInfo ) == 0;
       hasShaderClock |= m_profiling && strcmp( extension.extensionName, shaderClock ) == 0;
       hasSubgroupBallot |= strcmp( extension.extensionName, subgroupBallot ) == 0;
+      hasMaintenance5 |= strcmp( extension.extensionName, maintenance5 ) == 0;
+      hasPipelineBinary |= strcmp( extension.extensionName, pipelineBinary ) == 0;
     }
   }
   // and the subgroup's clock and the device's, for the parse's profile (shaders/parse.slang's PROFILE)
@@ -374,6 +393,25 @@ bool Context::init()
     deviceExtensions.push_back( subgroupBallot );
   }
   m_subgroupBallot = hasSubgroupBallot;
+  VkPhysicalDeviceMaintenance5FeaturesKHR   enableMaintenance5{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR };
+  VkPhysicalDevicePipelineBinaryFeaturesKHR enableBinaries{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
+  bool binaries = hasMaintenance5 && hasPipelineBinary && props.apiVersion >= VK_API_VERSION_1_3 && m_options.pipelineCache != "0";
+  if( binaries )
+  {
+    enableMaintenance5.pNext = &enableBinaries;
+    VkPhysicalDeviceFeatures2 features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    features.pNext = &enableMaintenance5;
+    m_api.vkGetPhysicalDeviceFeatures2( m_physical, &features );
+    binaries = enableMaintenance5.maintenance5 && enableBinaries.pipelineBinaries;
+  }
+  if( binaries )
+  {
+    enableBinaries.pNext     = enable.pNext;
+    enableMaintenance5.pNext = &enableBinaries;
+    enable.pNext             = &enableMaintenance5;
+    deviceExtensions.push_back( maintenance5 );
+    deviceExtensions.push_back( pipelineBinary );
+  }
 
   VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
   deviceInfo.pNext                = &enable;
@@ -393,6 +431,10 @@ bool Context::init()
   if( hasShaderInfo )
   {
     m_getShaderInfo = (PFN_vkGetShaderInfoAMD) m_api.vkGetDeviceProcAddr( m_device, "vkGetShaderInfoAMD" );
+  }
+  if( binaries )
+  {
+    openPipelineBinaries( props );
   }
 
   m_api.vkGetDeviceQueue( m_device, m_queueFamily, 0, &m_queue );
@@ -454,6 +496,361 @@ bool Context::init()
 
   msg( INFO, "Vulkan: %s\n", m_deviceName.c_str() );
   return true;
+}
+
+// ====================================================================================================================
+// The compiled pipelines' binaries
+// ====================================================================================================================
+// The driver keeps the pipelines it compiled in a cache of its own, but per program: the first run of a program it has
+// not seen -- a new or updated one, or any after a driver update -- compiled every shader again on first use (VideoQ
+// 1080p: the first frame 12.3 s after the start instead of 0.85 s). A VkPipelineCache of the decoder's own does not
+// help on AMD's driver (it compiles again, the cache's entries being per program too). With VK_KHR_pipeline_binary the
+// decoder keeps each pipeline's binaries itself and makes the pipeline from them, whatever the program: a set of
+// shaders is compiled once per driver. The binaries are kept in a file per device, with the driver's global key
+// (binaries of another driver do not fit) and the hash of the decoder's shaders (a new set starts the file anew, so it
+// does not grow with every version); it is rewritten when binaries were added.
+
+struct Context::PipelineBinaries
+{
+  PFN_vkGetPipelineKeyKHR              getKey  = nullptr;
+  PFN_vkCreatePipelineBinariesKHR      create  = nullptr;
+  PFN_vkDestroyPipelineBinaryKHR       destroy = nullptr;
+  PFN_vkGetPipelineBinaryDataKHR       getData = nullptr;
+  PFN_vkReleaseCapturedPipelineDataKHR release = nullptr;
+
+  struct Binary
+  {
+    std::vector<uint8_t> key, data;
+  };
+  std::map<std::vector<uint8_t>, std::vector<Binary>> pipelines;   // a pipeline's key -> its binaries
+  std::vector<uint8_t> globalKey;                                  // the driver's
+  uint64_t             shadersHash = 0;
+  std::string          path;
+  bool                 added = false;   // binaries added since the file was read
+
+  // the binaries in the file, when it is whole and of this driver and these shaders (else none)
+  std::map<std::vector<uint8_t>, std::vector<Binary>> read() const;
+  void                                                write() const;
+};
+
+static constexpr uint32_t kBinariesMagic   = 0x42445656;   // "VVDB"
+static constexpr uint32_t kBinariesVersion = 2;
+
+// A hash of all the shaders' SPIR-V words (a millisecond or so)
+static uint64_t shadersHash()
+{
+  uint64_t h = 0x9e3779b97f4a7c15ull;
+  for( int i = 0; i < kShaderCount; i++ )
+  {
+    for( size_t w = 0; w < kShaders[i].size / sizeof( uint32_t ); w++ )
+    {
+      h = ( h ^ kShaders[i].words[w] ) * 0xff51afd7ed558ccdull;
+      h = ( h << 29 ) | ( h >> 35 );
+    }
+  }
+  return h;
+}
+
+// The file name in the user's cache directory (its directory made when missing), or empty when there is none
+static std::string defaultCacheFile( const char* name )
+{
+#ifdef _WIN32
+  const char* base = getenv( "LOCALAPPDATA" );
+  if( !base || !*base )
+  {
+    return "";
+  }
+  const std::string dir = std::string( base ) + "\\vvdec";
+  CreateDirectoryA( dir.c_str(), nullptr );   // (fails when it exists)
+  return dir + "\\" + name;
+#else
+  const char*       xdg  = getenv( "XDG_CACHE_HOME" );
+  const char*       home = getenv( "HOME" );
+  const std::string base = xdg && *xdg ? std::string( xdg ) : home && *home ? std::string( home ) + "/.cache" : std::string();
+  if( base.empty() )
+  {
+    return "";
+  }
+  mkdir( base.c_str(), 0755 );   // (fails when it exists)
+  const std::string dir = base + "/vvdec";
+  mkdir( dir.c_str(), 0755 );
+  return dir + "/" + name;
+#endif
+}
+
+std::map<std::vector<uint8_t>, std::vector<Context::PipelineBinaries::Binary>> Context::PipelineBinaries::read() const
+{
+  std::map<std::vector<uint8_t>, std::vector<Binary>> read;
+  FILE*                                               f = fopen( path.c_str(), "rb" );
+  if( !f )
+  {
+    return read;
+  }
+  std::vector<uint8_t> file;
+  uint8_t              chunk[65536];
+  size_t               got;
+  while( ( got = fread( chunk, 1, sizeof( chunk ), f ) ) > 0 )
+  {
+    file.insert( file.end(), chunk, chunk + got );
+  }
+  fclose( f );
+  // (each read checked against the file's end: a cut or damaged file leaves no binaries)
+  size_t     at = 0;
+  const auto take = [&]( void* to, size_t size ) {
+    if( at + size > file.size() )
+    {
+      return false;
+    }
+    memcpy( to, file.data() + at, size );
+    at += size;
+    return true;
+  };
+  const auto takeBytes = [&]( std::vector<uint8_t>& to, size_t size ) {
+    if( at + size > file.size() )
+    {
+      return false;
+    }
+    to.assign( file.begin() + at, file.begin() + at + size );
+    at += size;
+    return true;
+  };
+  uint32_t             magic = 0, version = 0, keySize = 0, count = 0;
+  uint64_t             hash = 0;
+  std::vector<uint8_t> fileGlobalKey;
+  if( !take( &magic, 4 ) || magic != kBinariesMagic || !take( &version, 4 ) || version != kBinariesVersion || !take( &hash, 8 ) || hash != shadersHash
+      || !take( &keySize, 4 ) || keySize > VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR || !takeBytes( fileGlobalKey, keySize ) || fileGlobalKey != globalKey
+      || !take( &count, 4 ) )
+  {
+    return read;
+  }
+  for( uint32_t p = 0; p < count; p++ )
+  {
+    std::vector<uint8_t> key;
+    uint32_t             binaryCount = 0;
+    if( !take( &keySize, 4 ) || keySize > 256 || !takeBytes( key, keySize ) || !take( &binaryCount, 4 ) || binaryCount > 64 )
+    {
+      return {};
+    }
+    std::vector<Binary>& binaries = read[key];
+    for( uint32_t b = 0; b < binaryCount; b++ )
+    {
+      Binary   binary;
+      uint64_t dataSize = 0;
+      if( !take( &keySize, 4 ) || keySize > VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR || !takeBytes( binary.key, keySize ) || !take( &dataSize, 8 )
+          || dataSize > file.size() || !takeBytes( binary.data, size_t( dataSize ) ) )
+      {
+        return {};
+      }
+      binaries.push_back( std::move( binary ) );
+    }
+  }
+  return read;
+}
+
+// Writes the binaries beside the file, then puts them in its place at once (another decoder may be reading it)
+void Context::PipelineBinaries::write() const
+{
+#ifdef _WIN32
+  const std::string temp = path + ".tmp" + std::to_string( GetCurrentProcessId() );
+#else
+  const std::string temp = path + ".tmp" + std::to_string( getpid() );
+#endif
+  FILE* f = fopen( temp.c_str(), "wb" );
+  if( !f )
+  {
+    return;
+  }
+  bool       ok  = true;
+  const auto put = [&]( const void* from, size_t size ) { ok = ok && fwrite( from, 1, size, f ) == size; };
+  const uint32_t keySize = uint32_t( globalKey.size() ), count = uint32_t( pipelines.size() );
+  put( &kBinariesMagic, 4 );
+  put( &kBinariesVersion, 4 );
+  put( &shadersHash, 8 );
+  put( &keySize, 4 );
+  put( globalKey.data(), globalKey.size() );
+  put( &count, 4 );
+  for( const auto& pipeline: pipelines )
+  {
+    const uint32_t pipelineKeySize = uint32_t( pipeline.first.size() ), binaryCount = uint32_t( pipeline.second.size() );
+    put( &pipelineKeySize, 4 );
+    put( pipeline.first.data(), pipeline.first.size() );
+    put( &binaryCount, 4 );
+    for( const Binary& binary: pipeline.second )
+    {
+      const uint32_t binaryKeySize = uint32_t( binary.key.size() );
+      const uint64_t dataSize      = binary.data.size();
+      put( &binaryKeySize, 4 );
+      put( binary.key.data(), binary.key.size() );
+      put( &dataSize, 8 );
+      put( binary.data.data(), binary.data.size() );
+    }
+  }
+  ok = fclose( f ) == 0 && ok;
+#ifdef _WIN32
+  if( !ok || !MoveFileExA( temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING ) )
+#else
+  if( !ok || rename( temp.c_str(), path.c_str() ) != 0 )
+#endif
+  {
+    remove( temp.c_str() );
+  }
+}
+
+void Context::openPipelineBinaries( const VkPhysicalDeviceProperties& props )
+{
+  PipelineBinaries* b = new PipelineBinaries;
+  b->getKey           = (PFN_vkGetPipelineKeyKHR) m_api.vkGetDeviceProcAddr( m_device, "vkGetPipelineKeyKHR" );
+  b->create           = (PFN_vkCreatePipelineBinariesKHR) m_api.vkGetDeviceProcAddr( m_device, "vkCreatePipelineBinariesKHR" );
+  b->destroy          = (PFN_vkDestroyPipelineBinaryKHR) m_api.vkGetDeviceProcAddr( m_device, "vkDestroyPipelineBinaryKHR" );
+  b->getData          = (PFN_vkGetPipelineBinaryDataKHR) m_api.vkGetDeviceProcAddr( m_device, "vkGetPipelineBinaryDataKHR" );
+  b->release          = (PFN_vkReleaseCapturedPipelineDataKHR) m_api.vkGetDeviceProcAddr( m_device, "vkReleaseCapturedPipelineDataKHR" );
+  VkPipelineBinaryKeyKHR globalKey{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR };
+  if( !b->getKey || !b->create || !b->destroy || !b->getData || !b->release || b->getKey( m_device, nullptr, &globalKey ) != VK_SUCCESS )
+  {
+    delete b;
+    return;
+  }
+  b->globalKey.assign( globalKey.key, globalKey.key + globalKey.keySize );
+  b->shadersHash = shadersHash();
+  char name[64];
+  snprintf( name, sizeof( name ), "vulkan-pipelines-%04x-%04x.bin", props.vendorID, props.deviceID );
+  b->path = m_options.pipelineCache.empty() ? defaultCacheFile( name ) : m_options.pipelineCache;
+  if( !b->path.empty() )
+  {
+    b->pipelines = b->read();
+  }
+  m_binaries = b;
+}
+
+void Context::closePipelineBinaries()
+{
+  if( m_binaries && m_binaries->added && !m_binaries->path.empty() )
+  {
+    // with the binaries another decoder added to the file meanwhile (decoders running side by side)
+    for( auto& pipeline: m_binaries->read() )
+    {
+      m_binaries->pipelines.insert( std::move( pipeline ) );   // (ours kept where both have one)
+    }
+    m_binaries->write();
+  }
+  delete m_binaries;
+  m_binaries = nullptr;
+}
+
+VkResult Context::createPipeline( int shaderId, VkComputePipelineCreateInfo& info, VkPipeline& pipe )
+{
+  PipelineBinaries* b = m_binaries;
+  if( !b )
+  {
+    return m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
+  }
+  // the pipeline's key: its shader (its name and SPIR-V) and whether it asks for waves of 32 threads. (Not the driver's
+  // pipeline key, vkGetPipelineKeyKHR: AMD's makes it per program, as its shader cache.)
+  std::vector<uint8_t> pipelineKey( kShaders[shaderId].name, kShaders[shaderId].name + strlen( kShaders[shaderId].name ) );
+  uint64_t             h = 0x9e3779b97f4a7c15ull;
+  for( size_t w = 0; w < kShaders[shaderId].size / sizeof( uint32_t ); w++ )
+  {
+    h = ( h ^ kShaders[shaderId].words[w] ) * 0xff51afd7ed558ccdull;
+    h = ( h << 29 ) | ( h >> 35 );
+  }
+  pipelineKey.insert( pipelineKey.end(), reinterpret_cast<const uint8_t*>( &h ), reinterpret_cast<const uint8_t*>( &h ) + sizeof( h ) );
+  pipelineKey.push_back( info.stage.pNext ? 32 : 0 );
+  // made from its binaries, when the file has them
+  const auto found = pipelineKey.empty() ? b->pipelines.end() : b->pipelines.find( pipelineKey );
+  if( found != b->pipelines.end() && !found->second.empty() )
+  {
+    std::vector<VkPipelineBinaryKeyKHR>  keys;
+    std::vector<VkPipelineBinaryDataKHR> data;
+    for( const PipelineBinaries::Binary& binary: found->second )
+    {
+      VkPipelineBinaryKeyKHR k{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR };
+      k.keySize = uint32_t( binary.key.size() );
+      memcpy( k.key, binary.key.data(), binary.key.size() );
+      keys.push_back( k );
+      data.push_back( VkPipelineBinaryDataKHR{ binary.data.size(), const_cast<uint8_t*>( binary.data.data() ) } );
+    }
+    VkPipelineBinaryKeysAndDataKHR keysAndData{ uint32_t( keys.size() ), keys.data(), data.data() };
+    VkPipelineBinaryCreateInfoKHR  createInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR };
+    createInfo.pKeysAndDataInfo = &keysAndData;
+    std::vector<VkPipelineBinaryKHR> handles( keys.size(), VK_NULL_HANDLE );
+    VkPipelineBinaryHandlesInfoKHR   handlesInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR };
+    handlesInfo.pipelineBinaryCount = uint32_t( handles.size() );
+    handlesInfo.pPipelineBinaries   = handles.data();
+    VkResult result = b->create( m_device, &createInfo, nullptr, &handlesInfo );
+    if( result == VK_SUCCESS )
+    {
+      VkPipelineBinaryInfoKHR binaryInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR };
+      binaryInfo.binaryCount       = uint32_t( handles.size() );
+      binaryInfo.pPipelineBinaries = handles.data();
+      binaryInfo.pNext             = info.pNext;
+      info.pNext                   = &binaryInfo;
+      result                       = m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
+      info.pNext                   = binaryInfo.pNext;
+    }
+    for( VkPipelineBinaryKHR handle: handles )
+    {
+      if( handle )
+      {
+        b->destroy( m_device, handle, nullptr );
+      }
+    }
+    if( result == VK_SUCCESS )
+    {
+      return result;
+    }
+    b->pipelines.erase( found );   // (binaries the driver refused: compiled below)
+  }
+  // compiled, with its binaries kept
+  VkPipelineCreateFlags2CreateInfoKHR flags{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR };
+  flags.flags = VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;
+  flags.pNext = info.pNext;
+  info.pNext  = &flags;
+  const VkResult result = m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
+  info.pNext            = flags.pNext;
+  if( result != VK_SUCCESS || pipelineKey.empty() )
+  {
+    return result;
+  }
+  VkPipelineBinaryCreateInfoKHR createInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR };
+  createInfo.pipeline = pipe;
+  VkPipelineBinaryHandlesInfoKHR handlesInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR };
+  if( b->create( m_device, &createInfo, nullptr, &handlesInfo ) == VK_SUCCESS && handlesInfo.pipelineBinaryCount > 0 )
+  {
+    std::vector<VkPipelineBinaryKHR> handles( handlesInfo.pipelineBinaryCount, VK_NULL_HANDLE );
+    handlesInfo.pPipelineBinaries = handles.data();
+    if( b->create( m_device, &createInfo, nullptr, &handlesInfo ) == VK_SUCCESS )
+    {
+      std::vector<PipelineBinaries::Binary> binaries;
+      for( VkPipelineBinaryKHR handle: handles )
+      {
+        VkPipelineBinaryDataInfoKHR dataInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR };
+        dataInfo.pipelineBinary = handle;
+        VkPipelineBinaryKeyKHR binaryKey{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR };
+        size_t                 size = 0;
+        if( b->getData( m_device, &dataInfo, &binaryKey, &size, nullptr ) == VK_SUCCESS && size > 0 )
+        {
+          PipelineBinaries::Binary binary;
+          binary.data.resize( size );
+          if( b->getData( m_device, &dataInfo, &binaryKey, &size, binary.data.data() ) == VK_SUCCESS )
+          {
+            binary.key.assign( binaryKey.key, binaryKey.key + binaryKey.keySize );
+            binary.data.resize( size );
+            binaries.push_back( std::move( binary ) );
+          }
+        }
+        b->destroy( m_device, handle, nullptr );
+      }
+      if( binaries.size() == handles.size() )
+      {
+        b->pipelines[pipelineKey] = std::move( binaries );
+        b->added                  = true;
+      }
+    }
+  }
+  VkReleaseCapturedPipelineDataInfoKHR releaseInfo{ VK_STRUCTURE_TYPE_RELEASE_CAPTURED_PIPELINE_DATA_INFO_KHR };
+  releaseInfo.pipeline = pipe;
+  b->release( m_device, &releaseInfo, nullptr );
+  return result;
 }
 
 void Context::addTime( const char* label, double milliseconds )
@@ -547,6 +944,7 @@ Context::~Context()
       free( buf );
     }
     m_pool.clear();
+    closePipelineBinaries();
     if( m_profiling )
     {
       msg( INFO, "GPU memory (MB): device-local peak %.1f, at the end %.1f; host-visible peak %.1f, at the end %.1f\n", m_memoryPeak[0] / 1048576.0,
@@ -756,7 +1154,7 @@ VkPipeline Context::pipeline( int shaderId )
     info.stage.pNext = &size;
   }
   VkPipeline pipe   = VK_NULL_HANDLE;
-  const VkResult result = m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
+  const VkResult result = createPipeline( shaderId, info, pipe );
   m_api.vkDestroyShaderModule( m_device, module, nullptr );
   if( result != VK_SUCCESS )
   {

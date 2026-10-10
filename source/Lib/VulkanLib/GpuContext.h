@@ -124,6 +124,8 @@ struct Options
                                        // else the first integrated one)
   bool        profile       = false;   // VVDEC_GPU_PROFILE=1: the GPU time of each pass, each shader's registers
   std::string isaDir;                  // VVDEC_GPU_ISA: with profile on AMD, where each shader's machine code is written
+  std::string pipelineCache;           // VVDEC_GPU_CACHE: the file of the compiled pipelines' binaries (Context's
+                                       // PipelineBinaries; empty: in the user's cache directory, "0": none)
   bool        async         = true;    // VVDEC_GPU_ASYNC=0: the front end on the compute queue, not an async queue
   bool        frontEnd      = true;    // VVDEC_GPU_FRONT=0: the CPU front end drives the pictures
   bool        frontEndCheck = false;   // VVDEC_GPU_MIDER=1: the CPU front end drives, the GPU front end is compared with it
@@ -299,6 +301,14 @@ private:
   VkPipelineLayout                 m_layout    = VK_NULL_HANDLE;
   VkPipeline*                      m_pipelines = nullptr;
   std::mutex                       m_pipelineMutex;
+  // the compiled pipelines' binaries, kept in a file from one run to the next (VK_KHR_pipeline_binary: GpuContext.cpp's
+  // PipelineBinaries; null without it)
+  struct PipelineBinaries;
+  PipelineBinaries*                m_binaries = nullptr;
+  // Creates the compute pipeline of info: from its binaries when the file has them, else compiled (its binaries kept)
+  VkResult                         createPipeline( int shaderId, VkComputePipelineCreateInfo& info, VkPipeline& pipe );
+  void                             openPipelineBinaries( const VkPhysicalDeviceProperties& props );
+  void                             closePipelineBinaries();   // (the file rewritten when binaries were added)
 
   // the buffer pool (allocPooled, recycle)
   std::mutex                       m_poolMutex;
