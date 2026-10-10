@@ -428,16 +428,27 @@ static int  g_dmvrOffset;          // the DMVR refinements the CTU's CUs reserve
 static int  g_csChromaQpAdj;       // CodingStructure::chromaQpAdj
 static bool g_error;               // the substream gave up: slots or a stack were full, or a block was off the planes
 
+// LITE=1: the variant for pictures that leave off the tools below (GpuParse's ParseInput::lite): their syntax is
+// compiled out, which takes a large part of the code away and keeps more of the rest in the instruction cache.
+#ifndef LITE
+#  define LITE 0
+#endif
+static const int kToolsLeftOut = LITE != 0 ? ( kToolSbt | kToolAffine | kToolAffineType | kToolAffineAmvr | kToolBcw | kToolCiip | kToolGeo
+                                               | kToolMmvd | kToolSmvd | kToolIsp | kToolMrl | kToolMip | kToolLfnst | kToolMtsIntra
+                                               | kToolMtsInter | kToolAct | kToolJointCbCr )
+                                           : 0;
+static const int kSliceFlagsLeftOut = LITE != 0 ? kSlDepQuant : 0;
+
 // Whether the SPS enables tool t (kTool...)
 bool tool( int t )
 {
-  return ( g_tools & t ) != 0;
+  return ( t & kToolsLeftOut ) == 0 && ( g_tools & t ) != 0;
 }
 
 // Whether the slice has flag f (kSl...)
 bool sliceFlag( int f )
 {
-  return ( g_sliceFlags & f ) != 0;
+  return ( f & kSliceFlagsLeftOut ) == 0 && ( g_sliceFlags & f ) != 0;
 }
 
 groupshared int  s_pic[kPicWords];            // the picture's parameters (the first kPicWords words of pc.pic)

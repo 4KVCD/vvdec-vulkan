@@ -469,6 +469,13 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
   tools |= sps.getJointCbCrEnabledFlag() ? kToolJointCbCr : 0;
   tools |= sps.getUseMTS() ? kToolMts : 0;
   p[kPicTools]        = tools;
+  const int leftOut   = kToolSbt | kToolAffine | kToolAffineType | kToolAffineAmvr | kToolBcw | kToolCiip | kToolGeo | kToolMmvd | kToolSmvd
+                      | kToolIsp | kToolMrl | kToolMip | kToolLfnst | kToolMtsIntra | kToolMtsInter | kToolAct | kToolJointCbCr;
+  in.lite             = ( tools & leftOut ) == 0;
+  for( const Slice* slice: cs.picture->slices )
+  {
+    in.lite = in.lite && !slice->getDepQuantEnabledFlag();
+  }
   p[kPicMaxMergeCand] = int32_t( sps.getMaxNumMergeCand() );
   p[kPicMaxGeoCand]   = int32_t( sps.getMaxNumGeoCand() );
   p[kPicMaxIbcCand]   = int32_t( sps.getMaxNumIBCMergeCand() );
