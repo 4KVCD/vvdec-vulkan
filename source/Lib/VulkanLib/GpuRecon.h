@@ -86,6 +86,8 @@ struct LoopFilterParam;
 namespace gpu
 {
 
+struct JobsPush;   // (GpuReconFrontEnd.cpp)
+
 // The passes whose job counts the GPU front end works out (jobs.slang, intrasort.slang, edges.slang). For pass p,
 // the front end's argument buffer holds the pass's indirect dispatch (3 words) at word 3 * p, and its job count and
 // first job at words 32 + 2 * p and 33 + 2 * p.
@@ -278,9 +280,11 @@ private:
   // Ends and submits the front end's part 1 and begins part 2 (recordJobs calls it after the jobs).
   void splitFrontEnd();
   // Records the whole front end into m_cmd: the records uploaded, the motion derivation, the colocated motion, the
-  // jobs, the intra order, the deblocking parameters and edges. In the check mode (without m_useFrontEnd), the
-  // results are also copied to host memory for compareFrontEnd.
-  void recordFrontEnd( const CodingStructure& cs, const PictureJobs& jobs );
+  // jobs, the deblocking parameters, the intra jobs' waves, the edges and the intra order. In the check mode (without
+  // m_useFrontEnd), the results are also copied to host memory for compareFrontEnd. beside, when given, records work
+  // that needs only the jobs (the residuals): it goes to the GPU with the waves and the edges' first pass, no barrier
+  // between them. Returns whether beside was recorded (not without CUs).
+  bool recordFrontEnd( const CodingStructure& cs, const PictureJobs& jobs, const std::function<void()>& beside = {} );
   size_t uploadRecords( const CodingStructure& cs, const PictureJobs& jobs );   // returns the picture's CU count
   // With the GPU's parse: the front end reads the picture's records where the parse left them (parsed). Returns
   // the picture's CU count.
@@ -291,7 +295,9 @@ private:
   void   recordMotion( const CodingStructure& cs, size_t numCus );
   void   recordColMotion( const CodingStructure& cs );
   void   recordDeblockParams( const CodingStructure& cs, size_t numCus );
-  void   recordJobs( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );
+  void   recordJobs( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );       // passes 0 to 2
+  void   recordJobWaves( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );   // pass 3 (no barrier after)
+  void   jobsPush( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus, JobsPush& push ) const;
   void   allocateJobBuffers( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );
   void   recordIntraOrder( const PictureJobs& jobs );
   void   copyJobsForCheck( const PictureJobs& jobs );

@@ -956,20 +956,26 @@ void GpuRecon::recordFirstPart( const CodingStructure& cs, const PictureJobs& jo
   {
     recordParse( cs, jobs, hostPlanes( pic ) );
   }
+  static const std::vector<std::vector<TrafoJob>> noTrafo;
+  static const std::vector<std::vector<InterJob>> noInter;
+  const auto recordResiduals = [&]() {
+    recordTrafo( cs, jobs.useFrontEnd ? noTrafo : *jobs.trafo, jobs.earlyCtus, jobs.useFrontEnd ? 0 : jobs.trafo->size(), m_cpuJobs.trafo,
+                 hostPlanes( pic ), planes );
+  };
+  // With the front end here, the residuals go to the GPU beside its last passes (recordFrontEnd's beside)
+  bool trafoDone = false;
   if( ( jobs.cus || jobs.parsed ) && !frontEndAsync )
   {
-    recordFrontEnd( cs, jobs );
+    const bool beside = trafo && jobs.useFrontEnd;
+    trafoDone         = recordFrontEnd( cs, jobs, beside ? std::function<void()>( recordResiduals ) : std::function<void()>() );
   }
   if( jobs.useFrontEnd )
   {
     indirectBarrier();
   }
-  static const std::vector<std::vector<TrafoJob>> noTrafo;
-  static const std::vector<std::vector<InterJob>> noInter;
-  if( trafo )
+  if( trafo && !trafoDone )
   {
-    recordTrafo( cs, jobs.useFrontEnd ? noTrafo : *jobs.trafo, jobs.earlyCtus, jobs.useFrontEnd ? 0 : jobs.trafo->size(), m_cpuJobs.trafo,
-                 hostPlanes( pic ), planes );
+    recordResiduals();
     computeBarrier();
   }
   if( inter )

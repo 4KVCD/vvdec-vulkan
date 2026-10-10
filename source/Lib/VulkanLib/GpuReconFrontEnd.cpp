@@ -210,7 +210,7 @@ void GpuRecon::splitFrontEnd()
 // The front end
 // ====================================================================================================================
 
-void GpuRecon::recordFrontEnd( const CodingStructure& cs, const PictureJobs& jobs )
+bool GpuRecon::recordFrontEnd( const CodingStructure& cs, const PictureJobs& jobs, const std::function<void()>& beside )
 {
   CHECK( !cs.m_gpuSliceAllocation, "the GPU's motion derivation without the picture's slice table" );
   const size_t numCus = jobs.parsed ? useParsedRecords( cs, *jobs.parsed ) : uploadRecords( cs, jobs );
@@ -219,11 +219,28 @@ void GpuRecon::recordFrontEnd( const CodingStructure& cs, const PictureJobs& job
     recordMotion( cs, numCus );
     recordJobs( cs, jobs, numCus );   // (with the async queue, part 2 begins after the jobs)
     recordDeblockParams( cs, numCus );
+    // Side by side, one barrier after them (recordEdges' first): the caller's work, the intra jobs' waves (a
+    // wavefront of a few threads) and the edges' first pass
+    if( beside )
+    {
+      indirectBarrier();   // (the jobs' dispatch arguments)
+      beside();
+    }
+    recordJobWaves( cs, jobs, numCus );
     recordEdges( cs, jobs );
+    if( jobs.intra || m_useFrontEnd )
+    {
+      recordIntraOrder( jobs );
+    }
+    if( !m_useFrontEnd )
+    {
+      copyJobsForCheck( jobs );
+    }
     // the check's copies visible to the shaders that follow
     transferToComputeBarrier();
   }
   mark( "front end" );
+  return numCus > 0 && beside;
 }
 
 size_t GpuRecon::uploadRecords( const CodingStructure& cs, const PictureJobs& jobs )
@@ -529,16 +546,13 @@ void GpuRecon::allocateJobBuffers( const CodingStructure& cs, const PictureJobs&
   ensureBuffer( m_ctx, m_frontEnd.jobProgress, ( pcv.heightInCtus + 1 ) * sizeof( uint32_t ), MemKind::Device );
 }
 
-void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus )
+void GpuRecon::jobsPush( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus, JobsPush& push ) const
 {
-  allocateJobBuffers( cs, jobs, numCus );
-
   const PreCalcValues& pcv    = *cs.pcv;
   const SPS&           sps    = *cs.sps;
   const PicHeader&     ph     = *cs.picHeader;
   const PPS&           pps    = *cs.pps;
   const bool           chroma = isChromaEnabled( pcv.chrFormat );
-  JobsPush             push{};
   push.cus          = m_frontEnd.recordCus;
   push.tus          = m_frontEnd.recordTus;
   push.ctus         = m_frontEnd.recordCtus;
@@ -585,6 +599,13 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, s
   push.waveMap  = m_frontEnd.waveMap.addr;
   push.progress = m_frontEnd.jobProgress.addr;
   push.args     = m_frontEnd.args.addr;
+}
+
+void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus )
+{
+  allocateJobBuffers( cs, jobs, numCus );
+  JobsPush push{};
+  jobsPush( cs, jobs, numCus, push );
 
   // the wave map, the rows' progress and the passes' arguments start from zero
   const Api& vk = m_ctx->api();
@@ -607,20 +628,15 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, s
   {
     splitFrontEnd();
   }
-  // pass 3: the intra jobs' waves (jobs_waves: one workgroup per CTU row)
-  push.pass = 3;
-  dispatch( kShader_jobs_waves, push, uint32_t( pcv.heightInCtus ) );
-  computeBarrier();
-  mark( "waves" );
+}
 
-  if( jobs.intra || m_useFrontEnd )
-  {
-    recordIntraOrder( jobs );
-  }
-  if( !m_useFrontEnd )
-  {
-    copyJobsForCheck( jobs );
-  }
+void GpuRecon::recordJobWaves( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus )
+{
+  JobsPush push{};
+  jobsPush( cs, jobs, numCus, push );
+  // pass 3: the intra jobs' waves (jobs_waves: one workgroup per CTU row); the barrier after it is the next pass's
+  push.pass = 3;
+  dispatch( kShader_jobs_waves, push, uint32_t( cs.pcv->heightInCtus ) );
 }
 
 void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
