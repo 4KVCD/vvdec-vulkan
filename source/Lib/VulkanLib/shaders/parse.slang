@@ -73,17 +73,16 @@ struct Params
   // Per CTU, the map entries (word pairs, see s_map) of its bottom row of 4x4 luma blocks: 32 of the luma tree, then
   // 32 of the chroma tree. The CTU below reads them.
   uint2*        bottomRows;
-  int16_t*      levels0;   // out: the coefficient levels of Y, Cb and Cr, each laid out like the picture's plane
-  int16_t*      levels1;
-  int16_t*      levels2;
+  // out: the coefficient levels, each coded block's rectangle (writeLevels) with its rows one after the other, in the
+  // substream's chunk of them (pc.counters[7] gives the chunks out); pc.levelCap levels at most
+  int16_t*      levels;
   // [0] counts the substreams' runs (each workgroup that parses a substream in a dispatch adds 1), [1] counts the
   // substreams that gave up, and [2 + CTU] turns 1 once that CTU is parsed. The host zeroes it before the first
   // dispatch.
   Atomic<uint>* sync;
   uint*         wppCtx;    // WPP: the context states after the first CTU of a CTU row, CTX_COUNT words per slot
   int           numStreams;   // the number of substreams (the workgroups past it return at once)
-  int           stride0;   // the stride of the luma plane of levels, in samples
-  int           stride12;  // the stride of the chroma planes of levels
+  int           levelCap;  // the room for levels
   Atomic<uint>* prof;      // PROFILE: the cycles and counts of kProf..., summed over the workgroups
   uint*         state;     // per substream, kStateWords words: where its parse stands (the host zeroes it first)
   int           binBudget; // the bins a dispatch parses of a substream before it pauses at the end of a CTU
@@ -93,7 +92,8 @@ struct Params
   uint*         tuMeta;
   // [0] the CU records staged so far, [1] the TU records (counted on past the room: the host then parses the picture
   // again with more), [2..6] the room the front end's job lists need, added up over the CUs (gpu::frontCapacities
-  // without its margins): residual jobs, inter tiles, intra jobs, intra bands, deblocking edges. Zeroed first.
+  // without its margins): residual jobs, inter tiles, intra jobs, intra bands, deblocking edges; [7] the levels
+  // given out in chunks (counted on past the room too). Zeroed first.
   Atomic<uint>* counters;
   int           cuCap;     // the room for staged CU records
   int           tuCap;     // and for TU records
@@ -112,10 +112,18 @@ static const int kStPos        = 5;
 static const int kStQp0        = 6;
 static const int kStQp1        = 7;
 static const int kStCqpAdj     = 8;     // CodingStructure::chromaQpAdj
+static const int kStLevelsAt   = 9;     // the substream's chunk of pc.levels: its next free level, its end
+static const int kStLevelsEnd  = 10;
 static const int kStCtx        = 16;    // the contexts' states, CTX_COUNT words (their rates are the slice's)
 static const int kStLeft       = 400;   // s_left, the map entries of the column left of the next CTU (64 word pairs)
 
 static uint g_binCount;   // the bins decoded in this dispatch, plus 32 for each CU parsed (compared with pc.binBudget)
+// The substream's chunk of pc.levels, where writeLevels puts the blocks' levels: its next free level and its end. A
+// chunk is kLevelChunk levels, at least a whole block's (32 x 32), taken from pc.counters[7] when the next block does
+// not fit in what is left (the rest of the chunk stays unused).
+static const uint kLevelChunk = 4096;
+static uint       g_levelsAt;
+static uint       g_levelsEnd;
 // The room the front end's job lists need for the CUs parsed in this dispatch (pc.counters[2..6]'s order), added to
 // pc.counters at the dispatch's end
 static uint g_caps[5];
@@ -962,6 +970,8 @@ void saveState( uint* state, int k, int prevQp[2], bool done )
     state[kStQp0]        = uint( prevQp[0] );
     state[kStQp1]        = uint( prevQp[1] );
     state[kStCqpAdj]     = uint( g_csChromaQpAdj );
+    state[kStLevelsAt]   = g_levelsAt;
+    state[kStLevelsEnd]  = g_levelsEnd;
   }
 }
 
@@ -1039,6 +1049,9 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     prevQp[1]       = int( uni( state[kStQp1] ) );
     g_csChromaQpAdj = int( uni( state[kStCqpAdj] ) );
   }
+  // the substream's chunk of levels (none at its start: the host zeroes the state)
+  g_levelsAt  = uni( state[kStLevelsAt] );
+  g_levelsEnd = uni( state[kStLevelsEnd] );
   PROF_END( kProfStart, dispatchStart );
   g_binCount  = 0;
   for( int i = 0; i < 5; i++ )

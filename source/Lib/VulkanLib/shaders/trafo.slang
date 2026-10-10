@@ -1,10 +1,11 @@
 // Dequantization and the inverse transforms, as vvdec's Quant::dequant,
 // TrQuant::invTransformNxN and invTransformICT do them. A workgroup takes one
 // transform block of one component, reads the levels that the parser wrote
-// into a picture-sized buffer in host memory, and writes the residual into the
+// (the GPU's parse: the block's rectangle in the picture's levels; the CPU's:
+// the picture's planes in host memory), and writes the residual into the
 // picture on the GPU.
 //
-// A job is 8 uints (VulkanLib/GpuJobs.h, TrafoJob):
+// A job is 10 uints (VulkanLib/GpuJobs.h, TrafoJob):
 //   0: x | y << 16 (in the component's samples)
 //   1: log2 width | log2 height << 4 | component << 8 | horizontal type << 12 | vertical type << 14 | flags << 16
 //      | (joint Cb-Cr mode + 4) << 24                      (types: vvdec's TransType, 0 DCT-II, 1 DCT-VIII, 2 DST-VII)
@@ -12,6 +13,7 @@
 //   3: scale   4: right shift (negative: a left shift)   5: the levels' maximum (they are clipped to it)
 //   6: LFNST (0: none): index (1, 2) | set << 2 | transposed << 4 | 8x8 << 5 | 8 inputs << 6
 //   7: explicit scaling list (0: none): offset of the block's matrix in scaling, plus 1
+//   8: where the levels are in parsedLevels   9: the width of their rows (0: the levels are in the planes, levels0..2)
 // flags: 1 transform skip, 2 BDPCM horizontal, 4 BDPCM vertical, 8 zeros (no residual)
 //
 // The threads dequantize the levels into shared memory, run the vertical
@@ -29,9 +31,10 @@ struct Params
   int16_t*  plane0;
   int16_t*  plane1;
   int16_t*  plane2;
-  int16_t*  levels0;    // the levels, in host memory, laid out like the planes
+  int16_t*  levels0;    // the CPU parse's levels, in host memory, laid out like the planes
   int16_t*  levels1;
   int16_t*  levels2;
+  int16_t*  parsedLevels;   // the GPU parse's levels: each block's rectangle, where its job says (words 8 and 9)
   int16_t*  matrices;   // TrQuant's matrices, laid out as matrixOffset expects (GpuRecon.cpp fills them)
   int8_t*   lfnst;      // LFNST's matrices: vvdec's g_lfnst8x8, then g_lfnst4x4
   uint8_t*  scaling;    // the picture's dequantization matrices from explicit scaling lists (Quant's), 1 byte each
@@ -127,7 +130,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     return;   // (the whole workgroup returns here)
   }
   const int tid          = int( local.x );
-  uint*     job          = pc.jobs + ( ( pc.count >= 0 ? 0 : int( pc.countAt[1] ) ) + index ) * 8;
+  uint*     job          = pc.jobs + ( ( pc.count >= 0 ? 0 : int( pc.countAt[1] ) ) + index ) * 10;
   const int x0           = int( job[0] & 0xffff );
   const int y0           = int( job[0] >> 16 );
   const int log2W        = int( job[1] & 15 );
@@ -147,7 +150,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int height       = 1 << log2H;
   const int stride       = strideOf( comp );
   int16_t*  block        = planeOf( comp ) + y0 * stride + x0;
-  int16_t*  levels       = levelsOf( comp ) + y0 * stride + x0;
+  // the levels: the rows of the GPU parse's rectangle, or the plane's (rowWidth 0)
+  const int rowWidth     = int( job[9] );
+  int16_t*  levels       = rowWidth != 0 ? pc.parsedLevels + job[8] : levelsOf( comp ) + y0 * stride + x0;
+  const int levelStride  = rowWidth != 0 ? rowWidth : stride;
   int16_t*  other        = planeOf( comp == 1 ? 2 : 1 ) + y0 * stride + x0;   // joint Cb-Cr's other component
 
   if( ( flags & FLAG_ZERO ) != 0 )
@@ -171,7 +177,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         int sum = 0;
         for( int x = 0; x < width; x++ )
         {
-          const int level = int( levels[y * stride + x] );
+          const int level = int( levels[y * levelStride + x] );
           sum             = x == 0 ? level : clip3( COEFF_MIN, COEFF_MAX, sum + level );
           const int r     = dequant( sum, scale, rightShift, inputMaximum );
           block[y * stride + x] = int16_t( r );
@@ -189,7 +195,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         int sum = 0;
         for( int y = 0; y < height; y++ )
         {
-          const int level = int( levels[y * stride + x] );
+          const int level = int( levels[y * levelStride + x] );
           sum             = y == 0 ? level : clip3( COEFF_MIN, COEFF_MAX, sum + level );
           const int r     = dequant( sum, scale, rightShift, inputMaximum );
           block[y * stride + x] = int16_t( r );
@@ -206,7 +212,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       {
         const int x     = s & ( width - 1 );
         const int y     = s >> log2W;
-        const int level = x <= lastX && y <= lastY ? int( levels[y * stride + x] ) : 0;
+        const int level = x <= lastX && y <= lastY ? int( levels[y * levelStride + x] ) : 0;
         const int r     = dequant( level, scale, rightShift, inputMaximum );
         block[y * stride + x] = int16_t( r );
         if( ict != 0 )
@@ -239,7 +245,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       int sum = 0;
       for( int k = 0; k < count; k++ )
       {
-        sum += dequant( int( levels[ver ? k * stride : k] ), coefScale( sl, scale, width, ver ? 0 : k, ver ? k : 0 ), rightShift, inputMaximum )
+        sum += dequant( int( levels[ver ? k * levelStride : k] ), coefScale( sl, scale, width, ver ? 0 : k, ver ? k : 0 ), rightShift, inputMaximum )
                * int( m[k * n + s] );
       }
       const int r = clip3( COEFF_MIN, COEFF_MAX, ( sum + ( 1 << ( shift - 1 ) ) ) >> shift );
@@ -268,7 +274,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       const int x  = kLfnstScan[tid] & 3;
       const int y  = kLfnstScan[tid] >> 2;
-      s_lfnst[tid] = x <= lastX && y <= lastY ? dequant( int( levels[y * stride + x] ), coefScale( sl, scale, width, x, y ), rightShift, inputMaximum ) : 0;
+      s_lfnst[tid] = x <= lastX && y <= lastY ? dequant( int( levels[y * levelStride + x] ), coefScale( sl, scale, width, x, y ), rightShift, inputMaximum ) : 0;
     }
     nx = min( width, 8 );
     ny = min( height, 8 );
@@ -311,7 +317,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       const int k = s / nx;
       const int x = s - k * nx;
-      s_coef[k * 32 + x] = dequant( int( levels[k * stride + x] ), coefScale( sl, scale, width, x, k ), rightShift, inputMaximum );
+      s_coef[k * 32 + x] = dequant( int( levels[k * levelStride + x] ), coefScale( sl, scale, width, x, k ), rightShift, inputMaximum );
     }
   }
   GroupMemoryBarrierWithGroupSync();

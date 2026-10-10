@@ -84,15 +84,6 @@ struct Picture;
 namespace gpu
 {
 
-// Where the parse writes the coefficient levels: each plane's sample (0, 0) (luma, Cb, Cr) and the strides, in
-// samples
-struct LevelPlanes
-{
-  VkDeviceAddress addr[3]  = {};
-  int32_t         stride0  = 0;
-  int32_t         stride12 = 0;
-};
-
 // One picture's parse on the GPU
 class ParseSlot
 {
@@ -103,8 +94,9 @@ public:
   ParseSlot& operator=( const ParseSlot& ) = delete;
 
   // Sets the slot up for the picture of cs: its inputs uploaded, room for at least minCus and minTus staged records,
-  // every substream at its start. The levels go to levels. Returns false when a slice's data was not captured.
-  bool prepare( const CodingStructure& cs, const LevelPlanes& levels, size_t minCus, size_t minTus );
+  // the levels into levels (which the slot holds until takeLevels), every substream at its start. Returns false when a
+  // slice's data was not captured.
+  bool prepare( const CodingStructure& cs, size_t minCus, size_t minTus, Buffer levels );
   // With VVDEC_GPU_PROFILE and the shader clock: the parse's cycle counts are added up at prof (16 words)
   void setProfile( VkDeviceAddress prof ) { m_prof = prof; }
   // Records into cmd the clearing of the parse's counters (in GPU memory) when the parse starts from the beginning
@@ -125,18 +117,26 @@ public:
     Failed,     // a substream given up on (a broken bitstream), or none advanced for kParseMaxStalls submissions
   };
   Progress progress();
-  // After Overflow: room for the records the parse counted, and every substream back at its start
-  void restart();
+  // After Overflow: room for the records the parse counted, the levels into levels (the slot's buffer taken back
+  // first: takeLevels), and every substream back at its start
+  void   restart( Buffer levels );
+  size_t levelsCounted() const;   // the levels the parse counted, also those past the room
+  // The buffer of the levels, given back (an empty one when the slot holds none)
+  Buffer          takeLevels();
+  VkDeviceAddress levels() const { return m_levels.addr; }
 
   // --- What the parse left, once Done ---
   size_t                 numCus() const { return m_numCus; }
   size_t                 numTus() const { return m_numTus; }
+  size_t                 numLevels() const { return m_numLevels; }
   const FrontCapacities& capacities() const { return m_caps; }
   // CTU ctu's SAO and ALF parameters, as the parse wrote them (gpu::captureSaoAlf's layout: 7 words)
   const uint32_t*        saoAlf( int ctu ) const;
   // Records into cmd the copies of the records to their places in raster order: the CU and TU records into cus and
   // tus (numCus() and numTus() of them), the CTU records into ctus. Without a barrier after them.
   void recordScatter( VkCommandBuffer cmd, VkDeviceAddress cus, VkDeviceAddress tus, VkDeviceAddress ctus ) const;
+  // Records into cmd the copy of the levels (numLevels() of them) into levels, in the same places
+  void recordLevelsCopy( VkCommandBuffer cmd, const Buffer& levels ) const;
   size_t   numCtus() const { return m_numCtus; }
 
   // --- For the statistics and the check (VVDEC_GPU_PARSE=1) ---
@@ -161,7 +161,6 @@ private:
   Context*        m_ctx = nullptr;
   ParseInput      m_in;
   size_t          m_numCtus = 0;
-  LevelPlanes     m_levels;
   VkDeviceAddress m_prof = 0;
   // the inputs (upload memory)
   Buffer m_bits, m_streams, m_ctuList, m_ctuInfo, m_slices, m_pic, m_scans;
@@ -172,6 +171,9 @@ private:
   Buffer m_cus, m_tus, m_cuMeta, m_tuMeta, m_bottomRows, m_wpp, m_counters, m_sync, m_state, m_ctuOut;
   // the compaction's first pass: the CTU records, the totals (host memory)
   Buffer m_ctus, m_totals;
+  // the levels (GPU memory, ParseService's: the slot holds it from prepare to takeLevels)
+  Buffer m_levels;
+  size_t m_levelCap = 0, m_numLevels = 0;   // the room for levels, the levels once Done
   size_t          m_cuCap = 0, m_tuCap = 0;   // the staged records' room
   size_t          m_numCus = 0, m_numTus = 0;
   FrontCapacities m_caps;
@@ -181,8 +183,8 @@ private:
 };
 
 // What the GPU's parse left of a picture once it is done (ParseService): its CU, TU and CTU records in raster order
-// (GpuFrontEnd.h's layout), in GPU memory of their own and of their exact size; its CTUs' SAO and ALF parameters; the
-// room the front end's job lists need. The picture holds it until its GPU work is done (ParseService::release).
+// (GpuFrontEnd.h's layout) and its coefficient levels (each TU record says where its are), in GPU memory of their own
+// and of their exact size; its CTUs' SAO and ALF parameters; the room the front end's job lists need. The picture holds it until its GPU work is done (ParseService::release).
 class ParsedPicture
 {
 public:
@@ -194,6 +196,7 @@ public:
   VkDeviceAddress        cus() const { return m_cus.addr; }
   VkDeviceAddress        tus() const { return m_tus.addr; }
   VkDeviceAddress        ctus() const { return m_ctus.addr; }
+  VkDeviceAddress        levels() const { return m_levels.addr; }
   // the parse's copies' timeline value once the records are in place (Context::submitParseCopy): the front end waits
   // for it
   uint64_t               parseValue() const { return m_parseValue; }
@@ -203,10 +206,10 @@ public:
 private:
   friend class ParseService;
   static constexpr size_t kSaoAlfWords = 7;
-  size_t                  m_numCus = 0, m_numTus = 0;
+  size_t                  m_numCus = 0, m_numTus = 0, m_numLevels = 0;
   FrontCapacities         m_caps;
   std::vector<uint32_t>   m_saoAlf;
-  Buffer                  m_cus, m_tus, m_ctus;
+  Buffer                  m_cus, m_tus, m_ctus, m_levels;
   uint64_t                m_parseValue = 0;
 };
 
@@ -241,6 +244,7 @@ private:
   Buffer         takeBuffer( size_t size );                // GPU memory for records, from the bins
   void           giveBuffer( Buffer& buf );                // back into the bins
   void           startPicture( Picture* pic );             // its slot set up, among the pictures parsed
+  size_t         levelRoom( const Picture& pic ) const;    // the room for its levels when its parse starts
   // The finished pictures' records copied (a submission on the copies' queue), then all the pictures' steps (one on
   // the parse queue), both waited for: the copied pictures are handed over as soon as the copy is done
   void           submit();
@@ -269,6 +273,7 @@ private:
   static constexpr int kBins = 40;
   std::vector<Buffer>  m_bins[kBins];
   size_t                  m_maxCus = 0, m_maxTus = 0;             // the most records a picture had so far
+  size_t                  m_maxLevels[2] = {};   // the most levels a picture had so far: the other pictures, intra ones
   VkCommandPool           m_pool  = VK_NULL_HANDLE;   // the steps' submission
   VkCommandBuffer         m_cmd   = VK_NULL_HANDLE;
   VkFence                 m_fence = VK_NULL_HANDLE;

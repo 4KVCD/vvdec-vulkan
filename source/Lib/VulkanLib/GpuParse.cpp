@@ -796,15 +796,17 @@ void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint
     }
     for( size_t i = 0; i < tus.size(); i++ )
     {
-      const uint32_t* g = gpuTus + 16 * ( firstTu + i );
-      if( memcmp( tus[i].w, g, sizeof( TuRecord ) ) != 0 )
+      // (the words from 9 on say where the GPU's parse put the levels: the levels' check compares those)
+      static constexpr int kTuWordsCompared = 9;
+      const uint32_t*      g                = gpuTus + 16 * ( firstTu + i );
+      if( memcmp( tus[i].w, g, kTuWordsCompared * sizeof( uint32_t ) ) != 0 )
       {
         stats.tusDiffer++;
         if( stats.reported < 20 )
         {
           stats.reported++;
           int w = 0;
-          while( w < 16 && tus[i].w[w] == g[w] )
+          while( w < kTuWordsCompared && tus[i].w[w] == g[w] )
           {
             w++;
           }

@@ -2,8 +2,8 @@
 // is the transform tree and its TUs (the CU, or its tiles of the largest transform size, ISP's or SBT's parts), each
 // TU's coded block flags, delta QP, chroma QP offset and joint Cb-Cr mode, the residual coding (regular and transform
 // skip) of each coded block, and the CU's LFNST and MTS indices. The TUs' records (GpuFrontEnd.h's TuRecord) stay in
-// shared memory while their CU is parsed; the residual coding writes each coded block's levels into the planes of
-// levels (pc.levels0..2).
+// shared memory while their CU is parsed; the residual coding writes each coded block's levels into pc.levels, and
+// where it put them into the TU's record.
 
 // --------------------------------------------------------------------------------------------------------------------
 // The current CU's TUs: their records stay in shared memory until the CU is done; writeTuRecords then stores them
@@ -88,6 +88,15 @@ int4 tuBlock( int t, int comp )
   const uint p = comp == 0 ? tuWord( t, 0 ) : tuWord( t, 2 );
   const uint s = comp == 0 ? tuWord( t, 1 ) : tuWord( t, 3 );
   return int4( int( p & 0xffffu ), int( p >> 16 ), int( s & 0xffu ), int( ( s >> 8 ) & 0xffu ) );
+}
+
+// Sets where the component's levels are: their first one's index in pc.levels (record word 9 + comp) and the width
+// of their rows (record word 12, a byte per component)
+void setTuLevels( int t, int comp, uint at, int width )
+{
+  const uint shift = uint( comp ) * 8u;
+  setTuWord( t, 9 + comp, at );
+  setTuWord( t, 12, ( tuWord( t, 12 ) & ~( 0xffu << shift ) ) | ( uint( width ) & 0xffu ) << shift );
 }
 
 // Sets the component's maxScanPosX and maxScanPosY (record words 6 and 7, a byte per component)
@@ -1464,27 +1473,43 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
   }
 }
 
-// Writes the block's levels (s_out) into the plane of levels of component comp, over the rectangle [0, w) x [0, h) of
-// block b, zeros included (w is at most 32). Every level outside the rectangle is zero and is not written: the
-// transforms read no further than the rectangle. Then clears the shared memory that the block used. (writeLevelsBody
-// does the work; this wrapper times it for PROFILE.)
-void writeLevels( int comp, int4 b, int w, int h )
+// Writes the levels (s_out) of TU t's block b of component comp over the rectangle [0, w) x [0, h), zeros included (w
+// is at most 32), into pc.levels: the rectangle's rows one after the other, in the substream's chunk (past the room,
+// pc.levelCap, the chunks are only counted, like the records: the host then parses the picture again with more).
+// Every level outside the rectangle is zero and is not written: the transforms read no further than the rectangle.
+// The TU's record keeps the place and the rows' width. Then clears the shared memory that the block used.
+// (writeLevelsBody does the work; this wrapper times it for PROFILE.)
+void writeLevels( int t, int comp, int4 b, int w, int h )
 {
   PROF_BEGIN( levelsStart );
-  writeLevelsBody( comp, b, w, h );
+  writeLevelsBody( t, comp, b, w, h );
   PROF_END( kProfLevels, levelsStart );
 }
 
-void writeLevelsBody( int comp, int4 b, int w, int h )
+void writeLevelsBody( int t, int comp, int4 b, int w, int h )
 {
-  const int stride = comp == 0 ? pc.stride0 : pc.stride12;
-  const int pw     = comp == 0 ? g_width : g_width >> g_csx;
-  const int ph     = comp == 0 ? g_height : g_height >> g_csy;
-  const bool inside = b.x + w <= pw && b.y + h <= ph;
-  if( !inside )
+  const int pw = comp == 0 ? g_width : g_width >> g_csx;
+  const int ph = comp == 0 ? g_height : g_height >> g_csy;
+  if( b.x + w > pw || b.y + h > ph )
   {
     g_error = true;   // (a block off the planes: give up the substream)
   }
+  // The rectangle's place, a whole number of words, in the substream's chunk: a new one when it does not fit
+  const uint size = uint( w * h + 1 ) & ~1u;
+  if( g_levelsAt + size > g_levelsEnd )
+  {
+    uint chunk = 0;
+    if( g_lane == 0 )
+    {
+      chunk = pc.counters[7].add( kLevelChunk );
+    }
+    g_levelsAt  = uni( chunk );
+    g_levelsEnd = g_levelsAt + kLevelChunk;
+  }
+  const uint at   = g_levelsAt;
+  g_levelsAt     += size;
+  const bool room = at + size <= uint( pc.levelCap );
+  setTuLevels( t, comp, at, w );
   // Put the levels into s_final at their positions, a level a thread (s_final is zero there: an OR sets the half)
   for( int i = g_lane; i < g_outCount; i += 32 )
   {
@@ -1494,7 +1519,7 @@ void writeLevelsBody( int comp, int4 b, int w, int h )
   }
   GroupMemoryBarrierWithGroupSync();
   // Each thread writes one column of the rectangle (its lane's)
-  if( inside )
+  if( room )
   {
     for( int u = g_lane; u < h << 5; u += 32 )
     {
@@ -1506,19 +1531,7 @@ void writeLevelsBody( int comp, int4 b, int w, int h )
       }
       const int     pos = ( y << g_cc.log2W ) + x;
       const int16_t v   = int16_t( int( s_final[pos >> 1] << ( 16u - ( uint( pos ) & 1u ) * 16u ) ) >> 16 );
-      const int     at  = ( b.y + y ) * stride + b.x + x;
-      if( comp == 0 )
-      {
-        pc.levels0[at] = v;
-      }
-      else if( comp == 1 )
-      {
-        pc.levels1[at] = v;
-      }
-      else
-      {
-        pc.levels2[at] = v;
-      }
+      pc.levels[at + uint( y * w + x )] = v;
     }
   }
   GroupMemoryBarrierWithGroupSync();
@@ -1599,7 +1612,7 @@ void residualCodingTS( int t, int comp )
     setMaxScanPos( t, comp, maxX, maxY );
   }
   const int4 b = tuBlock( t, comp );
-  writeLevels( comp, b, b.z, b.w );
+  writeLevels( t, comp, b, b.z, b.w );
 }
 
 // CABACReader::residual_coding of TU t's block of comp; this wrapper times residualCodingBody for PROFILE
@@ -1697,7 +1710,7 @@ void residualCodingBody( int t, int comp, inout CuCtx ctx )
     maxX = ( maxX + 1 ) << g_cc.log2CGW;
     maxY = ( maxY + 1 ) << g_cc.log2CGH;
   }
-  writeLevels( comp, tuBlock( t, comp ), maxX, maxY );
+  writeLevels( t, comp, tuBlock( t, comp ), maxX, maxY );
   if( g_cc.scanPosLast == 0 )
   {
     setMaxScanPos( t, comp, 0, 0 );

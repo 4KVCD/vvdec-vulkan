@@ -96,11 +96,11 @@ bool GpuRecon::residualSupported( const CodingStructure& cs )
 // The push constants of trafo.slang
 struct TrafoPush
 {
-  VkDeviceAddress jobs, plane0, plane1, plane2, levels0, levels1, levels2, matrices, lfnst, scaling;
+  VkDeviceAddress jobs, plane0, plane1, plane2, levels0, levels1, levels2, parsedLevels, matrices, lfnst, scaling;
   int32_t         stride0, stride12, count, bitDepth;
   VkDeviceAddress countAt;
 };
-static_assert( sizeof( TrafoPush ) == 104, "TrafoPush: the layout of trafo.slang's Params" );
+static_assert( sizeof( TrafoPush ) == 112, "TrafoPush: the layout of trafo.slang's Params" );
 
 void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
                             const Planes& levels, const Planes& planes )
@@ -139,6 +139,7 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   push.levels0  = levels.addr[COMPONENT_Y];
   push.levels1  = levels.addr[COMPONENT_Cb];
   push.levels2  = levels.addr[COMPONENT_Cr];
+  push.parsedLevels = m_frontEnd.recordLevels;   // (the GPU parse's: its jobs say where in them)
   push.matrices = m_tables.transform.addr;
   push.lfnst    = m_tables.lfnst.addr;
   push.scaling  = m_scalingOn ? m_scaling.addr : 0;

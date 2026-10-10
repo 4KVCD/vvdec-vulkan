@@ -47,7 +47,6 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "GpuParseService.h"
 
-#include "GpuPictureMemory.h"
 #include "vvdec_gpu/GpuShaderIds.h"
 
 #include "CommonLib/CodingStructure.h"
@@ -72,7 +71,7 @@ static constexpr size_t   kParseStateDone    = 1;         // kStDone: the substr
 static constexpr int32_t  kParseBinBudget    = 1 << 14;
 static constexpr uint32_t kParseMaxStalls    = 4;         // submissions in a row without progress before giving up
 static constexpr uint32_t kParseLocalBits    = 12;        // a meta word: the CTU above the record's place in the CTU
-static constexpr size_t   kParseCounters     = 8;         // the staged CUs and TUs, the room of the 5 job lists, a spare
+static constexpr size_t   kParseCounters     = 8;         // the staged CUs and TUs, the room of the 5 job lists, the levels
 static constexpr size_t   kParseTotals       = 16;        // the CUs and TUs, then the counters (compaction pass 0)
 static constexpr size_t   kGroupsPerRow      = 32768;     // the shaders take group.y as rows of 32768 workgroups
 
@@ -84,15 +83,15 @@ static constexpr size_t   kMaxParsing         = 16;
 // The push constants of parse.slang
 struct ParsePush
 {
-  VkDeviceAddress bits, streams, ctuList, ctuInfo, slices, pic, scanTab, cus, tus, ctuOut, bottomRows, levels0, levels1, levels2, sync, wppCtx;
-  int32_t         numStreams, stride0, stride12;
+  VkDeviceAddress bits, streams, ctuList, ctuInfo, slices, pic, scanTab, cus, tus, ctuOut, bottomRows, levels, sync, wppCtx;
+  int32_t         numStreams, levelCap;
   VkDeviceAddress prof;
   VkDeviceAddress state;
   int32_t         binBudget;
   VkDeviceAddress cuMeta, tuMeta, counters;
   int32_t         cuCap, tuCap;
 };
-static_assert( sizeof( ParsePush ) == 200, "ParsePush: the layout of parse.slang's Params" );
+static_assert( sizeof( ParsePush ) == 176, "ParsePush: the layout of parse.slang's Params" );
 
 // The push constants of parsecompact.slang (pass 0: the CTU records and totals; 1, 2, 3: the scatter of the CU, TU
 // and CTU records)
@@ -164,21 +163,23 @@ static void startBarrier( Context* ctx, VkCommandBuffer cmd )
 ParseSlot::~ParseSlot()
 {
   for( Buffer* buf: { &m_bits, &m_streams, &m_ctuList, &m_ctuInfo, &m_slices, &m_pic, &m_scans, &m_cus, &m_tus, &m_cuMeta, &m_tuMeta, &m_bottomRows,
-                      &m_wpp, &m_sync, &m_state, &m_ctuOut, &m_counters, &m_ctus, &m_totals } )
+                      &m_wpp, &m_sync, &m_state, &m_ctuOut, &m_counters, &m_ctus, &m_totals, &m_levels } )
   {
     m_ctx->free( *buf );
   }
 }
 
-bool ParseSlot::prepare( const CodingStructure& cs, const LevelPlanes& levels, size_t minCus, size_t minTus )
+bool ParseSlot::prepare( const CodingStructure& cs, size_t minCus, size_t minTus, Buffer levels )
 {
+  m_ctx->free( m_levels );   // (none: taken back after the picture before)
+  m_levels   = levels;
+  m_levelCap = m_levels.size / sizeof( int16_t );
   if( !buildParseInput( cs, m_in ) )
   {
     return false;
   }
   CHECK( m_in.cuSlots >= ( 1u << kParseLocalBits ) || m_in.tuSlots >= ( 1u << kParseLocalBits ), "Vulkan: more records in a CTU than the parse's meta words hold" );
   m_numCtus = cs.pcv->sizeInCtus;
-  m_levels  = levels;
 
   // the inputs: the slice data (which the parse reads 128 bytes at a time: 256 zero bytes follow it), the
   // substreams, the CTUs in decoding order and their slices and tiles, the slices' parameters and contexts, the
@@ -236,6 +237,7 @@ void ParseSlot::clear()
   m_fresh        = true;   // (the counters, in GPU memory: recordClear)
   m_numCus       = 0;
   m_numTus       = 0;
+  m_numLevels    = 0;
   m_caps         = FrontCapacities();
   m_lastProgress = 0;
   m_stalls       = 0;
@@ -265,14 +267,11 @@ void ParseSlot::recordStep( VkCommandBuffer cmd ) const
   push.tus        = m_tus.addr;
   push.ctuOut     = m_ctuOut.addr;
   push.bottomRows = m_bottomRows.addr;
-  push.levels0    = m_levels.addr[0];
-  push.levels1    = m_levels.addr[1];
-  push.levels2    = m_levels.addr[2];
+  push.levels     = m_levels.addr;
   push.sync       = m_sync.addr;
   push.wppCtx     = m_wpp.addr;
   push.numStreams = int32_t( m_in.numStreams );
-  push.stride0    = m_levels.stride0;
-  push.stride12   = m_levels.stride12;
+  push.levelCap   = int32_t( std::min<size_t>( m_levelCap, INT32_MAX ) );
   push.prof       = m_prof;
   push.state      = m_state.addr;
   push.binBudget  = kParseBinBudget;
@@ -321,10 +320,10 @@ ParseSlot::Progress ParseSlot::progress()
   {
     return Progress::Failed;
   }
-  // all parsed, and the compaction's first pass done: the staged records within their room, as many as the CTUs
-  // counted
+  // all parsed, and the compaction's first pass done: the staged records and the levels within their room, as many
+  // records as the CTUs counted
   const uint32_t* sums = totals();
-  if( sums[2] > m_cuCap || sums[3] > m_tuCap )
+  if( sums[2] > m_cuCap || sums[3] > m_tuCap || sums[9] > m_levelCap )
   {
     return Progress::Overflow;
   }
@@ -332,8 +331,9 @@ ParseSlot::Progress ParseSlot::progress()
   {
     return Progress::Failed;   // (the CTUs' counts and the records staged disagree: a bug)
   }
-  m_numCus = sums[0];
-  m_numTus = sums[1];
+  m_numCus    = sums[0];
+  m_numTus    = sums[1];
+  m_numLevels = sums[9];
   // the job lists' room, as gpu::frontCapacities works it out (with its margins)
   m_caps.trafo = size_t( sums[4] ) + 64;
   m_caps.inter = size_t( sums[5] ) + 64;
@@ -343,12 +343,28 @@ ParseSlot::Progress ParseSlot::progress()
   return Progress::Done;
 }
 
-void ParseSlot::restart()
+void ParseSlot::restart( Buffer levels )
 {
-  // room for the records the parse counted, and a quarter more
+  // room for the records the parse counted, and a quarter more; the levels into levels
   const uint32_t* sums = totals();
   makeRoom( size_t( sums[2] ) * 5 / 4 + 64, size_t( sums[3] ) * 5 / 4 + 64 );
+  m_ctx->free( m_levels );   // (none: taken back first)
+  m_levels   = levels;
+  m_levelCap = m_levels.size / sizeof( int16_t );
   clear();
+}
+
+size_t ParseSlot::levelsCounted() const
+{
+  return totals()[9];
+}
+
+Buffer ParseSlot::takeLevels()
+{
+  const Buffer levels = m_levels;
+  m_levels            = Buffer();
+  m_levelCap          = 0;
+  return levels;
 }
 
 const uint32_t* ParseSlot::saoAlf( int ctu ) const
@@ -377,6 +393,15 @@ void ParseSlot::recordScatter( VkCommandBuffer cmd, VkDeviceAddress cus, VkDevic
   dispatch( m_ctx, cmd, kShader_parsecompact, push, ( m_numTus + 63 ) / 64 );
   push.pass = 3;
   dispatch( m_ctx, cmd, kShader_parsecompact, push, ( m_numCtus + 255 ) / 256 );
+}
+
+void ParseSlot::recordLevelsCopy( VkCommandBuffer cmd, const Buffer& levels ) const
+{
+  if( m_numLevels > 0 )
+  {
+    const VkBufferCopy region{ 0, 0, m_numLevels * sizeof( int16_t ) };
+    m_ctx->api().vkCmdCopyBuffer( cmd, m_levels.buffer, levels.buffer, 1, &region );
+  }
 }
 
 uint32_t ParseSlot::runs() const
@@ -494,7 +519,7 @@ ParseService::~ParseService()
   m_slots.clear();
   for( const auto& result: m_results )
   {
-    for( Buffer* buf: { &result->m_cus, &result->m_tus, &result->m_ctus } )
+    for( Buffer* buf: { &result->m_cus, &result->m_tus, &result->m_ctus, &result->m_levels } )
     {
       m_ctx->free( *buf );
     }
@@ -629,7 +654,7 @@ ParsedPicture* ParseService::takeParsed()
     std::lock_guard<std::mutex> lock( m_mutex );
     for( ParsedPicture* result: m_released )
     {
-      for( Buffer* buf: { &result->m_cus, &result->m_tus, &result->m_ctus } )
+      for( Buffer* buf: { &result->m_cus, &result->m_tus, &result->m_ctus, &result->m_levels } )
       {
         giveBuffer( *buf );
       }
@@ -676,25 +701,42 @@ void ParseService::giveBuffer( Buffer& buf )
   buf = Buffer();
 }
 
+// Whether all the picture's slices are intra slices
+static bool intraPicture( const Picture& pic )
+{
+  return std::all_of( pic.slices.begin(), pic.slices.end(), []( const Slice* s ) { return s->isIntra(); } );
+}
+
+size_t ParseService::levelRoom( const Picture& pic ) const
+{
+  // all the levels a picture can have: one a sample of each plane
+  const PreCalcValues& pcv     = *pic.cs->pcv;
+  const size_t         luma    = size_t( pcv.lumaWidth ) * pcv.lumaHeight;
+  const size_t         chroma  = isChromaEnabled( pcv.chrFormat )
+                                   ? luma >> ( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) + getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) )
+                                   : 0;
+  const size_t         samples = luma + 2 * chroma;
+  // a quarter more than the most a picture of its kind had so far; before the first, half the samples for an intra
+  // picture, a 32nd for the others (whose levels are few: a guess too big would stay in the bins); at most twice the
+  // samples (the substreams take the levels in chunks, whose ends may stay unused)
+  const bool   intra = intraPicture( pic );
+  const size_t most  = m_maxLevels[intra ? 1 : 0];
+  const size_t room  = most > 0 ? most * 5 / 4 + 4096 : ( intra ? samples / 2 : samples / 32 );
+  return std::min( room, 2 * samples + 65536 );
+}
+
 void ParseService::startPicture( Picture* pic )
 {
   ParseSlot* slot = takeSlot();
   slot->picture   = pic;
   slot->setProfile( m_prof );
-  // the levels go into the picture in host memory, where the residual pass reads them
-  VkDeviceAddress addr[MAX_NUM_COMPONENT]   = {};
-  int             stride[MAX_NUM_COMPONENT] = {};
-  const bool      host                      = hostPictureAddresses( pic->m_bufs[PIC_RECONSTRUCTION], addr, stride );
-  LevelPlanes     levels;
-  levels.addr[0]  = addr[0];
-  levels.addr[1]  = addr[1];
-  levels.addr[2]  = addr[2];
-  levels.stride0  = stride[0];
-  levels.stride12 = stride[1];
-  // room for a quarter more records than any picture so far had, and at least 32 a CTU
+  // room for a quarter more records than any picture so far had, and at least 32 a CTU; the levels' room from the bins
   const size_t ctus = pic->cs->pcv->sizeInCtus;
-  if( !host || !slot->prepare( *pic->cs, levels, std::max( m_maxCus * 5 / 4, ctus * 32 ), std::max( m_maxTus * 5 / 4, ctus * 32 ) ) )
+  if( !slot->prepare( *pic->cs, std::max( m_maxCus * 5 / 4, ctus * 32 ), std::max( m_maxTus * 5 / 4, ctus * 32 ),
+                      takeBuffer( levelRoom( *pic ) * sizeof( int16_t ) ) ) )
   {
+    Buffer levels = slot->takeLevels();
+    giveBuffer( levels );
     m_free.push_back( slot );
     {
       std::lock_guard<std::mutex> lock( m_mutex );
@@ -736,6 +778,8 @@ void ParseService::submit()
     for( const auto& copy: m_copying )
     {
       copy.second->m_parseValue = copyValue;
+      Buffer levels             = copy.first->takeLevels();
+      giveBuffer( levels );
       m_free.push_back( copy.first );
       handOver( copy.second->picture, copy.second );
     }
@@ -793,6 +837,7 @@ uint64_t ParseService::submitCopies()
   for( const auto& copy: m_copying )
   {
     copy.first->recordScatter( m_copyCmd, copy.second->cus(), copy.second->tus(), copy.second->ctus() );
+    copy.first->recordLevelsCopy( m_copyCmd, copy.second->m_levels );
   }
   vk.vkEndCommandBuffer( m_copyCmd );
   vk.vkResetFences( m_ctx->device(), 1, &m_copyFence );
@@ -812,8 +857,11 @@ void ParseService::finishPictures()
     }
     if( progress == ParseSlot::Progress::Overflow )
     {
-      // more records than the room: parsed again with room for them
-      slot->restart();
+      // more records or levels than the room: parsed again with room for them (a quarter more levels than counted)
+      Buffer       levels = slot->takeLevels();
+      const size_t room   = std::max( slot->levelsCounted() * 5 / 4 + 4096, levels.size / sizeof( int16_t ) );
+      giveBuffer( levels );
+      slot->restart( takeBuffer( room * sizeof( int16_t ) ) );
       std::lock_guard<std::mutex> lock( m_mutex );
       m_stats.restarts++;
       i++;
@@ -826,6 +874,9 @@ void ParseService::finishPictures()
       // the most records a picture had: the room the next pictures' slots start with
       m_maxCus = std::max( m_maxCus, slot->numCus() );
       m_maxTus = std::max( m_maxTus, slot->numTus() );
+      // and levels, for its kind of picture
+      size_t& maxLevels = m_maxLevels[intraPicture( *slot->picture ) ? 1 : 0];
+      maxLevels         = std::max( maxLevels, slot->numLevels() );
     }
     {
       std::lock_guard<std::mutex> lock( m_mutex );
@@ -836,6 +887,8 @@ void ParseService::finishPictures()
     }
     if( failed )
     {
+      Buffer levels = slot->takeLevels();
+      giveBuffer( levels );
       m_free.push_back( slot );
       handOver( slot->picture, nullptr );
       continue;
@@ -854,7 +907,9 @@ void ParseService::finishPictures()
     }
     result->m_cus  = takeBuffer( std::max<size_t>( result->m_numCus, 1 ) * sizeof( CuRecord ) );
     result->m_tus  = takeBuffer( std::max<size_t>( result->m_numTus, 1 ) * sizeof( TuRecord ) );
-    result->m_ctus = takeBuffer( slot->numCtus() * sizeof( CtuRecord ) );
+    result->m_ctus      = takeBuffer( slot->numCtus() * sizeof( CtuRecord ) );
+    result->m_numLevels = slot->numLevels();
+    result->m_levels    = takeBuffer( std::max<size_t>( result->m_numLevels, 1 ) * sizeof( int16_t ) );
     m_copying.emplace_back( slot, result );
   }
 }

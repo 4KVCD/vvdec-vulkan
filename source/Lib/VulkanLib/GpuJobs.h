@@ -59,7 +59,7 @@ namespace gpu
 {
 
 // A transform block of one component. trafo.slang dequantizes its coefficients and inverse-transforms them into
-// the residual. 8 words.
+// the residual. 10 words.
 struct TrafoJob
 {
   enum Flags
@@ -70,7 +70,7 @@ struct TrafoJob
     kZero          = 8,   // no coefficients: the job writes zeros, for an inter CU with a residual elsewhere in the component
   };
 
-  uint32_t w[8];
+  uint32_t w[10];
 
   // (x, y), log2Width, log2Height: the block, in samples of component comp. typeHor, typeVer: the transform types.
   // ict: the joint Cb-Cr mode (TU::getICTMode, signed) that derives the other chroma component's residual from this
@@ -86,7 +86,7 @@ struct TrafoJob
     w[3] = uint32_t( scale );
     w[4] = uint32_t( rightShift );
     w[5] = uint32_t( inputMaximum );
-    w[6] = w[7] = 0;
+    w[6] = w[7] = w[8] = w[9] = 0;   // (w8, w9: the GPU's parse's levels; the CPU's are in the picture's planes)
   }
   // LFNST (TrQuant::xInvLfnst): the CU's LFNST index (1 or 2); the transform set chosen by the block's intra mode
   // (g_lfnstLut); whether the output is transposed; whether the output covers the top-left 8x8 (blocks of at least

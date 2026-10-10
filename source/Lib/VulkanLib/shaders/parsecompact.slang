@@ -8,9 +8,9 @@
 //   nothing until the picture is parsed);
 // - passes 1 and 2 copy the staged CU and TU records to their places (32 CU records or 64 TU records a workgroup),
 //   pass 3 copies the CTU records (256 a workgroup) beside them.
-// The CHECK variant compares the coefficient levels the GPU's parse left with those the CPU's parse left in the
-// picture, over the rectangles of each TU's coded blocks that the transforms read (one workgroup per TU), and counts
-// the differences. GpuReconParse.cpp records both after the parse's own submissions.
+// The CHECK variant compares the coefficient levels the GPU's parse left (where each TU's record says) with those the
+// CPU's parse left in the picture, over the rectangles of each TU's coded blocks that the transforms read (one
+// workgroup per TU), and counts the differences. GpuReconParse.cpp records both after the parse's own submissions.
 
 #include "common.slang"
 
@@ -22,9 +22,7 @@
 struct Params
 {
   uint*         tus;        // the TU records, in raster order of the CTUs (pass 1's output)
-  int16_t*      gpu0;       // the GPU's planes of levels: Y, Cb, Cr
-  int16_t*      gpu1;
-  int16_t*      gpu2;
+  int16_t*      gpu;        // the GPU's levels: each coded block's rectangle where its TU's record says (words 9 to 12)
   int16_t*      cpu0;       // the CPU's: the picture's planes in host memory, where the CPU's parse left the levels
   int16_t*      cpu1;
   int16_t*      cpu2;
@@ -32,9 +30,7 @@ struct Params
   // workgroup gets there first), [3] a component of that TU that differs
   Atomic<uint>* counts;
   int           numTus;
-  int           gpuStride0;   // the planes' strides, in samples: luma, chroma
-  int           gpuStride12;
-  int           cpuStride0;
+  int           cpuStride0;   // the CPU's planes' strides, in samples: luma, chroma
   int           cpuStride12;
   int           width;      // the picture's size, in luma samples
   int           height;
@@ -81,11 +77,13 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       firstComp = firstComp < 0 ? comp : firstComp;
       continue;
     }
+    const uint at  = r[9 + comp];                                // the GPU's levels of the block, rows of row levels
+    const int  row = int( ( r[12] >> uint( 8 * comp ) ) & 0xffu );
     for( int u = int( local.x ); u < w * h; u += 64 )
     {
       const int x  = x0 + u % w;
       const int y  = y0 + u / w;
-      const int g  = comp == 0 ? int( pc.gpu0[y * pc.gpuStride0 + x] ) : ( comp == 1 ? int( pc.gpu1[y * pc.gpuStride12 + x] ) : int( pc.gpu2[y * pc.gpuStride12 + x] ) );
+      const int g  = int( pc.gpu[at + uint( ( u / w ) * row + u % w )] );
       const int c  = comp == 0 ? int( pc.cpu0[y * pc.cpuStride0 + x] ) : ( comp == 1 ? int( pc.cpu1[y * pc.cpuStride12 + x] ) : int( pc.cpu2[y * pc.cpuStride12 + x] ) );
       compared++;
       if( g != c )
@@ -120,12 +118,12 @@ struct Params
   uint* ctuOut;     // parse.slang's ctuOut, 16 words per CTU: its numbers of CUs and TUs first
   uint* ctuInfo;    // per CTU, 2 words: its slice; its tile | 1 << 16 if it is in its tile's first column
   uint* sync;       // parse.slang's sync: [2 + CTU] is 1 once the CTU is parsed
-  uint* counters;   // parse.slang's counters: the staged CU and TU records, the job lists' room (5 words)
+  uint* counters;   // parse.slang's counters: the staged CU and TU records, the job lists' room (5 words), the levels
   uint* cus;        // out (pass 1): the CU records in raster order of the CTUs
   uint* tus;        // out (pass 2): the TU records in raster order of the CTUs
   uint* ctus;       // the CTU records (CtuRecord, 4 words each): pass 0 writes them, passes 1 to 3 read them
   uint* ctusOut;    // out (pass 3): a copy of the CTU records
-  uint* totals;     // out (pass 0): the numbers of CUs and TUs, then the parse's 7 counters
+  uint* totals;     // out (pass 0): the numbers of CUs and TUs, then the parse's 8 counters
   int   numCtus;
   int   numCus;     // the CU records staged (passes 1 to 3)
   int   numTus;     // the TU records staged
@@ -205,7 +203,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       pc.totals[0] = baseCu;
       pc.totals[1] = baseTu;
-      for( int i = 0; i < 7; i++ )
+      for( int i = 0; i < 8; i++ )
       {
         pc.totals[2 + i] = pc.counters[i];
       }

@@ -110,7 +110,10 @@ struct CuRecord
 // w6, w7: per component, the largest x (w6) and y (w7) of a nonzero coefficient, one byte per component
 //      (vvdec's maxScanPosX, maxScanPosY)
 // w8:  index of the TU's CU within its CTU
-// w9..w15: reserved
+// w9, w10, w11: with the GPU's parse, where Y's, Cb's and Cr's levels are in the picture's levels (the index of their
+//      first one; ParsedPicture::levels), each coded block's rectangle with its rows one after the other
+// w12: the width of those rows, a byte per component (0: the CPU's parse, whose levels are in the picture's planes)
+// w13..w15: reserved
 struct TuRecord
 {
   uint32_t w[16];

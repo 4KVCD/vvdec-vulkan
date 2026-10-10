@@ -72,10 +72,10 @@ static constexpr uint32_t kParseDispatches = 8;   // the check's dispatches per 
 // The push constants of parsecompact.slang's CHECK variant
 struct ParseCheckPush
 {
-  VkDeviceAddress tus, gpu0, gpu1, gpu2, cpu0, cpu1, cpu2, counts;
-  int32_t         numTus, gpuStride0, gpuStride12, cpuStride0, cpuStride12, width, height, csx, csy;
+  VkDeviceAddress tus, gpu, cpu0, cpu1, cpu2, counts;
+  int32_t         numTus, cpuStride0, cpuStride12, width, height, csx, csy;
 };
-static_assert( sizeof( ParseCheckPush ) == 104, "ParseCheckPush: the layout of parsecompact.slang's CHECK Params" );
+static_assert( sizeof( ParseCheckPush ) == 80, "ParseCheckPush: the layout of parsecompact.slang's CHECK Params" );
 
 // Makes buf hold at least size bytes of kind, in steps of 64 KB.
 static void ensureParseBuffer( Context* ctx, Buffer& buf, size_t size, MemKind kind )
@@ -153,7 +153,11 @@ uint32_t GpuRecon::runParse( ParseSlot& slot )
     const ParseSlot::Progress progress = slot.progress();
     if( progress == ParseSlot::Progress::Overflow )
     {
-      slot.restart();   // (more records than the CPU's parse made: the comparison will tell)
+      // more records than the CPU's parse made (the comparison will tell), or more levels than the samples (the
+      // chunks' unused ends): room for what the parse counted
+      Buffer levels = slot.takeLevels();
+      ensureParseBuffer( m_ctx, levels, ( slot.levelsCounted() * 5 / 4 + 4096 ) * sizeof( int16_t ), MemKind::Device );
+      slot.restart( levels );
     }
     else if( progress != ParseSlot::Progress::Parsing )
     {
@@ -185,26 +189,19 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
   {
     numTus += ctu.size();
   }
-  // the levels into buffers of the parse's own (the CPU's parse has its levels in the picture), for the check below
-  const bool   chroma        = isChromaEnabled( pcv.chrFormat );
-  const int    csx           = chroma ? int( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
-  const int    csy           = chroma ? int( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
-  const size_t chromaSamples = std::max<size_t>( size_t( pcv.lumaWidth >> csx ) * ( pcv.lumaHeight >> csy ), 1 );
-  ensureParseBuffer( m_ctx, m_parse.levels[0], size_t( pcv.lumaWidth ) * pcv.lumaHeight * sizeof( int16_t ), MemKind::Device );
-  ensureParseBuffer( m_ctx, m_parse.levels[1], chromaSamples * sizeof( int16_t ), MemKind::Device );
-  ensureParseBuffer( m_ctx, m_parse.levels[2], chromaSamples * sizeof( int16_t ), MemKind::Device );
-  LevelPlanes levels;
-  levels.addr[0]  = m_parse.levels[0].addr;
-  levels.addr[1]  = m_parse.levels[1].addr;
-  levels.addr[2]  = m_parse.levels[2].addr;
-  levels.stride0  = int32_t( pcv.lumaWidth );
-  levels.stride12 = int32_t( pcv.lumaWidth >> csx );
-
   if( !m_parse.slot )
   {
     m_parse.slot = std::make_unique<ParseSlot>( m_ctx );
   }
   ParseSlot& slot = *m_parse.slot;
+  // the levels into the slot's own buffer (the CPU's parse has its levels in the picture), for the check below: the
+  // one of the picture before, with room for a level a sample of each plane
+  const bool   chroma        = isChromaEnabled( pcv.chrFormat );
+  const int    csx           = chroma ? int( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  const int    csy           = chroma ? int( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  const size_t chromaSamples = chroma ? size_t( pcv.lumaWidth >> csx ) * ( pcv.lumaHeight >> csy ) : 0;
+  Buffer       levels        = slot.takeLevels();
+  ensureParseBuffer( m_ctx, levels, ( size_t( pcv.lumaWidth ) * pcv.lumaHeight + 2 * chromaSamples ) * sizeof( int16_t ), MemKind::Device );
   // VVDEC_GPU_PROFILE with the shader clock: parse_prof's cycle counts, added up over the pictures (parse_prof reads
   // threads' values as parse does: with VK_EXT_shader_subgroup_ballot)
   if( m_ctx->profiling() && m_ctx->shaderClock() && m_ctx->subgroupBallot() )
@@ -217,7 +214,7 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
     slot.setProfile( m_parse.prof.addr );
   }
   // room for as many records as the CPU's parse made
-  if( !slot.prepare( cs, levels, numCus, numTus ) )
+  if( !slot.prepare( cs, numCus, numTus, levels ) )
   {
     return;
   }
@@ -242,16 +239,12 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
   transferToComputeBarrier();
   ParseCheckPush check{};
   check.tus         = m_parse.outTus.addr;
-  check.gpu0        = m_parse.levels[0].addr;
-  check.gpu1        = m_parse.levels[1].addr;
-  check.gpu2        = m_parse.levels[2].addr;
+  check.gpu         = slot.levels();
   check.cpu0        = cpuLevels.addr[COMPONENT_Y];
   check.cpu1        = chroma ? cpuLevels.addr[COMPONENT_Cb] : 0;
   check.cpu2        = chroma ? cpuLevels.addr[COMPONENT_Cr] : 0;
   check.counts      = m_parse.check.addr;
   check.numTus      = int32_t( slot.numTus() );
-  check.gpuStride0  = int32_t( pcv.lumaWidth );
-  check.gpuStride12 = int32_t( pcv.lumaWidth >> csx );
   check.cpuStride0  = cpuLevels.stride[COMPONENT_Y];
   check.cpuStride12 = chroma ? cpuLevels.stride[COMPONENT_Cb] : 0;
   check.width       = int32_t( pcv.lumaWidth );
@@ -331,7 +324,7 @@ void GpuRecon::compareParse( const CodingStructure& cs, const std::vector<std::v
 void GpuRecon::ParseCheck::release( Context* ctx )
 {
   slot.reset();
-  for( Buffer* buf: { &levels[0], &levels[1], &levels[2], &outCus, &outTus, &outCtus, &check, &prof } )
+  for( Buffer* buf: { &outCus, &outTus, &outCtus, &check, &prof } )
   {
     ctx->free( *buf );
   }

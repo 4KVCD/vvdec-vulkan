@@ -312,6 +312,8 @@ struct Tu
   int  chromaQp[2];
   int  maxX[3];
   int  maxY[3];
+  uint levelsAt[3];    // with the GPU's parse: where each component's levels are in the picture's levels
+  uint levelsRow[3];   // and the width of their rows (0: the CPU's parse, whose levels are in the planes)
 };
 
 Tu loadTu( int index )
@@ -331,8 +333,10 @@ Tu loadTu( int index )
   tu.chromaQp[1] = int( int8_t( ( r[5] >> 8 ) & 0xff ) );
   for( int c = 0; c < 3; c++ )
   {
-    tu.maxX[c] = int( ( r[6] >> ( 8 * c ) ) & 0xff );
-    tu.maxY[c] = int( ( r[7] >> ( 8 * c ) ) & 0xff );
+    tu.maxX[c]      = int( ( r[6] >> ( 8 * c ) ) & 0xff );
+    tu.maxY[c]      = int( ( r[7] >> ( 8 * c ) ) & 0xff );
+    tu.levelsAt[c]  = r[9 + c];
+    tu.levelsRow[c] = ( r[12] >> ( 8 * c ) ) & 0xff;
   }
   return tu;
 }
@@ -444,12 +448,14 @@ struct Out
   int  base[5];   // where the CU's jobs start, per list
 };
 
+static const int kTrafoWords = 10;   // a transform job's words (GpuJobs.h's TrafoJob)
+
 void emitTrafo( inout Out o, uint w[12] )
 {
   if( o.write && o.base[0] + o.n[0] < pc.capTrafo )
   {
-    uint* p = pc.trafo + ( o.base[0] + o.n[0] ) * 8;
-    for( int i = 0; i < 8; i++ )
+    uint* p = pc.trafo + ( o.base[0] + o.n[0] ) * kTrafoWords;
+    for( int i = 0; i < kTrafoWords; i++ )
     {
       p[i] = w[i];
     }
@@ -831,6 +837,8 @@ void trafoJobs( Cu cu, inout Out o )
       uint w[12];
       clearJob( w );
       setTrafo( w, block.x, block.y, log2W, log2H, comp, typeHor, typeVer, flags, ict, maxX, maxY, scale, rightShift, inputMax );
+      w[8] = tu.levelsAt[comp];   // the levels' place (the GPU's parse)
+      w[9] = tu.levelsRow[comp];
       // LFNST: the set and the orientation follow from the block's intra mode (TrQuant::xInvLfnst)
       if( cu.lfnst != 0 && ( pc.sps & kSpsLfnst ) != 0 && !ts && ( isSepTree( cu ) || comp == 0 ) )
       {

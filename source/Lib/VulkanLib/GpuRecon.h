@@ -451,8 +451,9 @@ private:
   struct FrontEndBuffers
   {
     Buffer cus, tus, ctus;   // the CPU parse's records (GpuFrontEnd.h), uploaded
-    // the records the front end reads: those, or where the GPU's parse left them (ParsedPicture)
-    VkDeviceAddress recordCus = 0, recordTus = 0, recordCtus = 0;
+    // the records the front end reads: those, or where the GPU's parse left them (ParsedPicture); and the GPU parse's
+    // levels (0 with the CPU's parse, whose levels are in the picture)
+    VkDeviceAddress recordCus = 0, recordTus = 0, recordCtus = 0, recordLevels = 0;
     // Motion derivation (mider.slang): per 4x4 block, its CU in the luma tree and in the chroma tree; per CU, its
     // motion; per 4x4 block, its motion (5 words); per CTU row, its progress
     Buffer cuMapLuma, cuMapChroma, cuMotion, motion, rowProgress;
@@ -487,9 +488,9 @@ private:
     std::unique_ptr<ParseSlot> slot;   // the picture's parse
     bool       recorded = false;       // compareParse has results to compare
     int        contexts = 0;           // parsectx.slang's context sets checked against vvdec's: 1 alike, -1 not
-    // the levels the parse writes (the CPU's parse has its own in the picture), the records in raster order and the
-    // levels check's counts in host memory, for compareParse
-    Buffer levels[MAX_NUM_COMPONENT], outCus, outTus, outCtus, check;
+    // the records in raster order and the levels check's counts in host memory, for compareParse (the slot holds the
+    // levels the parse writes)
+    Buffer outCus, outTus, outCtus, check;
     Buffer prof;   // VVDEC_GPU_PROFILE with the shader clock: parse_prof's cycle counts
     bool   profRead = false;
     // the parse's own commands on the compute queue

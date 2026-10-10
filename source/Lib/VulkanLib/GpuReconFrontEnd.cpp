@@ -242,9 +242,10 @@ size_t GpuRecon::uploadRecords( const CodingStructure& cs, const PictureJobs& jo
     numTus += ctu.size();
   }
   ensureFrontEndBuffers( cs, numCus, numTus );
-  m_frontEnd.recordCus  = m_frontEnd.cus.addr;
-  m_frontEnd.recordTus  = m_frontEnd.tus.addr;
-  m_frontEnd.recordCtus = m_frontEnd.ctus.addr;
+  m_frontEnd.recordCus    = m_frontEnd.cus.addr;
+  m_frontEnd.recordTus    = m_frontEnd.tus.addr;
+  m_frontEnd.recordCtus   = m_frontEnd.ctus.addr;
+  m_frontEnd.recordLevels = 0;   // (the CPU's parse left the levels in the picture)
   if( m_useFrontEnd )
   {
     m_frontEnd.capacities = frontCapacities( cs, cus, tus );
@@ -283,9 +284,10 @@ size_t GpuRecon::useParsedRecords( const CodingStructure& cs, const ParsedPictur
   // waits for the parse queue's timeline value that put them there)
   ensureFrontEndBuffers( cs, parsed.numCus(), parsed.numTus(), false );
   m_frontEnd.capacities = parsed.capacities();
-  m_frontEnd.recordCus  = parsed.cus();
-  m_frontEnd.recordTus  = parsed.tus();
-  m_frontEnd.recordCtus = parsed.ctus();
+  m_frontEnd.recordCus    = parsed.cus();
+  m_frontEnd.recordTus    = parsed.tus();
+  m_frontEnd.recordCtus   = parsed.ctus();
+  m_frontEnd.recordLevels = parsed.levels();
   return parsed.numCus();
 }
 
