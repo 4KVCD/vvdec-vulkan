@@ -478,6 +478,11 @@ void DecLibRecon::swapBufs( CodingStructure& cs )
 void DecLibRecon::decompressPicture( Picture* pcPic )
 {
   m_currDecompPic = pcPic;
+  // the CTU data of a picture the GPU parsed, which it has only while it is reconstructed (back in finishGpuTask)
+  if( !pcPic->cs->hasCtuData() )
+  {
+    pcPic->cs->attachCtuData();
+  }
 #if VVDEC_VULKAN
   m_currDecompReleasable = false;
 #endif
@@ -1738,6 +1743,7 @@ bool DecLibRecon::finishGpuTask( int, void* taskParam )
   FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( taskParam );
   param->decLib->m_gpuRecon->endDownload( param->download );
   param->pic->cs->deallocTempInternals();
+  param->pic->cs->detachCtuData();   // (a picture the GPU parsed: nothing reads its CTU data after its GPU work)
 
 #ifdef TRACE_ENABLE_ITT
   // mark end of frame

@@ -280,8 +280,9 @@ void CodingStructure::rebindPicBufs()
   else                                                    m_rec_wrap.destroy();
 }
 
-void CodingStructure::allocTempInternals( bool cuMap, bool colMotion )
+void CodingStructure::allocTempInternals( bool cuMap, bool colMotion, bool ctuData )
 {
+  detachCtuData();   // (a picture the GPU parsed before, in this buffer: its CTU data back to the pool)
   const ptrdiff_t ctuCuMapSize    = pcv->num4x4CtuBlks;
   const ptrdiff_t ctuColMiMapSize = pcv->num8x8CtuBlks;
 
@@ -306,10 +307,10 @@ void CodingStructure::allocTempInternals( bool cuMap, bool colMotion )
     allocColMiMap( newColMiMapSize );
   }
 
-  const size_t newCtuDataSize = pcv->sizeInCtus;
+  const size_t newCtuDataSize = ctuData ? size_t( pcv->sizeInCtus ) : 0;
   if( m_ctuDataSize != newCtuDataSize )
   {
-    m_ctuData     = std::make_unique<CtuData[]>( newCtuDataSize );
+    m_ctuData     = newCtuDataSize ? std::make_unique<CtuData[]>( newCtuDataSize ) : nullptr;
     m_ctuDataSize = newCtuDataSize;
   }
 }
@@ -390,6 +391,42 @@ void CodingStructure::deallocTempInternals()
   m_cuMapSize = 0;
 }
 
+void CodingStructure::attachCtuData()
+{
+  CHECK( m_ctuData, "the CTU data attached twice" );
+  m_ctuDataSize   = pcv->sizeInCtus;
+  m_ctuData       = m_cuMapCache ? m_cuMapCache->getCtuData( m_ctuDataSize ) : std::make_unique<CtuData[]>( m_ctuDataSize );
+  m_ctuDataPooled = true;
+  initCtuData();
+  // each CTU's slice (DecSlice::claimSlice only marked the CTUs: m_ctuClaimed)
+  for( Slice* slice: picture->slices )
+  {
+    for( unsigned i = 0; i < slice->getNumCtuInSlice(); i++ )
+    {
+      CtuData& ctu = m_ctuData[slice->getCtuAddrInSlice( int( i ) )];
+      ctu.slice    = slice;
+      ctu.pps      = slice->getPPS();
+      ctu.sps      = slice->getSPS();
+      ctu.ph       = slice->getPicHeader();
+    }
+  }
+}
+
+void CodingStructure::detachCtuData()
+{
+  if( !m_ctuDataPooled )
+  {
+    return;
+  }
+  if( m_cuMapCache )
+  {
+    m_cuMapCache->putCtuData( std::move( m_ctuData ), m_ctuDataSize );
+  }
+  m_ctuData.reset();
+  m_ctuDataSize   = 0;
+  m_ctuDataPooled = false;
+}
+
 void CodingStructure::clearColMotion()
 {
   if( m_colMiMap )   // (none yet: a picture the GPU parses, whose GPU work writes it all)
@@ -443,7 +480,6 @@ void CodingStructure::initStructData( bool clearColMotion )
   m_ctuWidthLog2[0] = pcv->maxCUWidthLog2 - unitScale[CH_L].posx;
   m_ctuWidthLog2[1] = m_ctuWidthLog2[0]; // same for luma and chroma, because of the 2x2 blocks
 
-  memset( NO_WARNING_class_memaccess( m_ctuData.get() ),             0, sizeof( CtuData             ) * m_ctuDataSize );
   if( !m_cuMapZero && m_cuMap )
   {
     memset( NO_WARNING_class_memaccess( m_cuMap.get() ),             0, sizeof( CodingUnit*         ) * m_cuMapSize );
@@ -454,14 +490,24 @@ void CodingStructure::initStructData( bool clearColMotion )
     this->clearColMotion();
   }
 
+  hasIbcBlock.clear();
+  hasIbcBlock.resize( pcv->heightInCtus, 0 );
+  m_ctuClaimed.assign( pcv->sizeInCtus, 0 );
+
+  if( m_ctuData )
+  {
+    memset( NO_WARNING_class_memaccess( m_ctuData.get() ), 0, sizeof( CtuData ) * m_ctuDataSize );
+    initCtuData();
+  }
+}
+
+void CodingStructure::initCtuData()
+{
   const ptrdiff_t ctuSampleSizeL  = pcv->maxCUHeight * pcv->maxCUWidth;
   const ptrdiff_t ctuSampleSizeC  = isChromaEnabled( pcv->chrFormat ) ? ( ctuSampleSizeL >> ( getChannelTypeScaleX( CH_C, pcv->chrFormat) + getChannelTypeScaleY( CH_C, pcv->chrFormat ) ) ) : 0;
   const ptrdiff_t ctuSampleSize   = ctuSampleSizeL + 2 * ctuSampleSizeC;
   const ptrdiff_t ctuCuMapSize    = pcv->num4x4CtuBlks;
   const ptrdiff_t ctuColMiMapSize = pcv->num8x8CtuBlks;
-
-  hasIbcBlock.clear();
-  hasIbcBlock.resize( pcv->heightInCtus, 0 );
 
   for( int y = 0; y < pcv->heightInCtus; y++ )
   {

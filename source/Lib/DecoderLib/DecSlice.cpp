@@ -227,13 +227,10 @@ bool DecSlice::claimSlice( Slice* slice )
   AdaptiveLoopFilter::reconstructCoeffAPSs( *slice );
   for( unsigned ctuIdx = 0; ctuIdx < slice->getNumCtuInSlice(); ctuIdx++ )
   {
+    // (the picture has no CTU data yet: its CTUs' slices are set when its reconstruction starts, attachCtuData)
     const unsigned ctuRsAddr = slice->getCtuAddrInSlice( ctuIdx );
-    CtuData&       ctuData   = cs.getCtuData( ctuRsAddr );
-    CHECK( ctuData.slice, "CTU " << ctuRsAddr << " has already been coded in a previous slice" );
-    ctuData.slice = slice;
-    ctuData.pps   = slice->getPPS();
-    ctuData.sps   = slice->getSPS();
-    ctuData.ph    = slice->getPicHeader();
+    CHECK( cs.m_ctuClaimed[ctuRsAddr], "CTU " << ctuRsAddr << " has already been coded in a previous slice" );
+    cs.m_ctuClaimed[ctuRsAddr] = 1;
 #if RECO_WHILE_PARSE
     pic->ctuParsedBarrier[ctuRsAddr].unlock();
 #endif

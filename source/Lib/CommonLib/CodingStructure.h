@@ -142,10 +142,38 @@ public:
     m_maps.push_back( std::move( map ) );
   }
 
+  // The CTU data of the pictures the GPU parses (CodingStructure::attachCtuData), kept the same way: zeroed
+  std::unique_ptr<CtuData[]> getCtuData( size_t count )
+  {
+    {
+      std::lock_guard<std::mutex> lock( m_mutex );
+      if( count == m_ctuCount && !m_ctuData.empty() )
+      {
+        std::unique_ptr<CtuData[]> data = std::move( m_ctuData.back() );
+        m_ctuData.pop_back();
+        return data;
+      }
+    }
+    return std::make_unique<CtuData[]>( count );
+  }
+  void putCtuData( std::unique_ptr<CtuData[]> data, size_t count )   // (zeroed here)
+  {
+    memset( NO_WARNING_class_memaccess( data.get() ), 0, sizeof( CtuData ) * count );
+    std::lock_guard<std::mutex> lock( m_mutex );
+    if( count != m_ctuCount )
+    {
+      m_ctuData.clear();   // of another picture size
+      m_ctuCount = count;
+    }
+    m_ctuData.push_back( std::move( data ) );
+  }
+
 private:
   std::mutex                                  m_mutex;
   ptrdiff_t                                   m_size = 0;
   std::vector<std::unique_ptr<CodingUnit*[]>> m_maps;
+  size_t                                      m_ctuCount = 0;
+  std::vector<std::unique_ptr<CtuData[]>>     m_ctuData;
 };
 
 class CodingStructure
@@ -168,6 +196,13 @@ public:
 
   std::unique_ptr<CtuData[]> m_ctuData;
   size_t                     m_ctuDataSize;
+  // A picture the GPU parses has its CTU data only while it is reconstructed (attachCtuData to detachCtuData: from
+  // m_cuMapCache's pool); until then the CTUs its slices claimed are marked here (DecSlice::claimSlice)
+  bool                       m_ctuDataPooled = false;
+  std::vector<uint8_t>       m_ctuClaimed;
+  bool                       hasCtuData() const { return m_ctuData != nullptr; }
+  void                       attachCtuData();   // the CTU data, from the pool, with each CTU's slice
+  void                       detachCtuData();   // back to the pool (nothing when not from it)
 
   // data for which memory is partially borrowed from DecLibRecon
   Pel*              m_predBuf;
@@ -226,11 +261,13 @@ public:
   // clearColMotion: the colocated motion too, else the picture's first parse
   // task clears it (clearColMotion(), off the parser's thread)
   void initStructData( bool clearColMotion = true );
+  void initCtuData();   // each CTU's place, maps and offsets in m_ctuData (zeroed)
   void clearColMotion();
 
   // cuMap: the CU map (a CodingUnit pointer a 4x4 block), which a picture the GPU parses never uses; colMotion: the
-  // colocated motion, which a picture the GPU parses gets later (attachColMotion)
-  void allocTempInternals( bool cuMap = true, bool colMotion = true );
+  // colocated motion, which a picture the GPU parses gets later (attachColMotion); ctuData: the CTU data, which a
+  // picture the GPU parses gets later too (attachCtuData)
+  void allocTempInternals( bool cuMap = true, bool colMotion = true, bool ctuData = true );
   void deallocTempInternals();
 
   void createInternals(const UnitArea& _unit);
