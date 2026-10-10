@@ -30,6 +30,8 @@ set( VVDEC_GPU_SHADERS
   "colmotion|colmotion"
   "parse|parse"
   "parse_prof|parse|PROFILE=1"
+  "parse_ctu64|parse|MAX_CTU=64"
+  "parse_prof_ctu64|parse|PROFILE=1|MAX_CTU=64"
   "parse_shuffle|parse|READ_INVOCATION=0"
   "parsecompact|parsecompact"
   "parsecheck|parsecompact|CHECK=1"

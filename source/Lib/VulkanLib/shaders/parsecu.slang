@@ -195,10 +195,10 @@ void writeCuInfo()
     const int  w4  = max( bw >> 2, 1 );
     const int  h4  = max( bh >> 2, 1 );
     const int  lw4 = firstbithigh( uint( w4 ) );
-    const int  at  = ch * 1024 + ( ( by - y0 ) >> 2 ) * 32 + ( ( bx - x0 ) >> 2 );
+    const int  at  = ch * kMapChannel + ( ( by - y0 ) >> 2 ) * kMapRow + ( ( bx - x0 ) >> 2 );
     for( int u = g_lane; u < w4 * h4; u += 32 )
     {
-      s_map[at + ( u >> lw4 ) * 32 + ( u & ( w4 - 1 ) )] = info;
+      s_map[at + ( u >> lw4 ) * kMapRow + ( u & ( w4 - 1 ) )] = info;
     }
   }
   GroupMemoryBarrierWithGroupSync();

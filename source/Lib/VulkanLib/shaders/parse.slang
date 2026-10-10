@@ -915,13 +915,13 @@ void beginCtu()
     // workgroup of an earlier dispatch wrote)
     AllMemoryBarrierWithGroupSync();
   }
-  for( int i = g_lane; i < 2048; i += 32 )
+  for( int i = g_lane; i < 2 * kMapChannel; i += 32 )
   {
     s_map[i] = uint2( 0, 0 );
   }
-  for( int i = g_lane; i < 64; i += 32 )
+  for( int i = g_lane; i < 2 * kMapRow; i += 32 )
   {
-    s_above[i] = g_aboveAvail ? pc.bottomRows[( g_ctu - g_widthInCtus ) * 64 + i] : uint2( 0, 0 );
+    s_above[i] = g_aboveAvail ? pc.bottomRows[bottomRowsAt( g_ctu - g_widthInCtus, i )] : uint2( 0, 0 );
     if( !g_leftAvail )
     {
       s_left[i] = uint2( 0, 0 );
@@ -935,12 +935,12 @@ void beginCtu()
 void endCtu()
 {
   const int last = ( g_ctuSize >> 2 ) - 1;
-  for( int i = g_lane; i < 64; i += 32 )
+  for( int i = g_lane; i < 2 * kMapRow; i += 32 )
   {
-    const int ch = i >> 5;
-    const int j  = i & 31;
-    pc.bottomRows[g_ctu * 64 + i] = s_map[ch * 1024 + last * 32 + j];
-    s_left[i]                     = s_map[ch * 1024 + j * 32 + last];
+    const int ch = i / kMapRow;
+    const int j  = i % kMapRow;
+    pc.bottomRows[bottomRowsAt( g_ctu, i )] = s_map[ch * kMapChannel + last * kMapRow + j];
+    s_left[i]                               = s_map[ch * kMapChannel + j * kMapRow + last];
   }
   GroupMemoryBarrierWithGroupSync();
 }
@@ -954,7 +954,7 @@ void saveState( uint* state, int k, int prevQp[2], bool done )
   {
     state[kStCtx + i] = s_ctx[i].x;
   }
-  for( int i = g_lane; i < 64; i += 32 )
+  for( int i = g_lane; i < 2 * kMapRow; i += 32 )
   {
     state[kStLeft + 2 * i]     = s_left[i].x;
     state[kStLeft + 2 * i + 1] = s_left[i].y;
@@ -1035,7 +1035,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       s_ctx[i].x = state[kStCtx + i];
     }
-    for( int i = g_lane; i < 64; i += 32 )
+    for( int i = g_lane; i < 2 * kMapRow; i += 32 )
     {
       s_left[i] = uint2( state[kStLeft + 2 * i], state[kStLeft + 2 * i + 1] );
     }

@@ -20,9 +20,23 @@
 // A CU's entries are written when the CU is done, so a lookup always finds another CU, completely parsed.
 // --------------------------------------------------------------------------------------------------------------------
 
-groupshared uint2 s_map[2048];   // [channel type][y >> 2][x >> 2], from the CTU's top-left corner, 32 entries per row
-groupshared uint2 s_above[64];   // [channel type][x >> 2]: the bottom row of the CTU above
-groupshared uint2 s_left[64];    // [channel type][y >> 2]: the right column of the CTU to the left
+// The maps are as large as the largest CTU of the shader's variant: MAX_CTU, 128 samples, or 64 for parse_ctu64,
+// whose maps take a quarter of the shared memory (the parse's workgroups stay resident for long, and the shared
+// memory they take the reconstruction's shaders cannot have). pc.bottomRows keeps 32 entries a channel type a CTU.
+#ifndef MAX_CTU
+#  define MAX_CTU 128
+#endif
+static const int kMapRow     = MAX_CTU / 4;         // a channel type's map: entries per row (one a 4x4 block)
+static const int kMapChannel = kMapRow * kMapRow;   // entries per channel type
+groupshared uint2 s_map[2 * kMapChannel];   // [channel type][y >> 2][x >> 2], from the CTU's top-left corner
+groupshared uint2 s_above[2 * kMapRow];     // [channel type][x >> 2]: the bottom row of the CTU above
+groupshared uint2 s_left[2 * kMapRow];      // [channel type][y >> 2]: the right column of the CTU to the left
+
+// Where entry i of s_above (or s_left) is in pc.bottomRows' entries of CTU ctu
+uint bottomRowsAt( int ctu, int i )
+{
+  return uint( ctu * 64 + ( i / kMapRow ) * 32 + i % kMapRow );
+}
 
 static bool g_leftAvail;    // the CTU to the left is in the same slice and tile
 static bool g_aboveAvail;   // the CTU above is in the same slice and tile
@@ -113,15 +127,15 @@ uint2 cuAt( int x, int y, int ch )
   const int dy = y - ( g_ctuY << g_log2Ctu );
   if( dx >= 0 && dy >= 0 && dx < g_ctuSize && dy < g_ctuSize )
   {
-    return uni( s_map[ch * 1024 + ( dy >> 2 ) * 32 + ( dx >> 2 )] );
+    return uni( s_map[ch * kMapChannel + ( dy >> 2 ) * kMapRow + ( dx >> 2 )] );
   }
   if( dy < 0 && dy >= -4 && dx >= 0 && dx < g_ctuSize )
   {
-    return uni( s_above[ch * 32 + ( dx >> 2 )] );
+    return uni( s_above[ch * kMapRow + ( dx >> 2 )] );
   }
   if( dx < 0 && dx >= -4 && dy >= 0 && dy < g_ctuSize )
   {
-    return uni( s_left[ch * 32 + ( dy >> 2 )] );
+    return uni( s_left[ch * kMapRow + ( dy >> 2 )] );
   }
   return uint2( 0, 0 );
 }

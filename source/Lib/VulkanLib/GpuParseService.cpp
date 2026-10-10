@@ -283,8 +283,12 @@ void ParseSlot::recordStep( VkCommandBuffer cmd ) const
   push.counters   = m_counters.addr;
   push.cuCap      = int32_t( std::min<size_t>( m_cuCap, INT32_MAX ) );
   push.tuCap      = int32_t( std::min<size_t>( m_tuCap, INT32_MAX ) );
-  // (parse_prof for the profile; parse_shuffle where the device lacks what parse reads threads' values with)
-  const int shader = m_prof ? kShader_parse_prof : ( m_ctx->subgroupBallot() ? kShader_parse : kShader_parse_shuffle );
+  // (parse_prof for the profile; parse_shuffle where the device lacks what parse reads threads' values with; the
+  // _ctu64 variants for CTUs of 64 samples at most, their maps a quarter of the shared memory)
+  const bool ctu64  = picture->cs->pcv->maxCUWidth <= 64;
+  const int  shader = m_prof                    ? ( ctu64 ? kShader_parse_prof_ctu64 : kShader_parse_prof )
+                      : m_ctx->subgroupBallot() ? ( ctu64 ? kShader_parse_ctu64 : kShader_parse )
+                                                : kShader_parse_shuffle;
   dispatch( m_ctx, cmd, shader, push, m_in.numStreams );   // a workgroup per substream
 }
 
