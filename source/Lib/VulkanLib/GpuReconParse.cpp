@@ -157,7 +157,9 @@ uint32_t GpuRecon::runParse( ParseSlot& slot )
       // chunks' unused ends): room for what the parse counted
       Buffer levels = slot.takeLevels();
       ensureParseBuffer( m_ctx, levels, ( slot.levelsCounted() * 5 / 4 + 4096 ) * sizeof( int16_t ), MemKind::Device );
-      slot.restart( levels );
+      StagedRecords staged = slot.takeStaged();
+      ParseSlot::growStaged( m_ctx, staged, slot.cusCounted() * 5 / 4 + 64, slot.tusCounted() * 5 / 4 + 64 );
+      slot.restart( staged, levels );
     }
     else if( progress != ParseSlot::Progress::Parsing )
     {
@@ -214,7 +216,9 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
     slot.setProfile( m_parse.prof.addr );
   }
   // room for as many records as the CPU's parse made
-  if( !slot.prepare( cs, numCus, numTus, levels ) )
+  StagedRecords staged = slot.takeStaged();
+  ParseSlot::growStaged( m_ctx, staged, numCus, numTus );
+  if( !slot.prepare( cs, staged, levels ) )
   {
     return;
   }

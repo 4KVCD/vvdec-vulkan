@@ -172,7 +172,7 @@ ParseSlot::~ParseSlot()
   }
 }
 
-bool ParseSlot::prepare( const CodingStructure& cs, size_t minCus, size_t minTus, Buffer levels )
+bool ParseSlot::prepare( const CodingStructure& cs, StagedRecords staged, Buffer levels )
 {
   m_ctx->free( m_levels );   // (none: taken back after the picture before)
   m_levels   = levels;
@@ -214,20 +214,40 @@ bool ParseSlot::prepare( const CodingStructure& cs, size_t minCus, size_t minTus
   ensureBuffer( m_ctx, m_counters, kParseCounters * sizeof( uint32_t ), MemKind::Device );   // (an atomic a CU: fast in GPU memory)
   ensureBuffer( m_ctx, m_ctus, m_numCtus * sizeof( CtuRecord ), MemKind::HostCached );
   ensureBuffer( m_ctx, m_totals, kParseTotals * sizeof( uint32_t ), MemKind::HostCached );
-  makeRoom( minCus, minTus );
+  setStaged( staged );
   clear();
   return true;
 }
 
-void ParseSlot::makeRoom( size_t cus, size_t tus )
+void ParseSlot::setStaged( StagedRecords staged )
 {
-  ensureBuffer( m_ctx, m_cus, std::max<size_t>( cus, 1 ) * sizeof( CuRecord ), MemKind::Device );
-  ensureBuffer( m_ctx, m_cuMeta, std::max<size_t>( cus, 1 ) * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, m_tus, std::max<size_t>( tus, 1 ) * sizeof( TuRecord ), MemKind::Device );
-  ensureBuffer( m_ctx, m_tuMeta, std::max<size_t>( tus, 1 ) * sizeof( uint32_t ), MemKind::Device );
+  for( Buffer* buf: { &m_cus, &m_tus, &m_cuMeta, &m_tuMeta } )
+  {
+    m_ctx->free( *buf );   // (none: taken back before)
+  }
+  m_cus    = staged.cus;
+  m_tus    = staged.tus;
+  m_cuMeta = staged.cuMeta;
+  m_tuMeta = staged.tuMeta;
   // (all the room the buffers have)
   m_cuCap = std::min<size_t>( m_cus.size / sizeof( CuRecord ), m_cuMeta.size / sizeof( uint32_t ) );
   m_tuCap = std::min<size_t>( m_tus.size / sizeof( TuRecord ), m_tuMeta.size / sizeof( uint32_t ) );
+}
+
+void ParseSlot::growStaged( Context* ctx, StagedRecords& staged, size_t cus, size_t tus )
+{
+  ensureBuffer( ctx, staged.cus, std::max<size_t>( cus, 1 ) * sizeof( CuRecord ), MemKind::Device );
+  ensureBuffer( ctx, staged.cuMeta, std::max<size_t>( cus, 1 ) * sizeof( uint32_t ), MemKind::Device );
+  ensureBuffer( ctx, staged.tus, std::max<size_t>( tus, 1 ) * sizeof( TuRecord ), MemKind::Device );
+  ensureBuffer( ctx, staged.tuMeta, std::max<size_t>( tus, 1 ) * sizeof( uint32_t ), MemKind::Device );
+}
+
+StagedRecords ParseSlot::takeStaged()
+{
+  const StagedRecords staged{ m_cus, m_tus, m_cuMeta, m_tuMeta };
+  m_cus = m_tus = m_cuMeta = m_tuMeta = Buffer();
+  m_cuCap = m_tuCap = 0;
+  return staged;
 }
 
 void ParseSlot::clear()
@@ -352,15 +372,23 @@ ParseSlot::Progress ParseSlot::progress()
   return Progress::Done;
 }
 
-void ParseSlot::restart( Buffer levels )
+void ParseSlot::restart( StagedRecords staged, Buffer levels )
 {
-  // room for the records the parse counted, and a quarter more; the levels into levels
-  const uint32_t* sums = totals();
-  makeRoom( size_t( sums[2] ) * 5 / 4 + 64, size_t( sums[3] ) * 5 / 4 + 64 );
+  setStaged( staged );
   m_ctx->free( m_levels );   // (none: taken back first)
   m_levels   = levels;
   m_levelCap = m_levels.size / sizeof( int16_t );
   clear();
+}
+
+size_t ParseSlot::cusCounted() const
+{
+  return totals()[2];
+}
+
+size_t ParseSlot::tusCounted() const
+{
+  return totals()[3];
 }
 
 size_t ParseSlot::levelsCounted() const
@@ -699,6 +727,10 @@ Buffer ParseService::takeBuffer( size_t size )
 
 void ParseService::giveBuffer( Buffer& buf )
 {
+  if( !buf.valid() )
+  {
+    return;
+  }
   int bin = 16;
   while( ( size_t( 1 ) << bin ) < buf.size )
   {
@@ -710,10 +742,39 @@ void ParseService::giveBuffer( Buffer& buf )
   buf = Buffer();
 }
 
+StagedRecords ParseService::takeStaged( size_t cus, size_t tus )
+{
+  StagedRecords staged;
+  staged.cus    = takeBuffer( std::max<size_t>( cus, 1 ) * sizeof( CuRecord ) );
+  staged.cuMeta = takeBuffer( std::max<size_t>( cus, 1 ) * sizeof( uint32_t ) );
+  staged.tus    = takeBuffer( std::max<size_t>( tus, 1 ) * sizeof( TuRecord ) );
+  staged.tuMeta = takeBuffer( std::max<size_t>( tus, 1 ) * sizeof( uint32_t ) );
+  return staged;
+}
+
+void ParseService::giveSlot( ParseSlot* slot )
+{
+  StagedRecords staged = slot->takeStaged();
+  Buffer        levels = slot->takeLevels();
+  for( Buffer* buf: { &staged.cus, &staged.tus, &staged.cuMeta, &staged.tuMeta, &levels } )
+  {
+    giveBuffer( *buf );
+  }
+  m_free.push_back( slot );
+}
+
 // Whether all the picture's slices are intra slices
 static bool intraPicture( const Picture& pic )
 {
   return std::all_of( pic.slices.begin(), pic.slices.end(), []( const Slice* s ) { return s->isIntra(); } );
+}
+
+// The room for a picture's staged records (its CUs' or its TUs'): a quarter more than the most a picture of its kind
+// had so far; before the first, 32 a CTU for an intra picture (VideoQ's have up to 23 with the dual tree), 8 for the
+// others (VideoQ's have 2 to 4; a guess too big stays in the bins). A picture with more is parsed again (Overflow).
+static size_t recordRoom( size_t most, size_t ctus, bool intra )
+{
+  return most > 0 ? most * 5 / 4 + 64 : ctus * ( intra ? 32 : 8 );
 }
 
 size_t ParseService::levelRoom( const Picture& pic ) const
@@ -739,14 +800,14 @@ void ParseService::startPicture( Picture* pic )
   ParseSlot* slot = takeSlot();
   slot->picture   = pic;
   slot->setProfile( m_prof );
-  // room for a quarter more records than any picture so far had, and at least 32 a CTU; the levels' room from the bins
-  const size_t ctus = pic->cs->pcv->sizeInCtus;
-  if( !slot->prepare( *pic->cs, std::max( m_maxCus * 5 / 4, ctus * 32 ), std::max( m_maxTus * 5 / 4, ctus * 32 ),
-                      takeBuffer( levelRoom( *pic ) * sizeof( int16_t ) ) ) )
+  // room for the records and the levels of a picture of its kind, from the bins
+  const bool   intra = intraPicture( *pic );
+  const size_t ctus  = pic->cs->pcv->sizeInCtus;
+  const size_t cus   = recordRoom( m_maxCus[intra ? 1 : 0], ctus, intra );
+  const size_t tus   = recordRoom( m_maxTus[intra ? 1 : 0], ctus, intra );
+  if( !slot->prepare( *pic->cs, takeStaged( cus, tus ), takeBuffer( levelRoom( *pic ) * sizeof( int16_t ) ) ) )
   {
-    Buffer levels = slot->takeLevels();
-    giveBuffer( levels );
-    m_free.push_back( slot );
+    giveSlot( slot );
     {
       std::lock_guard<std::mutex> lock( m_mutex );
       m_stats.errors++;
@@ -787,9 +848,7 @@ void ParseService::submit()
     for( const auto& copy: m_copying )
     {
       copy.second->m_parseValue = copyValue;
-      Buffer levels             = copy.first->takeLevels();
-      giveBuffer( levels );
-      m_free.push_back( copy.first );
+      giveSlot( copy.first );
       handOver( copy.second->picture, copy.second );
     }
     m_copying.clear();
@@ -866,11 +925,17 @@ void ParseService::finishPictures()
     }
     if( progress == ParseSlot::Progress::Overflow )
     {
-      // more records or levels than the room: parsed again with room for them (a quarter more levels than counted)
-      Buffer       levels = slot->takeLevels();
-      const size_t room   = std::max( slot->levelsCounted() * 5 / 4 + 4096, levels.size / sizeof( int16_t ) );
-      giveBuffer( levels );
-      slot->restart( takeBuffer( room * sizeof( int16_t ) ) );
+      // more records or levels than the room: parsed again with room for them (a quarter more than counted)
+      StagedRecords staged = slot->takeStaged();
+      Buffer        levels = slot->takeLevels();
+      const size_t  cus    = std::max( slot->cusCounted() * 5 / 4 + 64, staged.cus.size / sizeof( CuRecord ) );
+      const size_t  tus    = std::max( slot->tusCounted() * 5 / 4 + 64, staged.tus.size / sizeof( TuRecord ) );
+      const size_t  room   = std::max( slot->levelsCounted() * 5 / 4 + 4096, levels.size / sizeof( int16_t ) );
+      for( Buffer* buf: { &staged.cus, &staged.tus, &staged.cuMeta, &staged.tuMeta, &levels } )
+      {
+        giveBuffer( *buf );
+      }
+      slot->restart( takeStaged( cus, tus ), takeBuffer( room * sizeof( int16_t ) ) );
       std::lock_guard<std::mutex> lock( m_mutex );
       m_stats.restarts++;
       i++;
@@ -880,25 +945,22 @@ void ParseService::finishPictures()
     const bool failed = progress != ParseSlot::Progress::Done;
     if( !failed )
     {
-      // the most records a picture had: the room the next pictures' slots start with
-      m_maxCus = std::max( m_maxCus, slot->numCus() );
-      m_maxTus = std::max( m_maxTus, slot->numTus() );
-      // and levels, for its kind of picture
-      size_t& maxLevels = m_maxLevels[intraPicture( *slot->picture ) ? 1 : 0];
-      maxLevels         = std::max( maxLevels, slot->numLevels() );
+      // the most records and levels a picture of its kind had: the room the next ones' slots start with
+      const int kind    = intraPicture( *slot->picture ) ? 1 : 0;
+      m_maxCus[kind]    = std::max( m_maxCus[kind], slot->numCus() );
+      m_maxTus[kind]    = std::max( m_maxTus[kind], slot->numTus() );
+      m_maxLevels[kind] = std::max( m_maxLevels[kind], slot->numLevels() );
     }
     {
       std::lock_guard<std::mutex> lock( m_mutex );
       m_stats.runs += slot->runs();
       m_stats.errors += failed ? 1 : 0;
-      m_stats.maxCus = int64_t( m_maxCus );
-      m_stats.maxTus = int64_t( m_maxTus );
+      m_stats.maxCus = int64_t( std::max( m_maxCus[0], m_maxCus[1] ) );
+      m_stats.maxTus = int64_t( std::max( m_maxTus[0], m_maxTus[1] ) );
     }
     if( failed )
     {
-      Buffer levels = slot->takeLevels();
-      giveBuffer( levels );
-      m_free.push_back( slot );
+      giveSlot( slot );
       handOver( slot->picture, nullptr );
       continue;
     }

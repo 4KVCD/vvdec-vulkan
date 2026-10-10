@@ -84,6 +84,14 @@ struct Picture;
 namespace gpu
 {
 
+// The buffers a parse stages its records in, before the compaction puts them in raster order (GPU memory): the CU and
+// TU records and their meta words. The ParseService takes them from its bins for each picture, with room for the
+// picture's kind.
+struct StagedRecords
+{
+  Buffer cus, tus, cuMeta, tuMeta;
+};
+
 // One picture's parse on the GPU
 class ParseSlot
 {
@@ -93,10 +101,10 @@ public:
   ParseSlot( const ParseSlot& )            = delete;
   ParseSlot& operator=( const ParseSlot& ) = delete;
 
-  // Sets the slot up for the picture of cs: its inputs uploaded, room for at least minCus and minTus staged records,
-  // the levels into levels (which the slot holds until takeLevels), every substream at its start. Returns false when a
-  // slice's data was not captured.
-  bool prepare( const CodingStructure& cs, size_t minCus, size_t minTus, Buffer levels );
+  // Sets the slot up for the picture of cs: its inputs uploaded, its records staged in staged and its levels written
+  // into levels (the slot holds both until takeStaged and takeLevels), every substream at its start. Returns false
+  // when a slice's data was not captured.
+  bool prepare( const CodingStructure& cs, StagedRecords staged, Buffer levels );
   // With VVDEC_GPU_PROFILE and the shader clock: the parse's cycle counts are added up at prof (16 words)
   void setProfile( VkDeviceAddress prof ) { m_prof = prof; }
   // Records into cmd the clearing of the parse's counters (in GPU memory) when the parse starts from the beginning
@@ -117,12 +125,18 @@ public:
     Failed,     // a substream given up on (a broken bitstream), or none advanced for kParseMaxStalls submissions
   };
   Progress progress();
-  // After Overflow: room for the records the parse counted, the levels into levels (the slot's buffer taken back
-  // first: takeLevels), and every substream back at its start
-  void   restart( Buffer levels );
-  size_t levelsCounted() const;   // the levels the parse counted, also those past the room
-  // The buffer of the levels, given back (an empty one when the slot holds none)
+  // After Overflow: the records staged in staged and the levels written into levels (the slot's buffers taken back
+  // first: takeStaged, takeLevels), and every substream back at its start
+  void   restart( StagedRecords staged, Buffer levels );
+  // What the parse counted, also past the room: the CU and TU records, the levels
+  size_t cusCounted() const;
+  size_t tusCounted() const;
+  size_t levelsCounted() const;
+  // The buffers of the staged records and of the levels, given back (empty ones when the slot holds none)
+  StagedRecords   takeStaged();
   Buffer          takeLevels();
+  // Makes staged hold at least cus and tus records (for a caller that keeps its own buffers: GpuRecon's check)
+  static void     growStaged( Context* ctx, StagedRecords& staged, size_t cus, size_t tus );
   VkDeviceAddress levels() const { return m_levels.addr; }
 
   // --- What the parse left, once Done ---
@@ -153,8 +167,8 @@ public:
   bool     failed  = false;     // its parse gave up (GpuRecon's check, VVDEC_GPU_PARSE=1)
 
 private:
-  // Makes room for at least cus and tus staged records
-  void makeRoom( size_t cus, size_t tus );
+  // Takes the staged records' buffers, and the room they give
+  void setStaged( StagedRecords staged );
   // Clears what the parse counts and where each substream is, for a parse from the start
   void clear();
 
@@ -164,10 +178,10 @@ private:
   VkDeviceAddress m_prof = 0;
   // the inputs (upload memory)
   Buffer m_bits, m_streams, m_ctuList, m_ctuInfo, m_slices, m_pic, m_scans;
-  // what the parse writes: the staged records and their meta words, each CTU's bottom rows (the CTU below reads
-  // them), WPP's saved contexts, the counters (the staged records, the job lists' room) in GPU memory; the substreams'
-  // runs, the errors and each CTU's readiness (sync), each substream's state, each CTU's counts and SAO / ALF
-  // parameters (ctuOut) in host memory
+  // what the parse writes: the staged records and their meta words (the caller's buffers: prepare to takeStaged),
+  // each CTU's bottom rows (the CTU below reads them), WPP's saved contexts, the counters (the staged records, the
+  // job lists' room) in GPU memory; the substreams' runs, the errors and each CTU's readiness (sync), each substream's
+  // state, each CTU's counts and SAO / ALF parameters (ctuOut) in host memory
   Buffer m_cus, m_tus, m_cuMeta, m_tuMeta, m_bottomRows, m_wpp, m_counters, m_sync, m_state, m_ctuOut;
   // the compaction's first pass: the CTU records, the totals (host memory)
   Buffer m_ctus, m_totals;
@@ -243,6 +257,8 @@ private:
   ParsedPicture* takeParsed();                             // a parse result no picture holds, or a new one
   Buffer         takeBuffer( size_t size );                // GPU memory for records, from the bins
   void           giveBuffer( Buffer& buf );                // back into the bins
+  StagedRecords  takeStaged( size_t cus, size_t tus );     // room for a parse's staged records, from the bins
+  void           giveSlot( ParseSlot* slot );              // the slot's buffers back into the bins, the slot free
   void           startPicture( Picture* pic );             // its slot set up, among the pictures parsed
   size_t         levelRoom( const Picture& pic ) const;    // the room for its levels when its parse starts
   // The finished pictures' records copied (a submission on the copies' queue), then all the pictures' steps (one on
@@ -272,7 +288,8 @@ private:
   // GPU memory for the results' records, kept for reuse: bin b holds buffers of 2^b bytes (64 KB at least)
   static constexpr int kBins = 40;
   std::vector<Buffer>  m_bins[kBins];
-  size_t                  m_maxCus = 0, m_maxTus = 0;             // the most records a picture had so far
+  // the most records a picture of each kind had so far: the other pictures, intra ones
+  size_t                  m_maxCus[2] = {}, m_maxTus[2] = {};
   size_t                  m_maxLevels[2] = {};   // the most levels a picture had so far: the other pictures, intra ones
   VkCommandPool           m_pool  = VK_NULL_HANDLE;   // the steps' submission
   VkCommandBuffer         m_cmd   = VK_NULL_HANDLE;
