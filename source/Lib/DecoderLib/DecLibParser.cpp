@@ -347,6 +347,14 @@ Picture* DecLibParser::getNextDecodablePicture()
     if( pic->wasLost || pic->error )
       continue;
 
+#if VVDEC_VULKAN
+    // A picture the GPU parses is parsed once its GPU parse is done too (parseDone: the CPU read its headers). Taken
+    // before, its instance would wait for the parse -- the longest are those of the pictures this picks first, intra
+    // pictures and a GOP's first pictures (VideoQ 1080p: 190 ms, 450 ms) -- and the decoder thread for that instance.
+    if( pic->gpuParsed.getState() == Barrier::locked && m_gpuParseService && gpu::GpuRecon::parsesPicture( *pic, *pic->cs->sps ) )
+      continue;
+#endif
+
     bool allRefPicsDone = true;
     for( const Slice* slice: pic->slices )
     {
