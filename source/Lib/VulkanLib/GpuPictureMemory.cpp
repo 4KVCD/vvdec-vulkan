@@ -46,6 +46,15 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "GpuPictureMemory.h"
 
+#ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <sys/mman.h>
+#endif
+
 #include "CommonLib/Picture.h"
 
 namespace vvdec
@@ -110,9 +119,9 @@ VkDeviceAddress hostAllocationAddress( void* allocation )
 
 void releaseTwins( Picture& pic )
 {
-  if( !pic.gpuMemory )
+  if( !pic.gpuMemory || !hostPictureAddresses( pic.m_bufs[PIC_RECONSTRUCTION], nullptr, nullptr ) )
   {
-    return;
+    return;   // (stand-ins: no twins)
   }
   pic.gpuCurrent              = false;   // should it be referenced after all, it is uploaded again
   Context*          context   = static_cast<Context*>( pic.gpuMemory->opaque );
@@ -127,10 +136,137 @@ void releaseTwins( Picture& pic )
   }
 }
 
+// ====================================================================================================================
+// PlanePool
+// ====================================================================================================================
+
+// A stand-in plane: address space reserved without memory
+struct StandIn
+{
+  void*  base = nullptr;
+  size_t size = 0;
+};
+
+static void* reserveStandIn( void*, vvdecComponentType, uint32_t size, uint32_t, void** allocator )
+{
+#ifdef _WIN32
+  void* base = VirtualAlloc( nullptr, size, MEM_RESERVE, PAGE_NOACCESS );
+#else
+  void* base = mmap( nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0 );
+  base       = base == MAP_FAILED ? nullptr : base;
+#endif
+  if( !base )
+  {
+    return nullptr;
+  }
+  *allocator = new StandIn{ base, size };
+  return base;
+}
+
+static void releaseStandIn( void*, void* allocator )
+{
+  StandIn* standIn = static_cast<StandIn*>( allocator );
+#ifdef _WIN32
+  VirtualFree( standIn->base, 0, MEM_RELEASE );
+#else
+  munmap( standIn->base, standIn->size );
+#endif
+  delete standIn;
+}
+
+PlanePool::PlanePool( const UserAllocator* planes ) : m_planes( planes ), m_standIns( reserveStandIn, releaseStandIn, nullptr ) {}
+
+PlanePool::~PlanePool() = default;   // (the planes kept go back to their allocator)
+
+bool PlanePool::hasPlanes( const Picture& pic ) const
+{
+  return pic.m_bufs[PIC_RECONSTRUCTION].getUserAllocator() != &m_standIns;
+}
+
+std::unique_ptr<PelStorage> PlanePool::makeStorage( const Picture& pic, const UserAllocator* allocator ) const
+{
+  auto storage = std::make_unique<PelStorage>();
+  storage->create( pic.chromaFormat, pic.lumaSize(), pic.maxCUSize, pic.margin, MEMORY_ALIGN_DEF_SIZE, true, allocator );
+  return storage;
+}
+
+// Whether two storages have the same layout (PelStorage::swap's condition)
+static bool sameLayout( const PelStorage& a, const PelStorage& b )
+{
+  if( a.chromaFormat != b.chromaFormat || a.bufs.size() != b.bufs.size() )
+  {
+    return false;
+  }
+  for( size_t c = 0; c < a.bufs.size(); c++ )
+  {
+    if( a.bufs[c].width != b.bufs[c].width || a.bufs[c].height != b.bufs[c].height || a.bufs[c].stride != b.bufs[c].stride
+        || a.getBufSize( int( c ) ) != b.getBufSize( int( c ) ) )
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+void PlanePool::acquire( Picture& pic )
+{
+  std::lock_guard<std::mutex> lock( m_mutex );
+  if( hasPlanes( pic ) )
+  {
+    return;
+  }
+  // planes of its layout from the pool, else new ones
+  PelStorage&                 current = pic.m_bufs[PIC_RECONSTRUCTION];
+  std::unique_ptr<PelStorage> planes;
+  for( auto it = m_free.begin(); it != m_free.end(); ++it )
+  {
+    if( sameLayout( **it, current ) )
+    {
+      planes = std::move( *it );
+      m_free.erase( it );
+      break;
+    }
+  }
+  if( !planes )
+  {
+    planes = makeStorage( pic, m_planes );
+  }
+  current.swap( *planes );   // (planes now holds the stand-ins)
+  pic.gpuSwappedPlanes = std::move( planes );
+  if( pic.cs )
+  {
+    pic.cs->rebindPicBufs();
+  }
+}
+
+void PlanePool::release( Picture& pic )
+{
+  std::lock_guard<std::mutex> lock( m_mutex );
+  if( !hasPlanes( pic ) )
+  {
+    return;
+  }
+  releaseTwins( pic );
+  // the stand-ins swapped out when the planes came in, or new ones (a picture made with its planes)
+  std::unique_ptr<PelStorage> standIns = std::move( pic.gpuSwappedPlanes );
+  if( !standIns )
+  {
+    standIns = makeStorage( pic, &m_standIns );
+  }
+  pic.m_bufs[PIC_RECONSTRUCTION].swap( *standIns );   // (standIns now holds the planes)
+  m_free.push_back( std::move( standIns ) );
+  if( pic.cs )
+  {
+    pic.cs->rebindPicBufs();
+  }
+}
+
 HostPlane* hostPlane( const PelStorage& storage, ComponentID comp )
 {
   HostPlane* plane = static_cast<HostPlane*>( storage.getBufAllocator( comp ) );
   CHECK_FATAL( !plane || !storage.isExternAllocator(), "Vulkan: a picture buffer the GPU cannot reach" );
+  // (a picture's stand-ins have no HostPlane: the GPU must never get their addresses)
+  CHECK_FATAL( storage.getUserAllocator()->create != createHostPlane, "Vulkan: a picture's stand-ins used as its planes" );
   return plane;
 }
 

@@ -213,10 +213,13 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
   {
     ThreadPool* pool  = m_decodeThreadPool.get();
     m_gpuParseService = std::make_unique<gpu::ParseService>( m_gpu, [pool]() { pool->wakeUp(); } );
-    m_decLibParser.setGpuParseService( m_gpuParseService.get() );
+    m_gpuPlanes       = std::make_unique<gpu::PlanePool>( &m_gpuAllocator );
+    gpu::PlanePool* planes = m_gpuPlanes.get();
+    m_picListManager.setGpuPlanes( planes->standIns(), [planes]( Picture& pic ) { planes->release( pic ); } );
+    m_decLibParser.setGpuParseService( m_gpuParseService.get(), m_gpuPlanes.get() );
     for( auto& dec: m_decLibRecon )
     {
-      dec.setGpuParseService( m_gpuParseService.get() );
+      dec.setGpuParseService( m_gpuParseService.get(), m_gpuPlanes.get() );
     }
   }
 #endif
@@ -410,7 +413,8 @@ void DecLib::destroy()
   m_picListManager.deleteBuffers();
 
 #if VVDEC_VULKAN
-  // after the last picture buffer is gone
+  // after the last picture buffer is gone (the pictures' stand-ins are the pool's)
+  m_gpuPlanes.reset();
   if( m_gpu )
   {
     gpu::Context::release();
@@ -569,6 +573,12 @@ void DecLib::sanitizeBrokenPicture( Picture* pcParsedPic )
     // we don't know if all structures are there yet, so we init them
     pcParsedPic->ensureUsableAsRef();
   }
+#if VVDEC_VULKAN
+  if( m_gpuPlanes )
+  {
+    m_gpuPlanes->acquire( *pcParsedPic );   // (stand-ins until its GPU work is queued, which it did not get to)
+  }
+#endif
   pcParsedPic->fillGrey( m_decLibParser.getParameterSetManager().getFirstSPS() );
 
   // need to finish picture here, because it won't go through declibRecon
@@ -598,6 +608,12 @@ int DecLib::finishPicture( Picture* pcPic, MsgLevel msgl )
   if( pcPic->wasLost || pcPic->error || pcPic->reconDone.hasException() || pcPic->parseDone.hasException() )
   {
     msg( msgl, "POC %4d LId: %2d TId: %1d %s\n", pcPic->poc, pcPic->layerId, pcSlice->getTLayer(), pcPic->wasLost ? "LOST" : "ERROR" );
+#if VVDEC_VULKAN
+    if( m_gpuPlanes )
+    {
+      m_gpuPlanes->acquire( *pcPic );   // (it may have failed before its planes came)
+    }
+#endif
     pcPic->fillGrey( pcPic->cs->sps.get() );
     pcPic->progress = Picture::finished;
 

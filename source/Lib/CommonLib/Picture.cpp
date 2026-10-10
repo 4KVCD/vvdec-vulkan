@@ -102,6 +102,7 @@ void Picture::create(const ChromaFormat &_chromaFormat, const Size &size, const 
   layerId = _layerId;
   UnitArea::operator=( UnitArea( _chromaFormat, Area( Position{ 0, 0 }, size ) ) );
   margin            = _margin;
+  maxCUSize         = _maxCUSize;
   m_bufs[PIC_RECONSTRUCTION].create( _chromaFormat, size, _maxCUSize, _margin, MEMORY_ALIGN_DEF_SIZE, true, _userAllocator );
 }
 
@@ -200,6 +201,9 @@ void Picture::destroy()
   {
     m_bufs[t].destroy();
   }
+#if VVDEC_VULKAN
+  gpuSwappedPlanes.reset();
+#endif
 
   if( cs )
   {

@@ -231,7 +231,12 @@ public:
   // (DecSlice::claimSlice), and once gpuParsed unlocks, what the GPU's parse left (null: it gave up)
   std::atomic_int          gpuClaimedCtus  { 0 };
   gpu::ParsedPicture*      gpuParseResult  = nullptr;
+  // VVDEC_GPU_PARSE=2: a picture the GPU parses has its planes only from when its work goes to the GPU until it may
+  // be reused (gpu::PlanePool); before and after, m_bufs[PIC_RECONSTRUCTION] holds stand-ins of the same layout.
+  // gpuSwappedPlanes holds the storage swapped out of it: the stand-ins while the picture has its planes.
+  std::unique_ptr<PelStorage> gpuSwappedPlanes;
 #endif
+  unsigned         maxCUSize               = 0;              // create's, for the planes made for the picture later
   bool             isReferencePic          = false;          // mainly for setting vvdecPicAttributes::isRefPic for the library output frame
   bool             wasLost                 = false;
   std::atomic_bool error                   { false };

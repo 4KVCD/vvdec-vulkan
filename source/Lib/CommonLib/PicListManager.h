@@ -45,6 +45,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "Unit.h"
 #include "Picture.h"
 
+#include <functional>
 #include <unordered_set>
 
 namespace vvdec
@@ -67,6 +68,10 @@ private:
   UserAllocator*                     m_gpuAllocator   = nullptr;   // the decoder's own, for pictures the GPU reaches
 #if VVDEC_VULKAN
   void ( *m_releaseGpuCopy )( Picture& ) = nullptr;
+  // VVDEC_GPU_PARSE=2: the allocator of the planes' stand-ins, for new pictures, and what gives a picture's planes
+  // back (gpu::PlanePool)
+  UserAllocator*                  m_gpuStandIns = nullptr;
+  std::function<void( Picture& )> m_releaseGpuPlanes;
 #endif
   int                                m_tuneInDelay    = 0;
   bool                               m_firstOutputPic = true;
@@ -81,6 +86,14 @@ public:
   // gives back the GPU's copy of a reconstructed picture nothing will
   // reference any more (markUnusedPicturesReusable)
   void setReleaseGpuCopy( void ( *release )( Picture& ) ) { m_releaseGpuCopy = release; }
+  // VVDEC_GPU_PARSE=2: the pictures made from now on get stand-ins of their planes (the decoder gives the planes
+  // later: gpu::PlanePool), and a finished picture that may be reused gives its planes back with release
+  // (markUnusedPicturesReusable)
+  void setGpuPlanes( UserAllocator* standIns, std::function<void( Picture& )> release )
+  {
+    m_gpuStandIns      = standIns;
+    m_releaseGpuPlanes = std::move( release );
+  }
 #endif
   void restart()
   {

@@ -125,6 +125,13 @@ void PicListManager::create(int frameDelay, int decInstances, const UserAllocato
   m_gpuAllocator         = gpuAllocator;
 }
 
+// Whether the picture buffer may be used for another picture: the picture is reconstructed, no picture references it
+// any more, it was output, and the application gave it back
+static bool reusable( const Picture& pic )
+{
+  return pic.progress >= Picture::reconstructed && !pic.stillReferenced && !pic.dpbReferenceMark && !pic.neededForOutput && !pic.lockedByApplication;
+}
+
 Picture* PicListManager::getNewPicBuffer( const SPS& sps, const PPS& pps, const uint32_t temporalLayer, const int layerId, const VPS* vps )
 {
   CHECK_FATAL( m_parseFrameDelay < 0, "Parser frame delay is invalid" );
@@ -143,8 +150,15 @@ Picture* PicListManager::getNewPicBuffer( const SPS& sps, const PPS& pps, const 
       externAllocator = false;
     }
   }
-  // the GPU's allocator is the decoder's own: the pictures are reused as with the internal one
+  // the GPU's allocator is the decoder's own: the pictures are reused as with the internal one. With the GPU's parse
+  // ahead, a picture gets stand-ins of its planes first (the decoder swaps the planes in: gpu::PlanePool)
   UserAllocator* userAllocator = externAllocator ? &m_userAllocator : m_gpuAllocator;
+#if VVDEC_VULKAN
+  if( !externAllocator && m_gpuStandIns )
+  {
+    userAllocator = m_gpuStandIns;
+  }
+#endif
 
   if( m_cPicList.size() < (uint32_t)iMaxRefPicNum + m_parseFrameDelay )
   {
@@ -167,7 +181,7 @@ Picture* PicListManager::getNewPicBuffer( const SPS& sps, const PPS& pps, const 
   for( PicList::iterator itPic = m_cPicList.begin(); itPic != m_cPicList.end(); ++itPic )
   {
     Picture* pic = *itPic;
-    if( pic->progress < Picture::reconstructed || pic->stillReferenced || pic->dpbReferenceMark || pic->neededForOutput || pic->lockedByApplication )
+    if( !reusable( *pic ) )
     {
       continue;
     }
@@ -302,6 +316,22 @@ void PicListManager::markUnusedPicturesReusable()
       pic->m_subPicExtTasks.clear();
     }
   }
+
+#if VVDEC_VULKAN
+  // VVDEC_GPU_PARSE=2: the planes of the finished pictures that may be reused go back at once, for the pictures whose
+  // work goes to the GPU next (when the buffer is next used, which can be much later with a deep parse ahead, or never
+  // at the stream's end). (Finished, not just reconstructed: finishPicture still checks the picture's hash.)
+  if( m_releaseGpuPlanes )
+  {
+    for( auto& pic: m_cPicList )
+    {
+      if( pic->progress == Picture::finished && reusable( *pic ) )
+      {
+        m_releaseGpuPlanes( *pic );
+      }
+    }
+  }
+#endif
 }
 
 Picture* PicListManager::findClosestPic( int iLostPoc )

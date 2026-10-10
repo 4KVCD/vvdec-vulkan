@@ -65,6 +65,7 @@ class PicListManager;
 namespace gpu
 {
 class ParseService;
+class PlanePool;
 }
 #endif
 
@@ -139,8 +140,10 @@ private:
   CuMapCache                m_cuMapCache;
 
 #if VVDEC_VULKAN
-  // VVDEC_GPU_PARSE=2: the GPU's parse of the pictures (DecLib's), which the parse tasks hand each picture to
+  // VVDEC_GPU_PARSE=2: the GPU's parse of the pictures (DecLib's), which the parse tasks hand each picture to, and
+  // the planes of the pictures it parses (DecLib's): a picture the CPU parses gets them at once
   gpu::ParseService*        m_gpuParseService = nullptr;
+  gpu::PlanePool*           m_gpuPlanes       = nullptr;
 #endif
 
 public:
@@ -164,7 +167,11 @@ public:
 
   void setDecodedSEIMessageOutputStream( std::ostream* pOpStream ) { m_pDecodedSEIOutputStream = pOpStream; }
 #if VVDEC_VULKAN
-  void setGpuParseService( gpu::ParseService* service ) { m_gpuParseService = service; }
+  void setGpuParseService( gpu::ParseService* service, gpu::PlanePool* planes )
+  {
+    m_gpuParseService = service;
+    m_gpuPlanes       = planes;
+  }
 #endif
 
   void checkAPSInPictureUnit    ();

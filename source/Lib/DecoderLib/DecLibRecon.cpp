@@ -281,6 +281,12 @@ void DecLibRecon::borderExtPic( Picture* pic, const Picture* currPic )
         pic->parseDone.setException( std::current_exception() );
       }
 
+#if VVDEC_VULKAN
+      if( m_gpuPlanes )
+      {
+        m_gpuPlanes->acquire( *pic );   // (it may have failed before its planes came)
+      }
+#endif
       pic->fillGrey( currPic->cs->sps.get() );
     }
   }
@@ -1641,6 +1647,10 @@ bool DecLibRecon::earlyRowsTask( int, void* taskParam )
   FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( taskParam );
   CodingStructure&    cs    = *param->pic->cs;
   DecLibRecon*        dec   = param->decLib;
+  if( dec->m_gpuPlanes )
+  {
+    dec->m_gpuPlanes->acquire( *param->pic );   // (its planes, as in queueGpuTask)
+  }
   gpu::PictureJobs    jobs;
   jobs.trafo = &dec->m_gpuTrafoJobs;
   jobs.inter = dec->m_gpuInter ? &dec->m_gpuInterJobs : nullptr;
@@ -1654,6 +1664,12 @@ bool DecLibRecon::queueGpuTask( int, void* taskParam )
   FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( taskParam );
   CodingStructure&    cs    = *param->pic->cs;
   DecLibRecon*        dec   = param->decLib;
+  // The picture's planes, now that its work goes to the GPU: a picture the GPU parses waits for its parse with
+  // stand-ins of them (gpu::PlanePool), in the instance that took it as soon as its slices were in
+  if( dec->m_gpuPlanes )
+  {
+    dec->m_gpuPlanes->acquire( *param->pic );
+  }
   // With the GPU's parse: what it left (the records in the parse result, the coefficient levels in the picture)
   gpu::ParsedPicture* parsed = dec->m_gpuParseDrives ? cs.picture->gpuParseResult : nullptr;
   if( dec->m_gpuParseDrives && !parsed )

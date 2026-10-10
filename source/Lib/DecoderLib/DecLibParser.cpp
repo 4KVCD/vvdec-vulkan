@@ -1115,6 +1115,19 @@ void DecLibParser::xActivateParameterSets( const int layerId )
     // the colocated motion cleared by the first parse task, off this thread; no CU map for a picture the GPU parses
 #if VVDEC_VULKAN
     const bool gpuParses = m_gpuParseService && gpu::GpuRecon::parsesPictures( m_pcParsePic->gpuMemory, *sps );
+    // its planes: once its work goes to the GPU when the GPU parses it (stand-ins until then: DecLibRecon::queueGpuTask),
+    // at once when the CPU does (its parse writes the levels into them)
+    if( m_gpuPlanes )
+    {
+      if( gpuParses )
+      {
+        m_gpuPlanes->release( *m_pcParsePic );
+      }
+      else
+      {
+        m_gpuPlanes->acquire( *m_pcParsePic );
+      }
+    }
 #else
     const bool gpuParses = false;
 #endif
@@ -1351,6 +1364,12 @@ void DecLibParser::prepareUnavailablePicture( bool isLost, const PPS* pps, int i
   Picture* cFillPic = m_picListManager.getNewPicBuffer( *m_parameterSetManager.getFirstSPS(), *m_parameterSetManager.getFirstPPS(), 0, layerId, m_parameterSetManager.getVPS( m_parameterSetManager.getFirstSPS()->getVPSId() ) );
   CHECK( std::find( m_dpbReferencePics.cbegin(), m_dpbReferencePics.cend(), cFillPic ) != m_dpbReferencePics.cend(), "reused picture shouldn't be in decoded picture buffer" );
   m_dpbReferencePics.push_back( cFillPic );
+#if VVDEC_VULKAN
+  if( m_gpuPlanes )
+  {
+    m_gpuPlanes->acquire( *cFillPic );   // (the CPU fills the lost reference's picture in)
+  }
+#endif
   const APS* nullAlfApss[ALF_CTB_MAX_NUM_APS] = { nullptr, };
   cFillPic->finalInit( &m_cuChunkCache, &m_tuChunkCache, &m_cuMapCache, m_parameterSetManager.getFirstSPS(), m_parameterSetManager.getFirstPPS(), m_picHeader, nullAlfApss, nullptr, nullptr, false );
 

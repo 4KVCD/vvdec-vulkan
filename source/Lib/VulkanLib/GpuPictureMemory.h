@@ -51,6 +51,10 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "CommonLib/Buffer.h"
 #include "CommonLib/Common.h"
 
+#include <memory>
+#include <mutex>
+#include <vector>
+
 namespace vvdec
 {
 struct Picture;
@@ -79,6 +83,38 @@ VkDeviceAddress hostAllocationAddress( void* allocation );
 // Returns the twins of a reconstructed picture that no picture will reference any more to the pool. The picture is
 // then no longer gpuCurrent.
 void releaseTwins( Picture& pic );
+
+// The planes of the pictures the GPU parses (VVDEC_GPU_PARSE=2): a picture has them only from when its work goes to
+// the GPU (DecLibRecon::queueGpuTask) until it is finished and may be reused (PicListManager::markUnusedPicturesReusable).
+// Before and after, the PelStorage of its planes holds stand-ins with the same layout -- address space reserved without
+// memory -- so that the sizes and strides are there for whatever reads them, and a stray access to the samples faults
+// at once. The pool keeps the planes given back for the next pictures.
+class PlanePool
+{
+public:
+  // planes: the allocator of the planes (hostPictureAllocator's)
+  explicit PlanePool( const UserAllocator* planes );
+  ~PlanePool();
+  PlanePool( const PlanePool& )            = delete;
+  PlanePool& operator=( const PlanePool& ) = delete;
+
+  // The stand-ins' allocator, for the picture list's new pictures (PicListManager::setGpuPlanes)
+  UserAllocator* standIns() { return &m_standIns; }
+  // Swaps planes (from the pool, or new ones) in for the picture's stand-ins; nothing when it has its planes
+  void acquire( Picture& pic );
+  // Swaps stand-ins in for the picture's planes, which go back to the pool, their twins to the GPU's pool; nothing when
+  // it has stand-ins. For a finished picture whose buffer may be reused, and a buffer used for a picture the GPU parses.
+  void release( Picture& pic );
+
+private:
+  bool                        hasPlanes( const Picture& pic ) const;
+  std::unique_ptr<PelStorage> makeStorage( const Picture& pic, const UserAllocator* allocator ) const;   // of its layout
+
+  const UserAllocator*                     m_planes;
+  UserAllocator                            m_standIns;
+  std::mutex                               m_mutex;   // (acquire and release run on the decoder's threads)
+  std::vector<std::unique_ptr<PelStorage>> m_free;    // planes no picture has
+};
 
 // The HostPlane of a component of a picture whose planes come from hostPictureAllocator.
 HostPlane* hostPlane( const PelStorage& storage, ComponentID comp );
