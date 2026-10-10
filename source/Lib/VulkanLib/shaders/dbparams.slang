@@ -42,6 +42,7 @@ struct Params
   int   flags;      // bits: 1 loop filter across slices, 2 across tiles (PPS); 4 subpicture info present (SPS)
   int   vbPosHor[4];   // virtual boundaries: their count, then up to 3 positions in luma samples
   int   vbPosVer[4];
+  uint  lfpTag;      // the picture's tag in the parameters (see loadLfp)
 };
 
 [[vk::push_constant]] Params pc;
@@ -218,11 +219,16 @@ int2 lfpPos( int ch, int2 pos )
   return int2( ( pos.x << scaleX( ch ) ) >> 2, ( pos.y << scaleY( ch ) ) >> 2 );
 }
 
+// An entry's second word carries the tag of the picture that wrote it in its upper 16 bits: an entry of another
+// picture reads as zero, as the map was zeroed for each picture before (GpuRecon zeroes it only when the tags wrap
+// around).
 Lfp loadLfp( uint* p )
 {
   Lfp        l;
-  const uint a        = p[0];
-  const uint b        = p[1];
+  const uint b0       = p[1];
+  const bool ours     = ( b0 >> 16 ) == pc.lfpTag;
+  const uint a        = ours ? p[0] : 0u;
+  const uint b        = ours ? b0 : 0u;
   l.qp[0]             = int( int8_t( a & 0xff ) );
   l.qp[1]             = int( int8_t( ( a >> 8 ) & 0xff ) );
   l.qp[2]             = int( int8_t( ( a >> 16 ) & 0xff ) );
@@ -235,7 +241,7 @@ Lfp loadLfp( uint* p )
 void storeLfp( uint* p, Lfp l )
 {
   p[0] = ( uint( l.qp[0] ) & 0xff ) | ( ( uint( l.qp[1] ) & 0xff ) << 8 ) | ( ( uint( l.qp[2] ) & 0xff ) << 16 ) | ( uint( l.bs & 0xff ) << 24 );
-  p[1] = uint( l.sideMaxFiltLength & 0xff ) | ( uint( l.flags & 0xff ) << 8 );
+  p[1] = uint( l.sideMaxFiltLength & 0xff ) | ( uint( l.flags & 0xff ) << 8 ) | ( pc.lfpTag << 16 );
 }
 
 int  bsSet( int v, int comp ) { return v << ( comp << 1 ); }

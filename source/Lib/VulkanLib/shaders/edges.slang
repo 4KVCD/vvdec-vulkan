@@ -30,6 +30,7 @@ struct Params
   int   csy;
   int   pass;
   int   capacity;    // room in edges, in Edge records
+  uint  lfpTag;      // the picture's tag in the parameters (dbparams.slang's loadLfp)
   uint* args;        // SCAN: the front end's indirect arguments (GpuRecon's m_frontArgs) for the deblocking passes
 };
 
@@ -46,8 +47,8 @@ uint blockEdges( int ctu, int dir, int r, int c, out uint2 luma, out uint2 chrom
   const int  x0   = ( ctu % pc.widthInCtus ) << pc.log2Ctu;
   const int  y0   = ( ctu / pc.widthInCtus ) << pc.log2Ctu;
   uint*      p    = pc.lfp + ( ( ( 2 * ctu + dir ) << ( 2 * ( pc.log2Ctu - 2 ) ) ) + r * n + c ) * 2;
-  const uint a    = p[0];
   const uint b    = p[1];
+  const uint a    = ( b >> 16 ) == pc.lfpTag ? p[0] : 0u;   // (an entry of another picture: none)
   const uint bs   = a >> 24;
   luma            = uint2( 0 );
   chromaEdge      = uint2( 0 );

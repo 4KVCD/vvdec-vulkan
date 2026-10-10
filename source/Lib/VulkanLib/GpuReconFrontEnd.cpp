@@ -83,8 +83,9 @@ struct DbParamsPush
   VkDeviceAddress cus, tus, ctus, slices, cuMapL, cuMapC, cuMotion, motion, lfp, ctuInfo;
   int32_t         numCus, widthInCtus, heightInCtus, log2Ctu, width, height, widthIn4, csx, csy, chroma, qpBdOffset, pass, flags;
   int32_t         vbPosHor[4], vbPosVer[4];   // the count, then the positions
+  uint32_t        lfpTag;
 };
-static_assert( sizeof( DbParamsPush ) == 168, "DbParamsPush: the layout of dbparams.slang's Params" );
+static_assert( sizeof( DbParamsPush ) == 168, "DbParamsPush: the layout of dbparams.slang's Params" );   // (the tag in the padding)
 
 // The push constants of jobs.slang
 struct JobsPush
@@ -94,6 +95,7 @@ struct JobsPush
                   tsMinQp;
   uint32_t        sps, ph;
   int32_t         pass, capTrafo, capInter, capIntra, num8x8;
+  uint32_t        waveTag;
   VkDeviceAddress waveMap, progress, args;
 };
 static_assert( sizeof( JobsPush ) == 240, "JobsPush: the layout of jobs.slang's Params" );
@@ -112,9 +114,10 @@ struct EdgesPush
 {
   VkDeviceAddress lfp, slices, counts, lists, edges;
   int32_t         widthInCtus, heightInCtus, log2Ctu, width, height, chroma, csx, csy, pass, capacity;
+  uint32_t        lfpTag;
   VkDeviceAddress args;
 };
-static_assert( sizeof( EdgesPush ) == 88, "EdgesPush: the layout of edges.slang's Params" );
+static_assert( sizeof( EdgesPush ) == 96, "EdgesPush: the layout of edges.slang's Params" );
 
 // The size of a job in words: residual, inter and intra jobs
 static constexpr size_t kJobWords[3] = { sizeof( TrafoJob ) / sizeof( uint32_t ), sizeof( InterJob ) / sizeof( uint32_t ), sizeof( IntraJob ) / sizeof( uint32_t ) };
@@ -423,9 +426,17 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
     const SubPic&  sub = cs.pps->getSubPicFromPos( pos );
     info[ctu]          = sub.getSubPicIdx() | ( sub.getloopFilterAcrossSubPicEnabledFlag() ? 1u << 16 : 0u );
   }
-  // the parameters start zeroed, as the CTU tasks' LF_INIT leaves them
-  m_ctx->api().vkCmdFillBuffer( m_cmd, m_frontEnd.lfp.buffer, 0, VK_WHOLE_SIZE, 0 );
-  transferToComputeBarrier();
+  // the parameters start zeroed, as the CTU tasks' LF_INIT leaves them: each entry carries the picture's tag, and an
+  // entry with another tag reads as zero, so the map is zeroed only when it is new and when the tags wrap around; in
+  // the check mode always (tag 0: the CPU compares the map)
+  FrontEndBuffers& fe = m_frontEnd;
+  fe.lfpTag           = m_useFrontEnd ? fe.lfpTag % 65535 + 1 : 0;
+  if( fe.lfpTag <= 1 || fe.lfp.buffer != fe.lfpZeroed )
+  {
+    m_ctx->api().vkCmdFillBuffer( m_cmd, fe.lfp.buffer, 0, VK_WHOLE_SIZE, 0 );
+    transferToComputeBarrier();
+    fe.lfpZeroed = fe.lfp.buffer;
+  }
 
   DbParamsPush push{};
   push.cus          = m_frontEnd.recordCus;
@@ -449,6 +460,7 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
   push.csy          = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
   push.chroma       = chroma ? 1 : 0;
   push.qpBdOffset   = cs.sps->getQpBDOffset();
+  push.lfpTag       = fe.lfpTag;
   push.flags        = ( cs.pps->getLoopFilterAcrossSlicesEnabledFlag() ? 1 : 0 ) | ( cs.pps->getLoopFilterAcrossTilesEnabledFlag() ? 2 : 0 )
                       | ( cs.sps->getSubPicInfoPresentFlag() ? 4 : 0 );
   const PicHeader& ph = *cs.picHeader;
@@ -600,6 +612,7 @@ void GpuRecon::jobsPush( const CodingStructure& cs, const PictureJobs& jobs, siz
   push.capIntra = int32_t( m_frontEnd.jobCapacity[2] );
   push.num8x8   = int32_t( pcv.num8x8CtuBlks );
   push.waveMap  = m_frontEnd.waveMap.addr;
+  push.waveTag  = m_frontEnd.waveTag;
   push.progress = m_frontEnd.jobProgress.addr;
   push.args     = m_frontEnd.args.addr;
 }
@@ -607,12 +620,20 @@ void GpuRecon::jobsPush( const CodingStructure& cs, const PictureJobs& jobs, siz
 void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus )
 {
   allocateJobBuffers( cs, jobs, numCus );
+  // the wave map: each entry carries the picture's tag, and an entry with another tag reads as wave 0, so the map is
+  // zeroed only when it is new and when the tags wrap around
+  FrontEndBuffers& fe = m_frontEnd;
+  fe.waveTag          = fe.waveTag % 65535 + 1;
   JobsPush push{};
   jobsPush( cs, jobs, numCus, push );
 
-  // the wave map, the rows' progress and the passes' arguments start from zero
+  // the wave map (see above), the rows' progress and the passes' arguments start from zero
   const Api& vk = m_ctx->api();
-  vk.vkCmdFillBuffer( m_cmd, m_frontEnd.waveMap.buffer, 0, VK_WHOLE_SIZE, 0 );
+  if( fe.waveTag == 1 || fe.waveMap.buffer != fe.waveZeroed )
+  {
+    vk.vkCmdFillBuffer( m_cmd, fe.waveMap.buffer, 0, VK_WHOLE_SIZE, 0 );
+    fe.waveZeroed = fe.waveMap.buffer;
+  }
   vk.vkCmdFillBuffer( m_cmd, m_frontEnd.jobProgress.buffer, 0, VK_WHOLE_SIZE, 0 );
   vk.vkCmdFillBuffer( m_cmd, m_frontEnd.args.buffer, 0, VK_WHOLE_SIZE, 0 );
   transferToComputeBarrier();
@@ -774,6 +795,7 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs )
   const bool chroma = isChromaEnabled( pcv.chrFormat );
   EdgesPush  push{};
   push.lfp          = m_frontEnd.lfp.addr;
+  push.lfpTag       = m_frontEnd.lfpTag;
   push.slices       = sliceTable( cs );
   push.counts       = m_frontEnd.edgeCounts.addr;
   push.lists        = m_frontEnd.edgeLists.addr;

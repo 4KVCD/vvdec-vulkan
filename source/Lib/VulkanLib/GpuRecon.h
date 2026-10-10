@@ -466,11 +466,15 @@ private:
     Buffer cuMapLuma, cuMapChroma, cuMotion, motion, rowProgress;
     // Deblocking parameters (dbparams.slang): per CTU, its subpicture's index | whether loop filtering crosses the
     // subpicture's boundaries << 16; per 4x4 block and direction, the parameters (2 words)
-    Buffer ctuInfo, lfp;
+    Buffer   ctuInfo, lfp;
+    uint32_t lfpTag    = 0;                // the picture's tag in lfp's entries (dbparams.slang's loadLfp)
+    VkBuffer lfpZeroed = VK_NULL_HANDLE;   // lfp, once zeroed (a new one is zeroed first)
     // Jobs (jobs.slang): its tables (writeJobTables); the slices' words (writeJobSlices); the scaling lists' matrix
     // offsets; per CU, its job counts; per block of 256 CUs, their sums, then the totals; the job lists (residual,
     // inter, intra); each 4x4 block's wave; each CTU row's progress
-    Buffer jobTables, jobSlices, jobScaling, jobCounts, jobBlocks, jobs[3], waveMap, jobProgress;
+    Buffer   jobTables, jobSlices, jobScaling, jobCounts, jobBlocks, jobs[3], waveMap, jobProgress;
+    uint32_t waveTag    = 0;                // the picture's tag in waveMap's entries (jobs.slang's mapWave)
+    VkBuffer waveZeroed = VK_NULL_HANDLE;   // waveMap, once zeroed
     size_t jobCapacity[3] = { 0, 0, 0 };   // the room of the job lists, in jobs
     int    jobBlockCount  = 0;
     Buffer args;   // the passes' indirect dispatch arguments and job counts (FrontPass)

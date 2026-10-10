@@ -65,6 +65,7 @@ struct Params
   int   capInter;
   int   capIntra;
   int   num8x8;         // room for DMVR's refinements per CTU (PreCalcValues::num8x8CtuBlks)
+  uint  waveTag;        // WAVES: the picture's tag in the wave map (see mapWave)
   uint* waveMap;        // WAVES: per component, the wave of each area of 4x4 luma samples (GpuJobs.h's WaveMap)
   Atomic<uint>* progress;   // WAVES: per CTU row, the CTUs done; then the rows taken (zeroed before the dispatch)
   uint* args;        // SCAN: the front end's indirect arguments (GpuRecon's m_frontArgs): residual and inter passes
@@ -1736,6 +1737,13 @@ int waveShiftX( int c ) { return 2 - ( c == 0 ? 0 : pc.csx ); }
 int waveShiftY( int c ) { return 2 - ( c == 0 ? 0 : pc.csy ); }
 int waveWidth( int c ) { return ( ( pc.width >> ( c == 0 ? 0 : pc.csx ) ) + ( 1 << waveShiftX( c ) ) - 1 ) >> waveShiftX( c ); }
 int waveHeight( int c ) { return ( ( pc.height >> ( c == 0 ? 0 : pc.csy ) ) + ( 1 << waveShiftY( c ) ) - 1 ) >> waveShiftY( c ); }
+// A wave-map entry: the wave | the tag of the picture that wrote it << 16. An entry of another picture is wave 0,
+// as the map was zeroed for each picture before (GpuRecon zeroes it only when the tags wrap around).
+int mapWave( uint v )
+{
+  return ( v >> 16 ) == pc.waveTag ? int( v & 0xffffu ) : 0;
+}
+
 uint* waveRow( int c, int j )
 {
   const int planeSize = waveWidth( 0 ) * waveHeight( 0 );
@@ -1761,7 +1769,7 @@ int waveMaxInP( int c, int x, int y, int width, int height, int lane )
   for( int u = lane; u < n; u += 32 )
   {
     const int j = y0 + int( ( float( u ) + 0.5f ) * rcp );
-    wave        = max( wave, int( waveRow( c, j )[x0 + u - ( j - y0 ) * cols] ) );
+    wave        = max( wave, mapWave( waveRow( c, j )[x0 + u - ( j - y0 ) * cols] ) );
   }
   return WaveActiveMax( wave );
 }
@@ -1779,7 +1787,7 @@ void waveSetP( int c, int x, int y, int width, int height, int wave, int lane )
   for( int u = lane; u < n; u += 32 )
   {
     const int j                                 = y0 + int( ( float( u ) + 0.5f ) * rcp );
-    waveRow( c, j )[x0 + u - ( j - y0 ) * cols] = uint( wave );
+    waveRow( c, j )[x0 + u - ( j - y0 ) * cols] = uint( wave ) | pc.waveTag << 16;
   }
 }
 
