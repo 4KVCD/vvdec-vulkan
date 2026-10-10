@@ -502,13 +502,18 @@ void rprBlock( int tid, int slot, int comp, int bx, int by, int ox, int oy, int 
 // horizontal passes. Once luma is done, the chroma windows take the luma
 // windows' place.
 #define YW 23                             // a luma window's side: 16 + 7
-#define YS 32                             // stored row length: the 4 aligned 8-sample loads that cover a window row
+#define YS 24                             // stored row length: a window row from its first sample (23 used)
 #define CWD 11                            // a chroma window's side: 8 + 3
 #define CS 16                             // stored row length: 4 aligned 4-sample loads
 #define WY_AT( l ) ( ( l ) * YW * YS )
 #define WORK_AT ( 2 * YW * YS )
 #define WC_AT( b ) ( ( b ) * CWD * CS )   // b: 2 * list + chroma component - 1
+// (the affine variant's reference samples need more: 11 x 11 for each of up to 16 subblocks, 1,936 > 1,904)
+#if AFFINE
+groupshared int16_t s_pool[16 * 121];
+#else
 groupshared int16_t s_pool[WORK_AT + 2 * 20 * 20];
+#endif
 #define s_ref( i ) int( s_pool[REF_AT + ( i )] )
 #define s_tmp( i ) int( s_pool[TMP_AT + ( i )] )
 #define s_bil0( i ) int( s_pool[BIL0_AT + ( i )] )
@@ -1290,16 +1295,19 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     {
       const int s   = task >= 92 ? 1 : 0;
       const int rem = task - 92 * s;
-      const int at  = WY_AT( s ) + ( rem >> 2 ) * YS + 8 * ( rem & 3 );
-      const uint4 v = yChunk[k];
-      s_pool[at]     = int16_t( v.x );
-      s_pool[at + 1] = int16_t( v.x >> 16 );
-      s_pool[at + 2] = int16_t( v.y );
-      s_pool[at + 3] = int16_t( v.y >> 16 );
-      s_pool[at + 4] = int16_t( v.z );
-      s_pool[at + 5] = int16_t( v.z >> 16 );
-      s_pool[at + 6] = int16_t( v.w );
-      s_pool[at + 7] = int16_t( v.w >> 16 );
+      // (the row from the window's first sample: the chunk's samples before it, and past the row's room, are dropped)
+      const int   at   = WY_AT( s ) + ( rem >> 2 ) * YS;
+      const int   c0   = 8 * ( rem & 3 ) - ( s == 0 ? leadY[0] : leadY[1] );
+      const uint4 v    = yChunk[k];
+      const uint  w[4] = { v.x, v.y, v.z, v.w };
+      [unroll]
+      for( int m = 0; m < 8; m++ )
+      {
+        if( uint( c0 + m ) < uint( YS ) )
+        {
+          s_pool[at + c0 + m] = int16_t( w[m >> 1] >> ( 16 * ( m & 1 ) ) );
+        }
+      }
     }
   }
   if( tid < 25 )
@@ -1321,8 +1329,8 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     {
       const int e  = tid + THREADS * k;
       const int rc = ( 3 + 2 * ( e >> 4 ) ) * YS + 3 + ( e & 15 );
-      part += abs( bilinearW( WY_AT( 0 ) + leadY[0] + rc, mvs[0].x & 15, mvs[0].y & 15, shift )
-                   - bilinearW( WY_AT( 1 ) + leadY[1] + rc, mvs[1].x & 15, mvs[1].y & 15, shift ) );
+      part += abs( bilinearW( WY_AT( 0 ) + rc, mvs[0].x & 15, mvs[0].y & 15, shift )
+                   - bilinearW( WY_AT( 1 ) + rc, mvs[1].x & 15, mvs[1].y & 15, shift ) );
     }
     const int waveSum = WaveActiveSum( part );
     if( WaveIsFirstLane() )
@@ -1338,7 +1346,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
       [unroll]
       for( int s = 0; s < 2; s++ )
       {
-        const int at = WY_AT( s ) + leadY[s] + YS + 1;
+        const int at = WY_AT( s ) + YS + 1;
         for( int o = tid; o < 400; o += THREADS )
         {
           const int v = o / 20;
@@ -1405,7 +1413,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     {
       const int shift1  = 6 - headRoom;
       const int offset1 = -IF_INTERNAL_OFFS * ( 1 << shift1 );
-      const int at      = WY_AT( s ) + leadY[s];
+      const int at      = WY_AT( s );
       for( int g = tid; g < 92; g += THREADS )
       {
         const int r  = g >> 2;
@@ -1437,7 +1445,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     if( s < lists )
     {
-      predY[s] = lumaPred( WY_AT( s ) + leadY[s], WORK_AT + 368 * s, j, i0, rx0[s], ry0[s], clampY[s], mvR[s].x & 15, mvR[s].y & 15, cxY[s], cyY[s], bi );
+      predY[s] = lumaPred( WY_AT( s ), WORK_AT + 368 * s, j, i0, rx0[s], ry0[s], clampY[s], mvR[s].x & 15, mvR[s].y & 15, cxY[s], cyY[s], bi );
     }
   }
   GroupMemoryBarrierWithGroupSync();   // the luma windows are read; the chroma windows replace them
