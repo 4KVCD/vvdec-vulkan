@@ -8,8 +8,10 @@
 // three passes per digit; then the bands are built. The passes (pc.pass):
 // 0 HIST:    one workgroup per block of 1024 jobs counts each digit value in the block (hist, digit-major);
 // 1 SCAN:    one workgroup turns the counts into offsets per digit value and block, in place;
-// 2 SCATTER: one lane per block moves the block's jobs, in order, each to the next free place of its digit value
+// 2 SCATTER: one wave per block moves the block's jobs, in order, each to the next free place of its digit value
 //            (which keeps the sort stable);
+// When every wave is below 256 (HIST of the first digit finds none above), the second digit is 0 everywhere and its
+// sort would keep the order: its HIST and SCAN do nothing, and its SCATTER copies the keys.
 // 3 BANDS:   one workgroup per block of 1024 sorted jobs counts each job's bands and stores the block's total
 //            (bandSums);
 // 4 BSCAN:   one workgroup turns the blocks' band totals into offsets and stores the number of all bands;
@@ -31,7 +33,7 @@ struct Params
   uint*         waveFirst;  // first band of each wave (65536 entries)
   uint*         sorted;     // out: the bands as IntraJob records, word 7 replaced by their rows: first | count << 16
   uint*         waits;      // out: per band, the number of bands in the earlier waves
-  Atomic<uint>* flags;      // [0] is set when a wave is 65536 or more
+  Atomic<uint>* flags;      // [0] is set when a wave is 65536 or more, [1] when one is 256 or more
   int           numBlocks;  // blocks of 1024 jobs that the jobs buffer can hold
   int           pass;
   int           shift;      // shift of the current digit: 0 or 8
@@ -50,6 +52,12 @@ uint waveOf( uint index ) { return pc.jobs[index * 12 + 7]; }
 
 groupshared uint s_scan[1024];
 groupshared uint s_hist[256];
+
+// Synchronizes one wave's threads on its shared memory: each sees what the others wrote before.
+void waveSync()
+{
+  spirv_asm { OpControlBarrier Subgroup Subgroup AcquireRelease|WorkgroupMemory };
+}
 
 // Exclusive prefix sum of the 1024 entries of s_scan, in place; returns the total to every thread.
 uint scan1024( int tid )
@@ -80,9 +88,15 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   uint*      dst   = pc.shift == 0 ? pc.keysB : pc.keysA;
   const uint i     = uint( block * kBlock + tid );
 
+  // (the second digit's passes when it is 0 for every job; SCATTER copies the keys below)
+  const bool secondDigitZero = pc.shift != 0 && pc.flags[1].load() == 0;
   if( pc.pass == 0 )
   {
     // HIST
+    if( secondDigitZero )
+    {
+      return;
+    }
     if( tid < 256 )
     {
       s_hist[tid] = 0;
@@ -96,6 +110,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       {
         pc.flags[0].store( 1u );
       }
+      if( wave >= 256u )
+      {
+        pc.flags[1].store( 1u );
+      }
       InterlockedAdd( s_hist[( wave >> pc.shift ) & 255], 1u );
     }
     GroupMemoryBarrierWithGroupSync();
@@ -108,6 +126,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   if( pc.pass == 1 )
   {
     // SCAN: the 256 x numBlocks counts, digit-major; each thread takes a run of them.
+    if( secondDigitZero )
+    {
+      return;
+    }
     const int total = 256 * pc.numBlocks;
     const int per   = ( total + 1023 ) / 1024;
     const int a0    = min( tid * per, total );
@@ -131,19 +153,87 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   }
   if( pc.pass == 2 )
   {
-    // SCATTER: one lane moves the block's jobs, in order, each to the next place of its digit value.
-    if( tid != 0 )
+    if( secondDigitZero )
+    {
+      if( i < n )
+      {
+        dst[i] = src[i];
+      }
+      return;
+    }
+    const uint base = uint( block * kBlock );
+    const uint end  = min( n, base + uint( kBlock ) );
+    if( base >= end )
     {
       return;
     }
-    const uint end = min( n, uint( ( block + 1 ) * kBlock ) );
-    for( uint j = uint( block * kBlock ); j < end; j++ )
+    if( WaveGetLaneCount() != 32 )
     {
-      const uint index = pc.shift == 0 ? j : src[j];
-      const uint digit = ( waveOf( index ) >> pc.shift ) & 255;
-      const uint at    = pc.hist[digit * pc.numBlocks + block];
-      pc.hist[digit * pc.numBlocks + block] = at + 1;
-      dst[at]                               = index;
+      // SCATTER (waves of another size): one thread moves the block's jobs, in order, each to the next place of its
+      // digit value.
+      if( tid != 0 )
+      {
+        return;
+      }
+      for( uint j = base; j < end; j++ )
+      {
+        const uint index = pc.shift == 0 ? j : src[j];
+        const uint digit = ( waveOf( index ) >> pc.shift ) & 255;
+        const uint at    = pc.hist[digit * pc.numBlocks + block];
+        pc.hist[digit * pc.numBlocks + block] = at + 1;
+        dst[at]                               = index;
+      }
+      return;
+    }
+    // SCATTER: the first wave moves the block's jobs in order, 32 at a time. Each job goes to the next free place of
+    // its digit value after the jobs before it: those of the earlier chunks (the running places in s_hist) and the
+    // lower threads of its chunk with the same digit (ballots of the digit's bits find them).
+    if( tid >= 32 )
+    {
+      return;
+    }
+    for( int d = tid; d < 256; d += 32 )
+    {
+      s_hist[d] = pc.hist[d * pc.numBlocks + block];
+    }
+    // (all of the chunks' reads first, so that they wait for memory together)
+    uint indices[32], digits[32];
+    [unroll]
+    for( int c = 0; c < 32; c++ )
+    {
+      const uint j = min( base + uint( c * 32 + tid ), end - 1 );
+      indices[c]   = pc.shift == 0 ? j : src[j];
+      digits[c]    = ( waveOf( indices[c] ) >> pc.shift ) & 255;
+    }
+    waveSync();
+    const uint below = ( 1u << uint( tid ) ) - 1u;   // the lower threads
+    [unroll]
+    for( int c = 0; c < 32; c++ )
+    {
+      if( base + uint( c * 32 ) >= end )
+      {
+        break;
+      }
+      const bool valid = base + uint( c * 32 + tid ) < end;
+      const uint digit = digits[c];
+      uint       same  = WaveActiveBallot( valid ).x;   // the chunk's threads with this thread's digit
+      [unroll]
+      for( int b = 0; b < 8; b++ )
+      {
+        const bool bit = ( ( digit >> b ) & 1u ) != 0;
+        const uint set = WaveActiveBallot( bit ).x;
+        same &= bit ? set : ~set;
+      }
+      if( valid )
+      {
+        dst[s_hist[digit] + countbits( same & below )] = indices[c];
+      }
+      waveSync();   // (all have read s_hist before the lowest thread of each digit moves its place on)
+      if( valid && ( same & below ) == 0 )
+      {
+        s_hist[digit] += countbits( same );
+      }
+      waveSync();
     }
     return;
   }
