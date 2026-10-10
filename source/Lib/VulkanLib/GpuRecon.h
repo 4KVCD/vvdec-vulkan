@@ -58,6 +58,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 
 #include "GpuContext.h"
 #include "GpuFrontEnd.h"
@@ -164,6 +165,14 @@ public:
   // keeps it, lfp its deblocking parameters, jobs the CTU tasks' jobs and edges.
   void                 compareFrontEnd( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp, const PictureJobs* jobs );
   const FrontEndStats& frontEndStats() const { return m_check.stats; }
+
+  // --- The GPU parse instead of the CPU's (VVDEC_GPU_PARSE=2; GpuReconParse.cpp) ---
+  // Whether the GPU parses the picture (sps: its slices') instead of the CPU: only when the GPU front end takes it.
+  static bool parsesPicture( const Picture& pic, const SPS& sps );
+  // Parses the picture's slice data on the GPU: the coefficient levels into pic (the picture in host memory, where
+  // the CPU's parse would leave them), the records into cus and tus, CTU by CTU, each CTU's SAO and ALF parameters
+  // into its CTU data. Returns false when the parse gave up on a substream (a broken bitstream).
+  bool parsePicture( CodingStructure& cs, const PelStorage& pic, std::vector<std::vector<CuRecord>>& cus, std::vector<std::vector<TuRecord>>& tus );
 
   // --- The check of the GPU parse (VVDEC_GPU_PARSE=1; GpuReconParse.cpp) ---
   // After endCompute, compares the GPU's parse of the picture (PictureJobs::parse) with the CPU's: the records (cus,
@@ -281,14 +290,25 @@ private:
   void   recordEdges( const CodingStructure& cs, const PictureJobs& jobs );
 
   // --- The GPU parse (GpuReconParse.cpp) ---
-  // Parses the picture's slice data on the GPU in submissions of its own until every substream is parsed, then
-  // records into m_cmd the compaction of the parse's records and the check of its coefficient levels against the
-  // CPU's parse's (cpuLevels: the picture in host memory, where the CPU's parse left them).
+  // The check (VVDEC_GPU_PARSE=1): parses the picture's slice data on the GPU in submissions of its own until every
+  // substream is parsed, then records into m_cmd the compaction of the parse's records and the check of its
+  // coefficient levels against the CPU's parse's (cpuLevels: the picture in host memory, where the CPU's parse left
+  // them).
   void     recordParse( const CodingStructure& cs, const PictureJobs& jobs, const Planes& cpuLevels );
+  // Uploads the picture's inputs (m_parse.in) and makes room for what the parse writes, numCus and numTus records.
   void     uploadParseInput( const CodingStructure& cs, size_t numCus, size_t numTus );
+  // Parses the substreams: the levels into levels (planes and strides), or with null into the parse's own level
+  // buffers. Returns the number of submissions.
+  uint32_t parseSubstreams( const CodingStructure& cs, const Planes* levels );
   // Runs parse.slang (shader, with the push constants push) on the compute queue, a few dispatches per submission,
   // until every substream is parsed or none advances any more. Returns the number of submissions.
   uint32_t runParse( const void* push, size_t pushSize, int shader );
+  // Records into m_cmd the compaction's pass (0: each CTU's first CU and TU, and the totals; 1: the copies).
+  void     recordParseCompaction( size_t ctus, int pass );
+  // Records the commands record() records into the parse's own command buffer, submits them and waits for them.
+  void     submitParseCommands( const std::function<void()>& record );
+  // The substreams the parse gave up on, or left unparsed
+  uint32_t parseErrors() const;
 
   // --- Reconstruction (GpuReconPrediction.cpp) ---
   // The residuals: the coefficient levels from levels (the picture in host memory, where the parse left them), the

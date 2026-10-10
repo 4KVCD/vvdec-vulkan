@@ -73,6 +73,11 @@ public:
   virtual ~DecSlice() = default;
 
   void  parseSlice        ( Slice* slice, InputBitstream* bitstream, int threadId );
+#if VVDEC_VULKAN
+  // Instead of parseSlice when the GPU parses the picture (GpuRecon::parsesPicture): the slice's CTUs learn their
+  // slice and are marked parsed, without CABAC.
+  void  claimSlice        ( Slice* slice );
+#endif
   
   void  setContextStateVec( int numDecThreads ) { m_entropyCodingSyncContextState.resize( std::max( 1, numDecThreads ) ); }
   void  destroy           ()                    { m_entropyCodingSyncContextState.clear(); }

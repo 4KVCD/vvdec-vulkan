@@ -175,7 +175,15 @@ bool AdaptiveLoopFilter::isClipOrCrossedByVirtualBoundaries( const CodingStructu
 
   int               ctuSize = sps->getCTUSize();
   const Position    currCtuPos( area.x, area.y );
-  const CodingUnit* currCtu = cs.getCU( currCtuPos, CHANNEL_TYPE_LUMA );
+  // The CTUs' slices, tiles and subpictures come from their CTU data, not from their first CUs: with the GPU parse the
+  // CPU makes no CUs. (A CTU's CUs share its slice, tile and subpicture.)
+  const int         ctuX      = area.x / ctuSize;
+  const int         ctuY      = area.y / ctuSize;
+  const Slice*      currSlice = cs.getCtuData( ctuX, ctuY ).slice;
+  const auto        subPicIdx = [&]( int x, int y ) { return pps->getSubPicFromPos( Position( x * ctuSize, y * ctuSize ) ).getSubPicIdx(); };
+  const auto        sameSlice = [&]( int dx, int dy ) {
+    return currSlice->getIndependentSliceIdx() == cs.getCtuData( ctuX + dx, ctuY + dy ).slice->getIndependentSliceIdx();
+  };
   bool loopFilterAcrossSubPicEnabledFlag = true;
   bool loopFilterAcrossTilesEnabledFlag = true;
   bool loopFilterAcrossSlicesEnabledFlag = true;
@@ -190,24 +198,24 @@ bool AdaptiveLoopFilter::isClipOrCrossedByVirtualBoundaries( const CodingStructu
     loopFilterAcrossTilesEnabledFlag = pps->getLoopFilterAcrossTilesEnabledFlag();
   }
 
-  if( currCtu->slice->getNumCtuInSlice() != cs.pcv->sizeInCtus )
+  if( currSlice->getNumCtuInSlice() != cs.pcv->sizeInCtus )
   {
     loopFilterAcrossSlicesEnabledFlag = pps->getLoopFilterAcrossSlicesEnabledFlag();
   }
 
   bool restrictAny    = !loopFilterAcrossSlicesEnabledFlag || !loopFilterAcrossTilesEnabledFlag || !loopFilterAcrossSubPicEnabledFlag;
   bool restrictSlices = !loopFilterAcrossSlicesEnabledFlag;
+  // whether the CTU dx, dy CTUs away may be filtered across (CU::isAvailable on the CTUs)
+  const auto available = [&]( int dx, int dy ) {
+    return ( loopFilterAcrossSlicesEnabledFlag || sameSlice( dx, dy ) )
+           && ( loopFilterAcrossTilesEnabledFlag || pps->getTileIdx( ctuX, ctuY ) == pps->getTileIdx( ctuX + dx, ctuY + dy ) )
+           && ( loopFilterAcrossSubPicEnabledFlag || subPicIdx( ctuX, ctuY ) == subPicIdx( ctuX + dx, ctuY + dy ) );
+  };
 
   // top
   if( area.y >= ctuSize && clipTop == false && restrictAny )
   {
-    const Position    prevCtuPos( area.x, area.y - ctuSize );
-    const CodingUnit* prevCtu = cs.getCU( prevCtuPos, CHANNEL_TYPE_LUMA );
-    if( !CU::isAvailable( *currCtu,
-                          *prevCtu,
-                          !loopFilterAcrossSlicesEnabledFlag,
-                          !loopFilterAcrossTilesEnabledFlag,
-                          !loopFilterAcrossSubPicEnabledFlag ) )
+    if( !available( 0, -1 ) )
     {
       clipTop = true;
     }
@@ -216,13 +224,7 @@ bool AdaptiveLoopFilter::isClipOrCrossedByVirtualBoundaries( const CodingStructu
   // bottom
   if( area.y + ctuSize < cs.pcv->lumaHeight && clipBottom == false && restrictAny )
   {
-    const Position    nextCtuPos( area.x, area.y + ctuSize );
-    const CodingUnit* nextCtu = cs.getCU( nextCtuPos, CHANNEL_TYPE_LUMA );
-    if( !CU::isAvailable( *currCtu,
-                          *nextCtu,
-                          !loopFilterAcrossSlicesEnabledFlag,
-                          !loopFilterAcrossTilesEnabledFlag,
-                          !loopFilterAcrossSubPicEnabledFlag ) )
+    if( !available( 0, 1 ) )
     {
       clipBottom = true;
     }
@@ -231,13 +233,7 @@ bool AdaptiveLoopFilter::isClipOrCrossedByVirtualBoundaries( const CodingStructu
   // left
   if( area.x >= ctuSize && clipLeft == false && restrictAny )
   {
-    const Position    prevCtuPos( area.x - ctuSize, area.y );
-    const CodingUnit* prevCtu = cs.getCU( prevCtuPos, CHANNEL_TYPE_LUMA );
-    if( !CU::isAvailable( *currCtu,
-                          *prevCtu,
-                          !loopFilterAcrossSlicesEnabledFlag,
-                          !loopFilterAcrossTilesEnabledFlag,
-                          !loopFilterAcrossSubPicEnabledFlag ) )
+    if( !available( -1, 0 ) )
     {
       clipLeft = true;
     }
@@ -246,14 +242,7 @@ bool AdaptiveLoopFilter::isClipOrCrossedByVirtualBoundaries( const CodingStructu
   // right
   if( area.x + ctuSize < cs.pcv->lumaWidth && clipRight == false && restrictAny )
   {
-    const Position    nextCtuPos( area.x + ctuSize, area.y );
-    const CodingUnit* nextCtu = cs.getCU( nextCtuPos, CHANNEL_TYPE_LUMA );
-
-    if( !CU::isAvailable( *currCtu,
-                          *nextCtu,
-                          !loopFilterAcrossSlicesEnabledFlag,
-                          !loopFilterAcrossTilesEnabledFlag,
-                          !loopFilterAcrossSubPicEnabledFlag ) )
+    if( !available( 1, 0 ) )
     {
       clipRight = true;
     }
@@ -265,9 +254,7 @@ bool AdaptiveLoopFilter::isClipOrCrossedByVirtualBoundaries( const CodingStructu
     //top-left CTU
     if ( area.x >= ctuSize && area.y >= ctuSize )
     {
-      const Position prevCtuPos( area.x - ctuSize, area.y - ctuSize );
-      const CodingUnit *prevCtu = cs.getCU( prevCtuPos, CHANNEL_TYPE_LUMA );
-      if ( !loopFilterAcrossSlicesEnabledFlag && !CU::isSameSlice( *currCtu, *prevCtu ) )
+      if ( !loopFilterAcrossSlicesEnabledFlag && !sameSlice( -1, -1 ) )
       {
         rasterSliceAlfPad = 1;
       }
@@ -279,9 +266,7 @@ bool AdaptiveLoopFilter::isClipOrCrossedByVirtualBoundaries( const CodingStructu
     //bottom-right CTU
     if ( area.x + ctuSize < cs.pcv->lumaWidth && area.y + ctuSize < cs.pcv->lumaHeight )
     {
-      const Position nextCtuPos( area.x + ctuSize, area.y + ctuSize );
-      const CodingUnit *nextCtu = cs.getCU( nextCtuPos, CHANNEL_TYPE_LUMA );
-      if ( !loopFilterAcrossSlicesEnabledFlag && !CU::isSameSlice( *currCtu, *nextCtu ) )
+      if ( !loopFilterAcrossSlicesEnabledFlag && !sameSlice( 1, 1 ) )
       {
         rasterSliceAlfPad += 2;
       }

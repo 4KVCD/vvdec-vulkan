@@ -664,7 +664,9 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   m_doDeblock                  = !noFilters;
 #if VVDEC_VULKAN
   // with the GPU front end, every stage of the picture runs on the GPU
-  m_gpuFrontEnd = gpuFrontEnd;
+  m_gpuFrontEnd   = gpuFrontEnd;
+  m_gpuParseDrives = gpu::GpuRecon::parsesPicture( *pcPic, *sps );
+  CHECK( m_gpuParseDrives && !m_gpuFrontEnd, "Vulkan: a picture the GPU parses must be reconstructed by the GPU front end" );
   commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuFilters, doSAO && !m_gpuFilters, m_doDeblock && !m_gpuFilters, m_gpuIntra,
                          m_gpuInter, m_gpuResidual );
   commonTaskParam.gpuFrontEnd = m_gpuFrontEnd;
@@ -943,7 +945,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       CtuData& ctuData    = cs.getCtuData( ctuRsAddr );
       ctuData.motion      = &decLib.m_motionInfo[cs.pcv->num4x4CtuBlks * ctuRsAddr];
 #if VVDEC_VULKAN
-      if( ( decLib.m_gpuFrontEndCheck || param->common.gpuFrontEnd ) && param->common.gpuIntra )
+      if( ( decLib.m_gpuFrontEndCheck || param->common.gpuFrontEnd ) && param->common.gpuIntra && !decLib.m_gpuParseDrives )
       {
         // the CTU's records, written before the motion derivation turns the
         // motion vector differences into motion vectors
@@ -1529,15 +1531,19 @@ void DecLibRecon::addGpuTasks( Picture* pic, FinishPicTaskParam& finishParam )
   //   may take its next picture while this one downloads (releasePrevDecompressedPic: VideoQ 1080p +1.4%);
   // - finishGpuTask waits for the download.
   finishParam = FinishPicTaskParam( this, pic );
-  m_gpuFiltersPrepared.clearException();
-  m_gpuFiltersPrepared.lock();
-  m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pic->poc ) + " filterParamsTask" )
-                                      filterParamsTask,
-                                      &finishParam,
-                                      &pic->m_divTasksCounter,
-                                      &m_gpuFiltersPrepared,
-                                      { &pic->parseDone } );
-  CBarrierVec queueBarriers{ pic->m_ctuTaskCounter.donePtr(), &m_gpuFiltersPrepared };
+  CBarrierVec queueBarriers{ pic->m_ctuTaskCounter.donePtr() };
+  if( !m_gpuParseDrives )   // (with the GPU's parse, the SAO and ALF parameters come only with it: startPicture works them out)
+  {
+    m_gpuFiltersPrepared.clearException();
+    m_gpuFiltersPrepared.lock();
+    m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pic->poc ) + " filterParamsTask" )
+                                        filterParamsTask,
+                                        &finishParam,
+                                        &pic->m_divTasksCounter,
+                                        &m_gpuFiltersPrepared,
+                                        { &pic->parseDone } );
+    queueBarriers.push_back( &m_gpuFiltersPrepared );
+  }
   if( m_gpuEarlyRows > 0 )
   {
     // (a ready check rather than a barrier, so that a CTU task's failure fails it instead of leaving it waiting)
@@ -1641,6 +1647,12 @@ bool DecLibRecon::queueGpuTask( int, void* taskParam )
   FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( taskParam );
   CodingStructure&    cs    = *param->pic->cs;
   DecLibRecon*        dec   = param->decLib;
+  // The GPU's parse: the records, the coefficient levels in the picture, the CTUs' SAO and ALF parameters
+  if( dec->m_gpuParseDrives
+      && !dec->m_gpuRecon->parsePicture( cs, cs.picture->m_bufs[PIC_RECONSTRUCTION], dec->m_gpuCuRecords, dec->m_gpuTuRecords ) )
+  {
+    THROW_RECOVERABLE( "Vulkan: the GPU parse gave up on the slice data of POC " << cs.picture->poc );
+  }
   // The picture's slice table (its CTUs are parsed, so their slices are known), for the GPU's motion derivation of
   // this picture and of the pictures it is the colocated picture of
   if( ( dec->m_gpuFrontEndCheck || dec->m_gpuFrontEnd ) && cs.colMiAllocator )

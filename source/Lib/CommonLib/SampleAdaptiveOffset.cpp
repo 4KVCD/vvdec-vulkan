@@ -593,7 +593,13 @@ int SampleAdaptiveOffset::getMergeList(CodingStructure& cs, int ctuRsAddr, SAOBl
 
   const int ctuX       = ctuRsAddr % pcv.widthInCtus;
   const int ctuY       = ctuRsAddr / pcv.widthInCtus;
-  const CodingUnit& cu = *cs.getCtuData( ctuRsAddr ).cuPtr[CH_L][0];
+  // A neighbouring CTU is a merge candidate in the same slice and tile: the availability of the CTU's first CU's
+  // neighbours (CodingUnit::left and above), taken from the CTUs' data, as with the GPU parse the CPU makes no CUs.
+  const Slice* slice   = cs.getCtuData( ctuRsAddr ).slice;
+  const auto   sameSliceAndTile = [&]( int x, int y ) {
+    return cs.getCtuData( x, y ).slice->getIndependentSliceIdx() == slice->getIndependentSliceIdx()
+           && cs.pps->getTileIdx( x, y ) == cs.pps->getTileIdx( ctuX, ctuY );
+  };
   int mergedCTUPos;
   int numValidMergeCandidates = 0;
 
@@ -607,7 +613,7 @@ int SampleAdaptiveOffset::getMergeList(CodingStructure& cs, int ctuRsAddr, SAOBl
       if( ctuY > 0 )
       {
         mergedCTUPos = ctuRsAddr - pcv.widthInCtus;
-        if( cu.above )
+        if( sameSliceAndTile( ctuX, ctuY - 1 ) )
         {
           mergeCandidate = &( cs.m_ctuData[mergedCTUPos].saoParam );
         }
@@ -617,7 +623,7 @@ int SampleAdaptiveOffset::getMergeList(CodingStructure& cs, int ctuRsAddr, SAOBl
       if( ctuX > 0 )
       {
         mergedCTUPos = ctuRsAddr - 1;
-        if( cu.left )
+        if( sameSliceAndTile( ctuX - 1, ctuY ) )
         {
           mergeCandidate = &( cs.m_ctuData[mergedCTUPos].saoParam );
         }
@@ -772,68 +778,43 @@ void SampleAdaptiveOffset::deriveLoopFilterBoundaryAvailibility( CodingStructure
   const int width  = cs.pcv->widthInCtus;
   const int height = cs.pcv->heightInCtus;
 
-  const CodingUnit* cuCurr        =                       cs.getCtuData( ctuX,     ctuY     ).cuPtr[0][0];
-  const CodingUnit* cuLeft        = ctuX     > 0        ? cs.getCtuData( ctuX - 1, ctuY     ).cuPtr[0][0] : nullptr;
-  const CodingUnit* cuRight       = ctuX + 1 < width    ? cs.getCtuData( ctuX + 1, ctuY     ).cuPtr[0][0] : nullptr;
-  const CodingUnit* cuAbove       = ctuY     > 0        ? cs.getCtuData( ctuX,     ctuY - 1 ).cuPtr[0][0] : nullptr;
-  const CodingUnit* cuBelow       = ctuY + 1 < height   ? cs.getCtuData( ctuX,     ctuY + 1 ).cuPtr[0][0] : nullptr;
-  const CodingUnit* cuAboveLeft   = cuLeft  && cuAbove  ? cs.getCtuData( ctuX - 1, ctuY - 1 ).cuPtr[0][0] : nullptr;
-  const CodingUnit* cuAboveRight  = cuRight && cuAbove  ? cs.getCtuData( ctuX + 1, ctuY - 1 ).cuPtr[0][0] : nullptr;
-  const CodingUnit* cuBelowLeft   = cuLeft  && cuBelow  ? cs.getCtuData( ctuX - 1, ctuY + 1 ).cuPtr[0][0] : nullptr;
-  const CodingUnit* cuBelowRight  = cuRight && cuBelow  ? cs.getCtuData( ctuX + 1, ctuY + 1 ).cuPtr[0][0] : nullptr;
+  // The neighbouring CTUs inside the picture
+  isLeftAvail       = ctuX > 0;
+  isAboveAvail      = ctuY > 0;
+  isRightAvail      = ctuX + 1 < width;
+  isBelowAvail      = ctuY + 1 < height;
+  isAboveLeftAvail  = isLeftAvail && isAboveAvail;
+  isAboveRightAvail = isRightAvail && isAboveAvail;
+  isBelowLeftAvail  = isLeftAvail && isBelowAvail;
+  isBelowRightAvail = isRightAvail && isBelowAvail;
 
-  isLeftAvail       = (cuLeft       != NULL);
-  isAboveAvail      = (cuAbove      != NULL);
-  isRightAvail      = (cuRight      != NULL);
-  isBelowAvail      = (cuBelow      != NULL);
-  isAboveLeftAvail  = (cuAboveLeft  != NULL);
-  isAboveRightAvail = (cuAboveRight != NULL);
-  isBelowLeftAvail  = (cuBelowLeft  != NULL);
-  isBelowRightAvail = (cuBelowRight != NULL);
-
-  // check cross slice flags
-  const bool isLoopFilterAcrossSlicePPS = cs.pps->getLoopFilterAcrossSlicesEnabledFlag();
-  if (!isLoopFilterAcrossSlicePPS)
+  // Where loop filtering may not cross slices, tiles or subpictures, only the neighbours in the CTU's own count. The
+  // CTUs' slices, tiles and subpictures come from their CTU data, not from their first CUs: with the GPU parse the CPU
+  // makes no CUs. (A CTU's CUs share its slice, tile and subpicture.)
+  const Slice* curSlice  = cs.getCtuData( ctuX, ctuY ).slice;
+  const auto   subPicIdx = [&]( int x, int y ) { return cs.pps->getSubPicFromPos( Position( x * ctusz, y * ctusz ) ).getSubPicIdx(); };
+  const auto   restrict  = [&]( auto same ) {
+    isLeftAvail       = isLeftAvail       && same( ctuX - 1, ctuY );
+    isAboveAvail      = isAboveAvail      && same( ctuX,     ctuY - 1 );
+    isRightAvail      = isRightAvail      && same( ctuX + 1, ctuY );
+    isBelowAvail      = isBelowAvail      && same( ctuX,     ctuY + 1 );
+    isAboveLeftAvail  = isAboveLeftAvail  && same( ctuX - 1, ctuY - 1 );
+    isAboveRightAvail = isAboveRightAvail && same( ctuX + 1, ctuY - 1 );
+    isBelowLeftAvail  = isBelowLeftAvail  && same( ctuX - 1, ctuY + 1 );
+    isBelowRightAvail = isBelowRightAvail && same( ctuX + 1, ctuY + 1 );
+  };
+  if( !cs.pps->getLoopFilterAcrossSlicesEnabledFlag() )
   {
-    isLeftAvail       = isLeftAvail       && CU::isSameSlice(*cuCurr, *cuLeft);
-    isAboveAvail      = isAboveAvail      && CU::isSameSlice(*cuCurr, *cuAbove);
-    isRightAvail      = isRightAvail      && CU::isSameSlice(*cuCurr, *cuRight);
-    isBelowAvail      = isBelowAvail      && CU::isSameSlice(*cuCurr, *cuBelow);
-    isAboveLeftAvail  = isAboveLeftAvail  && CU::isSameSlice(*cuCurr, *cuAboveLeft);
-    isAboveRightAvail = isAboveRightAvail && CU::isSameSlice(*cuCurr, *cuAboveRight);
-    isBelowLeftAvail  = isBelowLeftAvail  && CU::isSameSlice(*cuCurr, *cuBelowLeft);
-    isBelowRightAvail = isBelowRightAvail && CU::isSameSlice(*cuCurr, *cuBelowRight);
+    restrict( [&]( int x, int y ) { return curSlice->getIndependentSliceIdx() == cs.getCtuData( x, y ).slice->getIndependentSliceIdx(); } );
   }
-
-  // check cross tile flags
-  const bool isLoopFilterAcrossTilePPS = cs.pps->getLoopFilterAcrossTilesEnabledFlag();
-  if (!isLoopFilterAcrossTilePPS)
+  if( !cs.pps->getLoopFilterAcrossTilesEnabledFlag() )
   {
-    isLeftAvail       = isLeftAvail       && CU::isSameTile(*cuCurr, *cuLeft);
-    isAboveAvail      = isAboveAvail      && CU::isSameTile(*cuCurr, *cuAbove);
-    isRightAvail      = isRightAvail      && CU::isSameTile(*cuCurr, *cuRight);
-    isBelowAvail      = isBelowAvail      && CU::isSameTile(*cuCurr, *cuBelow);
-    isAboveLeftAvail  = isAboveLeftAvail  && CU::isSameTile(*cuCurr, *cuAboveLeft);
-    isAboveRightAvail = isAboveRightAvail && CU::isSameTile(*cuCurr, *cuAboveRight);
-    isBelowLeftAvail  = isBelowLeftAvail  && CU::isSameTile(*cuCurr, *cuBelowLeft);
-    isBelowRightAvail = isBelowRightAvail && CU::isSameTile(*cuCurr, *cuBelowRight);
+    restrict( [&]( int x, int y ) { return cs.pps->getTileIdx( ctuX, ctuY ) == cs.pps->getTileIdx( x, y ); } );
   }
-
-  // check cross subpic flags
-  if( cs.sps->getSubPicInfoPresentFlag() )
+  if( cs.sps->getSubPicInfoPresentFlag()
+      && !cs.pps->getSubPicFromPos( Position( ctuX * ctusz, ctuY * ctusz ) ).getloopFilterAcrossSubPicEnabledFlag() )
   {
-    const SubPic& curSubPic = cs.pps->getSubPicFromCU(*cuCurr);
-    if( !curSubPic.getloopFilterAcrossSubPicEnabledFlag() )
-    {
-      isLeftAvail       = isLeftAvail       && CU::isSameSubPic(*cuCurr, *cuLeft);
-      isAboveAvail      = isAboveAvail      && CU::isSameSubPic(*cuCurr, *cuAbove);
-      isRightAvail      = isRightAvail      && CU::isSameSubPic(*cuCurr, *cuRight);
-      isBelowAvail      = isBelowAvail      && CU::isSameSubPic(*cuCurr, *cuBelow);
-      isAboveLeftAvail  = isAboveLeftAvail  && CU::isSameSubPic(*cuCurr, *cuAboveLeft);
-      isAboveRightAvail = isAboveRightAvail && CU::isSameSubPic(*cuCurr, *cuAboveRight);
-      isBelowLeftAvail  = isBelowLeftAvail  && CU::isSameSubPic(*cuCurr, *cuBelowLeft);
-      isBelowRightAvail = isBelowRightAvail && CU::isSameSubPic(*cuCurr, *cuBelowRight);
-    }
+    restrict( [&]( int x, int y ) { return subPicIdx( ctuX, ctuY ) == subPicIdx( x, y ); } );
   }
 }
 

@@ -51,6 +51,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #if VVDEC_VULKAN
 #  include "VulkanLib/GpuParse.h"
+#  include "VulkanLib/GpuRecon.h"
 #endif
 
 #include <unordered_map>
@@ -996,18 +997,26 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
       }
 
 #if VVDEC_VULKAN
-      // the slice data for the GPU's parse, compared with this one's
-      if( gpu::parseShadowRequested() )
+      // the slice data for the GPU's parse: compared with this one's (VVDEC_GPU_PARSE=1), or instead of it (=2)
+      const bool gpuParses = gpu::GpuRecon::parsesPicture( *pic, *slice->getSPS() );
+      if( gpuParses || gpu::parseShadowRequested() )
       {
         const auto&  fifo = bitstream.getFifo();
         const size_t at   = std::min<size_t>( bitstream.getByteLocation(), fifo.size() );
         slice->parseTaskParams.gpuSliceData.assign( fifo.begin() + at, fifo.end() );
       }
+      if( gpuParses )
+      {
+        decLib->m_cSliceDecoder.claimSlice( slice );
+      }
+      else
 #endif
-      //  Decode a picture
-      ITT_TASKSTART( itt_domain_prs, itt_handle_parse );
-      decLib->m_cSliceDecoder.parseSlice( slice, &bitstream, threadId );
-      ITT_TASKEND( itt_domain_prs, itt_handle_parse );
+      {
+        //  Decode a picture
+        ITT_TASKSTART( itt_domain_prs, itt_handle_parse );
+        decLib->m_cSliceDecoder.parseSlice( slice, &bitstream, threadId );
+        ITT_TASKEND( itt_domain_prs, itt_handle_parse );
+      }
 
       pic->stopProcessingTimer();
 

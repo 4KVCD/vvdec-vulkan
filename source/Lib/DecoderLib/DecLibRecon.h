@@ -193,6 +193,8 @@ private:
   // VVDEC_GPU_PARSE=1 (with the GPU front end): the GPU parses each picture's slice data too, compared with the CPU's
   // parse (GpuRecon::compareParse)
   bool m_gpuParse = false;
+  // the current picture is parsed on the GPU instead of the CPU (VVDEC_GPU_PARSE=2; gpu::GpuRecon::parsesPicture)
+  bool m_gpuParseDrives = false;
   // which of the current picture's passes run on the GPU (setUpGpuPicture)
   bool m_gpuFilters  = false;   // its in-loop filters
   bool m_gpuIntra    = false;   // and its intra and IBC blocks
@@ -272,7 +274,10 @@ public:
   int      residualPicturesGpu() const { return m_residualPicturesGpu; }
   int      residualPicturesCpu() const { return m_residualPicturesCpu; }
   const gpu::FrontEndStats* frontEndStats() const { return m_gpuFrontEndCheck && m_gpuRecon ? &m_gpuRecon->frontEndStats() : nullptr; }
-  const gpu::ParseStats*    parseStats() const { return m_gpuParse && m_gpuRecon ? &m_gpuRecon->parseStats() : nullptr; }
+  const gpu::ParseStats*    parseStats() const
+  {
+    return m_gpuRecon && ( m_gpuParse || m_gpu->options().parseDrives ) ? &m_gpuRecon->parseStats() : nullptr;
+  }
 #endif
 
 

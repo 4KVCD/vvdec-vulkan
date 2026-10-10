@@ -531,7 +531,7 @@ bool GpuRecon::prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& 
   for( int ctuIdx = 0; ctuIdx < (int) pcv.sizeInCtus; ctuIdx++ )
   {
     const CtuData&    ctuData = cs.getCtuData( ctuIdx );
-    const Slice*      slice   = ctuData.cuPtr[0][0]->slice;
+    const Slice*      slice   = ctuData.slice;
     const CtuAlfData& alf     = ctuData.alfParam;
     uint8_t*          ctu     = ctus + ctuIdx * 8;
 

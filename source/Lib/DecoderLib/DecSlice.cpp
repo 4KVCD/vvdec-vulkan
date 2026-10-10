@@ -219,4 +219,32 @@ void DecSlice::parseSlice( Slice* slice, InputBitstream* bitstream, int threadId
   }
 }
 
+#if VVDEC_VULKAN
+void DecSlice::claimSlice( Slice* slice )
+{
+  Picture*         pic = slice->getPic();
+  CodingStructure& cs  = *pic->cs;
+  AdaptiveLoopFilter::reconstructCoeffAPSs( *slice );
+  for( unsigned ctuIdx = 0; ctuIdx < slice->getNumCtuInSlice(); ctuIdx++ )
+  {
+    const unsigned ctuRsAddr = slice->getCtuAddrInSlice( ctuIdx );
+    CtuData&       ctuData   = cs.getCtuData( ctuRsAddr );
+    CHECK( ctuData.slice, "CTU " << ctuRsAddr << " has already been coded in a previous slice" );
+    ctuData.slice = slice;
+    ctuData.pps   = slice->getPPS();
+    ctuData.sps   = slice->getSPS();
+    ctuData.ph    = slice->getPicHeader();
+#if RECO_WHILE_PARSE
+    pic->ctuParsedBarrier[ctuRsAddr].unlock();
+#endif
+    if( ctuRsAddr + 1 == pic->cs->pcv->sizeInCtus )
+    {
+      Picture::PicStateEnum expected = Picture::parsing;
+      pic->progress.compare_exchange_strong( expected, Picture::parsed );
+      pic->parseDone.unlock();
+    }
+  }
+}
+#endif
+
 }

@@ -127,6 +127,7 @@ struct Options
   bool        frontEnd      = true;    // VVDEC_GPU_FRONT=0: the CPU front end drives the pictures
   bool        frontEndCheck = false;   // VVDEC_GPU_MIDER=1: the CPU front end drives, the GPU front end is compared with it
   bool        parse         = false;   // VVDEC_GPU_PARSE=1: the GPU parses the slice data too, compared with the CPU's parse
+  bool        parseDrives   = false;   // VVDEC_GPU_PARSE=2: the GPU parses the slice data instead of the CPU
 
   static Options fromEnvironment();
 };

@@ -113,7 +113,8 @@ Options Options::fromEnvironment()
   options.async         = !( value( "VVDEC_GPU_ASYNC" ) && atoi( value( "VVDEC_GPU_ASYNC" ) ) == 0 );
   options.frontEnd      = !( value( "VVDEC_GPU_FRONT" ) && atoi( value( "VVDEC_GPU_FRONT" ) ) == 0 );
   options.frontEndCheck = value( "VVDEC_GPU_MIDER" ) && atoi( value( "VVDEC_GPU_MIDER" ) ) != 0;
-  options.parse         = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) != 0;
+  options.parse         = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 1;
+  options.parseDrives   = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 2;
   return options;
 }
 
