@@ -744,15 +744,23 @@ void mtsIdx( inout CuCtx ctx )
 // --------------------------------------------------------------------------------------------------------------------
 
 
-// The coded block being parsed. Positions in it are raster positions with the block's width as the row stride.
-groupshared int  s_coef[4096];   // its levels: absolute (regular coding) or signed (transform skip)
+// The coded block being parsed. Positions in it are raster positions with the block's width as the row stride. A
+// block codes at most its top-left 32 x 32 (the zero-out of 64-wide and 64-tall blocks), so its positions are below
+// kCodedPositions: 32 rows of 64. (The shared memory here is sized to that: the parse's workgroups stay resident for
+// long, and what they take the reconstruction's shaders cannot have.)
+static const int kCodedPositions = 32 * 64;
+// its levels: absolute (regular coding) or signed (transform skip); and zeros two rows of 64 further, which
+// templateAbsSum reads below the last coded row
+static const int kCoefWords = kCodedPositions + 2 * 64;
+groupshared int  s_coef[kCoefWords];
 // CtxTpl, a byte per position: the sum of the absolute first-pass levels in the position's template | the number of
 // nonzero ones << 5. After the templates' kTplWords words, one word a thread, never read: absVal1stPass's threads add
 // 0 there when they have no template to add to.
-static const int kTplWords = 1024;
+static const int kTplWords = kCodedPositions / 4;
 groupshared uint s_tpl[kTplWords + 32];
 groupshared uint s_out[1024];    // its levels to write, in decoding order: position | level << 16
-groupshared uint s_final[2048];  // its levels at their positions, as int16, 2 per word, for writeLevels
+static const int kFinalWords = kCodedPositions / 2;
+groupshared uint s_final[kFinalWords];   // its levels at their positions, as int16, 2 per word, for writeLevels
 // (s_coef, s_tpl and s_final are zero whenever a block starts: after each block, writeLevels clears what it set)
 
 static int g_outCount;   // the levels in s_out
@@ -921,15 +929,15 @@ uint groupScanWord( int k )
 // Zeroes s_coef, s_tpl and s_final when the workgroup starts; writeLevels keeps them zero between blocks from then on
 void clearResidualMemory()
 {
-  for( int i = g_lane; i < 4096; i += 32 )
+  for( int i = g_lane; i < kCoefWords; i += 32 )
   {
     s_coef[i] = 0;
   }
-  for( int i = g_lane; i < 1024; i += 32 )
+  for( int i = g_lane; i < kTplWords; i += 32 )
   {
     s_tpl[i] = 0;
   }
-  for( int i = g_lane; i < 2048; i += 32 )
+  for( int i = g_lane; i < kFinalWords; i += 32 )
   {
     s_final[i] = 0;
   }
