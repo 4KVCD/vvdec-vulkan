@@ -738,15 +738,27 @@ void mtsIdx( inout CuCtx ctx )
 // The coded block being parsed. Positions in it are raster positions with the block's width as the row stride.
 groupshared int  s_coef[4096];   // its levels: absolute (regular coding) or signed (transform skip)
 // CtxTpl, a byte per position: the sum of the absolute first-pass levels in the position's template | the number of
-// nonzero ones << 5
-groupshared uint s_tpl[1024];
+// nonzero ones << 5. After the templates' kTplWords words, one word a thread, never read: absVal1stPass's threads add
+// 0 there when they have no template to add to.
+static const int kTplWords = 1024;
+groupshared uint s_tpl[kTplWords + 32];
 groupshared uint s_out[1024];    // its levels to write, in decoding order: position | level << 16
 groupshared uint s_final[2048];  // its levels at their positions, as int16, 2 per word, for writeLevels
 // (s_coef, s_tpl and s_final are zero whenever a block starts: after each block, writeLevels clears what it set)
-groupshared int  s_sigPos[16];   // the current group's nonzero positions, in decoding order
-groupshared int  s_gt1Pos[16];   // the current group's positions with a level greater than 1, in decoding order
 
 static int g_outCount;   // the levels in s_out
+
+// Lane arrays (laneValue, setLane). Of the current block, its scans as s_scanTab holds them, word k in thread k: the
+// scan inside a group (g_innerScan), and the scan of the groups (up to 64 words: g_groupScan0, then g_groupScan1);
+// initCctx loads them. Of the current group: the block position and the absolute level of its k-th nonzero level in
+// decoding order (g_sigPos, g_sigAbs), and for its k-th level greater than 1, that level's index among the nonzero
+// ones (g_gt1Sig).
+static uint g_innerScan;
+static uint g_groupScan0;
+static uint g_groupScan1;
+static int  g_sigPos;
+static int  g_sigAbs;
+static int  g_gt1Sig;
 
 // vvdec's CoeffCodingContext: the coded block's sizes and scans, its context sets, and the current coefficient group
 struct Cctx
@@ -782,10 +794,10 @@ static Cctx g_cc;
 
 
 // The block position of scan position scanPos, which lies in the current group. vvdec's g_scanOrder[SCAN_GROUPED_4x4]
-// scans the groups diagonally and, within each group, its positions diagonally; this reads both scans from s_scanTab.
+// scans the groups diagonally and, within each group, its positions diagonally; the group's scan is g_innerScan.
 int blockPos( int scanPos )
 {
-  const int inner = int( uni( s_scanTab[g_cc.innerOff + ( scanPos & ( ( 1 << g_cc.log2CGSize ) - 1 ) )] ) & 0xffffu );
+  const int inner = int( laneValue( g_innerScan, uint( scanPos & ( ( 1 << g_cc.log2CGSize ) - 1 ) ) ) & 0xffffu );
   return g_cc.subBase + ( inner >> g_cc.log2CGW ) * g_cc.width + ( inner & ( ( 1 << g_cc.log2CGW ) - 1 ) );
 }
 
@@ -793,11 +805,6 @@ int blockPos( int scanPos )
 uint tplGet( int pos )
 {
   return ( uni( s_tpl[pos >> 2] ) >> uint( ( pos & 3 ) * 8 ) ) & 0xffu;
-}
-
-void tplAdd( int pos, uint v )
-{
-  s_tpl[pos >> 2] += v << uint( ( pos & 3 ) * 8 );
 }
 
 // The coded_sub_block_flag of the group at raster index pos among the groups
@@ -889,6 +896,17 @@ void initCctx( int t, int comp, bool signHide )
   g_cc.ts           = tuMts( t, comp ) == MTS_SKIP;
   g_cc.numCtxBins   = 0;
   g_outCount        = 0;
+  // The block's scans into the lane arrays (a table near the end of s_scanTab has no words past it: min keeps the
+  // threads past the table inside s_scanTab, and their words go unused)
+  g_innerScan       = s_scanTab[min( g_cc.innerOff + g_lane, 960 )];
+  g_groupScan0      = s_scanTab[min( g_cc.cgOff + g_lane, 960 )];
+  g_groupScan1      = s_scanTab[min( g_cc.cgOff + 32 + g_lane, 960 )];
+}
+
+// Word k of the current block's scan of the groups (s_scanTab's table from g_cc.cgOff on)
+uint groupScanWord( int k )
+{
+  return k < 32 ? laneValue( g_groupScan0, uint( k ) ) : laneValue( g_groupScan1, uint( k - 32 ) );
 }
 
 // Zeroes s_coef, s_tpl and s_final when the workgroup starts; writeLevels keeps them zero between blocks from then on
@@ -914,7 +932,7 @@ void clearResidualMemory()
 void initSubblock( int subSetId )
 {
   g_cc.subSetId   = subSetId;
-  g_cc.subSetPos  = int( uni( s_scanTab[g_cc.cgOff + subSetId] ) & 0xffffu );
+  g_cc.subSetPos  = int( groupScanWord( subSetId ) & 0xffffu );
   g_cc.subSetPosY = g_cc.subSetPos >> log2i( g_cc.widthInGroups );
   g_cc.subSetPosX = g_cc.subSetPos - g_cc.subSetPosY * g_cc.widthInGroups;
   g_cc.subBase    = ( g_cc.subSetPosY << g_cc.log2CGH ) * g_cc.width + ( g_cc.subSetPosX << g_cc.log2CGW );
@@ -955,33 +973,21 @@ int sigCtxIdAbs( int blkPos, int state )
 }
 
 // Records the level the first pass decoded at blkPos, and adds it to the templates that contain blkPos: those of the
-// positions one and two to its left, one and two above it, and above-left of it (CoeffCodingContext::absVal1stPass)
+// positions two and one above it, above-left of it, and two and one to its left (CoeffCodingContext::absVal1stPass).
+// Threads 0 to 4 add to one template each, all with one atomic add to shared memory: no round trip. The other threads,
+// and a thread whose position is off the block, add 0 to a word of their own: an if on the thread here made the
+// compiler run the whole parse as vector code.
 void absVal1stPass( int blkPos, int absLevel1 )
 {
   s_coef[blkPos] = absLevel1;
   const int  posY = blkPos >> g_cc.log2W;
   const int  posX = blkPos & ( g_cc.width - 1 );
-  const uint v    = uint( 32 + absLevel1 );
-  if( posY > 1 )
-  {
-    tplAdd( blkPos - 2 * g_cc.width, v );
-  }
-  if( posY > 0 && posX > 0 )
-  {
-    tplAdd( blkPos - g_cc.width - 1, v );
-  }
-  if( posY > 0 )
-  {
-    tplAdd( blkPos - g_cc.width, v );
-  }
-  if( posX > 1 )
-  {
-    tplAdd( blkPos - 2, v );
-  }
-  if( posX > 0 )
-  {
-    tplAdd( blkPos - 1, v );
-  }
+  const int  w    = g_cc.width;
+  const int  l    = g_lane;
+  const bool add  = ( l == 0 && posY > 1 ) || ( l == 1 && posY > 0 && posX > 0 ) || ( l == 2 && posY > 0 ) || ( l == 3 && posX > 1 )
+                   || ( l == 4 && posX > 0 );
+  const int  pos  = blkPos - ( l == 0 ? 2 * w : ( l == 1 ? w + 1 : ( l == 2 ? w : ( l == 3 ? 2 : 1 ) ) ) );
+  InterlockedAdd( s_tpl[add ? pos >> 2 : kTplWords + l], add ? uint( 32 + absLevel1 ) << uint( ( pos & 3 ) * 8 ) : 0u );
 }
 
 // The context offset of the greater-than and parity flags at the position sigCtxIdAbs last looked at
@@ -1088,7 +1094,7 @@ int lastSigCoeff( int comp )
   // group size, plus the scan index of the position within its group
   const int cgRaster    = ( posLastY >> g_cc.log2CGH ) * g_cc.widthInGroups + ( posLastX >> g_cc.log2CGW );
   const int innerRaster = ( posLastY & ( ( 1 << g_cc.log2CGH ) - 1 ) ) * ( 1 << g_cc.log2CGW ) + ( posLastX & ( ( 1 << g_cc.log2CGW ) - 1 ) );
-  const int scanPos     = int( uni( s_scanTab[g_cc.cgOff + cgRaster] ) >> 16 ) << g_cc.log2CGSize | int( uni( s_scanTab[g_cc.innerOff + innerRaster] ) >> 16 );
+  const int scanPos     = int( groupScanWord( cgRaster ) >> 16 ) << g_cc.log2CGSize | int( laneValue( g_innerScan, uint( innerRaster ) ) >> 16 );
   return min( scanPos, g_cc.maxNumCoeff - 1 );
 }
 
@@ -1123,6 +1129,7 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
   int       remRegBins  = g_cc.regBinLimit;
   uint      gt2Mask     = 0;
   uint      stateVal    = 0;
+  int       sumAbsLevels = 0;   // the group's absolute levels added up, for sign data hiding
   for( ; nextSigPos >= minSubPos && remRegBins >= 4; nextSigPos-- )
   {
     const int blkPos  = blockPos( nextSigPos );
@@ -1136,7 +1143,7 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
     {
       const int ctxOff = ctxOffsetAbs();
       stateVal         = ( uint( state >> 1 ) & 1u ) | ( stateVal << 1 );
-      s_sigPos[numNonZero] = blkPos;
+      g_sigPos         = setLane( g_sigPos, numNonZero, blkPos );
       numNonZero++;
       firstNZPos = nextSigPos;
       lastNZPos  = max( lastNZPos, nextSigPos );
@@ -1151,7 +1158,7 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
         const uint gt2Flag = decodeBin( g_cc.gtx0Ctx + ctxOff );
         gt2Mask |= gt2Flag << uint( numGt1 - 1 );
         remRegBins--;
-        s_gt1Pos[numGt1 - 1] = blkPos;
+        g_gt1Sig             = setLane( g_gt1Sig, numGt1 - 1, numNonZero - 1 );
         absVal               = 2 + int( parFlag ) + int( gt2Flag << 1 );
         state                = ( stateTransTab >> ( ( state << 2 ) + int( parFlag << 1 ) ) ) & 3;
       }
@@ -1160,6 +1167,8 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
         absVal = 1;
         state  = ( stateTransTab >> ( ( state << 2 ) + 2 ) ) & 3;
       }
+      g_sigAbs = setLane( g_sigAbs, numNonZero - 1, absVal );
+      sumAbsLevels += absVal;
       absVal1stPass( blkPos, absVal );
     }
     else
@@ -1174,11 +1183,15 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
   {
     if( ( gt2Mask & 1u ) != 0 )
     {
-      const int pos     = uni( s_gt1Pos[k] );
+      const int sig     = laneValue( g_gt1Sig, k );
+      const int pos     = laneValue( g_sigPos, sig );
       const int sumAll  = templateAbsSum( pos, 4 );
       const int ricePar = kGoRiceParsCoeff[sumAll];
       const int rem     = int( decodeRemAbsEP( ricePar, COEF_REMAIN_BIN_REDUCTION, g_cc.maxLog2TrRange ) );
-      s_coef[pos] += rem << 1;
+      const int level   = laneValue( g_sigAbs, sig ) + ( rem << 1 );
+      g_sigAbs          = setLane( g_sigAbs, sig, level );
+      s_coef[pos]       = level;
+      sumAbsLevels += rem << 1;
     }
   }
   // The positions the first pass did not reach: their whole levels in bypass bins (dec_abs_level)
@@ -1196,7 +1209,9 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
     {
       s_coef[blkPos] = tcoeff;
       stateVal       = uint( sub1 ) | ( stateVal << 1 );
-      s_sigPos[numNonZero] = blkPos;
+      g_sigPos       = setLane( g_sigPos, numNonZero, blkPos );
+      g_sigAbs       = setLane( g_sigAbs, numNonZero, tcoeff );
+      sumAbsLevels += tcoeff;
       numNonZero++;
       firstNZPos = nextSigPos;
       lastNZPos  = max( lastNZPos, nextSigPos );
@@ -1209,26 +1224,20 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
   uint       signs    = decodeBinsEP( numSigns );
   if( numNonZero > numSigns )
   {
-    int sumAbs = 0;
-    for( int i = 0; i < numNonZero; i++ )
-    {
-      sumAbs += uni( s_coef[uni( s_sigPos[i] )] );
-    }
-    signs = ( signs << 1 ) + uint( sumAbs & 1 );
+    signs = ( signs << 1 ) + uint( sumAbsLevels & 1 );
   }
-  // The signed levels into s_out. With dependent quantization a level q is stored as 2 * |q|, minus 1 when the
-  // quantizer's state at its position was 2 or 3 (the bits of stateVal), as vvdec stores it. The first level decoded
-  // has the highest bit in signs and stateVal.
-  for( int j = 0; j < numNonZero; j++ )
+  // The signed levels into s_out, thread j writing the j-th level decoded. With dependent quantization a level q is
+  // stored as 2 * |q|, minus 1 when the quantizer's state at its position was 2 or 3 (the bits of stateVal), as vvdec
+  // stores it. The first level decoded has the highest bit in signs and stateVal.
+  if( g_lane < numNonZero )
   {
-    const int  pos = uni( s_sigPos[j] );
-    const uint bit = uint( numNonZero - 1 - j );
-    const int  c   = uni( s_coef[pos] );
+    const uint bit = uint( numNonZero - 1 - g_lane );
+    const int  c   = g_sigAbs;
     const int  a   = depQuant ? c * 2 - int( ( stateVal >> bit ) & 1u ) : c;
     const int  v   = ( ( signs >> bit ) & 1u ) != 0 ? -a : a;
-    s_out[g_outCount] = uint( pos ) | ( uint( v ) << 16 );
-    g_outCount++;
+    s_out[g_outCount + g_lane] = uint( g_sigPos ) | ( uint( v ) << 16 );
   }
+  g_outCount += numNonZero;
   return numNonZero;
 }
 
@@ -1366,7 +1375,7 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
       const uint sign = decodeBin( signCtxIdAbsTS( blkPos, g_cc.bdpcm ) );
       g_cc.numCtxBins--;
       signPattern += sign << uint( numNonZero );
-      s_sigPos[numNonZero] = blkPos;
+      g_sigPos     = setLane( g_sigPos, numNonZero, blkPos );
       numNonZero++;
       const uint gt1Flag = decodeBin( lrg1CtxIdAbsTS( blkPos, g_cc.bdpcm ) );
       g_cc.numCtxBins--;
@@ -1423,7 +1432,7 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
       {
         const uint sign = decodeBinEP();
         signPattern += sign << uint( numNonZero );
-        s_sigPos[numNonZero] = pos;
+        g_sigPos = setLane( g_sigPos, numNonZero, pos );
         numNonZero++;
       }
     }
@@ -1443,7 +1452,7 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
   // The signed levels: into s_coef (the contexts of the later groups read them) and s_out, and the largest x and y
   for( int k = 0; k < numNonZero; k++ )
   {
-    const int pos      = uni( s_sigPos[k] );
+    const int pos      = laneValue( g_sigPos, k );
     const int absCoeff = uni( s_coef[pos] );
     maxX               = max( maxX, pos & ( g_cc.width - 1 ) );
     maxY               = max( maxY, pos >> g_cc.log2W );
@@ -1476,13 +1485,12 @@ void writeLevelsBody( int comp, int4 b, int w, int h )
   {
     g_error = true;   // (a block off the planes: give up the substream)
   }
-  // Put the levels into s_final at their positions (every thread makes the same writes)
-  for( int i = 0; i < g_outCount; i++ )
+  // Put the levels into s_final at their positions, a level a thread (s_final is zero there: an OR sets the half)
+  for( int i = g_lane; i < g_outCount; i += 32 )
   {
     const uint e   = s_out[i];
     const uint pos = e & 0xffffu;
-    const uint sh  = ( pos & 1u ) * 16u;
-    s_final[pos >> 1] = ( s_final[pos >> 1] & ~( 0xffffu << sh ) ) | ( ( e >> 16 ) << sh );
+    InterlockedOr( s_final[pos >> 1], ( e >> 16 ) << ( ( pos & 1u ) * 16u ) );
   }
   GroupMemoryBarrierWithGroupSync();
   // Each thread writes one column of the rectangle (its lane's)
@@ -1514,10 +1522,10 @@ void writeLevelsBody( int comp, int4 b, int w, int h )
     }
   }
   GroupMemoryBarrierWithGroupSync();
-  // Clear what the block set: s_final and s_coef at its levels' positions, and the s_tpl words of the templates its
-  // levels were added to (absVal1stPass)
+  // Clear what the block set, a level a thread: s_final and s_coef at its levels' positions, and the s_tpl words of
+  // the templates its levels were added to (absVal1stPass)
   const int wb = g_cc.width;
-  for( int i = 0; i < g_outCount; i++ )
+  for( int i = g_lane; i < g_outCount; i += 32 )
   {
     const int pos  = int( s_out[i] & 0xffffu );
     const int posY = pos >> g_cc.log2W;

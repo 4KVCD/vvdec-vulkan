@@ -476,6 +476,18 @@ uint laneValue( uint v, uint lane )
 #endif
 }
 
+int laneValue( int v, int lane )
+{
+  return int( laneValue( uint( v ), uint( lane ) ) );
+}
+
+// A lane array holds up to 32 values in one register, value k in thread k: laneValue( a, k ) reads value k (in one
+// v_readlane, where shared memory takes a round trip), and setLane( a, k, v ) gives the array with value k set to v
+int setLane( int a, int k, int v )
+{
+  return g_lane == k ? v : a;
+}
+
 // Word w of the picture's parameters
 int picWord( int w )
 {
