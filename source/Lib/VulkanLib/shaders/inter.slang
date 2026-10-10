@@ -1221,61 +1221,65 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     leadC[s] = cxs[s] & 3;   // the same for chroma, in aligned 8 bytes
   }
 
-  // All of the tile's reads. Luma windows: 23 rows of 4 x 16 bytes per list.
+  // All of the tile's reads, none of them in a branch, so that they wait for memory together: after a branch the
+  // compiler makes the next read wait for all those before it. Luma windows: 23 rows of 4 x 16 bytes per list (a
+  // thread past the last chunk reads the last one again, and stores nothing).
   uint4 yChunk[3];
   [unroll]
   for( int k = 0; k < 3; k++ )
   {
-    const int task = tid + THREADS * k;
-    if( task < 92 * lists )
-    {
-      const int s   = task >= 92 ? 1 : 0;
-      const int rem = task - 92 * s;
-      // (the slot is picked with selects: an array indexed per lane would go to scratch memory)
-      const int row0 = s == 0 ? wy[0] : wy[1];
-      const int col0 = s == 0 ? wx[0] - leadY[0] : wx[1] - leadY[1];
-      int16_t*  p    = ( s == 0 ? planeY[0] : planeY[1] ) + ( row0 + ( rem >> 2 ) ) * pc.stride0 + col0 + 8 * ( rem & 3 );
-      yChunk[k]      = *(uint4*)p;
-    }
+    const int task = min( tid + THREADS * k, 92 * lists - 1 );
+    const int s    = task >= 92 ? 1 : 0;
+    const int rem  = task - 92 * s;
+    // (the slot is picked with selects: an array indexed per lane would go to scratch memory)
+    const int row0 = s == 0 ? wy[0] : wy[1];
+    const int col0 = s == 0 ? wx[0] - leadY[0] : wx[1] - leadY[1];
+    int16_t*  p    = ( s == 0 ? planeY[0] : planeY[1] ) + ( row0 + ( rem >> 2 ) ) * pc.stride0 + col0 + 8 * ( rem & 3 );
+    yChunk[k]      = *(uint4*)p;
   }
-  // Chroma windows: 11 rows of 4 x 8 bytes per component and list.
+  // Chroma windows: 11 rows of 4 x 8 bytes per component and list (the same).
   uint2 cChunk[3];
   [unroll]
   for( int k = 0; k < 3; k++ )
   {
-    const int task = tid + THREADS * k;
-    if( task < 88 * lists )
-    {
-      const int s    = task >= 88 ? 1 : 0;
-      const int rem  = task - 88 * s;
-      const int comp = rem >= 44 ? 1 : 0;
-      const int rem2 = rem - 44 * comp;
-      int16_t*  base = s == 0 ? ( comp == 0 ? planeCb[0] : planeCr[0] ) : ( comp == 0 ? planeCb[1] : planeCr[1] );
-      const int row0 = s == 0 ? cys[0] : cys[1];
-      const int col0 = s == 0 ? cxs[0] - leadC[0] : cxs[1] - leadC[1];
-      int16_t*  p    = base + ( row0 + ( rem2 >> 2 ) ) * pc.stride12 + col0 + 4 * ( rem2 & 3 );
-      cChunk[k]      = *(uint2*)p;
-    }
+    const int task = min( tid + THREADS * k, 88 * lists - 1 );
+    const int s    = task >= 88 ? 1 : 0;
+    const int rem  = task - 88 * s;
+    const int comp = rem >= 44 ? 1 : 0;
+    const int rem2 = rem - 44 * comp;
+    int16_t*  base = s == 0 ? ( comp == 0 ? planeCb[0] : planeCr[0] ) : ( comp == 0 ? planeCb[1] : planeCr[1] );
+    const int row0 = s == 0 ? cys[0] : cys[1];
+    const int col0 = s == 0 ? cxs[0] - leadC[0] : cxs[1] - leadC[1];
+    int16_t*  p    = base + ( row0 + ( rem2 >> 2 ) ) * pc.stride12 + col0 + 4 * ( rem2 & 3 );
+    cChunk[k]      = *(uint2*)p;
   }
-  // The residuals that the picture holds where the thread's predictions go: luma (j, i0 .. i0 + 3) and chroma
-  // (cj, ci0 .. ci0 + 1) of component cc.
-  const int j   = tid >> 2;
-  const int i0  = ( tid & 3 ) << 2;
-  const int cc  = tid >> 5;
-  const int cj  = ( tid & 31 ) >> 2;
-  const int ci0 = ( tid & 3 ) << 1;
-  int16_t*  dstY = pc.dst0 + ( y + j ) * pc.stride0 + x + i0;
-  int16_t*  dstC = ( cc == 0 ? pc.dst1 : pc.dst2 ) + ( ( y >> 1 ) + cj ) * pc.stride12 + ( x >> 1 ) + ci0;
-  uint2     resY = uint2( 0, 0 );
-  uint      resC = 0;
+  // The residuals that the picture holds where the thread's predictions go, when the block has any: luma (j, i0 ..
+  // i0 + 3) and chroma (cj, ci0 .. ci0 + 1) of component cc. Both chroma planes are read at the thread's place when
+  // either has a residual (the other is another thread's: no more memory traffic; and the branch is the same for all
+  // the threads), and the thread's picked after: a plane picked before reading would have its pointer read per
+  // thread, one more round trip.
+  const int  j     = tid >> 2;
+  const int  i0    = ( tid & 3 ) << 2;
+  const int  cc    = tid >> 5;
+  const int  cj    = ( tid & 31 ) >> 2;
+  const int  ci0   = ( tid & 3 ) << 1;
+  const int  atY   = ( y + j ) * pc.stride0 + x + i0;
+  const int  atC   = ( ( y >> 1 ) + cj ) * pc.stride12 + ( x >> 1 ) + ci0;
+  int16_t*   srcY  = pc.dst0 + atY;
+  int16_t*   srcCb = pc.dst1 + atC;
+  int16_t*   srcCr = pc.dst2 + atC;
+  uint2      resY  = uint2( 0, 0 );
+  uint       resCb = 0, resCr = 0;
   if( ( flags & FLAG_RES_Y ) != 0 )
   {
-    resY = *(uint2*)dstY;
+    resY = *(uint2*)srcY;
   }
-  if( ( flags & ( FLAG_RES_Y << ( 1 + cc ) ) ) != 0 )
+  if( ( flags & ( ( FLAG_RES_Y << 1 ) | ( FLAG_RES_Y << 2 ) ) ) != 0 )
   {
-    resC = *(uint*)dstC;
+    resCb = *(uint*)srcCb;
+    resCr = *(uint*)srcCr;
   }
+  const uint resC = cc == 0 ? resCb : resCr;
 
   // Store the luma windows in shared memory.
   [unroll]
@@ -1536,7 +1540,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     vy = clamp( vy + int4( lo16( resY.x ), hi16( resY.x ), lo16( resY.y ), hi16( resY.y ) ), 0, maxVal );
   }
-  int16_t* outY = ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 + ( y + j ) * pc.stride0 + x + i0 : dstY;
+  int16_t* outY = ( ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0 ) + atY;
   *(uint2*)outY  = uint2( uint( vy.x & 0xffff ) | uint( vy.y ) << 16, uint( vy.z & 0xffff ) | uint( vy.w ) << 16 );
   int2 vc;
   [unroll]
@@ -1548,9 +1552,10 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     vc = clamp( vc + int2( lo16( resC ), hi16( resC ) ), 0, maxVal );
   }
-  int16_t* outC = ( flags & ( FLAG_DEFER_CB << cc ) ) != 0 ? ( cc == 0 ? pc.defer1 : pc.defer2 ) + ( ( y >> 1 ) + cj ) * pc.stride12 + ( x >> 1 ) + ci0
-                                                           : dstC;
-  *(uint*)outC  = uint( vc.x & 0xffff ) | uint( vc.y ) << 16;
+  // (each component's place first, then the thread's: see the residuals)
+  int16_t* outCb = ( ( flags & FLAG_DEFER_CB ) != 0 ? pc.defer1 : pc.dst1 ) + atC;
+  int16_t* outCr = ( ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2 ) + atC;
+  *(uint*)( cc == 0 ? outCb : outCr ) = uint( vc.x & 0xffff ) | uint( vc.y ) << 16;
 }
 
 #if BDOF
