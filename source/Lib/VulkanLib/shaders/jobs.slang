@@ -1862,10 +1862,28 @@ void jobWaveP( uint* job, int lane )
 groupshared int s_scan[5][256];
 
 #if defined( WAVES )
-groupshared int s_row;
+groupshared int  s_row;
+groupshared int2 s_jobRange[32];   // the intra jobs of the 32 CTUs being walked: [first, end)
+
+// The intra jobs of CTU ctu: from the first job of its first CU up to the first job of the next CTU's first CU
+int2 intraJobRange( int ctu )
+{
+  const int first = int( pc.ctus[ctu * 4] );
+  const int count = int( pc.ctus[ctu * 4 + 1] & 0xffff );
+  if( count == 0 )
+  {
+    return int2( 0, 0 );
+  }
+  const int begin = int( pc.blocks[( first >> 8 ) * kLists + 2] + pc.counts[first * kLists + 2] );
+  const int next  = first + count;
+  const int end   = next < pc.numCus ? int( pc.blocks[( next >> 8 ) * kLists + 2] + pc.counts[next * kLists + 2] )
+                                     : int( pc.blocks[pc.numBlocks * kLists + 2] );
+  return int2( begin, min( end, pc.capIntra ) );
+}
 
 // WAVES: one workgroup of 32 threads per CTU row; the rows are taken in order (from a counter) and run as the
-// wavefront of vvdec's CTU tasks.
+// wavefront of vvdec's CTU tasks: a CTU with intra jobs waits until the row above is past the CTU above-right (its
+// jobs read samples up to there). A CTU without intra jobs reads and writes no wave, so it waits for nothing.
 [shader( "compute" )]
 [numthreads( 32, 1, 1 )]
 void main( uint3 local : SV_GroupThreadID )
@@ -1883,36 +1901,35 @@ void main( uint3 local : SV_GroupThreadID )
   }
   for( int col = 0; col < pc.widthInCtus; col++ )
   {
-    if( row > 0 )
+    // every 32 CTUs, each thread reads one CTU's range of jobs
+    if( ( col & 31 ) == 0 )
     {
-      if( lane == 0 )
-      {
-        const uint need = uint( min( col + 2, pc.widthInCtus ) );
-        while( pc.progress[row - 1].load( MemoryOrder.Relaxed ) < need )
-        {
-        }
-      }
-      AllMemoryBarrierWithGroupSync();
+      GroupMemoryBarrierWithGroupSync();   // (the ranges before read)
+      s_jobRange[lane] = col + lane < pc.widthInCtus ? intraJobRange( row * pc.widthInCtus + col + lane ) : int2( 0, 0 );
+      GroupMemoryBarrierWithGroupSync();
     }
-    const int ctu   = row * pc.widthInCtus + col;
-    const int first = int( pc.ctus[ctu * 4] );
-    const int count = int( pc.ctus[ctu * 4 + 1] & 0xffff );
-    if( count > 0 )
+    const int2 range = s_jobRange[col & 31];
+    if( range.x < range.y )
     {
-      // The CTU's intra jobs: from the first job of its first CU up to the first job of the next CTU's first CU
-      const int b0    = first >> 8;
-      const int begin = int( pc.blocks[b0 * kLists + 2] + pc.counts[first * kLists + 2] );
-      const int next  = first + count;
-      const int end   = next < pc.numCus ? int( pc.blocks[( next >> 8 ) * kLists + 2] + pc.counts[next * kLists + 2] )
-                                         : int( pc.blocks[pc.numBlocks * kLists + 2] );
-      for( int j = begin; j < min( end, pc.capIntra ); j++ )
+      if( row > 0 )
+      {
+        if( lane == 0 )
+        {
+          const uint need = uint( min( col + 2, pc.widthInCtus ) );
+          while( pc.progress[row - 1].load( MemoryOrder.Relaxed ) < need )
+          {
+          }
+        }
+        AllMemoryBarrierWithGroupSync();
+      }
+      for( int j = range.x; j < range.y; j++ )
       {
         jobWaveP( pc.intra + j * 12, lane );
         // (the job's wave-map units are written before the next job reads them)
         workgroupBarrierAll();
       }
+      AllMemoryBarrierWithGroupSync();   // (the CTU's waves visible to the rows below)
     }
-    AllMemoryBarrierWithGroupSync();
     if( lane == 0 )
     {
       pc.progress[row].store( uint( col + 1 ), MemoryOrder.Release );
