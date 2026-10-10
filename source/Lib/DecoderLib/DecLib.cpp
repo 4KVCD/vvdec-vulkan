@@ -330,15 +330,16 @@ void DecLib::destroy()
     {
       if( parse.prof[0] != 0 )
       {
+        // the parts in the device clock's ticks (100 MHz on AMD: shown as ms), decodeBin's in the subgroup's cycles
+        const auto ms = [&]( int k ) { return double( parse.prof[k] ) / 1e5; };
         msg( INFO,
-             "GPU: parse's profile (clock cycles of the subgroup): CTUs %llu, of which CUs %llu (residuals %llu, of which levels written %llu), "
-             "records %llu, SAO/ALF %llu; in decodeBin %llu, decodeBinEP %llu; bins %llu context-coded, %llu bypass; CUs %llu, TUs %llu, coded "
-             "blocks %llu, levels %llu" "\n",
-             (unsigned long long) parse.prof[0], (unsigned long long) parse.prof[1], (unsigned long long) parse.prof[2],
-             (unsigned long long) parse.prof[3], (unsigned long long) parse.prof[4], (unsigned long long) parse.prof[5],
-             (unsigned long long) parse.prof[6], (unsigned long long) parse.prof[7], (unsigned long long) parse.prof[8],
-             (unsigned long long) parse.prof[9], (unsigned long long) parse.prof[10], (unsigned long long) parse.prof[11],
-             (unsigned long long) parse.prof[12], (unsigned long long) parse.prof[13] );
+             "GPU: parse's profile, summed over the substreams: dispatches %.1f ms (their starts %.1f ms), CTUs %.1f ms, of which CUs %.1f ms "
+             "(residuals %.1f ms, of which levels written %.1f ms), records %.1f ms, SAO/ALF %.1f ms; decodeBin %llu cycles, decodeBinEP %llu; "
+             "bins %llu context-coded, %llu bypass; CUs %llu, TUs %llu, coded blocks %llu, levels %llu" "\n",
+             ms( 14 ), ms( 15 ), ms( 0 ), ms( 1 ), ms( 2 ), ms( 3 ), ms( 4 ), ms( 5 ), (unsigned long long) parse.prof[6],
+             (unsigned long long) parse.prof[7], (unsigned long long) parse.prof[8], (unsigned long long) parse.prof[9],
+             (unsigned long long) parse.prof[10], (unsigned long long) parse.prof[11], (unsigned long long) parse.prof[12],
+             (unsigned long long) parse.prof[13] );
       }
     }
     if( parseOn )

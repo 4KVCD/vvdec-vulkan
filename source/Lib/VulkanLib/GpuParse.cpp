@@ -655,10 +655,11 @@ bool checkParseContexts()
     { "TsLrg1Flag", Ctx::TsLrg1Flag(), CTX_TsLrg1Flag },
     { "TsResidualSign", Ctx::TsResidualSign(), CTX_TsResidualSign },
   };
-  bool ok = checkParseScans() && Ctx::NumberOfContexts == unsigned( CTX_COUNT );
-  if( !ok )
+  bool ok = checkParseScans();   // (it prints the scans that differ)
+  if( Ctx::NumberOfContexts != unsigned( CTX_COUNT ) )
   {
     msg( WARNING, "GPU parse: %u contexts, parsectx.slang has %d\n", Ctx::NumberOfContexts, CTX_COUNT );
+    ok = false;
   }
   for( const Set& s: sets )
   {
@@ -712,7 +713,7 @@ void captureSaoAlf( const CodingStructure& cs, int ctuRsAddr, uint32_t out[7] )
 }
 
 void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint32_t* gpuTus, const uint32_t* gpuCtus, const uint32_t* gpuCtuOut,
-                   const uint32_t* gpuTotals, const std::vector<std::vector<CuRecord>>& cpuCus, const std::vector<std::vector<TuRecord>>& cpuTus,
+                   const std::vector<std::vector<CuRecord>>& cpuCus, const std::vector<std::vector<TuRecord>>& cpuTus,
                    const std::vector<uint32_t>& cpuSaoAlf, const uint32_t* levels, uint32_t errors, ParseStats& stats )
 {
   const PreCalcValues& pcv  = *cs.pcv;
@@ -815,7 +816,6 @@ void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint
     }
   }
   // The levels, as parsecompact.slang's check counted them
-  (void) gpuTotals;
   stats.levelsCompared += levels[0];
   stats.levelsDiffer += levels[1];
   if( levels[1] != 0 && stats.reported < 20 )

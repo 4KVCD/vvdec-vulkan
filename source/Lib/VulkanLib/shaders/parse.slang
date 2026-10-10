@@ -129,13 +129,21 @@ static const int kProfCus      = 10;   // the CUs
 static const int kProfTus      = 11;   // the TUs
 static const int kProfBlocks   = 12;   // the coded blocks (residual_coding calls)
 static const int kProfLevelsN  = 13;   // the nonzero levels
+static const int kProfDispatch = 14;   // whole dispatches (each substream's, from its start to its state saved)
+static const int kProfStart    = 15;   // their starts: the picture, the slice, the contexts, the state restored
 static const int kProfWords    = 16;   // the size of the table of counters
 
-// PROF_BEGIN starts timing a part, PROF_END adds the part's cycles to counter k, and PROF_COUNT adds v to counter k.
+// PROF_BEGIN starts timing a part, PROF_END adds the part's time to counter k, and PROF_COUNT adds v to counter k.
+// The long parts take the device's real-time clock (units of 10 ns on AMD); decodeBin and decodeBinEP take the
+// subgroup's cycle clock (PROF_BEGIN_CYCLES, PROF_END_CYCLES), which on RDNA counts only 20 bits of cycles (~0.4 ms).
 // The workgroup sums its counters in g_prof and adds them to pc.prof at the end. Without PROFILE the macros vanish.
 #if PROFILE
 static uint g_prof[kProfWords];
 uint profClock()
+{
+  return getRealtimeClock().x;
+}
+uint profCycles()
 {
   return clock2x32ARB().x;
 }
@@ -143,13 +151,16 @@ void profAdd( int k, uint v )
 {
   g_prof[k] += v;
 }
-// (On RDNA the subgroup clock counts 20 bits of cycles, so PROF_END takes the difference modulo 2^20.)
 #  define PROF_BEGIN( name ) const uint name = profClock()
-#  define PROF_END( k, name ) profAdd( k, ( profClock() - name ) & 0xfffffu )
+#  define PROF_END( k, name ) profAdd( k, profClock() - name )
+#  define PROF_BEGIN_CYCLES( name ) const uint name = profCycles()
+#  define PROF_END_CYCLES( k, name ) profAdd( k, ( profCycles() - name ) & 0xfffffu )
 #  define PROF_COUNT( k, v ) profAdd( k, uint( v ) )
 #else
 #  define PROF_BEGIN( name )
 #  define PROF_END( k, name )
+#  define PROF_BEGIN_CYCLES( name )
+#  define PROF_END_CYCLES( k, name )
 #  define PROF_COUNT( k, v )
 #endif
 
@@ -359,8 +370,6 @@ static const int COEF_REMAIN_BIN_REDUCTION = 5;
 static const int SBH_THRESHOLD = 4;
 static const int CU_DQP_TU_CMAX = 5;
 
-// BinDecoder's m_RenormTable_32. decodeBin works out the same shift with firstbithigh, so this table is not used.
-static const uint kRenormTable[32] = { 6, 5, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
 // g_uiGroupIdx: the group (the value of last_sig_coeff_x/y_prefix) of each last position
 static const int  kGroupIdx[64] = { 0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
                                     10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
@@ -392,8 +401,8 @@ static const int  kBcwInternFwd[5]    = { 1, 2, 0, 3, 4 };
 static int g_lane = 0;   // the thread's lane (0..31); loops over a block's units take every 32nd unit from it
 
 // The picture's parameters (loadPicture); sizes in luma samples, g_csx and g_csy the chroma subsampling shifts
-static int  g_widthInCtus, g_heightInCtus, g_log2Ctu, g_ctuSize, g_width, g_height, g_widthIn4;
-static int  g_chromaFormat, g_csx, g_csy, g_qpBdOffset, g_log2MinCb, g_maxTbSize, g_wpp, g_log2MaxTs, g_tools;
+static int  g_widthInCtus, g_log2Ctu, g_ctuSize, g_width, g_height;
+static int  g_chromaFormat, g_csx, g_csy, g_qpBdOffset, g_log2MinCb, g_maxTbSize, g_log2MaxTs, g_tools;
 static int  g_cuSlots, g_tuSlots, g_tileCols, g_log2MaxTb;
 // The substream's slice: its index, type, QP and flags (kSl...), and whether it uses the dual tree
 static int  g_slice, g_sliceType, g_sliceQp, g_sliceFlags;
@@ -525,9 +534,9 @@ uint decodeBin( int ctxId )
   PROF_COUNT( kProfBins, 1 );
   g_binCount++;
 #if PROFILE
-  PROF_BEGIN( binStart );
+  PROF_BEGIN_CYCLES( binStart );
   const uint bin = decodeBinBody( ctxId );
-  PROF_END( kProfDecode, binStart );
+  PROF_END_CYCLES( kProfDecode, binStart );
   return bin;
 }
 
@@ -579,9 +588,9 @@ uint decodeBinEP()
   PROF_COUNT( kProfBinsEP, 1 );
   g_binCount++;
 #if PROFILE
-  PROF_BEGIN( epStart );
+  PROF_BEGIN_CYCLES( epStart );
   const uint bin = decodeBinEPBody();
-  PROF_END( kProfDecodeEP, epStart );
+  PROF_END_CYCLES( kProfDecodeEP, epStart );
   return bin;
 }
 
@@ -828,12 +837,10 @@ void loadPicture()
   }
   GroupMemoryBarrierWithGroupSync();
   g_widthInCtus  = picWord( kPicWidthInCtus );
-  g_heightInCtus = picWord( kPicHeightInCtus );
   g_log2Ctu      = picWord( kPicLog2Ctu );
   g_ctuSize      = 1 << g_log2Ctu;
   g_width        = picWord( kPicWidth );
   g_height       = picWord( kPicHeight );
-  g_widthIn4     = ( g_width + 3 ) >> 2;
   g_chromaFormat = picWord( kPicChromaFormat );
   g_csx          = g_chromaFormat == 1 || g_chromaFormat == 2 ? 1 : 0;
   g_csy          = g_chromaFormat == 1 ? 1 : 0;
@@ -841,7 +848,6 @@ void loadPicture()
   g_log2MinCb    = picWord( kPicLog2MinCb );
   g_maxTbSize    = picWord( kPicMaxTbSize );
   g_log2MaxTb    = firstbithigh( uint( g_maxTbSize ) );
-  g_wpp          = picWord( kPicWpp );
   g_log2MaxTs    = picWord( kPicLog2MaxTs );
   g_tools        = picWord( kPicTools );
   g_cuSlots      = picWord( kPicCuSlots );
@@ -943,6 +949,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   {
     pc.sync[0].add( 1u );   // (counts this run of the substream)
   }
+  PROF_BEGIN( dispatchStart );
   loadPicture();
   g_error = false;
 #if PROFILE
@@ -995,6 +1002,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     prevQp[1]       = int( uni( state[kStQp1] ) );
     g_csChromaQpAdj = int( uni( state[kStCqpAdj] ) );
   }
+  PROF_END( kProfStart, dispatchStart );
   g_binCount  = 0;
   for( int i = 0; i < 5; i++ )
   {
@@ -1060,6 +1068,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       break;
     }
   }
+  PROF_END( kProfDispatch, dispatchStart );
 #if PROFILE
   if( g_lane == 0 )
   {

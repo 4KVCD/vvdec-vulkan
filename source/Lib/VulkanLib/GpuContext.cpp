@@ -340,9 +340,16 @@ bool Context::init()
       hasShaderClock |= strcmp( extension.extensionName, shaderClock ) == 0;
     }
   }
-  // and the subgroup's clock, for the parse's profile (shaders/parse.slang's PROFILE)
+  // and the subgroup's clock and the device's, for the parse's profile (shaders/parse.slang's PROFILE)
   VkPhysicalDeviceShaderClockFeaturesKHR enableClock{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR };
-  enableClock.shaderSubgroupClock = VK_TRUE;
+  if( hasShaderClock )
+  {
+    VkPhysicalDeviceFeatures2 features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    features.pNext = &enableClock;
+    m_api.vkGetPhysicalDeviceFeatures2( m_physical, &features );
+    hasShaderClock = enableClock.shaderSubgroupClock && enableClock.shaderDeviceClock;
+    enableClock.pNext = nullptr;
+  }
   if( hasShaderClock )
   {
     enableClock.pNext = enable.pNext;

@@ -303,7 +303,7 @@ void GpuRecon::compareParse( const CodingStructure& cs, const std::vector<std::v
     return;
   }
   gpu::compareParse( cs, reinterpret_cast<const uint32_t*>( m_parse.outCus.mapped ), reinterpret_cast<const uint32_t*>( m_parse.outTus.mapped ),
-                     reinterpret_cast<const uint32_t*>( m_parse.outCtus.mapped ), slot.ctuOut(), slot.totals(), cus, tus, cs.m_gpuSaoAlf,
+                     reinterpret_cast<const uint32_t*>( m_parse.outCtus.mapped ), slot.ctuOut(), cus, tus, cs.m_gpuSaoAlf,
                      reinterpret_cast<const uint32_t*>( m_parse.check.mapped ), slot.errors(), stats );
   // The room of the front end's job lists, as the parse added it up, against gpu::frontCapacities of the CPU's records
   const FrontCapacities  cpu = frontCapacities( cs, cus, tus );

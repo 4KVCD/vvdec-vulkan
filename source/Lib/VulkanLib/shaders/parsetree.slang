@@ -164,7 +164,6 @@ struct Part
   int top;   // the current level, the top of the stack
   int currDepth;
   int currQtDepth;
-  int currTrDepth;
   int currSubdiv;
   int currMtDepth;
   int currImplicitBtDepth;
@@ -253,9 +252,6 @@ void setNeighborCu( int l )
 {
   const int  ch = g_p.treeType == TREE_C ? 1 : g_p.chType;
   const int4 a  = partArea( uni( s_lvSplit[l] ), uni( s_lvIdx[l] ), int4( uni( s_lvArea[l].x ), uni( s_lvArea[l].y ), uni( s_lvArea[l].z ), uni( s_lvArea[l].w ) ) );
-  if( g_lane == 0 )
-  {
-  }
   s_lvAbove[l] = cuAt( a.x, a.y - stepY( ch ), ch );
   s_lvLeft[l]  = cuAt( a.x - stepX( ch ), a.y, ch );
 }
@@ -265,7 +261,6 @@ void initCtu( int chType )
 {
   g_p.top                 = 0;
   g_p.currDepth           = 0;
-  g_p.currTrDepth         = 0;
   g_p.currMtDepth         = 0;
   g_p.currQtDepth         = 0;
   g_p.currSubdiv          = 0;
@@ -313,14 +308,12 @@ void splitCurrArea( int split )
   s_lvArea[l]               = area;
   if( split == CU_QUAD_SPLIT )
   {
-    g_p.currTrDepth = 0;
     g_p.currMtDepth = 0;
     g_p.currQtDepth++;
     g_p.currSubdiv++;
   }
   else if( split == CU_HORZ_SPLIT || split == CU_VERT_SPLIT )
   {
-    g_p.currTrDepth = 0;
     if( isImplicit )
     {
       g_p.currImplicitBtDepth++;
@@ -329,7 +322,6 @@ void splitCurrArea( int split )
   }
   else
   {
-    g_p.currTrDepth = 0;
     g_p.currMtDepth++;
     g_p.currSubdiv++;
   }

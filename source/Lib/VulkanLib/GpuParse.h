@@ -142,13 +142,13 @@ struct ParseStats
 };
 // Compares the GPU's parse of a picture with the CPU's, adds the counts to stats and prints the first differences.
 // gpuCus, gpuTus: the GPU's CU and TU records in raster order of the CTUs (gathered by parsecompact.slang); gpuCtus:
-// its CTU records; gpuCtuOut: parse.slang's ctuOut words; gpuTotals: the numbers of CUs and TUs (not used).
+// its CTU records; gpuCtuOut: parse.slang's ctuOut words.
 // cpuCus, cpuTus: the CPU's records, CTU by CTU; cpuSaoAlf: the CPU's SAO and ALF parameters, 7 words per CTU
 // (captureSaoAlf's; empty when they were not captured). levels: the levels check's counts (the levels compared, the
 // levels that differ, the index + 1 of the first TU found to differ, a component of it that differs). errors: the
 // number of substreams that gave up or were left unparsed.
 void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint32_t* gpuTus, const uint32_t* gpuCtus, const uint32_t* gpuCtuOut,
-                   const uint32_t* gpuTotals, const std::vector<std::vector<CuRecord>>& cpuCus, const std::vector<std::vector<TuRecord>>& cpuTus,
+                   const std::vector<std::vector<CuRecord>>& cpuCus, const std::vector<std::vector<TuRecord>>& cpuTus,
                    const std::vector<uint32_t>& cpuSaoAlf, const uint32_t* levels, uint32_t errors, ParseStats& stats );
 
 }   // namespace gpu
