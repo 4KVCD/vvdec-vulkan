@@ -220,7 +220,7 @@ void DecSlice::parseSlice( Slice* slice, InputBitstream* bitstream, int threadId
 }
 
 #if VVDEC_VULKAN
-void DecSlice::claimSlice( Slice* slice )
+bool DecSlice::claimSlice( Slice* slice )
 {
   Picture*         pic = slice->getPic();
   CodingStructure& cs  = *pic->cs;
@@ -244,6 +244,8 @@ void DecSlice::claimSlice( Slice* slice )
       pic->parseDone.unlock();
     }
   }
+  const int ctus = int( slice->getNumCtuInSlice() );
+  return pic->gpuClaimedCtus.fetch_add( ctus ) + ctus == int( pic->cs->pcv->sizeInCtus );
 }
 #endif
 

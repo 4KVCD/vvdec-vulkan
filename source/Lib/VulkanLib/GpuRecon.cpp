@@ -875,7 +875,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   }
 
   // The GPU front end on the async compute queue, alongside the work submitted before
-  const bool frontEndAsync = jobs.useFrontEnd && jobs.cus && m_cmdFrontEnd1 != VK_NULL_HANDLE;
+  const bool frontEndAsync = jobs.useFrontEnd && ( jobs.cus || jobs.parsed ) && m_cmdFrontEnd1 != VK_NULL_HANDLE;
   if( frontEndAsync )
   {
     recordFrontEndAsync( cs, jobs );
@@ -947,7 +947,7 @@ void GpuRecon::recordFirstPart( const CodingStructure& cs, const PictureJobs& jo
   {
     recordParse( cs, jobs, hostPlanes( pic ) );
   }
-  if( jobs.cus && !frontEndAsync )
+  if( ( jobs.cus || jobs.parsed ) && !frontEndAsync )
   {
     recordFrontEnd( cs, jobs );
   }

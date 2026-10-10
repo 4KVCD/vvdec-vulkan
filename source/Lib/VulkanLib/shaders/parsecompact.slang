@@ -1,9 +1,13 @@
-// Runs after the GPU's parse (parse.slang), which leaves each CTU's CU and TU records in slots reserved for the CTU.
-// This shader gathers them in raster order of the CTUs, the layout the host gives the CPU's parse's records
-// (GpuFrontEnd.cpp's writeCuRecords and writeCtuRecords), so that the two can be compared word for word:
-// - pass 0 (one workgroup of 1024 threads) writes the CTU records: each CTU's first CU and first TU are the prefix
-//   sums of the CTUs' counts, which it works out 1024 CTUs at a time; it also writes the totals;
-// - pass 1 (one workgroup per CTU) copies the CTU's records from its slots to their place.
+// Runs after the GPU's parse (parse.slang), which leaves the CU and TU records staged wherever there was room, each
+// with a meta word (its CTU and its index in the CTU). This shader puts them in raster order of the CTUs, the layout
+// the host gives the CPU's parse's records (GpuFrontEnd.cpp's writeCuRecords and writeCtuRecords), which the front end
+// reads and the check compares word for word:
+// - pass 0 (one workgroup of 1024 threads), once every CTU is parsed, writes the CTU records: each CTU's first CU and
+//   first TU are the prefix sums of the CTUs' counts, which it works out 1024 CTUs at a time; it also writes the
+//   totals, with the parse's counters (the host records it after each round of the parse's dispatches, so it does
+//   nothing until the picture is parsed);
+// - passes 1 and 2 copy the staged CU and TU records to their places (32 CU records or 64 TU records a workgroup),
+//   pass 3 copies the CTU records (256 a workgroup) beside them.
 // The CHECK variant compares the coefficient levels the GPU's parse left with those the CPU's parse left in the
 // picture, over the rectangles of each TU's coded blocks that the transforms read (one workgroup per TU), and counts
 // the differences. GpuReconParse.cpp records both after the parse's own submissions.
@@ -109,26 +113,32 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 #else
 struct Params
 {
-  uint* cusIn;      // parse.slang's CU records, cuSlots slots per CTU
-  uint* tusIn;      // parse.slang's TU records, tuSlots slots per CTU
+  uint* cusIn;      // parse.slang's staged CU records (32 words each)
+  uint* tusIn;      // its staged TU records (16 words each)
+  uint* cuMeta;     // per staged CU record: its CTU << kLocalBits | its index among the CTU's CUs
+  uint* tuMeta;     // per staged TU record: its CTU << kLocalBits | its index among the CTU's TUs
   uint* ctuOut;     // parse.slang's ctuOut, 16 words per CTU: its numbers of CUs and TUs first
   uint* ctuInfo;    // per CTU, 2 words: its slice; its tile | 1 << 16 if it is in its tile's first column
-  uint* cus;        // out: the CU records in raster order of the CTUs
-  uint* tus;        // out: the TU records in raster order of the CTUs
-  uint* ctus;       // out: the CTU records (CtuRecord, 4 words each)
-  uint* totals;     // out: the total numbers of CUs and TUs
+  uint* sync;       // parse.slang's sync: [2 + CTU] is 1 once the CTU is parsed
+  uint* counters;   // parse.slang's counters: the staged CU and TU records, the job lists' room (5 words)
+  uint* cus;        // out (pass 1): the CU records in raster order of the CTUs
+  uint* tus;        // out (pass 2): the TU records in raster order of the CTUs
+  uint* ctus;       // the CTU records (CtuRecord, 4 words each): pass 0 writes them, passes 1 to 3 read them
+  uint* ctusOut;    // out (pass 3): a copy of the CTU records
+  uint* totals;     // out (pass 0): the numbers of CUs and TUs, then the parse's 7 counters
   int   numCtus;
-  int   cuSlots;
-  int   tuSlots;
-  int   pass;       // 0 or 1
-  int   cuCap;      // the room in cus and tus, in records (the CPU's numbers); records past it are dropped
-  int   tuCap;
+  int   numCus;     // the CU records staged (passes 1 to 3)
+  int   numTus;     // the TU records staged
+  int   pass;       // 0: the CTU records and totals; 1: the CU records; 2: the TU records; 3: the CTU records' copy
 };
 
 [[vk::push_constant]] Params pc;
 
+static const uint kLocalBits = 12;   // parse.slang's: the bits of a meta word below the CTU
+
 groupshared uint s_cus[1024];   // pass 0: the prefix sums of a chunk of 1024 CTUs' numbers of CUs and TUs
 groupshared uint s_tus[1024];
+groupshared uint s_parsed;      // pass 0: 1 while every CTU looked at is parsed
 
 [shader( "compute" )]
 [numthreads( 1024, 1, 1 )]
@@ -137,8 +147,26 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int tid = int( local.x );
   if( pc.pass == 0 )
   {
-    // Pass 0: one workgroup goes through the CTUs 1024 at a time, one per thread; baseCu and baseTu count the CUs and
-    // TUs of the chunks before
+    // Pass 0, once every CTU is parsed (a substream marks each of its CTUs parsed, also those it gave up on)
+    if( tid == 0 )
+    {
+      s_parsed = 1;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for( int ctu = tid; ctu < pc.numCtus; ctu += 1024 )
+    {
+      if( pc.sync[2 + ctu] == 0 )
+      {
+        s_parsed = 0;
+      }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if( s_parsed == 0 )
+    {
+      return;
+    }
+    // One workgroup goes through the CTUs 1024 at a time, one per thread; baseCu and baseTu count the CUs and TUs of
+    // the chunks before
     uint baseCu = 0;
     uint baseTu = 0;
     for( int chunk = 0; chunk < pc.numCtus; chunk += 1024 )
@@ -177,28 +205,44 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       pc.totals[0] = baseCu;
       pc.totals[1] = baseTu;
+      for( int i = 0; i < 7; i++ )
+      {
+        pc.totals[2 + i] = pc.counters[i];
+      }
     }
     return;
   }
-  // Pass 1: workgroup i copies CTU i's CU and TU records to their place, as far as cus and tus have room
-  const int  ctu     = int( group.x ) + int( group.y ) * 32768;
-  if( ctu >= pc.numCtus )
+  const uint first = ( group.x + group.y * 32768u ) * 1024u;   // the workgroup's first word of the records copied
+  if( pc.pass == 1 )
   {
-    return;
+    // Pass 1: each 32 threads copy a staged CU record to its place: its CTU's first CU + its index in the CTU
+    const uint i = ( first + uint( tid ) ) / 32u;
+    if( i < uint( pc.numCus ) )
+    {
+      const uint meta = pc.cuMeta[i];
+      const uint at   = pc.ctus[( meta >> kLocalBits ) * 4u] + ( meta & ( ( 1u << kLocalBits ) - 1u ) );
+      pc.cus[at * 32u + uint( tid & 31 )] = pc.cusIn[i * 32u + uint( tid & 31 )];
+    }
   }
-  const uint nc      = pc.ctuOut[ctu * 16];
-  const uint nt      = pc.ctuOut[ctu * 16 + 1];
-  const uint firstCu = pc.ctus[ctu * 4];
-  const uint firstTu = pc.ctus[ctu * 4 + 3];
-  const uint cuEnd   = min( firstCu + nc, uint( pc.cuCap ) );
-  const uint tuEnd   = min( firstTu + nt, uint( pc.tuCap ) );
-  for( uint i = uint( tid ); firstCu + i / 32u < cuEnd; i += 1024u )
+  else if( pc.pass == 2 )
   {
-    pc.cus[firstCu * 32u + i] = pc.cusIn[uint( ctu * pc.cuSlots ) * 32u + i];
+    // Pass 2: each 16 threads copy a staged TU record to its place: its CTU's first TU + its index in the CTU
+    const uint i = ( first + uint( tid ) ) / 16u;
+    if( i < uint( pc.numTus ) )
+    {
+      const uint meta = pc.tuMeta[i];
+      const uint at   = pc.ctus[( meta >> kLocalBits ) * 4u + 3u] + ( meta & ( ( 1u << kLocalBits ) - 1u ) );
+      pc.tus[at * 16u + uint( tid & 15 )] = pc.tusIn[i * 16u + uint( tid & 15 )];
+    }
   }
-  for( uint i = uint( tid ); firstTu + i / 16u < tuEnd; i += 1024u )
+  else
   {
-    pc.tus[firstTu * 16u + i] = pc.tusIn[uint( ctu * pc.tuSlots ) * 16u + i];
+    // Pass 3: the CTU records copied, a word a thread
+    const uint w = first + uint( tid );
+    if( w < uint( pc.numCtus ) * 4u )
+    {
+      pc.ctusOut[w] = pc.ctus[w];
+    }
   }
 }
 #endif

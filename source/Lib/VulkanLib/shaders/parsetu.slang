@@ -99,8 +99,8 @@ void setMaxScanPos( int t, int comp, int x, int y )
 }
 
 // Adds a TU to the current CU (CodingStructure::addTU) with its luma block (in luma samples) and its chroma block (in
-// chroma samples), each when valid. Returns the TU's index in the CU, or -1, giving up the substream, when the CTU's
-// slots or the CU's room are full.
+// chroma samples), each when valid. Returns the TU's index in the CU, or -1, giving up the substream, when the CTU
+// has more TUs than a CTU can have (g_tuSlots) or the CU more than kMaxCuTus.
 int addTu( int4 luma, bool lumaValid, int4 chroma, bool chromaValid )
 {
   if( g_numTus >= g_tuSlots || g_cu.numTus >= kMaxCuTus )
@@ -124,16 +124,23 @@ int addTu( int4 luma, bool lumaValid, int4 chroma, bool chromaValid )
   return t;
 }
 
-// Stores the CU's TU records in the CTU's TU slots, after those of the CTU's earlier CUs
-void writeTuRecords()
+// Writes the CU's TU records as the staged records from at on (as far as there is room), each with its meta word: the
+// CTU << kLocalBits | the TU's index among the CTU's TUs
+void writeTuRecords( uint at )
 {
   for( int t = 0; t < g_cu.numTus; t++ )
   {
-    uint* r = pc.tus + uint( g_ctu * g_tuSlots + g_cu.firstTu + t ) * 16u;
+    const uint i = at + uint( t );
+    if( i >= uint( pc.tuCap ) )
+    {
+      break;
+    }
+    uint* r = pc.tus + i * 16u;
     for( int w = 0; w < 16; w++ )
     {
       r[w] = tuWord( t, w );
     }
+    pc.tuMeta[i] = uint( g_ctu ) << kLocalBits | uint( g_cu.firstTu + t );
   }
 }
 

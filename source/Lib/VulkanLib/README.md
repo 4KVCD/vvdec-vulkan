@@ -1,9 +1,10 @@
 # VulkanLib: reconstructing VVC pictures on the GPU
 
 With `vvdecParams::gpu` set (`vvdecapp --gpu 1`), vvdec reconstructs pictures with Vulkan compute shaders. The
-output is bit-exact with the CPU decoder. The CPU still parses the bitstream (CABAC), handles the parameter sets,
-picture and slice headers and reference picture lists, and records and submits the GPU work. This document is the
-overview; each source file and each shader starts with a description of its own part.
+output is bit-exact with the CPU decoder. The CPU handles the parameter sets, picture and slice headers and reference
+picture lists, and records and submits the GPU work. It also parses the slice data (CABAC), unless
+`VVDEC_GPU_PARSE=2` hands that to the GPU too (see "The GPU parse" below). This document is the overview; each
+source file and each shader starts with a description of its own part.
 
 ## The three paths
 
@@ -22,14 +23,37 @@ The path is chosen per picture in `DecLibRecon::decompressPicture`.
 `VVDEC_GPU_MIDER=1` runs path 2 and the GPU front end side by side, and compares the GPU's motion, deblocking
 parameters, job lists and edges with the CPU's (`GpuRecon::compareFrontEnd`). It is a debugging aid.
 
+## The GPU parse
+
+`parse.slang` parses the slice data on the GPU: one workgroup of 32 threads per substream (a slice, a tile, or a
+CTU row with WPP), in dispatches of a bounded number of bins each, resumed where they stopped (a single long
+dispatch or submission would be cut short by the driver or reset by Windows). It writes what the CPU's parse
+writes: the CU and TU records, the coefficient levels in the picture's host planes, and each CTU's SAO and ALF
+parameters. The records are **staged** wherever the picture's counters give them room, each with its CTU and its
+place in the CTU; `parsecompact.slang` then works out each CTU's first CU and TU in raster order (pass 0, once the
+picture is parsed) and copies the records there (the **scatter**). The parse also adds up the room the front end's
+job lists need (`gpu::frontCapacities`).
+
+- `VVDEC_GPU_PARSE=1`: the check. The CPU parses as usual, and each picture is also parsed on the GPU, in its own
+  submissions on the compute queue (`GpuRecon::recordParse`); the records, levels, SAO and ALF parameters and the
+  job lists' room are compared with the CPU's (`GpuRecon::compareParse`).
+- `VVDEC_GPU_PARSE=2`: the GPU parses instead of the CPU (with path 1). The CPU's parse task only keeps the slice
+  data and marks the slice's CTUs parsed (`DecSlice::claimSlice`); once a picture's last slice is in, it goes to
+  the **ParseService** (`GpuParseService.h`). Its thread parses many pictures ahead of their reconstruction at a
+  time: each submission on the **parse queue** (an async compute queue of its own) holds a few dispatches of every
+  picture it is parsing, side by side, and each picture's compaction pass 0. A picture whose parse is done unlocks
+  `Picture::gpuParsed`; its front end then scatters the records from the picture's **parse slot** into its own
+  buffers, waiting for the parse queue's timeline semaphore. The slot is reused once the picture's first part is
+  done on the GPU.
+
 ## A picture's journey (path 1)
 
 **Tasks** (`DecLibRecon`, on the decoder's thread pool):
 
 | task | runs when | does |
 |---|---|---|
-| CTU tasks | the picture is parsed | write the CU and TU records |
-| `filterParamsTask` | the picture is parsed | works out the SAO, ALF and deblocking parameters (`GpuRecon::prepareFilters`) |
+| CTU tasks | the picture is parsed | write the CU and TU records (nothing with `VVDEC_GPU_PARSE=2`) |
+| `filterParamsTask` | the picture is parsed (with `VVDEC_GPU_PARSE=2`: `gpuParsed`) | works out the SAO, ALF and deblocking parameters (`GpuRecon::prepareFilters`; with `VVDEC_GPU_PARSE=2` first the CTUs' SAO and ALF parameters from the GPU's parse) |
 | `queueGpuTask` | its CTU tasks are done and every reference picture's GPU work is queued (`gpuRefReady`) | records and submits the picture's GPU work (`GpuRecon::startPicture`), then unlocks the picture's `gpuRefReady` |
 | `computeDoneTask` | the picture's GPU work is queued | waits for the GPU's compute work (`GpuRecon::endCompute`), then unlocks `gpuComputeDone`: the decoder instance may take its next picture |
 | `finishGpuTask` | `gpuComputeDone` | waits for the picture's download to host memory (`GpuRecon::endDownload`) |
@@ -38,7 +62,8 @@ parameters, job lists and edges with the CPU's (`GpuRecon::compareFrontEnd`). It
 
 | queue | submission | contents | waits for |
 |---|---|---|---|
-| async compute (one per decoder instance) | front end, part 1 | motion, colocated motion, job lists | the first parts of the picture's colocated pictures (the timeline semaphore) |
+| parse (`VVDEC_GPU_PARSE=2`) | the ParseService's | a few parse dispatches of each picture being parsed, their compaction pass 0 | the submission before (the service waits for each) |
+| async compute (one per decoder instance) | front end, part 1 | the scatter of the GPU's parse's records (`VVDEC_GPU_PARSE=2`), motion, colocated motion, job lists | the first parts of the picture's colocated pictures (the timeline semaphore); the picture's parse (the parse queue's timeline semaphore) |
 | async compute | front end, part 2 | intra order, deblocking parameters, deblocking edges | front end part 1 (same queue) |
 | compute | first part | uploads of reference pictures the CPU made, residuals, inter prediction (DMVR writes its refined motion into the colocated motion) | front end part 1; then signals the timeline semaphore |
 | compute | rest | intra prediction, LMCS's inverse mapping, deblocking, SAO, ALF and CC-ALF | front end part 2 |
@@ -63,6 +88,10 @@ output frames, not to the reference pictures.
 - **front end**: everything between parsing and reconstruction: motion derivation, deblocking parameters, job
   lists, intra order, deblocking edges.
 - **records**: the per-CU, per-TU and per-CTU words the CPU's parse writes for the GPU front end (`GpuFrontEnd.h`).
+- **staged records, scatter**: the GPU parse's records where they were written, each with its CTU and its place in
+  the CTU, and their copy to raster order (`parsecompact.slang`).
+- **parse slot**: everything of one picture's parse on the GPU (`ParseSlot`): its inputs, its substreams' state, its
+  staged records, its CTUs' counts and SAO and ALF parameters.
 - **jobs**: the work items of a reconstruction pass (`GpuJobs.h`): `TrafoJob`, `InterJob`, `IntraJob`.
 - **waves**: groups of intra jobs that may run at the same time; a job's wave is one more than the highest wave
   of the blocks it reads from.
@@ -81,6 +110,8 @@ output frames, not to the reference pictures.
 | `VVDEC_GPU_FRONT=0` | path 2: the CPU builds the GPU's jobs |
 | `VVDEC_GPU_MIDER=1` | path 2 plus the GPU front end, compared with the CPU's (debugging) |
 | `VVDEC_GPU_ASYNC=0` | run the front end on the compute queue instead of an async compute queue |
+| `VVDEC_GPU_PARSE=1` | the GPU parses the slice data too, compared with the CPU's parse (debugging) |
+| `VVDEC_GPU_PARSE=2` | the GPU parses the slice data instead of the CPU (needs the async compute queues) |
 | `VVDEC_FASTHASH=1` | (vvdecapp) `-md5` hashes the output with CRC-32C instead of MD5, for fast checks |
 
 ## Files
@@ -94,7 +125,11 @@ output frames, not to the reference pictures.
   - `GpuReconFrontEnd.cpp`: the GPU front end;
   - `GpuReconPrediction.cpp`: the residuals, inter prediction and intra prediction;
   - `GpuReconFilters.cpp`: LMCS's inverse mapping, deblocking, SAO and ALF;
+  - `GpuReconParse.cpp`: whether the GPU parses a picture, and the check of its parse (`VVDEC_GPU_PARSE=1`);
   - `GpuFrontEndCheck.*`: the comparison of the GPU front end with the CPU's (`VVDEC_GPU_MIDER=1`).
+- `GpuParse.*`: the GPU parse's inputs, built from a picture's slices, and the comparison with the CPU's parse.
+- `GpuParseService.*`: one picture's parse on the GPU (`ParseSlot`), and the parse of the pictures ahead of their
+  reconstruction (`ParseService`).
 - `GpuFrontEnd.*`: the CU, TU and CTU records the CPU writes for the GPU front end, and the tables its shaders read.
 - `GpuJobs.h`: the job structures shared by the CPU and the shaders.
 - `GpuFilmGrain.*`: film grain synthesis on the output frames.

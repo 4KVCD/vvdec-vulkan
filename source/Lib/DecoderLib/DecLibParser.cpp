@@ -998,7 +998,7 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
 
 #if VVDEC_VULKAN
       // the slice data for the GPU's parse: compared with this one's (VVDEC_GPU_PARSE=1), or instead of it (=2)
-      const bool gpuParses = gpu::GpuRecon::parsesPicture( *pic, *slice->getSPS() );
+      const bool gpuParses = decLib->m_gpuParseService && gpu::GpuRecon::parsesPicture( *pic, *slice->getSPS() );
       if( gpuParses || gpu::parseShadowRequested() )
       {
         const auto&  fifo = bitstream.getFifo();
@@ -1007,7 +1007,11 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
       }
       if( gpuParses )
       {
-        decLib->m_cSliceDecoder.claimSlice( slice );
+        // the picture to the GPU's parse once its last slice is in
+        if( decLib->m_cSliceDecoder.claimSlice( slice ) )
+        {
+          decLib->m_gpuParseService->enqueue( pic );
+        }
       }
       else
 #endif

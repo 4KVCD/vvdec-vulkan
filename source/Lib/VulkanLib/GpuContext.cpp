@@ -278,8 +278,10 @@ bool Context::init()
   }
 
   const float priority = 1.0f;
-  const float asyncPriorities[kMaxAsync] = { 1.0f, 1.0f, 1.0f, 1.0f };
+  const float asyncPriorities[kMaxAsync + 1] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
   m_asyncCount = m_asyncFamily != UINT32_MAX ? int( std::min<uint32_t>( families[m_asyncFamily].queueCount, uint32_t( kMaxAsync ) ) ) : 0;
+  // the parse queue: one more of the family's when it has one (AMD's has 8)
+  const bool ownParseQueue = m_asyncCount > 0 && families[m_asyncFamily].queueCount > uint32_t( m_asyncCount );
   VkDeviceQueueCreateInfo queueInfos[3] = { { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO }, { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO },
                                             { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO } };
   uint32_t numQueueInfos = 0;
@@ -288,7 +290,7 @@ bool Context::init()
     if( family != UINT32_MAX )
     {
       queueInfos[numQueueInfos].queueFamilyIndex = family;
-      queueInfos[numQueueInfos].queueCount       = family == m_asyncFamily ? uint32_t( m_asyncCount ) : 1;
+      queueInfos[numQueueInfos].queueCount       = family == m_asyncFamily ? uint32_t( m_asyncCount + ( ownParseQueue ? 1 : 0 ) ) : 1;
       queueInfos[numQueueInfos].pQueuePriorities = family == m_asyncFamily ? asyncPriorities : &priority;
       numQueueInfos++;
     }
@@ -388,13 +390,23 @@ bool Context::init()
     {
       m_api.vkGetDeviceQueue( m_device, m_asyncFamily, uint32_t( i ), &m_asyncQueues[i] );
     }
+    if( ownParseQueue )
+    {
+      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, uint32_t( m_asyncCount ), &m_parseQueue );
+    }
+    else
+    {
+      m_parseQueue = m_asyncQueues[m_asyncCount - 1];
+      m_parseMutex = &m_asyncMutexes[m_asyncCount - 1];
+    }
     VkSemaphoreTypeCreateInfo timelineType{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
     timelineType.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkSemaphoreCreateInfo timelineInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     timelineInfo.pNext = &timelineType;
-    if( m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_timeline ) != VK_SUCCESS )
+    if( m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_timeline ) != VK_SUCCESS
+        || m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_parseTimeline ) != VK_SUCCESS )
     {
-      THROW_FATAL( "Vulkan: vkCreateSemaphore failed (the timeline semaphore)" );
+      THROW_FATAL( "Vulkan: vkCreateSemaphore failed (the timeline semaphores)" );
     }
   }
   m_api.vkGetPhysicalDeviceMemoryProperties( m_physical, &m_memProps );
@@ -531,6 +543,10 @@ Context::~Context()
     if( m_timeline )
     {
       m_api.vkDestroySemaphore( m_device, m_timeline, nullptr );
+    }
+    if( m_parseTimeline )
+    {
+      m_api.vkDestroySemaphore( m_device, m_parseTimeline, nullptr );
     }
     m_api.vkDestroyDevice( m_device, nullptr );
   }
@@ -787,26 +803,39 @@ uint64_t Context::submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemap
   return signalValue;
 }
 
-void Context::submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, VkSemaphore done )
+void Context::submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, VkSemaphore done, uint64_t waitParse )
 {
   VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
   info.commandBufferCount   = 1;
   info.pCommandBuffers      = &cmd;
   info.signalSemaphoreCount = 1;
   info.pSignalSemaphores    = &done;
-  const VkPipelineStageFlags    stage       = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  const VkPipelineStageFlags    stages[2]   = { VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
   const uint64_t                signalValue = 0;   // (a binary semaphore's)
   VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
   timeline.signalSemaphoreValueCount = 1;
   timeline.pSignalSemaphoreValues    = &signalValue;
+  // the waits: the colocated pictures' first parts, the picture's parse
+  VkSemaphore waits[2];
+  uint64_t    waitValues[2];
+  uint32_t    numWaits = 0;
   if( waitFirst > 0 )
   {
-    info.waitSemaphoreCount          = 1;
-    info.pWaitSemaphores             = &m_timeline;
-    info.pWaitDstStageMask           = &stage;
-    timeline.waitSemaphoreValueCount = 1;
-    timeline.pWaitSemaphoreValues    = &waitFirst;
+    waits[numWaits]      = m_timeline;
+    waitValues[numWaits] = waitFirst;
+    numWaits++;
   }
+  if( waitParse > 0 )
+  {
+    waits[numWaits]      = m_parseTimeline;
+    waitValues[numWaits] = waitParse;
+    numWaits++;
+  }
+  info.waitSemaphoreCount          = numWaits;
+  info.pWaitSemaphores             = waits;
+  info.pWaitDstStageMask           = stages;
+  timeline.waitSemaphoreValueCount = numWaits;
+  timeline.pWaitSemaphoreValues    = waitValues;
   info.pNext = &timeline;
   std::lock_guard<std::mutex> lock( m_asyncMutexes[queue] );
   const VkResult result = m_api.vkQueueSubmit( m_asyncQueues[queue], 1, &info, VK_NULL_HANDLE );
@@ -814,6 +843,37 @@ void Context::submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, V
   {
     THROW_FATAL( "Vulkan: vkQueueSubmit failed on the async compute queue (" << result << ")" );
   }
+}
+
+uint64_t Context::firstPartsDone() const
+{
+  uint64_t value = 0;
+  if( m_timeline && m_api.vkGetSemaphoreCounterValue( m_device, m_timeline, &value ) != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkGetSemaphoreCounterValue failed" );
+  }
+  return value;
+}
+
+uint64_t Context::submitParse( VkCommandBuffer cmd, VkFence done )
+{
+  VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+  info.commandBufferCount   = 1;
+  info.pCommandBuffers      = &cmd;
+  info.signalSemaphoreCount = 1;
+  info.pSignalSemaphores    = &m_parseTimeline;
+  VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+  std::lock_guard<std::mutex>   lock( *m_parseMutex );
+  const uint64_t                value = ++m_parseValue;
+  timeline.signalSemaphoreValueCount = 1;
+  timeline.pSignalSemaphoreValues    = &value;
+  info.pNext                         = &timeline;
+  const VkResult result = m_api.vkQueueSubmit( m_parseQueue, 1, &info, done );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkQueueSubmit failed on the parse queue (" << result << ")" );
+  }
+  return value;
 }
 
 void Context::submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore semaphore, VkCommandBuffer transfer, VkFence transferDone,

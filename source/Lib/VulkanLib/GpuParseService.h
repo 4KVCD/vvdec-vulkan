@@ -1,0 +1,239 @@
+/* -----------------------------------------------------------------------------
+The copyright in this software is being made available under the Clear BSD
+License, included below. No patent rights, trademark rights and/or
+other Intellectual Property Rights other than the copyrights concerning
+the Software are granted under this license.
+
+The Clear BSD License
+
+Copyright (c) 2018-2026, Fraunhofer-Gesellschaft zur Förderung der angewandten Forschung e.V. & The VVdeC Authors.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted (subject to the limitations in the disclaimer below) provided that
+the following conditions are met:
+
+     * Redistributions of source code must retain the above copyright notice,
+     this list of conditions and the following disclaimer.
+
+     * Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in the
+     documentation and/or other materials provided with the distribution.
+
+     * Neither the name of the copyright holder nor the names of its
+     contributors may be used to endorse or promote products derived from this
+     software without specific prior written permission.
+
+NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY
+THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
+IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+
+------------------------------------------------------------------------------------------- */
+
+/** \file     GpuParseService.h
+    \brief    The GPU's parse of a picture's slice data (ParseSlot), and of the pictures ahead of their
+              reconstruction (ParseService, VVDEC_GPU_PARSE=2)
+
+    A ParseSlot holds one picture's parse on the GPU: its inputs, where each substream stopped between dispatches,
+    and what the parse leaves. parse.slang writes each CU's record, and its TUs' records, wherever the picture's
+    counters give them room (the staged records), with the CTU and the place in the CTU of each (its meta word);
+    parsecompact.slang's first pass then works out each CTU's first CU and TU in raster order, and its scatter passes
+    copy the records to those places, in the buffers the front end reads. The parse also adds up the room the front
+    end's job lists need (gpu::frontCapacities).
+
+    The ParseService parses the pictures as soon as all their slices are in (DecLibParser), many pictures at a time:
+    its thread records a few dispatches of every picture it is parsing into one submission on the parse queue, so
+    that their substreams run side by side, waits for it, and hands each picture whose parse is done to its
+    reconstruction (Picture::gpuParsed). The reconstruction gives the picture's slot back after recording its front
+    end (release); the slot is reused once the picture's first part, which waits for the front end's scatter, is done
+    on the GPU.
+*/
+
+#pragma once
+
+#include "GpuContext.h"
+#include "GpuFrontEnd.h"
+#include "GpuParse.h"
+
+#include <condition_variable>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace vvdec
+{
+
+class CodingStructure;
+struct Picture;
+
+namespace gpu
+{
+
+// Where the parse writes the coefficient levels: each plane's sample (0, 0) (luma, Cb, Cr) and the strides, in
+// samples
+struct LevelPlanes
+{
+  VkDeviceAddress addr[3]  = {};
+  int32_t         stride0  = 0;
+  int32_t         stride12 = 0;
+};
+
+// One picture's parse on the GPU
+class ParseSlot
+{
+public:
+  explicit ParseSlot( Context* ctx ) : m_ctx( ctx ) {}
+  ~ParseSlot();
+  ParseSlot( const ParseSlot& )            = delete;
+  ParseSlot& operator=( const ParseSlot& ) = delete;
+
+  // Sets the slot up for the picture of cs: its inputs uploaded, room for at least minCus and minTus staged records,
+  // every substream at its start. The levels go to levels. Returns false when a slice's data was not captured.
+  bool prepare( const CodingStructure& cs, const LevelPlanes& levels, size_t minCus, size_t minTus );
+  // With VVDEC_GPU_PROFILE and the shader clock: the parse's cycle counts are added up at prof (16 words)
+  void setProfile( VkDeviceAddress prof ) { m_prof = prof; }
+  // Records into cmd the clearing of the parse's counters (in GPU memory) when the parse starts from the beginning
+  // (after prepare or restart). The steps after it need a barrier.
+  void recordClear( VkCommandBuffer cmd );
+  // Records into cmd one dispatch of the parse: each substream parsed from where it stopped up to the bin budget
+  void recordStep( VkCommandBuffer cmd ) const;
+  // Records into cmd the compaction's first pass, which does its work once every CTU is parsed: each CTU's record
+  // (its first CU and TU in raster order) and the totals
+  void recordCompaction( VkCommandBuffer cmd ) const;
+
+  // Where the parse is, after a submission of its steps and compaction
+  enum class Progress
+  {
+    Parsing,    // substreams left to parse
+    Done,       // all parsed and compacted
+    Overflow,   // all parsed, but with more records than the room: restart() and parse again
+    Failed,     // a substream given up on (a broken bitstream), or none advanced for kParseMaxStalls submissions
+  };
+  Progress progress();
+  // After Overflow: room for the records the parse counted, and every substream back at its start
+  void restart();
+
+  // --- What the parse left, once Done ---
+  size_t                 numCus() const { return m_numCus; }
+  size_t                 numTus() const { return m_numTus; }
+  const FrontCapacities& capacities() const { return m_caps; }
+  // CTU ctu's SAO and ALF parameters, as the parse wrote them (gpu::captureSaoAlf's layout: 7 words)
+  const uint32_t*        saoAlf( int ctu ) const;
+  // Records into cmd the copies of the records to their places in raster order: the CU and TU records into cus and
+  // tus (numCus() and numTus() of them), the CTU records into ctus. Without a barrier after them.
+  void recordScatter( VkCommandBuffer cmd, VkDeviceAddress cus, VkDeviceAddress tus, VkDeviceAddress ctus ) const;
+  // the parse queue's timeline value once the parse is done (Context::submitParse), which the front end waits for
+  uint64_t parseValue() const { return m_parseValue; }
+  void     setParseValue( uint64_t value ) { m_parseValue = value; }
+
+  // --- For the statistics and the check (VVDEC_GPU_PARSE=1) ---
+  const ParseInput& input() const { return m_in; }
+  uint32_t          runs() const;   // the substreams' runs: one per substream and dispatch it parsed in
+  uint32_t          errors() const;   // the substreams given up on, or left unparsed
+  const uint32_t*   ctuRecords() const { return reinterpret_cast<const uint32_t*>( m_ctus.mapped ); }   // CtuRecord a CTU
+  const uint32_t*   ctuOut() const { return reinterpret_cast<const uint32_t*>( m_ctuOut.mapped ); }     // kParseCtuOutWords a CTU
+  // the numbers of CUs and TUs (the CTUs' counts), then the parse's counters: the staged CU and TU records, the job
+  // lists' room (5 words)
+  const uint32_t*   totals() const { return reinterpret_cast<const uint32_t*>( m_totals.mapped ); }
+
+  Picture* picture = nullptr;   // the picture parsed (ParseService)
+  bool     failed  = false;     // its parse gave up (ParseService)
+
+private:
+  // Makes room for at least cus and tus staged records
+  void makeRoom( size_t cus, size_t tus );
+  // Clears what the parse counts and where each substream is, for a parse from the start
+  void clear();
+
+  Context*        m_ctx = nullptr;
+  ParseInput      m_in;
+  size_t          m_numCtus = 0;
+  LevelPlanes     m_levels;
+  VkDeviceAddress m_prof = 0;
+  // the inputs (upload memory)
+  Buffer m_bits, m_streams, m_ctuList, m_ctuInfo, m_slices, m_pic, m_scans;
+  // what the parse writes: the staged records and their meta words, each CTU's bottom rows (the CTU below reads
+  // them), WPP's saved contexts, the counters (the staged records, the job lists' room) in GPU memory; the substreams'
+  // runs, the errors and each CTU's readiness (sync), each substream's state, each CTU's counts and SAO / ALF
+  // parameters (ctuOut) in host memory
+  Buffer m_cus, m_tus, m_cuMeta, m_tuMeta, m_bottomRows, m_wpp, m_counters, m_sync, m_state, m_ctuOut;
+  // the compaction's first pass: the CTU records, the totals (host memory)
+  Buffer m_ctus, m_totals;
+  size_t          m_cuCap = 0, m_tuCap = 0;   // the staged records' room
+  size_t          m_numCus = 0, m_numTus = 0;
+  FrontCapacities m_caps;
+  uint64_t        m_lastProgress = 0;   // the substreams' next CTUs added up, after the submission before
+  uint32_t        m_stalls       = 0;   // submissions in a row without progress
+  uint64_t        m_parseValue   = 0;
+  bool            m_fresh        = false;   // the counters to clear (recordClear)
+};
+
+// Sets each CTU's SAO and ALF parameters in its CTU data (CtuData::saoParam, alfParam) from the GPU's parse of the
+// picture, as the CPU's parse leaves them
+void applyParsedSaoAlf( CodingStructure& cs, const ParseSlot& parsed );
+
+// The GPU's parse of the pictures ahead of their reconstruction (VVDEC_GPU_PARSE=2), on the parse queue
+class ParseService
+{
+public:
+  // wakeUp: called after each picture handed over (the decoder's thread pool may sleep while its tasks wait for it)
+  ParseService( Context* ctx, std::function<void()> wakeUp );
+  // Stops the thread once its submission is done. The pictures waiting stay unparsed (the decoder is shutting down).
+  ~ParseService();
+  ParseService( const ParseService& )            = delete;
+  ParseService& operator=( const ParseService& ) = delete;
+
+  // Parses the picture, whose slices are all in, as soon as it can: then pic->gpuParseSlot holds the result and
+  // pic->gpuParsed unlocks.
+  void enqueue( Picture* pic );
+  // Gives a picture's slot back: it is reused once the compute queue's timeline (Context::firstPartsDone) reaches
+  // firstPartValue, the value of the picture's first part, which waits for the front end that reads the slot (0: at
+  // once).
+  void release( ParseSlot* slot, uint64_t firstPartValue );
+  // What the service did so far
+  ParseStats stats() const;
+
+private:
+  void       run();                                // the thread
+  ParseSlot* takeSlot();                           // a slot no picture uses, or a new one
+  void       startPicture( Picture* pic );         // its slot set up, among the pictures parsed
+  void       submitSteps();                        // one submission of all the pictures' steps, waited for
+  void       finishPictures();                     // the pictures done handed over, the others kept or restarted
+  void       handOver( ParseSlot* slot, bool failed );
+
+  Context*                m_ctx;
+  std::function<void()>   m_wakeUp;
+  std::thread             m_thread;
+  mutable std::mutex      m_mutex;   // guards what the other threads touch: m_waiting, m_released, m_stop, m_stats
+  std::condition_variable m_wake;
+  bool                    m_stop   = false;
+  bool                    m_broken = false;   // the GPU failed: every picture fails
+  std::vector<Picture*>   m_waiting;                              // enqueued, not started yet
+  std::vector<std::pair<ParseSlot*, uint64_t>> m_released;        // given back, with their first part's value
+  std::vector<std::unique_ptr<ParseSlot>>      m_slots;           // all of them (the thread's)
+  std::vector<ParseSlot*> m_free;                                 // reusable (the thread's)
+  std::vector<ParseSlot*> m_parsing;                              // the pictures being parsed (the thread's)
+  size_t                  m_maxCus = 0, m_maxTus = 0;             // the most records a picture had so far
+  VkCommandPool           m_pool  = VK_NULL_HANDLE;
+  VkCommandBuffer         m_cmd   = VK_NULL_HANDLE;
+  VkFence                 m_fence = VK_NULL_HANDLE;
+  VkDeviceAddress         m_prof  = 0;   // VVDEC_GPU_PROFILE with the shader clock: the parse's cycle counts
+  Buffer                  m_profBuf;
+  ParseStats              m_stats;
+};
+
+}   // namespace gpu
+}   // namespace vvdec

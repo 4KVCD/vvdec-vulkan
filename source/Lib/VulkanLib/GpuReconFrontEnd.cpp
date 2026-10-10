@@ -180,6 +180,8 @@ void GpuRecon::recordFrontEndAsync( const CodingStructure& cs, const PictureJobs
     }
   }
   m_frontEndWait = wait;
+  // and, with the GPU's parse, for the picture's parse
+  m_frontEndParseWait = jobs.parsed ? jobs.parsed->parseValue() : 0;
   // Part 1 (motion and jobs) ends after the jobs (recordJobs calls splitFrontEnd); the picture's first part waits
   // for it. Part 2 holds the rest, which the picture's rest waits for.
   m_splitFrontEnd = true;
@@ -198,7 +200,7 @@ void GpuRecon::recordFrontEndAsync( const CodingStructure& cs, const PictureJobs
 void GpuRecon::splitFrontEnd()
 {
   m_ctx->api().vkEndCommandBuffer( m_cmdFrontEnd1 );
-  m_ctx->submitFront( m_asyncQueue, m_cmdFrontEnd1, m_frontEndWait, m_frontEnd1Done );
+  m_ctx->submitFront( m_asyncQueue, m_cmdFrontEnd1, m_frontEndWait, m_frontEnd1Done, m_frontEndParseWait );
   m_cmd = m_cmdFrontEnd2;
   beginOneTime( m_cmd );
   fullBarrier();   // what part 1 wrote, visible
@@ -211,7 +213,7 @@ void GpuRecon::splitFrontEnd()
 void GpuRecon::recordFrontEnd( const CodingStructure& cs, const PictureJobs& jobs )
 {
   CHECK( !cs.m_gpuSliceAllocation, "the GPU's motion derivation without the picture's slice table" );
-  const size_t numCus = uploadRecords( cs, jobs );
+  const size_t numCus = jobs.parsed ? useParsedRecords( cs, *jobs.parsed ) : uploadRecords( cs, jobs );
   if( numCus > 0 )
   {
     recordMotion( cs, numCus );
@@ -239,18 +241,7 @@ size_t GpuRecon::uploadRecords( const CodingStructure& cs, const PictureJobs& jo
   {
     numTus += ctu.size();
   }
-  // The records are written in order by the CPU. What only the GPU reads and writes (the CU maps, the CUs' motion,
-  // the rows' progress) is in its own memory, where mider.slang's waits for each read are far shorter (in host
-  // memory: VideoQ 1080p took 0.6 s per picture). In the check mode, the 4x4 blocks' motion is copied to host memory.
-  const int widthIn4  = int( ( pcv.lumaWidth + 3 ) >> 2 );
-  const int heightIn4 = int( ( pcv.lumaHeight + 3 ) >> 2 );
-  ensureBuffer( m_ctx, m_frontEnd.cus, std::max<size_t>( numCus, 1 ) * sizeof( CuRecord ), MemKind::Upload );
-  ensureBuffer( m_ctx, m_frontEnd.tus, std::max<size_t>( numTus, 1 ) * sizeof( TuRecord ), MemKind::Upload );
-  ensureBuffer( m_ctx, m_frontEnd.ctus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::Upload );
-  ensureBuffer( m_ctx, m_frontEnd.cuMapLuma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, m_frontEnd.cuMapChroma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, m_frontEnd.cuMotion, std::max<size_t>( numCus, 1 ) * 16 * sizeof( int32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, m_frontEnd.motion, motionBytes( pcv ), MemKind::Device );
+  ensureFrontEndBuffers( cs, numCus, numTus );
   if( m_useFrontEnd )
   {
     m_frontEnd.capacities = frontCapacities( cs, cus, tus );
@@ -259,8 +250,8 @@ size_t GpuRecon::uploadRecords( const CodingStructure& cs, const PictureJobs& jo
   {
     ensureBuffer( m_ctx, m_check.motion, motionBytes( pcv ), MemKind::HostCached );
   }
-  ensureBuffer( m_ctx, m_frontEnd.rowProgress, ( pcv.heightInCtus + 1 ) * sizeof( uint32_t ), MemKind::Device );
 
+  // the records, written in order by the CPU
   CuRecord* cuDst = reinterpret_cast<CuRecord*>( m_frontEnd.cus.mapped );
   for( const auto& ctu: cus )
   {
@@ -281,6 +272,34 @@ size_t GpuRecon::uploadRecords( const CodingStructure& cs, const PictureJobs& jo
   }
   writeCtuRecords( cs, cus, tus, reinterpret_cast<CtuRecord*>( m_frontEnd.ctus.mapped ) );
   return numCus;
+}
+
+size_t GpuRecon::useParsedRecords( const CodingStructure& cs, const ParseSlot& parsed )
+{
+  // the job lists' room as the parse added it up; the records in raster order, where the CPU's would be uploaded
+  ensureFrontEndBuffers( cs, parsed.numCus(), parsed.numTus() );
+  m_frontEnd.capacities = parsed.capacities();
+  parsed.recordScatter( m_cmd, m_frontEnd.cus.addr, m_frontEnd.tus.addr, m_frontEnd.ctus.addr );
+  computeBarrier();
+  return parsed.numCus();
+}
+
+void GpuRecon::ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, size_t numTus )
+{
+  // The records: written by the CPU in order, or by the GPU's parse (its scatter). What only the GPU reads and writes
+  // (the CU maps, the CUs' motion, the rows' progress) is in its own memory, where mider.slang's waits for each read
+  // are far shorter (in host memory: VideoQ 1080p took 0.6 s per picture).
+  const PreCalcValues& pcv       = *cs.pcv;
+  const int            widthIn4  = int( ( pcv.lumaWidth + 3 ) >> 2 );
+  const int            heightIn4 = int( ( pcv.lumaHeight + 3 ) >> 2 );
+  ensureBuffer( m_ctx, m_frontEnd.cus, std::max<size_t>( numCus, 1 ) * sizeof( CuRecord ), MemKind::Upload );
+  ensureBuffer( m_ctx, m_frontEnd.tus, std::max<size_t>( numTus, 1 ) * sizeof( TuRecord ), MemKind::Upload );
+  ensureBuffer( m_ctx, m_frontEnd.ctus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::Upload );
+  ensureBuffer( m_ctx, m_frontEnd.cuMapLuma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
+  ensureBuffer( m_ctx, m_frontEnd.cuMapChroma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
+  ensureBuffer( m_ctx, m_frontEnd.cuMotion, std::max<size_t>( numCus, 1 ) * 16 * sizeof( int32_t ), MemKind::Device );
+  ensureBuffer( m_ctx, m_frontEnd.motion, motionBytes( pcv ), MemKind::Device );
+  ensureBuffer( m_ctx, m_frontEnd.rowProgress, ( pcv.heightInCtus + 1 ) * sizeof( uint32_t ), MemKind::Device );
 }
 
 void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )

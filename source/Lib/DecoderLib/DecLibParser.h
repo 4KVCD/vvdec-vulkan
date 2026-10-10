@@ -61,6 +61,12 @@ class InputNALUnit;
 class ThreadPool;
 class DecLib;
 class PicListManager;
+#if VVDEC_VULKAN
+namespace gpu
+{
+class ParseService;
+}
+#endif
 
 class DecLibParser
 {
@@ -132,6 +138,11 @@ private:
   TUChunkCache              m_tuChunkCache;
   CuMapCache                m_cuMapCache;
 
+#if VVDEC_VULKAN
+  // VVDEC_GPU_PARSE=2: the GPU's parse of the pictures (DecLib's), which the parse tasks hand each picture to
+  gpu::ParseService*        m_gpuParseService = nullptr;
+#endif
+
 public:
   DecLibParser( DecLib& decLib, PicListManager& picListManager ) : m_decLib( decLib ), m_picListManager( picListManager ) {}
   ~DecLibParser();
@@ -152,6 +163,9 @@ public:
   bool getNoOutputPriorPicsFlag () const                { return m_isNoOutputPriorPics; }
 
   void setDecodedSEIMessageOutputStream( std::ostream* pOpStream ) { m_pDecodedSEIOutputStream = pOpStream; }
+#if VVDEC_VULKAN
+  void setGpuParseService( gpu::ParseService* service ) { m_gpuParseService = service; }
+#endif
 
   void checkAPSInPictureUnit    ();
   void resetPictureUnitNals     ()                      { m_pictureUnitNals.clear(); }

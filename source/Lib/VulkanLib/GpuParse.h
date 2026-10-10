@@ -131,6 +131,14 @@ struct ParseStats
   int64_t runs           = 0;    // the substreams' runs: one per substream and dispatch until the substream is parsed
   int64_t submissions    = 0;    // the parse's submissions (GpuRecon::runParse)
   uint64_t prof[16]      = {};   // VVDEC_GPU_PROFILE: the sums of parse_prof's counters (parse.slang's kProf...)
+  // the check of the room of the front end's job lists the parse adds up, against gpu::frontCapacities
+  int64_t capsCompared   = 0;
+  int64_t capsDiffer     = 0;
+  // the parse ahead of the reconstruction (VVDEC_GPU_PARSE=2: ParseService)
+  int64_t restarts       = 0;   // pictures parsed again, with more room for their records
+  int64_t parsingSum     = 0;   // the pictures in each submission, added up
+  int64_t maxCus         = 0;   // the most CU records a picture had
+  int64_t maxTus         = 0;
 };
 // Compares the GPU's parse of a picture with the CPU's, adds the counts to stats and prints the first differences.
 // gpuCus, gpuTus: the GPU's CU and TU records in raster order of the CTUs (gathered by parsecompact.slang); gpuCtus:

@@ -26,14 +26,15 @@
 // counts as 32 bins more), then stops at the end of that CTU, saves where it is (the kSt... words of pc.state), and
 // the next dispatch resumes from there. A substream also pauses until the next dispatch when its next CTU needs the
 // CTU above, which another substream parses, and that CTU is not parsed after a short wait. So no dispatch runs long,
-// whatever the slice data (Windows resets the GPU when one dispatch keeps it busy for 2 s). The host
-// (GpuRecon::runParse in GpuReconParse.cpp) submits the dispatches, a few per submission, until every substream is
-// parsed or none advances any more.
+// whatever the slice data (Windows resets the GPU when one dispatch keeps it busy for 2 s). The host (ParseService,
+// or GpuRecon::runParse for the check) submits the dispatches, a few per submission, until every substream is parsed
+// or none advances any more.
 //
-// The records go to slots reserved for each CTU (as many as a CTU can have CUs and TUs). Neighbouring CUs are looked
-// up in maps that hold, for each 4x4 luma block, a word pair describing the CU there, including its index in the CTU
-// plus one (one map per channel type; see parsetree.slang). parsecompact.slang then gathers the records in raster
-// order of the CTUs.
+// Each CU's record and its TUs' records go wherever the picture's counters give them room (the staged records), each
+// with a meta word that tells its CTU and its index among the CTU's CUs (or TUs); parsecompact.slang then copies them
+// to their places in raster order of the CTUs. Neighbouring CUs are looked up in maps that hold, for each 4x4 luma
+// block, a word pair describing the CU there, including its index in the CTU plus one (one map per channel type; see
+// parsetree.slang). The parse also adds up the room the front end's job lists need (gpu::frontCapacities).
 
 #include "common.slang"
 #include "parsectx.slang"
@@ -60,8 +61,8 @@ struct Params
   // vvdec's diagonal scans (g_scanOrder[SCAN_UNGROUPED]) of the blocks 1, 2, 4, 8 and 16 samples wide and high, 961
   // words (GpuParse.h's kParseScanTab); loadPicture copies them into s_scanTab
   uint*         scanTab;
-  uint*         cus;       // out: the CU records (32 words each), g_cuSlots slots per CTU
-  uint*         tus;       // out: the TU records (16 words each), g_tuSlots slots per CTU
+  uint*         cus;       // out: the staged CU records (32 words each), pc.cuCap of them at most
+  uint*         tus;       // out: the staged TU records (16 words each), pc.tuCap of them at most
   uint*         ctuOut;    // out: kCtuOutWords words per CTU: its numbers of CUs and TUs, SAO's and ALF's parameters
   // Per CTU, the map entries (word pairs, see s_map) of its bottom row of 4x4 luma blocks: 32 of the luma tree, then
   // 32 of the chroma tree. The CTU below reads them.
@@ -80,6 +81,16 @@ struct Params
   Atomic<uint>* prof;      // PROFILE: the cycles and counts of kProf..., summed over the workgroups
   uint*         state;     // per substream, kStateWords words: where its parse stands (the host zeroes it first)
   int           binBudget; // the bins a dispatch parses of a substream before it pauses at the end of a CTU
+  // out: per staged CU record (and per staged TU record), its meta word: its CTU << kLocalBits | its index among the
+  // CTU's CUs (or TUs)
+  uint*         cuMeta;
+  uint*         tuMeta;
+  // [0] the CU records staged so far, [1] the TU records (counted on past the room: the host then parses the picture
+  // again with more), [2..6] the room the front end's job lists need, added up over the CUs (gpu::frontCapacities
+  // without its margins): residual jobs, inter tiles, intra jobs, intra bands, deblocking edges. Zeroed first.
+  Atomic<uint>* counters;
+  int           cuCap;     // the room for staged CU records
+  int           tuCap;     // and for TU records
 };
 
 // The words of a substream's state between dispatches (pc.state)
@@ -99,6 +110,9 @@ static const int kStCtx        = 16;    // the contexts' states, CTX_COUNT words
 static const int kStLeft       = 400;   // s_left, the map entries of the column left of the next CTU (64 word pairs)
 
 static uint g_binCount;   // the bins decoded in this dispatch, plus 32 for each CU parsed (compared with pc.binBudget)
+// The room the front end's job lists need for the CUs parsed in this dispatch (pc.counters[2..6]'s order), added to
+// pc.counters at the dispatch's end
+static uint g_caps[5];
 
 // PROFILE: the parts of the parse that are timed (in cycles of the subgroup's clock), then the things counted
 static const int kProfCtu      = 0;    // whole CTUs
@@ -982,6 +996,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     g_csChromaQpAdj = int( uni( state[kStCqpAdj] ) );
   }
   g_binCount  = 0;
+  for( int i = 0; i < 5; i++ )
+  {
+    g_caps[i] = 0;
+  }
   bool paused = false;
   while( k < count && !g_error )
   {
@@ -1065,6 +1083,17 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       for( int j = k; j < count; j++ )
       {
         pc.sync[2 + int( pc.ctuList[( first + j ) * 2] )].store( 1u, MemoryOrder.Release );
+      }
+    }
+  }
+  // the room the job lists need for this dispatch's CUs, added to the picture's
+  if( g_lane == 0 )
+  {
+    for( int i = 0; i < 5; i++ )
+    {
+      if( g_caps[i] != 0 )
+      {
+        pc.counters[2 + i].add( g_caps[i] );
       }
     }
   }

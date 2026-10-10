@@ -522,6 +522,9 @@ public:
 
   void shutdown( bool block );
   void waitForThreads();
+  // Wakes the threads when they all sleep, waiting for tasks to become ready (PoolPause): for a barrier unlocked by a
+  // thread outside the pool (the GPU's parse, gpu::ParseService), which adds no task that would wake them
+  void wakeUp();
 
   int numThreads() const { return (int)m_threads.size(); }
 

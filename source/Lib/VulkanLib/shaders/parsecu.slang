@@ -1,13 +1,13 @@
 // The coding unit part of parse.slang, which includes this file. For each leaf of the coding tree it creates the CU
 // (CodingStructure::addCU) and predicts its QP, parses CABACReader::coding_unit with the prediction syntax it calls
 // (skip, the prediction mode, BDPCM, the intra luma and chroma modes, the prediction unit's merge data and motion
-// vector differences, AMVR, BCW), then writes the CU's record (laid out as GpuFrontEnd.cpp's writeCuRecords writes
-// it), its TUs' records and its entries in the maps of parsed CUs. The residual syntax is in parsetu.slang.
+// vector differences, AMVR, BCW), then stages the CU's record (laid out as GpuFrontEnd.cpp's writeCuRecords writes
+// it) and its TUs' records, adds up the room the front end's job lists need for them, and writes the CU's entries in
+// the maps of parsed CUs. The residual syntax is in parsetu.slang.
 
 // The CU being parsed: the fields of its record (GpuFrontEnd.h's CuRecord), plus what the parse needs on the way
 struct Cu
 {
-  int  slot;                   // its record's slot in pc.cus: the CTU's first slot + local
   int  local;                  // its index among its CTU's CUs
   int  lx, ly, lw, lh;         // its luma block, in luma samples (lw 0: none)
   int  cx, cy, cw, chh;        // its chroma block, in chroma samples (cw 0: none)
@@ -78,8 +78,9 @@ void setFlag( uint f, bool on )
 // --------------------------------------------------------------------------------------------------------------------
 
 // Starts the CU of the partitioner's current area, as CodingStructure::addCU and coding_tree set it up: its luma and
-// chroma blocks (a chroma tree's CU has no luma block, a luma tree's CU no chroma block), its slot, its neighbours and
-// its place among the CTU's DMVR refinements. Returns false, giving up the substream, when the CTU's slots are full.
+// chroma blocks (a chroma tree's CU has no luma block, a luma tree's CU no chroma block), its index in the CTU, its
+// neighbours and its place among the CTU's DMVR refinements. Returns false, giving up the substream, when the CTU has
+// more CUs than a CTU can have (g_cuSlots).
 bool addCu()
 {
   if( g_numCus >= g_cuSlots )
@@ -102,7 +103,6 @@ bool addCu()
     treeType    = TREE_L;
   }
   Cu cu;
-  cu.slot     = g_ctu * g_cuSlots + g_numCus;
   cu.local    = g_numCus;
   g_numCus++;
   cu.lx       = lumaValid ? a.x : 0;
@@ -204,12 +204,12 @@ void writeCuInfo()
   GroupMemoryBarrierWithGroupSync();
 }
 
-// Writes the CU's record (GpuFrontEnd.h's CuRecord) into its slot, word for word as writeCuRecords writes it from the
-// CPU's parse
-void writeCuRecord()
+// Writes the CU's record (GpuFrontEnd.h's CuRecord) into the staged record at, word for word as writeCuRecords writes
+// it from the CPU's parse
+void writeCuRecord( uint at )
 {
   const Cu  cu  = g_cu;
-  uint*     r   = pc.cus + uint( cu.slot ) * 32u;
+  uint*     r   = pc.cus + at * 32u;
   uint      flags = cu.flags | ( cu.chType == 1 ? kChroma : 0u );
   r[0]  = uint( cu.lx ) | uint( cu.ly ) << 16;
   r[1]  = uint( cu.lw ) | uint( cu.lh ) << 8 | uint( cu.predMode ) << 16 | flags << 18;
@@ -323,10 +323,102 @@ void codingUnitAtPart( inout CuCtx ctx )
     }
   }
   PROF_BEGIN( recStart );
-  writeCuRecord();
-  writeTuRecords();
+  stageRecords();
   writeCuInfo();
   PROF_END( kProfRecords, recStart );
+}
+
+// --------------------------------------------------------------------------------------------------------------------
+// The CU's records staged, and the room the front end's job lists need for them
+// --------------------------------------------------------------------------------------------------------------------
+
+// The bits of a meta word (pc.cuMeta, pc.tuMeta) below the CTU: the record's index among its CTU's CUs (or TUs)
+static const uint kLocalBits = 12;
+
+// Stages the CU's record and its TUs' records: each at the place the picture's counters give it (pc.counters[0] and
+// [1]), with its meta word for parsecompact.slang's scatter. A record past the room (pc.cuCap, pc.tuCap) is only
+// counted: the host then parses the picture again with more room. Then adds up the CU's share of the room the front
+// end's job lists need.
+void stageRecords()
+{
+  uint cuAt = 0;
+  uint tuAt = 0;
+  if( g_lane == 0 )
+  {
+    cuAt = pc.counters[0].add( 1u );
+    tuAt = g_cu.numTus > 0 ? pc.counters[1].add( uint( g_cu.numTus ) ) : 0u;
+  }
+  cuAt = uni( cuAt );
+  tuAt = uni( tuAt );
+  if( cuAt < uint( pc.cuCap ) )
+  {
+    writeCuRecord( cuAt );
+    pc.cuMeta[cuAt] = uint( g_ctu ) << kLocalBits | uint( g_cu.local );
+  }
+  writeTuRecords( tuAt );
+  addCapacities();
+}
+
+// The pieces a block side of n samples splits into for the residual jobs: one per set bit (SBT's 3/4 blocks: two)
+uint pieces( uint n )
+{
+  return countbits( n );
+}
+
+// The bands of rows an intra job of w x h samples is cut into (GpuRecon::recordIntra's: 256 samples a band)
+uint bandsOf( uint w, uint h )
+{
+  const uint rows = max( 1u, 256u / max( w, 1u ) );
+  return ( h + rows - 1u ) / rows;
+}
+
+// Adds the CU's share of the room the front end's job lists need to g_caps, as gpu::frontCapacities works it out from
+// the CU's record and its TUs' records: residual jobs, inter tiles, intra jobs, intra bands, deblocking edges
+void addCapacities()
+{
+  const Cu   cu = g_cu;
+  const uint w  = uint( cu.lw );
+  const uint h  = uint( cu.lh );
+  const uint sx = uint( g_csx );
+  const uint sy = uint( g_csy );
+  if( cu.predMode == MODE_INTER && cu.lw > 0 )
+  {
+    // GPM's, the regular tiles, affine's pairs or SbTMVP's sub-PUs (the subblock merge CUs are affine ones)
+    const uint tiles16 = ( ( w + 15u ) / 16u ) * ( ( h + 15u ) / 16u );
+    const bool affine  = ( cu.flags & kAffine ) != 0;
+    g_caps[1] += affine ? max( 2u * tiles16, max( w / 8u, 1u ) * max( h / 8u, 1u ) ) : tiles16;
+    if( ( cu.flags & kCiip ) != 0 )
+    {
+      g_caps[2] += 3u;
+      g_caps[3] += bandsOf( w, h ) + 2u * bandsOf( w >> sx, h >> sy );
+    }
+    if( affine )
+    {
+      g_caps[4] += 2u * ( ( w / 8u ) * ( h / 4u ) + ( h / 8u ) * ( w / 4u ) );   // the subblock grid's edges
+    }
+  }
+  for( int t = 0; t < cu.numTus; t++ )
+  {
+    const uint w1           = tuWord( t, 1 );
+    const uint w3           = tuWord( t, 3 );
+    const bool luma         = ( w1 & 0x10000u ) != 0;
+    const bool chroma       = ( w3 & 0x10000u ) != 0;
+    const uint lw           = w1 & 0xffu;
+    const uint lh           = ( w1 >> 8 ) & 0xffu;
+    const uint cw           = w3 & 0xffu;
+    const uint ch           = ( w3 >> 8 ) & 0xffu;
+    const uint chromaPieces = chroma ? pieces( cw ) * pieces( ch ) : 0u;
+    // a residual job, or the pieces of zeros, a component
+    g_caps[0] += ( luma ? pieces( lw ) * pieces( lh ) : 0u ) + 2u * chromaPieces;
+    if( cu.predMode != MODE_INTER || cu.rootCbf )
+    {
+      // an intra or IBC job a component, or LMCS's chroma pieces
+      g_caps[2] += ( luma ? 1u : 0u ) + ( chroma ? 2u : 0u ) + 2u * chromaPieces;
+      g_caps[3] += ( luma ? bandsOf( lw, lh ) : 0u ) + ( chroma ? 2u * bandsOf( cw, ch ) + 2u * chromaPieces * bandsOf( cw, ch ) : 0u );
+    }
+    // the edges along the TU's left and top sides, luma's and chroma's (on the luma grid)
+    g_caps[4] += ( luma ? lw / 4u + lh / 4u : 0u ) + ( chroma ? ( cw << sx ) / 4u + ( ch << sy ) / 4u : 0u );
+  }
 }
 
 // --------------------------------------------------------------------------------------------------------------------

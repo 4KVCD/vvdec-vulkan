@@ -41,20 +41,20 @@ POSSIBILITY OF SUCH DAMAGE.
 ------------------------------------------------------------------------------------------- */
 
 /** \file     GpuReconParse.cpp
-    \brief    GpuRecon's GPU parse of the slice data: instead of the CPU's parse (VVDEC_GPU_PARSE=2), or beside it and
-              checked against it (VVDEC_GPU_PARSE=1); see GpuParse.h
+    \brief    GpuRecon's side of the GPU parse: whether the GPU parses a picture instead of the CPU (VVDEC_GPU_PARSE=2:
+              the ParseService parses it, the front end takes its records), and the check of the GPU's parse against
+              the CPU's (VVDEC_GPU_PARSE=1); see GpuParseService.h
 
-    parse.slang parses each substream (a slice, tile or CTU row with WPP) with one 32-thread workgroup. A dispatch
-    parses each substream up to a budget of bins and saves where it stopped in the state buffer, so the parse runs
-    as many dispatches. They go to the GPU in short submissions fed by the host until every substream is parsed:
-    this driver silently cuts short a submission that runs for more than about 1.2 s of GPU time.
-
-    The parse writes each CTU's records into slots of their own; parsecompact.slang then gathers them in raster order,
-    as the CPU's CTU tasks lay them out (GpuFrontEnd.h).
+    The check parses each picture's slice data on the GPU too, with a ParseSlot of its own, in short submissions on
+    the compute queue until every substream is parsed (this driver silently cuts short a submission that runs for
+    more than about 1.2 s of GPU time). The picture's first part then copies the records to raster order in host
+    memory and compares the levels with the CPU's parse's; compareParse compares the records, each CTU's SAO and ALF
+    parameters and the room of the front end's job lists with the CPU's.
 */
 
 #include "GpuRecon.h"
 
+#include "GpuParseService.h"
 #include "vvdec_gpu/GpuShaderIds.h"
 
 #include "CommonLib/CodingStructure.h"
@@ -67,31 +67,7 @@ namespace vvdec
 namespace gpu
 {
 
-static constexpr size_t   kParseStateWords   = 1024;      // parse.slang's kStateWords
-static constexpr size_t   kParseStateDone    = 1;         // parse.slang's kStDone: the substream is parsed (or given up)
-static constexpr size_t   kParseStateNextCtu = 0;         // parse.slang's kStK: the substream's next CTU
-static constexpr int32_t  kParseBinBudget    = 1 << 16;   // bins per substream and dispatch (a CU counts as 32): ~10 ms
-static constexpr uint32_t kParseDispatches   = 8;         // dispatches per submission
-static constexpr uint32_t kParseMaxStalls    = 4;         // submissions in a row without progress before giving up
-
-// The push constants of parse.slang
-struct ParsePush
-{
-  VkDeviceAddress bits, streams, ctuList, ctuInfo, slices, pic, scanTab, cus, tus, ctuOut, bottomRows, levels0, levels1, levels2, sync, wppCtx;
-  int32_t         numStreams, stride0, stride12;
-  VkDeviceAddress prof;
-  VkDeviceAddress state;
-  int32_t         binBudget;
-};
-static_assert( sizeof( ParsePush ) == 168, "ParsePush: the layout of parse.slang's Params" );
-
-// The push constants of parsecompact.slang
-struct ParseCompactPush
-{
-  VkDeviceAddress cusIn, tusIn, ctuOut, ctuInfo, cus, tus, ctus, totals;
-  int32_t         numCtus, cuSlots, tuSlots, pass, cuCap, tuCap;
-};
-static_assert( sizeof( ParseCompactPush ) == 88, "ParseCompactPush: the layout of parsecompact.slang's Params" );
+static constexpr uint32_t kParseDispatches = 8;   // the check's dispatches per submission
 
 // The push constants of parsecompact.slang's CHECK variant
 struct ParseCheckPush
@@ -111,110 +87,18 @@ static void ensureParseBuffer( Context* ctx, Buffer& buf, size_t size, MemKind k
   }
 }
 
-// A CTU's SAO and ALF parameters as the parse writes them (ctuOut's words 2 to 8; gpu::captureSaoAlf's layout) into
-// its CTU data, as the CPU's parse leaves them.
-static void applySaoAlf( CtuData& ctu, const uint32_t words[7] )
-{
-  for( int comp = 0; comp < 3; comp++ )
-  {
-    SAOOffset&     o    = ctu.saoParam[comp];
-    const uint32_t mode = words[2 * comp];
-    o.reset();
-    o.modeIdc = SAOMode( mode & 15 );
-    if( o.modeIdc == SAO_MODE_OFF )
-    {
-      continue;
-    }
-    o.typeIdc     = int( ( mode >> 4 ) & 15 );
-    o.typeAuxInfo = int( int8_t( ( mode >> 8 ) & 0xff ) );   // (-1 where the parse leaves none)
-    if( o.modeIdc == SAO_MODE_NEW )
-    {
-      int v[4];
-      for( int k = 0; k < 4; k++ )
-      {
-        v[k] = int( int8_t( ( words[2 * comp + 1] >> ( 8 * k ) ) & 0xff ) );
-      }
-      if( o.typeIdc == SAO_TYPE_START_BO )
-      {
-        for( int k = 0; k < 4; k++ )
-        {
-          o.offset[( o.typeAuxInfo + k ) % MAX_NUM_SAO_CLASSES] = v[k];
-        }
-      }
-      else
-      {
-        o.offset[0] = v[0];
-        o.offset[1] = v[1];
-        o.offset[3] = v[2];
-        o.offset[4] = v[3];
-      }
-    }
-  }
-  CtuAlfData&    a   = ctu.alfParam;
-  const uint32_t alf = words[6];
-  a.alfCtuEnableFlag[0]   = uint8_t( alf & 1 );
-  a.alfCtuEnableFlag[1]   = uint8_t( ( alf >> 1 ) & 1 );
-  a.alfCtuEnableFlag[2]   = uint8_t( ( alf >> 2 ) & 1 );
-  a.alfCtbFilterIndex     = short( ( alf >> 3 ) & 31 );
-  a.alfCtuAlternative[0]  = uint8_t( ( alf >> 8 ) & 15 );
-  a.alfCtuAlternative[1]  = uint8_t( ( alf >> 12 ) & 15 );
-  a.ccAlfFilterControl[0] = uint8_t( ( alf >> 16 ) & 15 );
-  a.ccAlfFilterControl[1] = uint8_t( ( alf >> 20 ) & 15 );
-}
-
 bool GpuRecon::parsesPicture( const Picture& pic, const SPS& sps )
 {
   // The GPU parses a picture instead of the CPU only when the GPU front end takes it, which needs every pass on the
   // GPU: a sequence within interSupported (which covers intra prediction and the residuals), the colocated motion
-  // in the GPU's memory, and the GPU front end requested.
+  // in the GPU's memory, and the GPU front end requested. The parse runs on a queue of its own.
   if( !pic.gpuMemory || !pic.cs || !pic.cs->colMiAllocator )
   {
     return false;
   }
-  const Options& options = static_cast<const Context*>( pic.gpuMemory->opaque )->options();
-  return options.parseDrives && options.frontEnd && !options.frontEndCheck && interSupported( sps );
-}
-
-void GpuRecon::uploadParseInput( const CodingStructure& cs, size_t numCus, size_t numTus )
-{
-  const ParseInput&    in   = m_parse.in;
-  const PreCalcValues& pcv  = *cs.pcv;
-  const size_t         ctus = pcv.sizeInCtus;
-  const auto upload = [&]( Buffer& buf, const void* data, size_t size ) {
-    ensureParseBuffer( m_ctx, buf, std::max<size_t>( size, 16 ), MemKind::Upload );
-    memcpy( buf.mapped, data, size );
-  };
-  // (the parse reads the slice data 128 bytes at a time: 256 zero bytes follow it)
-  ensureParseBuffer( m_ctx, m_parse.bits, in.bits.size() + 256, MemKind::Upload );
-  memcpy( m_parse.bits.mapped, in.bits.data(), in.bits.size() );
-  memset( m_parse.bits.mapped + in.bits.size(), 0, 256 );
-  upload( m_parse.streams, in.streams.data(), in.streams.size() * sizeof( uint32_t ) );
-  upload( m_parse.ctuList, in.ctuList.data(), in.ctuList.size() * sizeof( uint32_t ) );
-  upload( m_parse.ctuInfo, in.ctuInfo.data(), in.ctuInfo.size() * sizeof( uint32_t ) );
-  upload( m_parse.slices, in.slices.data(), in.slices.size() * sizeof( uint32_t ) );
-  upload( m_parse.pic, in.pic.data(), in.pic.size() * sizeof( int32_t ) );
-  if( !m_parse.scans.mapped )
-  {
-    ensureParseBuffer( m_ctx, m_parse.scans, kParseScanTab * sizeof( uint32_t ), MemKind::Upload );
-    writeParseScans( reinterpret_cast<uint32_t*>( m_parse.scans.mapped ) );
-  }
-  // what the parse writes: the records in each CTU's slots, each CTU's bottom rows, the CTUs' readiness and the
-  // counters, WPP's saved contexts, per CTU its counts and SAO and ALF parameters, each substream's state
-  ensureParseBuffer( m_ctx, m_parse.cus, ctus * in.cuSlots * sizeof( CuRecord ), MemKind::Device );
-  ensureParseBuffer( m_ctx, m_parse.tus, ctus * in.tuSlots * sizeof( TuRecord ), MemKind::Device );
-  ensureParseBuffer( m_ctx, m_parse.bottomRows, ctus * 64 * 2 * sizeof( uint32_t ), MemKind::Device );
-  ensureParseBuffer( m_ctx, m_parse.sync, ( 2 + ctus ) * sizeof( uint32_t ), MemKind::HostCached );
-  ensureParseBuffer( m_ctx, m_parse.state, std::max<size_t>( in.numStreams, 1 ) * kParseStateWords * sizeof( uint32_t ), MemKind::HostCached );
-  ensureParseBuffer( m_ctx, m_parse.wpp, std::max<size_t>( in.wppSlots, 1 ) * in.contexts * sizeof( uint32_t ), MemKind::Device );
-  ensureParseBuffer( m_ctx, m_parse.ctuOut, ctus * kParseCtuOutWords * sizeof( uint32_t ), MemKind::HostCached );
-  // the compacted records, their totals and the levels check's counts, in host memory
-  m_parse.cuCap = std::max<size_t>( numCus, 1 );
-  m_parse.tuCap = std::max<size_t>( numTus, 1 );
-  ensureParseBuffer( m_ctx, m_parse.outCus, m_parse.cuCap * sizeof( CuRecord ), MemKind::HostCached );
-  ensureParseBuffer( m_ctx, m_parse.outTus, m_parse.tuCap * sizeof( TuRecord ), MemKind::HostCached );
-  ensureParseBuffer( m_ctx, m_parse.outCtus, ctus * sizeof( CtuRecord ), MemKind::HostCached );
-  ensureParseBuffer( m_ctx, m_parse.totals, 4 * sizeof( uint32_t ), MemKind::HostCached );
-  ensureParseBuffer( m_ctx, m_parse.check, 4 * sizeof( uint32_t ), MemKind::HostCached );
+  const Context* ctx     = static_cast<const Context*>( pic.gpuMemory->opaque );
+  const Options& options = ctx->options();
+  return options.parseDrives && options.frontEnd && !options.frontEndCheck && ctx->parseQueue() && interSupported( sps );
 }
 
 void GpuRecon::submitParseCommands( const std::function<void()>& record )
@@ -226,7 +110,7 @@ void GpuRecon::submitParseCommands( const std::function<void()>& record )
     m_parse.fence = m_ctx->createFence();
   }
   const Api&            vk        = m_ctx->api();
-  const VkCommandBuffer recording = m_cmd;   // (with the check, the picture's first part, recorded meanwhile)
+  const VkCommandBuffer recording = m_cmd;   // (the picture's first part, recorded meanwhile)
   m_cmd                           = m_parse.cmd;
   vk.vkResetCommandPool( m_ctx->device(), m_parse.pool, 0 );
   beginOneTime( m_cmd );
@@ -244,202 +128,33 @@ void GpuRecon::submitParseCommands( const std::function<void()>& record )
   m_cmd = recording;
 }
 
-uint32_t GpuRecon::runParse( const void* push, size_t pushSize, int shader )
+uint32_t GpuRecon::runParse( ParseSlot& slot )
 {
-  // The substreams' state, the CTUs' readiness and the counters start from zero (host memory the GPU reaches), and so
-  // do the CTUs' counts the parse writes.
-  memset( m_parse.sync.mapped, 0, m_parse.sync.size );
-  memset( m_parse.state.mapped, 0, m_parse.state.size );
-  memset( m_parse.ctuOut.mapped, 0, m_parse.ctuOut.size );
-
-  const uint32_t  streams      = m_parse.in.numStreams;
-  const uint32_t* state        = reinterpret_cast<const uint32_t*>( m_parse.state.mapped );
-  uint32_t        submissions  = 0;
-  uint32_t        stalls       = 0;
-  uint64_t        lastProgress = 0;
+  uint32_t submissions = 0;
   while( true )
   {
     submitParseCommands( [&]() {
-      bind( shader );
-      pushConstants( push, pushSize );
+      slot.recordClear( m_cmd );
+      fullBarrier();
       for( uint32_t i = 0; i < kParseDispatches; i++ )
       {
-        dispatchGroups( streams );   // one workgroup per substream
+        slot.recordStep( m_cmd );
         computeBarrier();
       }
+      slot.recordCompaction( m_cmd );
     } );
     submissions++;
-    // done when every substream is; given up (as compareParse and parsePicture count it) when none advances any more
-    uint32_t done     = 0;
-    uint64_t progress = 0;
-    for( uint32_t s = 0; s < streams; s++ )
+    const ParseSlot::Progress progress = slot.progress();
+    if( progress == ParseSlot::Progress::Overflow )
     {
-      done     += state[s * kParseStateWords + kParseStateDone] != 0 ? 1 : 0;
-      progress += state[s * kParseStateWords + kParseStateNextCtu];
+      slot.restart();   // (more records than the CPU's parse made: the comparison will tell)
     }
-    if( done == streams )
+    else if( progress != ParseSlot::Progress::Parsing )
     {
-      break;
-    }
-    stalls       = progress == lastProgress ? stalls + 1 : 0;
-    lastProgress = progress;
-    if( stalls >= kParseMaxStalls )
-    {
-      break;
+      slot.failed = progress == ParseSlot::Progress::Failed;
+      return submissions;
     }
   }
-  return submissions;
-}
-
-uint32_t GpuRecon::parseSubstreams( const CodingStructure& cs, const Planes* levels )
-{
-  const PreCalcValues& pcv    = *cs.pcv;
-  const bool           chroma = isChromaEnabled( pcv.chrFormat );
-  const int            csx    = chroma ? int( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
-  ParsePush            push{};
-  push.bits       = m_parse.bits.addr;
-  push.streams    = m_parse.streams.addr;
-  push.ctuList    = m_parse.ctuList.addr;
-  push.ctuInfo    = m_parse.ctuInfo.addr;
-  push.slices     = m_parse.slices.addr;
-  push.pic        = m_parse.pic.addr;
-  push.scanTab    = m_parse.scans.addr;
-  push.cus        = m_parse.cus.addr;
-  push.tus        = m_parse.tus.addr;
-  push.ctuOut     = m_parse.ctuOut.addr;
-  push.bottomRows = m_parse.bottomRows.addr;
-  if( levels )
-  {
-    push.levels0  = levels->addr[COMPONENT_Y];
-    push.levels1  = chroma ? levels->addr[COMPONENT_Cb] : 0;
-    push.levels2  = chroma ? levels->addr[COMPONENT_Cr] : 0;
-    push.stride0  = levels->stride[COMPONENT_Y];
-    push.stride12 = chroma ? levels->stride[COMPONENT_Cb] : 0;
-  }
-  else
-  {
-    push.levels0  = m_parse.levels[0].addr;
-    push.levels1  = m_parse.levels[1].addr;
-    push.levels2  = m_parse.levels[2].addr;
-    push.stride0  = int32_t( pcv.lumaWidth );
-    push.stride12 = int32_t( pcv.lumaWidth >> csx );
-  }
-  push.sync       = m_parse.sync.addr;
-  push.wppCtx     = m_parse.wpp.addr;
-  push.numStreams = int32_t( m_parse.in.numStreams );
-  push.state      = m_parse.state.addr;
-  push.binBudget  = kParseBinBudget;
-  // VVDEC_GPU_PROFILE with the shader clock: parse_prof's cycle counts, added up over the pictures
-  const bool prof = m_ctx->profiling() && m_ctx->shaderClock();
-  if( prof )
-  {
-    ensureParseBuffer( m_ctx, m_parse.prof, 16 * sizeof( uint32_t ), MemKind::HostCached );
-    if( !m_parse.profRead )
-    {
-      memset( m_parse.prof.mapped, 0, 16 * sizeof( uint32_t ) );
-    }
-    push.prof = m_parse.prof.addr;
-  }
-  return runParse( &push, sizeof( push ), prof ? kShader_parse_prof : kShader_parse );
-}
-
-void GpuRecon::recordParseCompaction( size_t ctus, int pass )
-{
-  // pass 0 works out each CTU's first CU and TU (one workgroup); pass 1 copies the records (one workgroup per CTU)
-  ParseCompactPush compact{};
-  compact.cusIn   = m_parse.cus.addr;
-  compact.tusIn   = m_parse.tus.addr;
-  compact.ctuOut  = m_parse.ctuOut.addr;
-  compact.ctuInfo = m_parse.ctuInfo.addr;
-  compact.cus     = m_parse.outCus.addr;
-  compact.tus     = m_parse.outTus.addr;
-  compact.ctus    = m_parse.outCtus.addr;
-  compact.totals  = m_parse.totals.addr;
-  compact.numCtus = int32_t( ctus );
-  compact.cuSlots = int32_t( m_parse.in.cuSlots );
-  compact.tuSlots = int32_t( m_parse.in.tuSlots );
-  compact.cuCap   = int32_t( m_parse.cuCap );
-  compact.tuCap   = int32_t( m_parse.tuCap );
-  compact.pass    = pass;
-  bind( kShader_parsecompact );
-  pushConstants( compact );
-  if( pass == 0 )
-  {
-    dispatchGroups( 1 );
-  }
-  else
-  {
-    dispatchJobs( ctus );
-  }
-  computeBarrier();
-}
-
-uint32_t GpuRecon::parseErrors() const
-{
-  // sync[1]: the substreams that gave up; a substream left unparsed counts as given up too
-  const uint32_t* sync   = reinterpret_cast<const uint32_t*>( m_parse.sync.mapped );
-  const uint32_t* state  = reinterpret_cast<const uint32_t*>( m_parse.state.mapped );
-  uint32_t        errors = sync[1];
-  for( uint32_t s = 0; s < m_parse.in.numStreams; s++ )
-  {
-    errors += state[s * kParseStateWords + kParseStateDone] == 0 ? 1 : 0;
-  }
-  return errors;
-}
-
-bool GpuRecon::parsePicture( CodingStructure& cs, const PelStorage& pic, std::vector<std::vector<CuRecord>>& cus, std::vector<std::vector<TuRecord>>& tus )
-{
-  if( m_parse.contexts == 0 )
-  {
-    m_parse.contexts = checkParseContexts() ? 1 : -1;
-  }
-  CHECK( m_parse.contexts < 0, "Vulkan: the GPU parse's context tables differ from vvdec's" );
-  CHECK( !buildParseInput( cs, m_parse.in ), "Vulkan: the slice data for the GPU parse is missing" );
-  const size_t ctus = cs.pcv->sizeInCtus;
-  uploadParseInput( cs, 1, 1 );   // (the records' room once their totals are known)
-
-  // The coefficient levels go into the picture in host memory, where the CPU's parse would leave them for the
-  // residual pass.
-  const Planes levels = hostPlanes( pic );
-  m_parse.stats.submissions += parseSubstreams( cs, &levels );
-  m_parse.stats.pictures++;
-  m_parse.stats.substreams += m_parse.in.numStreams;
-  m_parse.stats.runs += reinterpret_cast<const uint32_t*>( m_parse.sync.mapped )[0];
-  if( parseErrors() != 0 )
-  {
-    m_parse.stats.errors++;
-    return false;
-  }
-
-  // the records in raster order: pass 0 counts them, then they are copied into room of their exact size
-  submitParseCommands( [&]() { recordParseCompaction( ctus, 0 ); } );
-  const uint32_t* totals = reinterpret_cast<const uint32_t*>( m_parse.totals.mapped );
-  m_parse.cuCap          = std::max<size_t>( totals[0], 1 );
-  m_parse.tuCap          = std::max<size_t>( totals[1], 1 );
-  ensureParseBuffer( m_ctx, m_parse.outCus, m_parse.cuCap * sizeof( CuRecord ), MemKind::HostCached );
-  ensureParseBuffer( m_ctx, m_parse.outTus, m_parse.tuCap * sizeof( TuRecord ), MemKind::HostCached );
-  submitParseCommands( [&]() { recordParseCompaction( ctus, 1 ); } );
-
-  // the records CTU by CTU, as the CTU tasks would have written them, and each CTU's SAO and ALF parameters into its
-  // CTU data
-  const CuRecord*  gpuCus  = reinterpret_cast<const CuRecord*>( m_parse.outCus.mapped );
-  const TuRecord*  gpuTus  = reinterpret_cast<const TuRecord*>( m_parse.outTus.mapped );
-  const CtuRecord* gpuCtus = reinterpret_cast<const CtuRecord*>( m_parse.outCtus.mapped );
-  const uint32_t*  ctuOut  = reinterpret_cast<const uint32_t*>( m_parse.ctuOut.mapped );
-  cus.resize( ctus );
-  tus.resize( ctus );
-  for( size_t ctu = 0; ctu < ctus; ctu++ )
-  {
-    const uint32_t firstCu = gpuCtus[ctu].w[0];
-    const uint32_t numCus  = ctuOut[ctu * kParseCtuOutWords];
-    const uint32_t firstTu = gpuCtus[ctu].w[3];
-    const uint32_t numTus  = ctuOut[ctu * kParseCtuOutWords + 1];
-    CHECK( firstCu + numCus > m_parse.cuCap || firstTu + numTus > m_parse.tuCap, "Vulkan: the GPU parse's records past their totals" );
-    cus[ctu].assign( gpuCus + firstCu, gpuCus + firstCu + numCus );
-    tus[ctu].assign( gpuTus + firstTu, gpuTus + firstTu + numTus );
-    applySaoAlf( cs.getCtuData( int( ctu ) ), ctuOut + ctu * kParseCtuOutWords + 2 );
-  }
-  return true;
 }
 
 void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, const Planes& cpuLevels )
@@ -449,12 +164,11 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
   {
     m_parse.contexts = checkParseContexts() ? 1 : -1;
   }
-  if( m_parse.contexts < 0 || !buildParseInput( cs, m_parse.in ) )
+  if( m_parse.contexts < 0 )
   {
     return;
   }
   const PreCalcValues& pcv    = *cs.pcv;
-  const size_t         ctus   = pcv.sizeInCtus;
   size_t               numCus = 0;
   size_t               numTus = 0;
   for( const auto& ctu: *jobs.cus )
@@ -465,7 +179,6 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
   {
     numTus += ctu.size();
   }
-  uploadParseInput( cs, numCus, numTus );
   // the levels into buffers of the parse's own (the CPU's parse has its levels in the picture), for the check below
   const bool   chroma        = isChromaEnabled( pcv.chrFormat );
   const int    csx           = chroma ? int( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
@@ -474,11 +187,47 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
   ensureParseBuffer( m_ctx, m_parse.levels[0], size_t( pcv.lumaWidth ) * pcv.lumaHeight * sizeof( int16_t ), MemKind::Device );
   ensureParseBuffer( m_ctx, m_parse.levels[1], chromaSamples * sizeof( int16_t ), MemKind::Device );
   ensureParseBuffer( m_ctx, m_parse.levels[2], chromaSamples * sizeof( int16_t ), MemKind::Device );
-  m_parse.stats.submissions += parseSubstreams( cs, nullptr );
+  LevelPlanes levels;
+  levels.addr[0]  = m_parse.levels[0].addr;
+  levels.addr[1]  = m_parse.levels[1].addr;
+  levels.addr[2]  = m_parse.levels[2].addr;
+  levels.stride0  = int32_t( pcv.lumaWidth );
+  levels.stride12 = int32_t( pcv.lumaWidth >> csx );
 
-  // the records gathered in raster order, into m_cmd (the picture's first part)
-  recordParseCompaction( ctus, 0 );
-  recordParseCompaction( ctus, 1 );
+  if( !m_parse.slot )
+  {
+    m_parse.slot = std::make_unique<ParseSlot>( m_ctx );
+  }
+  ParseSlot& slot = *m_parse.slot;
+  // VVDEC_GPU_PROFILE with the shader clock: parse_prof's cycle counts, added up over the pictures
+  if( m_ctx->profiling() && m_ctx->shaderClock() )
+  {
+    ensureParseBuffer( m_ctx, m_parse.prof, 16 * sizeof( uint32_t ), MemKind::HostCached );
+    if( !m_parse.profRead )
+    {
+      memset( m_parse.prof.mapped, 0, 16 * sizeof( uint32_t ) );
+    }
+    slot.setProfile( m_parse.prof.addr );
+  }
+  // room for as many records as the CPU's parse made
+  if( !slot.prepare( cs, levels, numCus, numTus ) )
+  {
+    return;
+  }
+  m_parse.stats.submissions += runParse( slot );
+  m_parse.recorded = true;
+  if( slot.failed )
+  {
+    return;   // (compareParse counts it)
+  }
+
+  // the records in raster order, in host memory: copied in m_cmd (the picture's first part)
+  ensureParseBuffer( m_ctx, m_parse.outCus, std::max<size_t>( slot.numCus(), 1 ) * sizeof( CuRecord ), MemKind::HostCached );
+  ensureParseBuffer( m_ctx, m_parse.outTus, std::max<size_t>( slot.numTus(), 1 ) * sizeof( TuRecord ), MemKind::HostCached );
+  ensureParseBuffer( m_ctx, m_parse.outCtus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::HostCached );
+  ensureParseBuffer( m_ctx, m_parse.check, 4 * sizeof( uint32_t ), MemKind::HostCached );
+  slot.recordScatter( m_cmd, m_parse.outCus.addr, m_parse.outTus.addr, m_parse.outCtus.addr );
+  computeBarrier();
 
   // The levels against the CPU's parse's (in the picture in host memory, which the residual pass reads), one
   // workgroup per TU
@@ -493,7 +242,7 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
   check.cpu1        = chroma ? cpuLevels.addr[COMPONENT_Cb] : 0;
   check.cpu2        = chroma ? cpuLevels.addr[COMPONENT_Cr] : 0;
   check.counts      = m_parse.check.addr;
-  check.numTus      = int32_t( numTus );
+  check.numTus      = int32_t( slot.numTus() );
   check.gpuStride0  = int32_t( pcv.lumaWidth );
   check.gpuStride12 = int32_t( pcv.lumaWidth >> csx );
   check.cpuStride0  = cpuLevels.stride[COMPONENT_Y];
@@ -502,15 +251,14 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
   check.height      = int32_t( pcv.lumaHeight );
   check.csx         = csx;
   check.csy         = csy;
-  if( numTus > 0 )
+  if( slot.numTus() > 0 )
   {
     bind( kShader_parsecheck );
     pushConstants( check );
-    dispatchJobs( numTus );
+    dispatchJobs( slot.numTus() );
     computeBarrier();
   }
   mark( "parse checks" );
-  m_parse.recorded = true;
 }
 
 void GpuRecon::compareParse( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus )
@@ -519,30 +267,64 @@ void GpuRecon::compareParse( const CodingStructure& cs, const std::vector<std::v
   {
     return;
   }
-  m_parse.recorded = false;
-  m_parse.stats.substreams += m_parse.in.numStreams;
-  m_parse.stats.runs += reinterpret_cast<const uint32_t*>( m_parse.sync.mapped )[0];   // (one per substream and dispatch)
+  m_parse.recorded       = false;
+  const ParseSlot& slot  = *m_parse.slot;
+  ParseStats&      stats = m_parse.stats;
+  stats.substreams += slot.input().numStreams;
+  stats.runs += slot.runs();
   if( m_parse.prof.mapped )
   {
     // the profile's sums, the buffer cleared for the next picture
     uint32_t* p = reinterpret_cast<uint32_t*>( m_parse.prof.mapped );
     for( int i = 0; i < 16; i++ )
     {
-      m_parse.stats.prof[i] += p[i];
+      stats.prof[i] += p[i];
       p[i] = 0;
     }
     m_parse.profRead = true;
   }
+  if( slot.failed )
+  {
+    // given up: every record counts as differing
+    stats.pictures++;
+    stats.errors++;
+    for( size_t ctu = 0; ctu < cus.size(); ctu++ )
+    {
+      stats.cusCompared += int64_t( cus[ctu].size() );
+      stats.cusDiffer += int64_t( cus[ctu].size() );
+      stats.tusCompared += int64_t( tus[ctu].size() );
+      stats.tusDiffer += int64_t( tus[ctu].size() );
+    }
+    if( stats.reported < 20 )
+    {
+      stats.reported++;
+      msg( WARNING, "GPU parse: POC %d: %u substreams gave up\n", cs.picture->poc, slot.errors() );
+    }
+    return;
+  }
   gpu::compareParse( cs, reinterpret_cast<const uint32_t*>( m_parse.outCus.mapped ), reinterpret_cast<const uint32_t*>( m_parse.outTus.mapped ),
-                     reinterpret_cast<const uint32_t*>( m_parse.outCtus.mapped ), reinterpret_cast<const uint32_t*>( m_parse.ctuOut.mapped ),
-                     reinterpret_cast<const uint32_t*>( m_parse.totals.mapped ), cus, tus, cs.m_gpuSaoAlf,
-                     reinterpret_cast<const uint32_t*>( m_parse.check.mapped ), parseErrors(), m_parse.stats );
+                     reinterpret_cast<const uint32_t*>( m_parse.outCtus.mapped ), slot.ctuOut(), slot.totals(), cus, tus, cs.m_gpuSaoAlf,
+                     reinterpret_cast<const uint32_t*>( m_parse.check.mapped ), slot.errors(), stats );
+  // The room of the front end's job lists, as the parse added it up, against gpu::frontCapacities of the CPU's records
+  const FrontCapacities  cpu = frontCapacities( cs, cus, tus );
+  const FrontCapacities& gpu = slot.capacities();
+  stats.capsCompared++;
+  if( cpu.trafo != gpu.trafo || cpu.inter != gpu.inter || cpu.intra != gpu.intra || cpu.bands != gpu.bands || cpu.edges != gpu.edges )
+  {
+    stats.capsDiffer++;
+    if( stats.reported < 20 )
+    {
+      stats.reported++;
+      msg( WARNING, "GPU parse: POC %d job lists' room: CPU %zu %zu %zu %zu %zu, GPU %zu %zu %zu %zu %zu\n", cs.picture->poc, cpu.trafo, cpu.inter,
+           cpu.intra, cpu.bands, cpu.edges, gpu.trafo, gpu.inter, gpu.intra, gpu.bands, gpu.edges );
+    }
+  }
 }
 
-void GpuRecon::ParseBuffers::release( Context* ctx )
+void GpuRecon::ParseCheck::release( Context* ctx )
 {
-  for( Buffer* buf: { &bits, &streams, &ctuList, &ctuInfo, &slices, &pic, &scans, &cus, &tus, &bottomRows, &levels[0], &levels[1], &levels[2], &sync,
-                      &wpp, &ctuOut, &state, &outCus, &outTus, &outCtus, &totals, &check, &prof } )
+  slot.reset();
+  for( Buffer* buf: { &levels[0], &levels[1], &levels[2], &outCus, &outTus, &outCtus, &check, &prof } )
   {
     ctx->free( *buf );
   }

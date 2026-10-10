@@ -665,7 +665,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 #if VVDEC_VULKAN
   // with the GPU front end, every stage of the picture runs on the GPU
   m_gpuFrontEnd   = gpuFrontEnd;
-  m_gpuParseDrives = gpu::GpuRecon::parsesPicture( *pcPic, *sps );
+  m_gpuParseDrives = m_gpuParseService && gpu::GpuRecon::parsesPicture( *pcPic, *sps );
   CHECK( m_gpuParseDrives && !m_gpuFrontEnd, "Vulkan: a picture the GPU parses must be reconstructed by the GPU front end" );
   commonTaskParam.reset( cs, ctuStartState, numTasksPerLine, doALF && !m_gpuFilters, doSAO && !m_gpuFilters, m_doDeblock && !m_gpuFilters, m_gpuIntra,
                          m_gpuInter, m_gpuResidual );
@@ -1521,7 +1521,8 @@ void DecLibRecon::resetGpuJobLists( Picture* pic )
 void DecLibRecon::addGpuTasks( Picture* pic, FinishPicTaskParam& finishParam )
 {
   // The picture's GPU tasks (README.md):
-  // - filterParamsTask works out the in-loop filters' parameters once the picture is parsed, while its CTU tasks run;
+  // - filterParamsTask works out the in-loop filters' parameters once the picture is parsed, while its CTU tasks run
+  //   (with the GPU's parse: once the GPU parsed it, from the CTUs' SAO and ALF parameters it left);
   // - earlyRowsTask (CPU front end) submits the early rows once their CTU tasks are done;
   // - queueGpuTask records and submits the picture's work once its CTU tasks are done, then unlocks gpuRefReady: the
   //   pictures whose inter prediction the GPU makes can now reference this one, their work submitted after its.
@@ -1531,19 +1532,15 @@ void DecLibRecon::addGpuTasks( Picture* pic, FinishPicTaskParam& finishParam )
   //   may take its next picture while this one downloads (releasePrevDecompressedPic: VideoQ 1080p +1.4%);
   // - finishGpuTask waits for the download.
   finishParam = FinishPicTaskParam( this, pic );
-  CBarrierVec queueBarriers{ pic->m_ctuTaskCounter.donePtr() };
-  if( !m_gpuParseDrives )   // (with the GPU's parse, the SAO and ALF parameters come only with it: startPicture works them out)
-  {
-    m_gpuFiltersPrepared.clearException();
-    m_gpuFiltersPrepared.lock();
-    m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pic->poc ) + " filterParamsTask" )
-                                        filterParamsTask,
-                                        &finishParam,
-                                        &pic->m_divTasksCounter,
-                                        &m_gpuFiltersPrepared,
-                                        { &pic->parseDone } );
-    queueBarriers.push_back( &m_gpuFiltersPrepared );
-  }
+  m_gpuFiltersPrepared.clearException();
+  m_gpuFiltersPrepared.lock();
+  m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pic->poc ) + " filterParamsTask" )
+                                      filterParamsTask,
+                                      &finishParam,
+                                      &pic->m_divTasksCounter,
+                                      &m_gpuFiltersPrepared,
+                                      { m_gpuParseDrives ? &pic->gpuParsed : &pic->parseDone } );
+  CBarrierVec queueBarriers{ pic->m_ctuTaskCounter.donePtr(), &m_gpuFiltersPrepared };
   if( m_gpuEarlyRows > 0 )
   {
     // (a ready check rather than a barrier, so that a CTU task's failure fails it instead of leaving it waiting)
@@ -1615,6 +1612,16 @@ bool DecLibRecon::filterParamsTask( int, void* taskParam )
 {
   FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( taskParam );
   DecLibRecon*        dec   = param->decLib;
+  if( dec->m_gpuParseDrives )
+  {
+    // the CTUs' SAO and ALF parameters as the GPU's parse left them (when it gave up, queueGpuTask fails the picture)
+    const gpu::ParseSlot* parsed = param->pic->gpuParseSlot;
+    if( !parsed || parsed->failed )
+    {
+      return true;
+    }
+    gpu::applyParsedSaoAlf( *param->pic->cs, *parsed );
+  }
   dec->m_gpuRecon->prepareFilters( *param->pic->cs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr, dec->m_doALF ? &dec->m_cALF : nullptr );
   return true;
 }
@@ -1647,10 +1654,15 @@ bool DecLibRecon::queueGpuTask( int, void* taskParam )
   FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( taskParam );
   CodingStructure&    cs    = *param->pic->cs;
   DecLibRecon*        dec   = param->decLib;
-  // The GPU's parse: the records, the coefficient levels in the picture, the CTUs' SAO and ALF parameters
-  if( dec->m_gpuParseDrives
-      && !dec->m_gpuRecon->parsePicture( cs, cs.picture->m_bufs[PIC_RECONSTRUCTION], dec->m_gpuCuRecords, dec->m_gpuTuRecords ) )
+  // With the GPU's parse: what it left (the records in its slot, the coefficient levels in the picture)
+  gpu::ParseSlot* parsed = dec->m_gpuParseDrives ? cs.picture->gpuParseSlot : nullptr;
+  if( dec->m_gpuParseDrives && ( !parsed || parsed->failed ) )
   {
+    if( parsed )
+    {
+      dec->m_gpuParseService->release( parsed, 0 );
+      cs.picture->gpuParseSlot = nullptr;
+    }
     THROW_RECOVERABLE( "Vulkan: the GPU parse gave up on the slice data of POC " << cs.picture->poc );
   }
   // The picture's slice table (its CTUs are parsed, so their slices are known), for the GPU's motion derivation of
@@ -1659,13 +1671,21 @@ bool DecLibRecon::queueGpuTask( int, void* taskParam )
   {
     gpu::writeSliceTable( cs, cs.gpuSliceTable( gpu::sliceTableWords( cs ) ) );
   }
-  const gpu::PictureJobs jobs = dec->gpuPictureJobs( cs );
+  gpu::PictureJobs jobs = dec->gpuPictureJobs( cs );
+  jobs.parsed           = parsed;
   // With DMVR and the CPU front end, the GPU stores the refined motion for TMVP in the first part (the CTU tasks
   // stored the rest), which the next pictures' CTU tasks wait for.
   const bool refine = dec->m_gpuInter && cs.picture->stillReferenced && !dec->m_gpuFrontEnd;
   param->download   = dec->m_gpuRecon->startPicture( cs, jobs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr,
                                                      dec->m_doALF ? &dec->m_cALF : nullptr, cs.picture->m_bufs[PIC_RECONSTRUCTION], refine );
   cs.picture->gpuCurrent = true;   // for the work submitted after this
+  if( parsed )
+  {
+    // the slot back to the GPU's parse, for reuse once the picture's first part (after the front end that reads it)
+    // is done
+    dec->m_gpuParseService->release( parsed, cs.picture->gpuFirstValue );
+    cs.picture->gpuParseSlot = nullptr;
+  }
   return true;
 }
 

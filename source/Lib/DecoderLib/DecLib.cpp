@@ -206,6 +206,20 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
     dec.create( m_decodeThreadPool.get(), id++, upscalingEnabled );
 #endif
   }
+#if VVDEC_VULKAN
+  // VVDEC_GPU_PARSE=2: the GPU parses the pictures ahead of their reconstruction, on the parse queue
+  const gpu::Options* options = m_gpu ? &m_gpu->options() : nullptr;
+  if( options && options->parseDrives && options->frontEnd && !options->frontEndCheck && m_gpu->parseQueue() )
+  {
+    ThreadPool* pool  = m_decodeThreadPool.get();
+    m_gpuParseService = std::make_unique<gpu::ParseService>( m_gpu, [pool]() { pool->wakeUp(); } );
+    m_decLibParser.setGpuParseService( m_gpuParseService.get() );
+    for( auto& dec: m_decLibRecon )
+    {
+      dec.setGpuParseService( m_gpuParseService.get() );
+    }
+  }
+#endif
 
   std::stringstream cssCap;
   cssCap << "THREADS="     << numDecThreads << "; "
@@ -235,11 +249,30 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
 
 void DecLib::destroy()
 {
+#if VVDEC_VULKAN
+  // the GPU's parse ahead stops (its last submission done) after the thread pool's threads, which hand it pictures,
+  // and before the pool, which it wakes, and the pictures it writes into go
+  const bool      parseAheadOn = m_gpuParseService != nullptr;
+  gpu::ParseStats parseAhead;
+  const auto      stopParseAhead = [&]() {
+    if( m_gpuParseService )
+    {
+      parseAhead = m_gpuParseService->stats();
+      m_gpuParseService.reset();
+    }
+  };
+#endif
   if( m_decodeThreadPool )
   {
     m_decodeThreadPool->shutdown( true );
+#if VVDEC_VULKAN
+    stopParseAhead();
+#endif
     m_decodeThreadPool.reset();
   }
+#if VVDEC_VULKAN
+  stopParseAhead();   // (without a thread pool)
+#endif
 
   m_decLibParser.destroy();
 #if VVDEC_VULKAN
@@ -281,13 +314,19 @@ void DecLib::destroy()
         parse.substreams += s->substreams;
         parse.runs += s->runs;
         parse.submissions += s->submissions;
+        parse.capsCompared += s->capsCompared;
+        parse.capsDiffer += s->capsDiffer;
         for( int i = 0; i < 16; i++ )
         {
           parse.prof[i] += s->prof[i];
         }
       }
     }
-    if( parseOn )
+    if( parseAheadOn )
+    {
+      parse = parseAhead;
+    }
+    if( parseOn || parseAheadOn )
     {
       if( parse.prof[0] != 0 )
       {
@@ -301,12 +340,26 @@ void DecLib::destroy()
              (unsigned long long) parse.prof[9], (unsigned long long) parse.prof[10], (unsigned long long) parse.prof[11],
              (unsigned long long) parse.prof[12], (unsigned long long) parse.prof[13] );
       }
+    }
+    if( parseOn )
+    {
       msg( INFO,
            "GPU: parse (VVDEC_GPU_PARSE) of %lld pictures: CUs %lld compared with the CPU's, %lld differ; TUs %lld, %lld; CTUs (with SAO, ALF) %lld, "
            "%lld; levels %lld, %lld; substreams %lld in %lld runs, %lld submissions" "\n",
            (long long) parse.pictures, (long long) parse.cusCompared, (long long) parse.cusDiffer, (long long) parse.tusCompared,
            (long long) parse.tusDiffer, (long long) parse.ctusCompared, (long long) parse.ctusDiffer, (long long) parse.levelsCompared,
            (long long) parse.levelsDiffer, (long long) parse.substreams, (long long) parse.runs, (long long) parse.submissions );
+      msg( INFO, "GPU: parse's job lists' room (VVDEC_GPU_PARSE): %lld pictures compared with the CPU's records' (gpu::frontCapacities), %lld differ\n",
+           (long long) parse.capsCompared, (long long) parse.capsDiffer );
+    }
+    if( parseAheadOn )
+    {
+      msg( INFO,
+           "GPU: parse ahead (VVDEC_GPU_PARSE=2) of %lld pictures: %lld submissions with %.1f pictures each on average, %lld pictures parsed again "
+           "for room, %lld failed; substreams %lld in %lld runs; at most %lld CU and %lld TU records a picture\n",
+           (long long) parse.pictures, (long long) parse.submissions,
+           parse.submissions > 0 ? double( parse.parsingSum ) / double( parse.submissions ) : 0.0, (long long) parse.restarts,
+           (long long) parse.errors, (long long) parse.substreams, (long long) parse.runs, (long long) parse.maxCus, (long long) parse.maxTus );
     }
     gpu::FrontEndStats check;
     bool               checkOn = false;

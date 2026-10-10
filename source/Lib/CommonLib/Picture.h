@@ -69,6 +69,12 @@ using namespace arm_simd;
 #endif
 
 struct Picture;
+#if VVDEC_VULKAN
+namespace gpu
+{
+class ParseSlot;
+}
+#endif
 
 typedef std::list<Picture*> PicList;
 
@@ -220,6 +226,10 @@ public:
   // motion the CPU derives waits for gpuComputeDone
   bool                     gpuMotionLater  = false;
   UserAllocator*           gpuMemory       = nullptr;        // the GPU's allocator of the picture's buffers (PicListManager): its colocated motion too
+  // VVDEC_GPU_PARSE=2, the GPU parses the picture (gpu::ParseService): its CTUs the parse tasks claimed so far
+  // (DecSlice::claimSlice), and once gpuParsed unlocks, what the GPU's parse left (null, or failed: it gave up)
+  std::atomic_int          gpuClaimedCtus  { 0 };
+  gpu::ParseSlot*          gpuParseSlot    = nullptr;
 #endif
   bool             isReferencePic          = false;          // mainly for setting vvdecPicAttributes::isRefPic for the library output frame
   bool             wasLost                 = false;
@@ -278,6 +288,8 @@ public:
   // its work on the GPU done but for its download (DecLibRecon: its instance
   // may take the next picture then)
   BlockingBarrier gpuComputeDone;
+  // VVDEC_GPU_PARSE=2: the GPU's parse of the picture done (gpu::ParseService)
+  Barrier         gpuParsed;
 #endif
 #if RECO_WHILE_PARSE
   std::vector<Barrier> ctuParsedBarrier;

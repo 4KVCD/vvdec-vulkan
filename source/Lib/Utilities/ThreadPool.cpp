@@ -162,6 +162,11 @@ void ThreadPool::shutdown( bool block )
   }
 }
 
+void ThreadPool::wakeUp()
+{
+  m_poolPause.unpauseIfPaused( m_poolPause.acquireLock() );
+}
+
 void ThreadPool::waitForThreads()
 {
   m_poolPause.unpauseIfPaused( m_poolPause.acquireLock() );

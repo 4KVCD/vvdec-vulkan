@@ -136,6 +136,10 @@ void Picture::resetForUse( int _layerId )
   gpuRefReady.clearException();
   gpuRefReady.lock();
   gpuComputeDone.clearException();
+  gpuClaimedCtus          = 0;
+  gpuParseSlot            = nullptr;
+  gpuParsed.clearException();
+  gpuParsed.lock();
 #endif
   isReferencePic          = false;
   progress                = Picture::init;
@@ -373,6 +377,9 @@ void Picture::setParseError( std::exception_ptr e )
 {
   error = true;
   parseDone.setException( e );
+#if VVDEC_VULKAN
+  gpuParsed.setException( e );   // (the GPU's parse never gets the picture)
+#endif
 #if RECO_WHILE_PARSE
   // reconstruction can already be waiting for CTUs, that will never be parsed
   for( auto& b: ctuParsedBarrier )

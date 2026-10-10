@@ -84,7 +84,8 @@ namespace gpu
   X( vkCmdDispatchIndirect ) X( vkCmdPipelineBarrier ) X( vkCmdCopyBuffer ) X( vkCmdFillBuffer ) X( vkCreateFence )     \
   X( vkDestroyFence ) X( vkWaitForFences ) X( vkResetFences ) X( vkGetFenceStatus ) X( vkQueueSubmit )                  \
   X( vkQueueWaitIdle ) X( vkDeviceWaitIdle ) X( vkCreateQueryPool ) X( vkDestroyQueryPool ) X( vkCmdResetQueryPool )    \
-  X( vkCmdWriteTimestamp ) X( vkGetQueryPoolResults ) X( vkCreateSemaphore ) X( vkDestroySemaphore )
+  X( vkCmdWriteTimestamp ) X( vkGetQueryPoolResults ) X( vkCreateSemaphore ) X( vkDestroySemaphore )                 \
+  X( vkGetSemaphoreCounterValue )
 
 struct Api
 {
@@ -197,11 +198,22 @@ public:
   // pictures' front ends run there, alongside the compute queue's work. Each decoder instance takes its own queue
   // (takeAsyncQueue), so the front ends of different instances also run at the same time. submitFront() submits a
   // front end's commands: they wait until the compute queue's timeline semaphore reaches waitFirst (the first parts
-  // of the picture's colocated pictures) and then signal done.
+  // of the picture's colocated pictures) and the parse queue's reaches waitParse (the picture's parse), then signal
+  // done.
   bool     asyncQueue() const { return m_asyncFamily != UINT32_MAX; }
   uint32_t asyncFamily() const { return m_asyncFamily; }
   int      takeAsyncQueue() { return int( m_asyncNext++ % uint32_t( m_asyncCount ) ); }
-  void     submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, VkSemaphore done );
+  void     submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, VkSemaphore done, uint64_t waitParse = 0 );
+  // How far the compute queue's timeline semaphore is: the value of the last picture's first part done on the GPU
+  uint64_t firstPartsDone() const;
+
+  // --- The parse queue ---
+  // With the async compute queues, the GPU's parse of the pictures ahead of their reconstruction (VVDEC_GPU_PARSE=2;
+  // ParseService) runs on a queue of its own: an async compute queue that no decoder instance takes when the family
+  // has one more, else the last one. submitParse() submits the parse's commands, which signal the parse's timeline
+  // semaphore and done; the value they signal is returned, for the front ends that read what they wrote.
+  bool     parseQueue() const { return m_parseQueue != VK_NULL_HANDLE; }
+  uint64_t submitParse( VkCommandBuffer cmd, VkFence done );
 
   uint32_t           queueFamily()     const { return m_queueFamily; }
   uint32_t           transferFamily()  const { return m_transferFamily; }
@@ -256,6 +268,13 @@ private:
   int                              m_asyncCount  = 0;
   std::atomic<uint32_t>            m_asyncNext{ 0 };
   uint32_t                         m_asyncFamily = UINT32_MAX;
+
+  // the parse queue (one of the async family's), its lock (its own, or the async queue's it shares) and timeline
+  VkQueue                          m_parseQueue    = VK_NULL_HANDLE;
+  std::mutex                       m_parseOwnMutex;
+  std::mutex*                      m_parseMutex    = &m_parseOwnMutex;
+  VkSemaphore                      m_parseTimeline = VK_NULL_HANDLE;
+  uint64_t                         m_parseValue    = 0;   // the last value signalled (guarded by *m_parseMutex)
 
   // the pipelines
   VkPipelineLayout                 m_layout    = VK_NULL_HANDLE;
