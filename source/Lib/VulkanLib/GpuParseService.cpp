@@ -76,9 +76,12 @@ static constexpr size_t   kParseTotals       = 16;        // the CUs and TUs, th
 static constexpr size_t   kGroupsPerRow      = 32768;     // the shaders take group.y as rows of 32768 workgroups
 
 // The service: each picture's dispatches in one submission (one, so that a picture is handed over as soon as it is
-// parsed), the pictures parsed at a time; the buffers of the parse results kept for reuse, in each size
+// parsed), the pictures parsed at a time; the buffers of the parse results kept for reuse, in each size. The parse
+// waves slow each other: with 16 at a time the intra picture that starts VideoQ 1080p parsed in 800 ms (~190 ms alone)
+// while the first frame waited for it; 12 decode as fast (1080p 250 fps, 4K 99 at -p 64; 8: 242 / 96) with the first
+// frame 80-140 ms earlier.
 static constexpr uint32_t kStepsPerSubmission = 1;
-static constexpr size_t   kMaxParsing         = 16;
+static constexpr size_t   kMaxParsing         = 12;
 
 // The push constants of parse.slang
 struct ParsePush
