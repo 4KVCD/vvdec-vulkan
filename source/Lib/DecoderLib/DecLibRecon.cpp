@@ -453,6 +453,22 @@ void DecLibRecon::createSubPicRefBufs( Picture* pic, const Picture* currPic )
   }
 }
 
+void DecLibRecon::allocateFrontEndMaps( const CodingStructure& cs, bool cpuFrontEnd )
+{
+  // The motion and the deblocking parameters of each 4x4 block, which the CPU's front end works out (MIDER and
+  // LF_INIT; at 4K 10 and 6 MB): allocated only when it drives a picture, and kept for the next pictures of the size.
+  const ptrdiff_t num4x4 = ptrdiff_t( cs.pcv->num4x4CtuBlks ) * cs.pcv->sizeInCtus;
+  if( m_num4x4Elements == num4x4 && ( m_motionInfo || !cpuFrontEnd ) )
+  {
+    return;
+  }
+  free( m_loopFilterParam );
+  free( m_motionInfo );
+  m_num4x4Elements  = num4x4;
+  m_loopFilterParam = cpuFrontEnd ? ( LoopFilterParam* ) malloc( sizeof( LoopFilterParam ) * num4x4 * 2 ) : nullptr;
+  m_motionInfo      = cpuFrontEnd ? ( MotionInfo* ) malloc( sizeof( MotionInfo ) * num4x4 ) : nullptr;
+}
+
 void DecLibRecon::swapBufs( CodingStructure& cs )
 {
   cs.picture->m_bufs[PIC_RECONSTRUCTION].swap( m_fltBuf );
@@ -576,19 +592,6 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   }
 
   pcPic->cs->m_dmvrMvCache = m_dmvrMvCache;
-
-  if( m_num4x4Elements != cs.pcv->num4x4CtuBlks * cs.pcv->sizeInCtus )
-  {
-    if( m_loopFilterParam ) free( m_loopFilterParam );
-    if( m_motionInfo      ) free( m_motionInfo );
-
-    m_num4x4Elements = cs.pcv->num4x4CtuBlks * cs.pcv->sizeInCtus;
-
-    // (with the GPU too: its deblocking takes the parameters it needs from the
-    // edge lists, GpuRecon::listEdges)
-    m_loopFilterParam = ( LoopFilterParam* ) malloc( sizeof( LoopFilterParam ) * m_num4x4Elements * 2 );
-    m_motionInfo      = ( MotionInfo* )      malloc( sizeof( MotionInfo      ) * m_num4x4Elements );
-  }
   // finished
 
   const int widthInCtus  = cs.pcv->widthInCtus;
@@ -614,7 +617,11 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 #if VVDEC_VULKAN
   // whether the GPU front end drives the picture (m_gpuFrontEnd, below)
   const bool gpuFrontEnd = m_gpuFrontEndRequested && m_gpuFilters && m_gpuIntra && m_gpuResidual && ( isIntra || m_gpuInter ) && cs.colMiAllocator;
+  const bool cpuFrontEnd = !gpuFrontEnd;
+#else
+  const bool cpuFrontEnd = true;
 #endif
+  allocateFrontEndMaps( cs, cpuFrontEnd );
   for( Picture* refPic : borderExtRefPics )
   {
 #if VVDEC_VULKAN
@@ -949,7 +956,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
     {
       const int ctuRsAddr = ctu + line * cs.pcv->widthInCtus;
       CtuData& ctuData    = cs.getCtuData( ctuRsAddr );
-      ctuData.motion      = &decLib.m_motionInfo[cs.pcv->num4x4CtuBlks * ctuRsAddr];
+      ctuData.motion      = decLib.m_motionInfo ? &decLib.m_motionInfo[cs.pcv->num4x4CtuBlks * ctuRsAddr] : nullptr;
 #if VVDEC_VULKAN
       if( ( decLib.m_gpuFrontEndCheck || param->common.gpuFrontEnd ) && param->common.gpuIntra && !decLib.m_gpuParseDrives )
       {
@@ -994,8 +1001,9 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
     {
       const int ctuRsAddr = ctu + line * cs.pcv->widthInCtus;
       CtuData& ctuData    = cs.getCtuData( ctuRsAddr );
-      ctuData.lfParam[0]  = &decLib.m_loopFilterParam[cs.pcv->num4x4CtuBlks * ( 2 * ctuRsAddr + 0 )];
-      ctuData.lfParam[1]  = &decLib.m_loopFilterParam[cs.pcv->num4x4CtuBlks * ( 2 * ctuRsAddr + 1 )];
+      LoopFilterParam* lfp = decLib.m_loopFilterParam;
+      ctuData.lfParam[0]  = lfp ? &lfp[cs.pcv->num4x4CtuBlks * ( 2 * ctuRsAddr + 0 )] : nullptr;
+      ctuData.lfParam[1]  = lfp ? &lfp[cs.pcv->num4x4CtuBlks * ( 2 * ctuRsAddr + 1 )] : nullptr;
 #if VVDEC_VULKAN
       if( param->common.gpuFrontEnd )
       {

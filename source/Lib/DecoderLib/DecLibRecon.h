@@ -289,6 +289,8 @@ public:
 private:
   void borderExtPic       ( Picture* pic, const Picture* currPic );
   void createSubPicRefBufs( Picture* pic, const Picture* currPic );
+  // m_motionInfo and m_loopFilterParam, for the CPU's front end (not when the GPU's drives the picture)
+  void allocateFrontEndMaps( const CodingStructure& cs, bool cpuFrontEnd );
 
   template<bool checkReadyState=false>
   static bool ctuTask( int tid, void* task_param );

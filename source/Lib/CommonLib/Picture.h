@@ -154,8 +154,10 @@ public:
   void (*paddPicBorderTop) (Pel *pi, ptrdiff_t stride,int width,int xmargin,int ymargin);
   void (*paddPicBorderLeftRight) (Pel *pi, ptrdiff_t stride,int width,int xmargin,int height);
 
+  // cuMap, colMotion, ibcBuffer: whether the coding structure gets its CU map, its colocated motion and IBC's virtual
+  // buffer (a picture the GPU parses needs none of them)
   void finalInit( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache, CuMapCache* cuMapCache, const SPS * sps, const PPS * pps, const std::shared_ptr<PicHeader>& ph, const APS* const alfApss[ALF_CTB_MAX_NUM_APS], const APS * lmcsAps, const APS* scalingListAps, bool phPSupdate = true, bool clearColMotion = true,
-                  bool cuMap = true, bool colMotion = true );
+                  bool cuMap = true, bool colMotion = true, bool ibcBuffer = true );
 
   int      getPOC()                           const { return poc; }
   uint64_t getCts()                           const { return cts; }

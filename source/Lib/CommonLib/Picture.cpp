@@ -258,7 +258,7 @@ Picture::Picture( bool enableOpt )
   }
 }
 
-void Picture::finalInit( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache, CuMapCache* cuMapCache, const SPS *sps, const PPS *pps, const std::shared_ptr<PicHeader>& ph, const APS* const alfApss[ALF_CTB_MAX_NUM_APS], const APS* lmcsAps, const APS* scalingListAps, bool phPSupdate, bool clearColMotion, bool cuMap, bool colMotion )
+void Picture::finalInit( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache, CuMapCache* cuMapCache, const SPS *sps, const PPS *pps, const std::shared_ptr<PicHeader>& ph, const APS* const alfApss[ALF_CTB_MAX_NUM_APS], const APS* lmcsAps, const APS* scalingListAps, bool phPSupdate, bool clearColMotion, bool cuMap, bool colMotion, bool ibcBuffer )
 {
   SEI_internal::deleteSEIs( seiMessageList );
   clearSliceBuffer();
@@ -312,9 +312,15 @@ void Picture::finalInit( CUChunkCache* cuChunkCache, TUChunkCache* tuChunkCache,
   cs->rebindPicBufs();
   cs->initStructData( clearColMotion );
 
-  if( sps->getIBCFlag() )
+  // IBC's virtual buffer, which the CPU's IBC prediction reads: per CTU row, 256 x 128 luma samples' worth (VideoQ 4K:
+  // 3.2 MB a picture). A reused coding structure gives back the one it had when the picture does not need it.
+  if( sps->getIBCFlag() && ibcBuffer )
   {
     cs->initVIbcBuf( cs->pcv->heightInCtus, sps->getChromaFormatIdc(), sps->getMaxCUHeight() );
+  }
+  else
+  {
+    cs->m_virtualIBCbuf.clear();
   }
 
   resetProcessingTime();
