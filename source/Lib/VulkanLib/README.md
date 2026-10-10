@@ -112,6 +112,7 @@ output frames, not to the reference pictures.
 | `VVDEC_GPU_ASYNC=0` | run the front end on the compute queue instead of an async compute queue |
 | `VVDEC_GPU_PARSE=1` | the GPU parses the slice data too, compared with the CPU's parse (debugging) |
 | `VVDEC_GPU_PARSE=2` | the GPU parses the slice data instead of the CPU (needs the async compute queues) |
+| `VVDEC_GPU_CACHE=<file>` | where the compiled shaders are kept between runs (default: `%LOCALAPPDATA%\vvdec\` on Windows, `$XDG_CACHE_HOME/vvdec/` or `~/.cache/vvdec/` elsewhere; one file per GPU, made anew when the driver or the shaders change); `0`: none, every program's first run compiles them again (~12 s) |
 | `VVDEC_FASTHASH=1` | (vvdecapp) `-md5` hashes the output with CRC-32C instead of MD5, for fast checks |
 
 ## Files
