@@ -271,8 +271,9 @@ void GpuRecon::splitCommands()
   // Submitted at once: the rest is recorded while it runs.
   vk.vkResetFences( m_ctx->device(), 1, &m_fenceFirst );
   m_submitted     = std::chrono::steady_clock::now();
-  m_firstValue    = m_ctx->submitFirst( m_cmdFirst, m_fenceFirst, m_waitFrontEnd1 );
-  m_waitFrontEnd1 = VK_NULL_HANDLE;
+  m_firstValue     = m_ctx->submitFirst( m_cmdFirst, m_fenceFirst, m_waitFrontEnd1, m_firstParseWait );
+  m_waitFrontEnd1  = VK_NULL_HANDLE;
+  m_firstParseWait = 0;
 
   // The rest, after what the first part wrote
   m_cmd = m_cmdRest;
@@ -874,11 +875,19 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
     m_earlyRowsMarks = 0;
   }
 
-  // The GPU front end on the async compute queue, alongside the work submitted before
-  const bool frontEndAsync = jobs.useFrontEnd && ( jobs.cus || jobs.parsed ) && m_cmdFrontEnd1 != VK_NULL_HANDLE;
+  // The GPU front end on the async compute queue, alongside the work submitted before -- but not for a picture the
+  // GPU parsed: the parse's waves keep the GPU busy then, and the front end's passes beside the compute queue's work
+  // slowed that more than they gained (VideoQ 4K: inter 4.6 ms a picture instead of 2.5, 116.3 -> 119.5 fps; with the
+  // CPU's parse the async queue gains, 147.3 -> 161.5 fps). That picture's first part holds its front end, and waits
+  // for its parsed records itself.
+  const bool frontEndAsync = jobs.useFrontEnd && jobs.cus && !jobs.parsed && m_cmdFrontEnd1 != VK_NULL_HANDLE;
   if( frontEndAsync )
   {
     recordFrontEndAsync( cs, jobs );
+  }
+  else if( jobs.useFrontEnd && jobs.parsed && m_ctx->asyncQueue() )
+  {
+    m_firstParseWait = jobs.parsed->parseValue();
   }
 
   // The picture is reconstructed in the GPU's own memory, which its shaders reach faster than host memory, and

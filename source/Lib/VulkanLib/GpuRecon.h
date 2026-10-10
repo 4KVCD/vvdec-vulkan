@@ -371,6 +371,7 @@ private:
   VkSemaphore     m_waitFrontEnd2 = VK_NULL_HANDLE;   // what the next rest waits for (part 2's semaphore)
   uint64_t        m_frontEndWait  = 0;                // the timeline value part 1 waits for: the colocated pictures' first parts
   uint64_t        m_frontEndParseWait = 0;            // the parse's copies' timeline value part 1 waits for: the picture's records
+  uint64_t        m_firstParseWait    = 0;            // the same for the first part, when it holds the front end
   bool            m_splitFrontEnd = false;            // recordJobs ends part 1 after the jobs (splitFrontEnd)
 
   // The downloads on the copy queue: two sets of commands that take turns

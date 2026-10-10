@@ -178,8 +178,10 @@ public:
   // --- The compute queue, which all decoder instances of the process share ---
   // A picture's work is submitted in two parts. submitFirst() submits the first part, which signals firstDone.
   // With the async queues, the first part also waits for waitFront (the semaphore of the picture's front end) and
-  // signals the timeline semaphore; the value it signals is returned (0 without the async queues).
-  uint64_t submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemaphore waitFront = VK_NULL_HANDLE );
+  // for the parse's copies' timeline to reach waitParse (the picture's parsed records, when its front end is in its
+  // first part: submitParseCopy), and signals the timeline semaphore; the value it signals is returned (0 without the
+  // async queues).
+  uint64_t submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemaphore waitFront = VK_NULL_HANDLE, uint64_t waitParse = 0 );
   // submitRest() submits the rest, which waits for waitFront (the front end's second submission) when given and
   // signals restDone. With a copy queue it also submits the picture's download (transfer), which waits for the
   // rest's semaphore and signals transferDone.

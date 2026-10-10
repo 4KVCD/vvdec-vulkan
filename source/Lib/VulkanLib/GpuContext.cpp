@@ -797,23 +797,39 @@ VkPipeline Context::pipeline( int shaderId )
   return pipe;
 }
 
-uint64_t Context::submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemaphore waitFront )
+uint64_t Context::submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemaphore waitFront, uint64_t waitParse )
 {
   VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
   info.commandBufferCount = 1;
   info.pCommandBuffers    = &first;
-  // (the front end's results: its buffers, the indirect dispatches' arguments)
-  const VkPipelineStageFlags    stage       = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-  const uint64_t                waitValue   = 0;   // (a binary semaphore's)
+  // the waits: the front end's results (its buffers, the indirect dispatches' arguments), the picture's parsed records
+  const VkPipelineStageFlags    stages[2]   = { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
+  VkSemaphore                   waits[2];
+  uint64_t                      waitValues[2];
+  uint32_t                      numWaits    = 0;
   uint64_t                      signalValue = 0;
   VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
   if( waitFront )
   {
-    info.waitSemaphoreCount          = 1;
-    info.pWaitSemaphores             = &waitFront;
-    info.pWaitDstStageMask           = &stage;
-    timeline.waitSemaphoreValueCount = 1;
-    timeline.pWaitSemaphoreValues    = &waitValue;
+    waits[numWaits]      = waitFront;
+    waitValues[numWaits] = 0;   // (a binary semaphore's)
+    numWaits++;
+  }
+  if( waitParse > 0 )
+  {
+    waits[numWaits]      = m_parseCopyTimeline;
+    waitValues[numWaits] = waitParse;
+    numWaits++;
+  }
+  if( numWaits > 0 )
+  {
+    info.waitSemaphoreCount          = numWaits;
+    info.pWaitSemaphores             = waits;
+    info.pWaitDstStageMask           = stages + ( waitFront ? 0 : 1 );
+    timeline.waitSemaphoreValueCount = numWaits;
+    timeline.pWaitSemaphoreValues    = waitValues;
+    info.pNext                       = &timeline;
   }
   std::lock_guard<std::mutex> lock( m_queueMutex );
   if( m_timeline )
