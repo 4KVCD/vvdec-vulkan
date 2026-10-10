@@ -985,6 +985,19 @@ void Context::submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore se
   }
 }
 
+void Context::submitCopy( VkCommandBuffer cmd, VkFence done )
+{
+  VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+  info.commandBufferCount = 1;
+  info.pCommandBuffers    = &cmd;
+  std::lock_guard<std::mutex> lock( transferQueue() ? m_transferMutex : m_queueMutex );
+  const VkResult              result = m_api.vkQueueSubmit( transferQueue() ? m_transferQueue : m_queue, 1, &info, done );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkQueueSubmit (copies) failed (" << result << ")" );
+  }
+}
+
 VkCommandPool Context::createCommandPool( uint32_t family )
 {
   VkCommandPoolCreateInfo info{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };

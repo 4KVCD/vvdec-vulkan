@@ -286,13 +286,15 @@ void PicListManager::markUnusedPicturesReusable()
 
 #if VVDEC_VULKAN
   // the GPU's copy of a picture: given back once the picture is reconstructed,
-  // no picture in progress references it, and none to come can (it is no
-  // longer marked as a reference)
+  // no picture in progress references it, none to come can (it is no longer
+  // marked as a reference), and it was downloaded (when it needs that: its
+  // output reads it, gpu::PlanePool::startDownload)
   if( m_releaseGpuCopy )
   {
     for( auto& pic: m_cPicList )
     {
-      if( pic->gpuCurrent && pic->progress >= Picture::reconstructed && !pic->dpbReferenceMark && m_allRefPics.count( pic ) == 0 )
+      if( pic->gpuCurrent && pic->progress >= Picture::reconstructed && !pic->dpbReferenceMark && m_allRefPics.count( pic ) == 0
+          && !pic->gpuNeedsDownload )
       {
         m_releaseGpuCopy( *pic );
       }
@@ -325,14 +327,29 @@ void PicListManager::markUnusedPicturesReusable()
   {
     for( auto& pic: m_cPicList )
     {
-      if( pic->progress == Picture::finished && reusable( *pic ) )
-      {
-        m_releaseGpuPlanes( *pic );
-      }
+      releaseGpuPlanes( *pic );
     }
   }
 #endif
 }
+
+#if VVDEC_VULKAN
+void PicListManager::releaseGpuPlanes( Picture& pic )
+{
+  if( pic.progress != Picture::finished )
+  {
+    return;
+  }
+  if( reusable( pic ) )
+  {
+    m_releaseGpuPlanes( pic );
+  }
+  else if( !pic.neededForOutput && !pic.lockedByApplication )
+  {
+    m_releaseGpuHostPlanes( pic );   // (output, and given back: but still referenced)
+  }
+}
+#endif
 
 Picture* PicListManager::findClosestPic( int iLostPoc )
 {
@@ -348,6 +365,27 @@ Picture* PicListManager::findClosestPic( int iLostPoc )
     }
   }
   return closestPic;
+}
+
+std::vector<Picture*> PicListManager::nextOutputs( size_t count ) const
+{
+  // the pictures waiting for their output up to the next IDR picture (the ones after it are output after them), in
+  // the order of their output (POC)
+  std::vector<Picture*> waiting;
+  for( Picture* pic: m_cPicList )
+  {
+    if( isIDR( pic ) && !pic->getMixedNaluTypesInPicFlag() && !waiting.empty() )
+    {
+      break;
+    }
+    if( pic->neededForOutput )
+    {
+      waiting.push_back( pic );
+    }
+  }
+  std::sort( waiting.begin(), waiting.end(), []( const Picture* a, const Picture* b ) { return a->poc < b->poc; } );
+  waiting.resize( std::min( waiting.size(), count ) );
+  return waiting;
 }
 
 Picture* PicListManager::getNextOutputPic( uint32_t numReorderPicsHighestTid,
@@ -481,6 +519,13 @@ void PicListManager::releasePicture( Picture* pic )
   if( pic )
   {
     pic->lockedByApplication = Picture::UNLOCKED;
+#if VVDEC_VULKAN
+    // its planes back at once (VVDEC_GPU_PARSE=2), not only when the next picture is finished
+    if( m_releaseGpuPlanes )
+    {
+      releaseGpuPlanes( *pic );
+    }
+#endif
   }
 }
 

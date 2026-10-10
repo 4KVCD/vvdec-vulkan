@@ -292,9 +292,11 @@ int GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
 {
   const Api& vk = m_ctx->api();
 
-  // Without a copy queue, the download ends the rest's commands. The rest's writes become visible to the CPU (and
-  // to the copies).
-  if( !m_ctx->transferQueue() )
+  // A picture with stand-ins of its planes (the GPU parsed it) is downloaded only when it is about to be output
+  // (PlanePool::startDownload), from its twins. Otherwise, without a copy queue, the download ends the rest's
+  // commands. The rest's writes become visible to the CPU (and to the copies).
+  const bool downloads = hostPictureAddresses( pic, nullptr, nullptr );
+  if( downloads && !m_ctx->transferQueue() )
   {
     copyPlanes( pic, kTwin, kHost );
   }
@@ -302,7 +304,7 @@ int GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
   vk.vkEndCommandBuffer( m_cmd );
 
   int turn = -1;
-  if( m_ctx->transferQueue() )
+  if( downloads && m_ctx->transferQueue() )
   {
     turn = m_download;
     m_download ^= 1;
@@ -344,7 +346,7 @@ void GpuRecon::recordDownload( const PelStorage& pic, int turn )
     const HostPlane* plane  = hostPlane( pic, ComponentID( comp ) );
     const GpuLayout  layout = gpuLayout( pic, ComponentID( comp ) );
     VkBufferCopy     region{ 0, layout.hostOffset, layout.size };
-    vk.vkCmdCopyBuffer( download.cmd, plane->twin.buffer, plane->host.buffer, 1, &region );
+    vk.vkCmdCopyBuffer( download.cmd, planeTwin( pic, ComponentID( comp ) ).buffer, plane->host.buffer, 1, &region );
   }
   memoryBarrier( download.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT );
   if( download.queries )
@@ -553,11 +555,11 @@ VkDeviceAddress GpuRecon::frontEndCount( FrontPass pass ) const
 
 GpuRecon::Planes GpuRecon::hostPlanes( const PelStorage& pic )
 {
+  // (none for a picture with stand-ins of its planes: the GPU parsed it, so no pass reads its planes in host memory)
   Planes planes{};
-  for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
+  if( !hostPictureAddresses( pic, planes.addr, planes.stride ) )
   {
-    planes.addr[comp]   = hostPlane( pic, ComponentID( comp ) )->host.addr + planeOffset( pic, ComponentID( comp ) );
-    planes.stride[comp] = int32_t( pic.bufs[comp].stride );
+    return Planes{};
   }
   return planes;
 }
@@ -567,12 +569,12 @@ GpuRecon::Planes GpuRecon::twinPlanes( const PelStorage& pic )
   Planes planes{};
   for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
   {
-    HostPlane* plane = hostPlane( pic, ComponentID( comp ) );
-    if( !plane->twin.valid() )
+    Buffer& twin = planeTwin( pic, ComponentID( comp ) );
+    if( !twin.valid() )
     {
-      plane->twin = m_ctx->allocPooled( size_t( gpuLayout( pic, ComponentID( comp ) ).size ) );
+      twin = m_ctx->allocPooled( size_t( gpuLayout( pic, ComponentID( comp ) ).size ) );
     }
-    planes.addr[comp]   = plane->twin.addr + gpuLayout( pic, ComponentID( comp ) ).origin;
+    planes.addr[comp]   = twin.addr + gpuLayout( pic, ComponentID( comp ) ).origin;
     planes.stride[comp] = int32_t( pic.bufs[comp].stride );
   }
   return planes;
@@ -599,8 +601,8 @@ void GpuRecon::copyPlanes( const PelStorage& pic, int from, int to )
   const Api& vk = m_ctx->api();
   for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
   {
-    const HostPlane* plane   = hostPlane( pic, ComponentID( comp ) );
-    const Buffer*    bufs[3] = { &plane->host, &plane->twin, &m_scratch[comp] };
+    const Buffer*    host    = from == kHost || to == kHost ? &hostPlane( pic, ComponentID( comp ) )->host : nullptr;
+    const Buffer*    bufs[3] = { host, &planeTwin( pic, ComponentID( comp ) ), &m_scratch[comp] };
     const GpuLayout  layout  = gpuLayout( pic, ComponentID( comp ) );
     VkBufferCopy     region{ from == kHost ? layout.hostOffset : 0, to == kHost ? layout.hostOffset : 0, layout.size };
     vk.vkCmdCopyBuffer( m_cmd, bufs[from]->buffer, bufs[to]->buffer, 1, &region );
@@ -923,7 +925,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
     // planes (they have the same sizes).
     for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
     {
-      std::swap( hostPlane( pic, ComponentID( comp ) )->twin, m_scratch[comp] );
+      std::swap( planeTwin( pic, ComponentID( comp ) ), m_scratch[comp] );
     }
   }
   const int download = submitPicture( pic, waitFirst );

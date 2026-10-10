@@ -112,6 +112,9 @@ public:
   void     setDecodedPictureHashSEIEnabled( int enabled ) { m_decodedPictureHashSEIEnabled = enabled; }
   uint32_t getNumberOfChecksumErrorsDetected() const { return m_numberOfChecksumErrorsDetected; }
   void     checkPictureHashSEI( Picture* pcPic );
+  // Readies the picture for its output: with the GPU's parse, its planes filled from its twins (its download), and the
+  // downloads of the next pictures to output started
+  void     prepareOutput( Picture* pcPic );
 
   void     checkNalUnitConstraints( uint32_t naluType );
   void     checkSeiInPictureUnit();

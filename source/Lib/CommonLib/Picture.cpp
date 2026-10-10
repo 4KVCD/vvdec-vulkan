@@ -139,6 +139,7 @@ void Picture::resetForUse( int _layerId )
   gpuComputeDone.clearException();
   gpuClaimedCtus          = 0;
   gpuParseResult          = nullptr;
+  gpuNeedsDownload        = false;
   gpuParsed.clearException();
   gpuParsed.lock();
 #endif

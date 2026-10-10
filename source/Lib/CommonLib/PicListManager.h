@@ -72,6 +72,7 @@ private:
   // back (gpu::PlanePool)
   UserAllocator*                  m_gpuStandIns = nullptr;
   std::function<void( Picture& )> m_releaseGpuPlanes;
+  std::function<void( Picture& )> m_releaseGpuHostPlanes;   // only the planes, of a picture output (its twins stay)
 #endif
   int                                m_tuneInDelay    = 0;
   bool                               m_firstOutputPic = true;
@@ -88,11 +89,13 @@ public:
   void setReleaseGpuCopy( void ( *release )( Picture& ) ) { m_releaseGpuCopy = release; }
   // VVDEC_GPU_PARSE=2: the pictures made from now on get stand-ins of their planes (the decoder gives the planes
   // later: gpu::PlanePool), and a finished picture that may be reused gives its planes back with release
-  // (markUnusedPicturesReusable)
-  void setGpuPlanes( UserAllocator* standIns, std::function<void( Picture& )> release )
+  // (markUnusedPicturesReusable); a picture output that the application gave back, but which may still be
+  // referenced, gives back its planes with releaseHost (its twins hold it for the GPU)
+  void setGpuPlanes( UserAllocator* standIns, std::function<void( Picture& )> release, std::function<void( Picture& )> releaseHost )
   {
-    m_gpuStandIns      = standIns;
-    m_releaseGpuPlanes = std::move( release );
+    m_gpuStandIns          = standIns;
+    m_releaseGpuPlanes     = std::move( release );
+    m_releaseGpuHostPlanes = std::move( releaseHost );
   }
 #endif
   void restart()
@@ -108,6 +111,16 @@ public:
   void           markUnusedPicturesReusable();
   Picture*       findClosestPic( int iLostPoc );
   Picture*       getNextOutputPic( uint32_t numReorderPicsHighestTid, uint32_t maxDecPicBufferingHighestTid, bool bFlush );
+  // the first count of the pictures waiting for their output, in their output order
+  std::vector<Picture*> nextOutputs( size_t count ) const;
+#if VVDEC_VULKAN
+private:
+  // VVDEC_GPU_PARSE=2: a finished picture's planes back to the GPU's pool (gpu::PlanePool) once it may be reused, or
+  // only its planes (its twins stay) once it was output and the application gave it back
+  void releaseGpuPlanes( Picture& pic );
+
+public:
+#endif
   void           releasePicture( Picture* pic );
 };
 }

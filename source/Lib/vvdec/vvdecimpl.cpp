@@ -1028,6 +1028,9 @@ void VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft, i
 
 int VVDecImpl::xAddPicture( Picture* pcPic )
 {
+  // (with the GPU's parse, its planes filled from its twins now)
+  m_cDecLib->prepareOutput( pcPic );
+
   // copy internal picture to external (Priority PPS > SPS)
   const Window &conf    = pcPic->cs->pps->getConformanceWindowPresentFlag()
                           ? pcPic->cs->pps->getConformanceWindow()

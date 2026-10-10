@@ -231,7 +231,8 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
     m_gpuParseService = std::make_unique<gpu::ParseService>( m_gpu, [pool]() { pool->wakeUp(); } );
     m_gpuPlanes       = std::make_unique<gpu::PlanePool>( &m_gpuAllocator );
     gpu::PlanePool* planes = m_gpuPlanes.get();
-    m_picListManager.setGpuPlanes( planes->standIns(), [planes]( Picture& pic ) { planes->release( pic ); } );
+    m_picListManager.setGpuPlanes( planes->standIns(), [planes]( Picture& pic ) { planes->release( pic ); },
+                                   [planes]( Picture& pic ) { planes->releasePlanes( pic ); } );
     m_decLibParser.setGpuParseService( m_gpuParseService.get(), m_gpuPlanes.get() );
     for( auto& dec: m_decLibRecon )
     {
@@ -426,6 +427,12 @@ void DecLib::destroy()
     dec.destroy();
   }
 
+#if VVDEC_VULKAN
+  if( m_gpuPlanes )
+  {
+    m_gpuPlanes->waitDownloads();   // (the downloads started ahead write into planes freed now)
+  }
+#endif
   m_picListManager.deleteBuffers();
 
 #if VVDEC_VULKAN
@@ -751,6 +758,31 @@ int DecLib::finishPicture( Picture* pcPic, MsgLevel msgl )
   return pcSlice->getPOC();
 }
 
+// With the GPU's parse, the next pictures to output whose downloads start when a picture is output (PlanePool): its
+// download is usually done when its turn comes, and only these pictures and the ones the application holds have their
+// planes in host memory
+static constexpr size_t kOutputsDownloadedAhead = 3;
+
+void DecLib::prepareOutput( Picture* pcPic )
+{
+#if VVDEC_VULKAN
+  if( !m_gpuPlanes )
+  {
+    return;
+  }
+  m_gpuPlanes->finishDownload( *pcPic );
+  for( Picture* next: m_picListManager.nextOutputs( kOutputsDownloadedAhead ) )
+  {
+    if( next != pcPic && next->gpuNeedsDownload && next->progress >= Picture::reconstructed )
+    {
+      m_gpuPlanes->startDownload( *next );
+    }
+  }
+#else
+  (void) pcPic;
+#endif
+}
+
 void DecLib::checkPictureHashSEI( Picture* pcPic )
 {
   if( !m_decodedPictureHashSEIEnabled )
@@ -763,6 +795,12 @@ void DecLib::checkPictureHashSEI( Picture* pcPic )
   }
 
   CHECK( pcPic->progress < Picture::reconstructed, "picture not reconstructed" );
+#if VVDEC_VULKAN
+  if( m_gpuPlanes )
+  {
+    m_gpuPlanes->finishDownload( *pcPic );   // (the hash reads its planes)
+  }
+#endif
 
   seiMessages pictureHashes = SEI_internal::getSeisByType( pcPic->seiMessageList, VVDEC_DECODED_PICTURE_HASH );
   if( !pictureHashes.empty() )

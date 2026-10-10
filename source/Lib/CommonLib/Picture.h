@@ -237,6 +237,9 @@ public:
   // be reused (gpu::PlanePool); before and after, m_bufs[PIC_RECONSTRUCTION] holds stand-ins of the same layout.
   // gpuSwappedPlanes holds the storage swapped out of it: the stand-ins while the picture has its planes.
   std::unique_ptr<PelStorage> gpuSwappedPlanes;
+  // its work went to the GPU with stand-ins of its planes: its twins hold it, and stay, until it is downloaded when it
+  // is about to be output (gpu::PlanePool::startDownload)
+  std::atomic_bool            gpuNeedsDownload{ false };
 #endif
   unsigned         maxCUSize               = 0;              // create's, for the planes made for the picture later
   bool             isReferencePic          = false;          // mainly for setting vvdecPicAttributes::isRefPic for the library output frame

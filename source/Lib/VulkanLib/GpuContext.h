@@ -194,6 +194,10 @@ public:
   // A queue for copies only (the GPU's copy engine), when the device has one. Its copies run alongside the compute
   // queue's work. Buffers are shared by both queues' families.
   bool transferQueue() const { return m_transferFamily != UINT32_MAX; }
+  // Submits commands that only copy (a picture's download: PlanePool), which signal done: on the copy queue, or on the
+  // compute queue without one. Their command pool is of copyFamily().
+  void     submitCopy( VkCommandBuffer cmd, VkFence done );
+  uint32_t copyFamily() const { return transferQueue() ? m_transferFamily : m_queueFamily; }
 
   // --- The async compute queues ---
   // Compute-only queues (async compute engines), when the device has them and VVDEC_GPU_ASYNC is not 0. The

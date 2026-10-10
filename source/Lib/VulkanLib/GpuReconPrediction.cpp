@@ -149,7 +149,9 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   push.countAt  = frontEndCount( kPassTrafo );
   push.bitDepth = cs.sps->getBitDepth();
   CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
-  CHECK( levels.stride[COMPONENT_Y] != planes.stride[COMPONENT_Y] || levels.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cb],
+  // (the levels in the picture in host memory, when the CPU parsed it: none for a picture the GPU parsed, whose levels
+  // are in parsedLevels)
+  CHECK( levels.addr[COMPONENT_Y] && ( levels.stride[COMPONENT_Y] != planes.stride[COMPONENT_Y] || levels.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cb] ),
          "the levels laid out differently" );
 
   // one workgroup per job

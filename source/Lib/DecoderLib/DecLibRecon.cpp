@@ -1672,11 +1672,13 @@ bool DecLibRecon::queueGpuTask( int, void* taskParam )
   FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( taskParam );
   CodingStructure&    cs    = *param->pic->cs;
   DecLibRecon*        dec   = param->decLib;
-  // The picture's planes, now that its work goes to the GPU: a picture the GPU parses waits for its parse with
-  // stand-ins of them (gpu::PlanePool), in the instance that took it as soon as its slices were in
+  // The picture's colocated motion, which its work writes, now that its work goes to the GPU. A picture the GPU parses
+  // has stand-ins of its planes (gpu::PlanePool): its work goes to the GPU without them, its twins hold it, and its
+  // planes come when it is about to be output (DecLib::prepareOutput).
   if( dec->m_gpuPlanes )
   {
-    dec->m_gpuPlanes->acquire( *param->pic );
+    dec->m_gpuPlanes->acquireColMotion( *param->pic );
+    param->pic->gpuNeedsDownload = !dec->m_gpuPlanes->hasPlanes( *param->pic );
   }
   // With the GPU's parse: what it left (the records in the parse result, the coefficient levels in the picture)
   gpu::ParsedPicture* parsed = dec->m_gpuParseDrives ? cs.picture->gpuParseResult : nullptr;
