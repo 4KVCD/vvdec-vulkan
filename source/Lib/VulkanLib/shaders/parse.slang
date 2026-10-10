@@ -43,6 +43,12 @@
 #  define PROFILE 0
 #endif
 
+// READ_INVOCATION (1 unless the build says 0): laneValue reads a thread's value with OpSubgroupReadInvocationKHR, which
+// needs the device's VK_EXT_shader_subgroup_ballot; parse_shuffle is built without it, for devices that lack it
+#ifndef READ_INVOCATION
+#  define READ_INVOCATION 1
+#endif
+
 struct Params
 {
   // The slice data of the picture's slices, one after another, as bytes packed 4 per word. 256 zero bytes follow it,
@@ -450,6 +456,26 @@ uint2 uni( uint2 v )
   return WaveReadLaneFirst( v );
 }
 
+// The value v has in thread `lane`, which all threads name alike. The compiler must know that the value is the same in
+// all threads: the arithmetic decoder works out its registers, the bins and all the bins decide from the bytes this
+// reads, and these then run as scalar code. OpSubgroupReadInvocationKHR does that in one v_readlane on AMD. Vulkan
+// 1.1's way to read a thread chosen at run time, WaveReadLaneAt, is a shuffle: on AMD a round trip through the LDS
+// unit, whose result the compiler takes as different in each thread, so uni() has to follow it.
+uint laneValue( uint v, uint lane )
+{
+#if READ_INVOCATION
+  const uint l = uni( lane );
+  return spirv_asm
+  {
+    OpExtension "SPV_KHR_shader_ballot";
+    OpCapability SubgroupBallotKHR;
+    result:$$uint = OpSubgroupReadInvocationKHR $v $l
+  };
+#else
+  return uni( WaveReadLaneAt( v, int( lane ) ) );
+#endif
+}
+
 // Word w of the picture's parameters
 int picWord( int w )
 {
@@ -497,9 +523,8 @@ static uint g_end;       // the end of the substream's bytes: bytes past it read
 static uint g_win;       // a window of 128 bytes of the slice data, spread over the threads: each holds 4 bytes
 static uint g_winBase;   // the window's first byte (a multiple of 128)
 
-// Reads the next byte of the substream. The 32 threads load a 128-byte window together, one word each, and every
-// thread takes the byte it needs from the thread that holds it, so the slice data is read from memory once per 128
-// bytes.
+// Reads the next byte of the substream. The 32 threads load a 128-byte window together, one word each, and all take
+// the byte from the thread that holds it (laneValue), so the slice data is read from memory once per 128 bytes.
 uint readByte()
 {
   const uint p = g_pos;
@@ -513,7 +538,7 @@ uint readByte()
     g_winBase = p & ~127u;
     g_win     = pc.bits[( g_winBase >> 2 ) + uint( g_lane )];
   }
-  const uint word = WaveReadLaneAt( g_win, int( ( p - g_winBase ) >> 2 ) );
+  const uint word = laneValue( g_win, ( p - g_winBase ) >> 2 );
   return ( word >> ( ( p & 3u ) * 8u ) ) & 0xffu;
 }
 

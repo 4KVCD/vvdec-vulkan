@@ -214,6 +214,9 @@ public:
   // semaphore and done; the value they signal is returned, for the front ends that read what they wrote.
   bool     parseQueue() const { return m_parseQueue != VK_NULL_HANDLE; }
   uint64_t submitParse( VkCommandBuffer cmd, VkFence done );
+  // VK_EXT_shader_subgroup_ballot: the parse shader reads a thread's value with OpSubgroupReadInvocationKHR, a
+  // v_readlane on AMD (shaders/parse.slang's laneValue); without it, the parse_shuffle variant
+  bool     subgroupBallot() const { return m_subgroupBallot; }
 
   uint32_t           queueFamily()     const { return m_queueFamily; }
   uint32_t           transferFamily()  const { return m_transferFamily; }
@@ -247,6 +250,7 @@ private:
   double                           m_timestampPeriod = 1.0;
   std::string                      m_deviceName;
   bool                             m_wave32 = false;   // the shaders may ask for waves of 32 threads
+  bool                             m_subgroupBallot = false;   // VK_EXT_shader_subgroup_ballot is on
 
   // the compute queue
   VkQueue                          m_queue       = VK_NULL_HANDLE;

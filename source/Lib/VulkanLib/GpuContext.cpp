@@ -326,9 +326,11 @@ bool Context::init()
   m_profiling = m_options.profile;
   const char* shaderInfo = "VK_AMD_shader_info";
   const char* shaderClock = "VK_KHR_shader_clock";
+  // and for the parse shader, OpSubgroupReadInvocationKHR (GpuContext.h's subgroupBallot)
+  const char* subgroupBallot = "VK_EXT_shader_subgroup_ballot";
   bool        hasShaderInfo = false;
   bool        hasShaderClock = false;
-  if( m_profiling )
+  bool        hasSubgroupBallot = false;
   {
     uint32_t extensionCount = 0;
     m_api.vkEnumerateDeviceExtensionProperties( m_physical, nullptr, &extensionCount, nullptr );
@@ -336,8 +338,9 @@ bool Context::init()
     m_api.vkEnumerateDeviceExtensionProperties( m_physical, nullptr, &extensionCount, extensions.data() );
     for( const VkExtensionProperties& extension: extensions )
     {
-      hasShaderInfo |= strcmp( extension.extensionName, shaderInfo ) == 0;
-      hasShaderClock |= strcmp( extension.extensionName, shaderClock ) == 0;
+      hasShaderInfo |= m_profiling && strcmp( extension.extensionName, shaderInfo ) == 0;
+      hasShaderClock |= m_profiling && strcmp( extension.extensionName, shaderClock ) == 0;
+      hasSubgroupBallot |= strcmp( extension.extensionName, subgroupBallot ) == 0;
     }
   }
   // and the subgroup's clock and the device's, for the parse's profile (shaders/parse.slang's PROFILE)
@@ -365,6 +368,11 @@ bool Context::init()
   {
     deviceExtensions.push_back( shaderClock );
   }
+  if( hasSubgroupBallot )
+  {
+    deviceExtensions.push_back( subgroupBallot );
+  }
+  m_subgroupBallot = hasSubgroupBallot;
 
   VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
   deviceInfo.pNext                = &enable;

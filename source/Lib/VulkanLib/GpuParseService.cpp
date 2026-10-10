@@ -283,7 +283,9 @@ void ParseSlot::recordStep( VkCommandBuffer cmd ) const
   push.counters   = m_counters.addr;
   push.cuCap      = int32_t( std::min<size_t>( m_cuCap, INT32_MAX ) );
   push.tuCap      = int32_t( std::min<size_t>( m_tuCap, INT32_MAX ) );
-  dispatch( m_ctx, cmd, m_prof ? kShader_parse_prof : kShader_parse, push, m_in.numStreams );   // a workgroup per substream
+  // (parse_prof for the profile; parse_shuffle where the device lacks what parse reads threads' values with)
+  const int shader = m_prof ? kShader_parse_prof : ( m_ctx->subgroupBallot() ? kShader_parse : kShader_parse_shuffle );
+  dispatch( m_ctx, cmd, shader, push, m_in.numStreams );   // a workgroup per substream
 }
 
 void ParseSlot::recordCompaction( VkCommandBuffer cmd ) const
@@ -471,7 +473,7 @@ ParseService::ParseService( Context* ctx, std::function<void()> wakeUp ) : m_ctx
   m_pool = m_ctx->createCommandPool( m_ctx->asyncFamily() );
   m_ctx->allocateCommandBuffers( m_pool, 1, &m_cmd );
   m_fence = m_ctx->createFence();
-  if( m_ctx->profiling() && m_ctx->shaderClock() )
+  if( m_ctx->profiling() && m_ctx->shaderClock() && m_ctx->subgroupBallot() )   // (parse_prof reads as parse does)
   {
     m_profBuf = m_ctx->alloc( 16 * sizeof( uint32_t ), MemKind::HostCached );
     memset( m_profBuf.mapped, 0, 16 * sizeof( uint32_t ) );

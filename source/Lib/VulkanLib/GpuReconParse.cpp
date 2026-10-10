@@ -199,8 +199,9 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
     m_parse.slot = std::make_unique<ParseSlot>( m_ctx );
   }
   ParseSlot& slot = *m_parse.slot;
-  // VVDEC_GPU_PROFILE with the shader clock: parse_prof's cycle counts, added up over the pictures
-  if( m_ctx->profiling() && m_ctx->shaderClock() )
+  // VVDEC_GPU_PROFILE with the shader clock: parse_prof's cycle counts, added up over the pictures (parse_prof reads
+  // threads' values as parse does: with VK_EXT_shader_subgroup_ballot)
+  if( m_ctx->profiling() && m_ctx->shaderClock() && m_ctx->subgroupBallot() )
   {
     ensureParseBuffer( m_ctx, m_parse.prof, 16 * sizeof( uint32_t ), MemKind::HostCached );
     if( !m_parse.profRead )
