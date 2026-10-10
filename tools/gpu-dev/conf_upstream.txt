@@ -1,0 +1,283 @@
+10b400_A_2 PASS 0.2s 
+10b400_B_2 PASS 1.6s 
+10b422_A_5 PASS 0.2s 
+10b422_B_5 PASS 0.2s 
+10b422_C_5 PASS 0.4s 
+10b422_D_5 PASS 0.4s 
+10b422_E_5 PASS 0.4s 
+10b422_F_5 PASS 0.4s 
+10b422_G_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+10b422_H_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+10b422_I_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+10b422_J_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+10b422_K_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+10b422_L_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+10b444_A_3 PASS 0.6s 
+10b444_B_3 PASS 1.5s 
+8b400_A_2 PASS 0.2s 
+8b400_B_2 PASS 0.4s 
+8b420_A_2 PASS 0.2s 
+8b420_B_2 PASS 0.5s 
+8b422_A_5 PASS 0.2s 
+8b422_B_5 PASS 0.2s 
+8b422_C_5 PASS 0.4s 
+8b422_D_5 PASS 0.4s 
+8b422_E_5 PASS 0.4s 
+8b422_F_5 PASS 0.4s 
+8b422_G_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+8b422_H_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+8b422_I_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+8b422_J_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+8b422_K_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+8b422_L_5 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+8b444_A_2 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+8b444_B_2 ERROR rc=127 0.2s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+ACTPIC_A_3 PASS 0.1s 
+ACTPIC_B_3 PASS 0.1s 
+ACTPIC_C_3 PASS 0.1s 
+ACT_A_3 ERROR rc=127 0.1s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+ACT_B_3 ERROR rc=127 0.2s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+AFF_A_2 PASS 0.3s 
+AFF_B_2 PASS 0.3s 
+ALF_A_3 PASS 0.1s 
+ALF_B_3 PASS 0.1s 
+ALF_C_3 PASS 0.1s 
+ALF_D_2 PASS 0.2s 
+AMVR_A_3 PASS 0.2s 
+AMVR_B_3 PASS 1.5s 
+APSALF_A_2 PASS 0.2s 
+APSLMCS_A_3 PASS 2.1s 
+APSLMCS_B_3 PASS 2.1s 
+APSLMCS_C_2 PASS 2.2s 
+APSLMCS_D_1 PASS 0.5s 
+APSLMCS_E_1 PASS 0.8s 
+APSMULT_A_4 PASS 0.2s 
+APSMULT_B_4 PASS 0.2s 
+AUD_A_3 PASS 0.2s 
+BCW_A_4 PASS 0.2s 
+BDOF_A_4 PASS 0.2s 
+BDPCM_A_2 PASS 0.1s 
+BOUNDARY_A_3 PASS 0.9s 
+BUMP_A_2 PASS 0.2s 
+BUMP_B_2 PASS 0.2s 
+BUMP_C_2 PASS 0.2s 
+CCALF_A_3 PASS 0.5s 
+CCALF_B_3 PASS 0.5s 
+CCALF_C_3 PASS 0.5s 
+CCALF_D_3 PASS 0.6s 
+CCLM_A_2 PASS 0.1s 
+CIIP_A_4 PASS 0.8s 
+CROP_A_4 PASS 0.8s 
+CROP_B_4 PASS 1.2s 
+CST_A_4 PASS 0.2s 
+CTU_A_4 PASS 0.3s 
+CTU_B_4 PASS 0.3s 
+CTU_C_4 PASS 0.3s 
+CUBEMAP_A_3 PASS 1.9s 
+CUBEMAP_B_3 PASS 1.9s 
+CUBEMAP_C_3 PASS 1.7s 
+CodingToolsSets_A_2 PASS 0.1s 
+CodingToolsSets_B_2 PASS 0.1s 
+CodingToolsSets_C_2 PASS 0.1s 
+CodingToolsSets_D_2 PASS 0.1s 
+CodingToolsSets_E_1 PASS 0.2s 
+DCI_A_3 PASS 0.1s 
+DCI_B_3 PASS 0.1s 
+DEBLOCKING_A_3 PASS 0.2s 
+DEBLOCKING_B_2 PASS 0.9s 
+DEBLOCKING_C_3 PASS 0.3s 
+DEBLOCKING_E_3 PASS 0.1s 
+DEBLOCKING_F_2 PASS 0.4s 
+DMVR_A_3 PASS 0.2s 
+DMVR_B_4 PASS 0.1s 
+DPB_A_2 PASS 0.2s 
+DPB_B_2 PASS 0.1s 
+DQ_A_3 PASS 0.2s 
+DQ_B_3 PASS 7.4s 
+ENT444HIGHTIER_A_3 PASS 0.3s 
+ENT444HIGHTIER_B_3 PASS 0.3s 
+ENT444HIGHTIER_C_3 PASS 0.9s 
+ENT444HIGHTIER_D_3 PASS 0.9s 
+ENT444MAINTIER_A_3 PASS 0.3s 
+ENT444MAINTIER_B_3 PASS 0.3s 
+ENT444MAINTIER_C_3 PASS 0.7s 
+ENT444MAINTIER_D_3 PASS 0.7s 
+ENTHIGHTIER_A_3 PASS 0.2s 
+ENTHIGHTIER_B_3 PASS 0.2s 
+ENTHIGHTIER_C_3 PASS 0.6s 
+ENTHIGHTIER_D_3 PASS 0.5s 
+ENTMAINTIER_A_3 PASS 0.2s 
+ENTMAINTIER_B_3 PASS 0.2s 
+ENTMAINTIER_C_3 PASS 0.4s 
+ENTMAINTIER_D_3 PASS 0.4s 
+ENTROPY_A_2 PASS 2.9s 
+ENTROPY_B_2 PASS 0.1s 
+ENTROPY_C_1 PASS 0.5s 
+ERP_A_3 PASS 1.6s 
+FIELD_A_4 PASS 0.2s 
+FIELD_B_2 PASS 0.1s 
+FILLER_A_1 PASS 0.2s 
+GDR_A_2 PASS 0.1s 
+GDR_B_2 PASS 0.2s 
+GDR_C_2 PASS 0.1s 
+GDR_D_1 PASS 0.1s 
+GPM_A_3 PASS 0.2s 
+GPM_B_1 PASS 0.2s 
+HLG_A_4 PASS 2.7s 
+HLG_B_4 PASS 2.8s 
+HRD_A_3 PASS 0.2s 
+HRD_B_2 PASS 0.2s 
+IBC_A_2 PASS 0.1s 
+IBC_B_2 PASS 0.1s 
+IBC_C_2 PASS 0.1s 
+IBC_D_2 PASS 0.1s 
+IBC_E_1 PASS 0.2s 
+ILRPL_A_2 ERROR rc=127 0.1s vvdecapp [error]: decoding failed: unsupported feature exception (unsupported request) detail: caught exception for unsupported feature: 
+IP_A_2 PASS 0.2s 
+IP_B_1 PASS 0.4s 
+ISP_A_3 PASS 0.2s 
+ISP_B_3 PASS 1.8s 
+JCCR_A_2 PASS 0.1s 
+JCCR_B_2 PASS 0.2s 
+JCCR_C_3 PASS 0.2s 
+JCCR_D_3 PASS 4.9s 
+JCCR_E_1 PASS 0.1s 
+JCCR_F_1 PASS 0.2s 
+LFNST_A_4 PASS 0.2s 
+LFNST_B_4 PASS 0.2s 
+LFNST_C_3 PASS 0.3s 
+LFNST_D_3 PASS 3.8s 
+LMCS_A_3 PASS 0.8s 
+LMCS_B_2 PASS 0.8s 
+LMCS_C_1 PASS 0.5s 
+LOSSLESS_A_3 PASS 0.3s 
+LOSSLESS_B_3 PASS 0.2s 
+LTRP_A_3 PASS 0.1s 
+MERGE_A_2 PASS 0.2s 
+MERGE_B_2 PASS 0.2s 
+MERGE_C_2 PASS 0.2s 
+MERGE_D_2 PASS 0.2s 
+MERGE_E_2 PASS 0.2s 
+MERGE_F_2 PASS 2.8s 
+MERGE_G_2 PASS 2.9s 
+MERGE_H_2 PASS 2.9s 
+MERGE_I_2 PASS 2.9s 
+MERGE_J_2 PASS 2.8s 
+MIP_A_3 PASS 0.2s 
+MIP_B_3 PASS 0.3s 
+MMVD_A_3 PASS 3.2s 
+MNUT_A_4 PASS 0.3s 
+MNUT_B_3 PASS 0.2s 
+MPM_A_3 PASS 1.7s 
+MRLP_A_2 PASS 0.2s 
+MRLP_B_2 PASS 0.2s 
+MTS_A_4 PASS 0.1s 
+MTS_B_4 PASS 0.2s 
+MTS_LFNST_A_4 PASS 0.4s 
+MTS_LFNST_B_4 PASS 0.3s 
+MVCOMP_A_2 PASS 0.1s 
+OLS_A_5 ERROR rc=127 0.1s vvdecapp [error]: decoding failed: unsupported feature exception (unsupported request) detail: caught exception for unsupported feature: 
+OLS_B_5 ERROR rc=127 0.1s vvdecapp [error]: decoding failed: unsupported feature exception (unsupported request) detail: caught exception for unsupported feature: 
+OLS_C_5 ERROR rc=127 0.1s vvdecapp [error]: decoding failed: unsupported feature exception (unsupported request) detail: caught exception for unsupported feature: 
+OPI_A_1 PASS 0.1s 
+OPI_B_3 ERROR rc=127 0.1s vvdecapp [error]: decoding failed: unsupported feature exception (unsupported request) detail: caught exception for unsupported feature: 
+PALETTE_A_2 ERROR rc=127 0.6s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+PALETTE_B_2 ERROR rc=127 0.2s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+PALETTE_C_2 ERROR rc=127 0.3s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+PALETTE_D_2 ERROR rc=127 0.2s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+PALETTE_E_2 ERROR rc=127 0.3s vvdecapp [warning]: (possibly recoverable) exception (decoder input data error) detail: Exception while tuning in: 
+PDPC_A_3 PASS 0.4s 
+PDPC_B_3 PASS 0.4s 
+PDPC_C_2 PASS 0.4s 
+PHSH_B_1 PASS 0.1s 
+PMERGE_A_1 PASS 0.2s 
+PMERGE_B_1 PASS 0.2s 
+PMERGE_C_1 PASS 0.2s 
+PMERGE_D_1 PASS 0.2s 
+PMERGE_E_1 PASS 0.2s 
+POC_A_1 PASS 0.3s 
+POUT_A_2 PASS 0.1s 
+PPS_A_1 PASS 2.8s 
+PPS_B_1 PASS 0.2s 
+PPS_C_1 PASS 0.2s 
+PQ_A_1 PASS 2.2s 
+PROF_A_3 PASS 0.2s 
+PROF_B_3 PASS 0.2s 
+PSEXT_A_2 PASS 0.3s 
+PSEXT_B_2 PASS 0.3s 
+QTBTT_A_4 PASS 0.3s 
+QUANT_A_2 PASS 0.1s 
+QUANT_B_2 PASS 0.2s 
+QUANT_C_2 PASS 0.2s 
+QUANT_D_4 PASS 0.2s 
+QUANT_E_1 PASS 0.2s 
+RAP_A_1 PASS 0.1s 
+RAP_B_1 PASS 0.1s 
+RAP_C_1 PASS 0.2s 
+RAP_D_1 PASS 0.2s 
+RPL_A_2 PASS 0.1s 
+RPR_A_4 PASS 0.2s 
+RPR_B_3 PASS 0.1s 
+RPR_C_3 PASS 0.1s 
+RPR_D_1 PASS 0.2s 
+SAO_A_3 PASS 0.8s 
+SAO_B_3 PASS 0.7s 
+SAO_C_3 PASS 0.8s 
+SBT_A_2 PASS 0.2s 
+SCALING_A_1 PASS 0.2s 
+SCALING_B_1 PASS 0.2s 
+SCALING_C_1 PASS 0.3s 
+SDH_A_2 PASS 0.8s 
+SLICES_A_3 PASS 0.4s 
+SMVD_A_2 PASS 0.3s 
+SPATSCAL444_A_2 ERROR rc=127 0.1s vvdecapp [error]: decoding failed: unsupported feature exception (unsupported request) detail: caught exception for unsupported feature: 
+SPATSCAL_A_3 ERROR rc=127 0.1s vvdecapp [error]: decoding failed: unsupported feature exception (unsupported request) detail: caught exception for unsupported feature: 
+SPS_A_1 PASS 2.7s 
+SPS_B_1 PASS 0.2s 
+SPS_C_1 PASS 0.2s 
+STILL444_A_1 PASS 0.2s 
+STILL444_B_1 MISMATCH 0.3s vvdecapp [error] full YUV output MD5 mismatch: d52401d89d289d06f069016bdbd0b951 != c5f4ff05ee061876d801bdcf6dc17f66
+STILL_A_1 PASS 0.1s 
+STILL_B_1 MISMATCH 0.1s vvdecapp [error] full YUV output MD5 mismatch: 24295aa7c9060124f5bceb6a6694eddd != 64ef9f7915c500aabfa83d6a278d7579
+SUBPIC_A_3 PASS 0.2s 
+SUBPIC_B_3 PASS 0.2s 
+SUBPIC_C_1 PASS 0.2s 
+SUBPIC_D_1 PASS 0.5s 
+SUBPIC_E_1 PASS 0.3s 
+SUFAPS_A_1 PASS 0.1s 
+SbTMVP_A_3 PASS 0.2s 
+SbTMVP_B_3 PASS 0.2s 
+TEMPSCAL_A_4 PASS 1.4s 
+TEMPSCAL_B_7 PASS 0.7s 
+TEMPSCAL_C_4 PASS 0.6s 
+TILE_A_2 PASS 0.3s 
+TILE_B_2 PASS 0.3s 
+TILE_C_2 PASS 0.3s 
+TILE_D_2 PASS 0.3s 
+TILE_E_2 PASS 0.3s 
+TILE_F_2 PASS 0.3s 
+TILE_G_2 PASS 0.3s 
+TMVP_A_3 PASS 0.5s 
+TMVP_B_3 PASS 0.5s 
+TMVP_C_3 PASS 0.4s 
+TMVP_D_3 PASS 0.4s 
+TRANS_A_2 PASS 0.8s 
+TRANS_B_2 PASS 0.8s 
+TRANS_C_4 PASS 0.5s 
+TRANS_D_4 PASS 0.5s 
+TREE_A_3 PASS 2.8s 
+TREE_B_3 PASS 5.8s 
+TREE_C_3 PASS 7.7s 
+VIRTUAL_A_3 PASS 1.0s 
+VIRTUAL_B_3 PASS 1.9s 
+VPS_A_3 ERROR rc=127 0.1s vvdecapp [error]: decoding failed: unsupported feature exception (unsupported request) detail: caught exception for unsupported feature: 
+VPS_B_1 ERROR rc=127 0.1s vvdecapp [error]: decoding failed: unsupported feature exception (unsupported request) detail: caught exception for unsupported feature: 
+VPS_C_2 ERROR rc=127 0.1s vvdecapp [error]: decoding failed: unsupported feature exception (unsupported request) detail: caught exception for unsupported feature: 
+WPP_A_3 PASS 0.2s 
+WPP_B_2 PASS 0.7s 
+WP_A_3 PASS 0.1s 
+WP_B_3 PASS 0.1s 
+WRAP_A_4 PASS 0.2s 
+WRAP_B_4 PASS 0.3s 
+WRAP_C_4 PASS 0.2s 
+WRAP_D_4 PASS 0.2s 

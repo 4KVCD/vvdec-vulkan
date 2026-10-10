@@ -1,0 +1,2422 @@
+{
+"10b400_A_2/default": [
+1.4,
+17
+],
+"10b400_A_2/parse": [
+1.75,
+17
+],
+"10b400_B_2/default": [
+2.48,
+17
+],
+"10b400_B_2/parse": [
+6.12,
+11
+],
+"10b422_A_5/default": [
+0.65,
+3
+],
+"10b422_A_5/parse": [
+2.67,
+3
+],
+"10b422_B_5/default": [
+0.57,
+3
+],
+"10b422_B_5/parse": [
+0.52,
+3
+],
+"10b422_C_5/default": [
+0.75,
+17
+],
+"10b422_C_5/parse": [
+5.44,
+17
+],
+"10b422_D_5/default": [
+0.77,
+17
+],
+"10b422_D_5/parse": [
+2.0,
+17
+],
+"10b422_E_5/default": [
+1.08,
+17
+],
+"10b422_E_5/parse": [
+4.09,
+17
+],
+"10b422_F_5/default": [
+1.04,
+17
+],
+"10b422_F_5/parse": [
+2.1,
+17
+],
+"10b444_A_3/default": [
+1.45,
+17
+],
+"10b444_A_3/parse": [
+5.39,
+2
+],
+"10b444_B_3/default": [
+2.77,
+16
+],
+"10b444_B_3/parse": [
+37.91,
+2
+],
+"8b400_A_2/default": [
+0.46,
+17
+],
+"8b400_A_2/parse": [
+1.28,
+17
+],
+"8b400_B_2/default": [
+0.94,
+17
+],
+"8b400_B_2/parse": [
+2.12,
+11
+],
+"8b420_A_2/default": [
+0.72,
+17
+],
+"8b420_A_2/parse": [
+1.74,
+8
+],
+"8b420_B_2/default": [
+1.66,
+17
+],
+"8b420_B_2/parse": [
+3.61,
+5
+],
+"8b422_A_5/default": [
+0.4,
+3
+],
+"8b422_A_5/parse": [
+2.32,
+3
+],
+"8b422_B_5/default": [
+0.19,
+3
+],
+"8b422_B_5/parse": [
+0.57,
+3
+],
+"8b422_C_5/default": [
+1.34,
+17
+],
+"8b422_C_5/parse": [
+3.57,
+17
+],
+"8b422_D_5/default": [
+1.4,
+17
+],
+"8b422_D_5/parse": [
+1.51,
+17
+],
+"8b422_E_5/default": [
+0.85,
+17
+],
+"8b422_E_5/parse": [
+3.16,
+17
+],
+"8b422_F_5/default": [
+0.61,
+17
+],
+"8b422_F_5/parse": [
+1.68,
+17
+],
+"ACTPIC_A_3/default": [
+0.76,
+17
+],
+"ACTPIC_A_3/parse": [
+1.92,
+17
+],
+"ACTPIC_B_3/default": [
+0.93,
+17
+],
+"ACTPIC_B_3/parse": [
+2.05,
+17
+],
+"ACTPIC_C_3/default": [
+0.77,
+17
+],
+"ACTPIC_C_3/parse": [
+1.42,
+17
+],
+"AFF_A_2/default": [
+0.87,
+10
+],
+"AFF_A_2/parse": [
+3.14,
+2
+],
+"AFF_B_2/default": [
+0.59,
+10
+],
+"AFF_B_2/parse": [
+3.37,
+2
+],
+"ALF_A_3/default": [
+0.27,
+3
+],
+"ALF_A_3/parse": [
+4.01,
+3
+],
+"ALF_B_3/default": [
+0.4,
+3
+],
+"ALF_B_3/parse": [
+0.61,
+3
+],
+"ALF_C_3/default": [
+0.48,
+4
+],
+"ALF_C_3/parse": [
+0.75,
+4
+],
+"ALF_D_2/default": [
+0.41,
+8
+],
+"ALF_D_2/parse": [
+1.16,
+8
+],
+"AMVR_A_3/default": [
+1.87,
+17
+],
+"AMVR_A_3/parse": [
+1.81,
+2
+],
+"AMVR_B_3/default": [
+0.86,
+17
+],
+"AMVR_B_3/parse": [
+4.97,
+2
+],
+"APSALF_A_2/default": [
+0.55,
+8
+],
+"APSALF_A_2/parse": [
+1.84,
+8
+],
+"APSLMCS_A_3/default": [
+1.03,
+17
+],
+"APSLMCS_A_3/parse": [
+2.23,
+14
+],
+"APSLMCS_B_3/default": [
+2.17,
+17
+],
+"APSLMCS_B_3/parse": [
+3.62,
+17
+],
+"APSLMCS_C_2/default": [
+1.8,
+17
+],
+"APSLMCS_C_2/parse": [
+3.46,
+17
+],
+"APSLMCS_D_1/default": [
+1.54,
+17
+],
+"APSLMCS_D_1/parse": [
+1.99,
+17
+],
+"APSLMCS_E_1/default": [
+1.52,
+17
+],
+"APSLMCS_E_1/parse": [
+3.49,
+17
+],
+"APSMULT_A_4/default": [
+1.06,
+17
+],
+"APSMULT_A_4/parse": [
+2.87,
+17
+],
+"APSMULT_B_4/default": [
+0.43,
+17
+],
+"APSMULT_B_4/parse": [
+1.36,
+17
+],
+"AUD_A_3/default": [
+0.54,
+17
+],
+"AUD_A_3/parse": [
+1.95,
+3
+],
+"BCW_A_4/default": [
+0.58,
+17
+],
+"BCW_A_4/parse": [
+4.21,
+2
+],
+"BDOF_A_4/default": [
+0.77,
+17
+],
+"BDOF_A_4/parse": [
+4.51,
+2
+],
+"BDPCM_A_2/default": [
+0.24,
+3
+],
+"BDPCM_A_2/parse": [
+1.03,
+3
+],
+"BOUNDARY_A_3/default": [
+0.42,
+17
+],
+"BOUNDARY_A_3/parse": [
+1.52,
+17
+],
+"BUMP_A_2/default": [
+1.22,
+17
+],
+"BUMP_A_2/parse": [
+1.93,
+17
+],
+"BUMP_B_2/default": [
+0.74,
+17
+],
+"BUMP_B_2/parse": [
+1.6,
+17
+],
+"BUMP_C_2/default": [
+0.74,
+17
+],
+"BUMP_C_2/parse": [
+1.76,
+17
+],
+"CCALF_A_3/default": [
+1.33,
+17
+],
+"CCALF_A_3/parse": [
+9.07,
+2
+],
+"CCALF_B_3/default": [
+1.69,
+17
+],
+"CCALF_B_3/parse": [
+9.58,
+2
+],
+"CCALF_C_3/default": [
+1.48,
+17
+],
+"CCALF_C_3/parse": [
+8.7,
+2
+],
+"CCALF_D_3/default": [
+1.58,
+17
+],
+"CCALF_D_3/parse": [
+9.37,
+2
+],
+"CCLM_A_2/default": [
+0.47,
+7
+],
+"CCLM_A_2/parse": [
+0.66,
+7
+],
+"CIIP_A_4/default": [
+1.24,
+17
+],
+"CIIP_A_4/parse": [
+2.51,
+2
+],
+"CROP_A_4/default": [
+2.97,
+17
+],
+"CROP_A_4/parse": [
+13.36,
+2
+],
+"CROP_B_4/default": [
+1.34,
+17
+],
+"CROP_B_4/parse": [
+5.68,
+2
+],
+"CST_A_4/default": [
+0.77,
+17
+],
+"CST_A_4/parse": [
+2.05,
+2
+],
+"CTU_A_4/default": [
+1.24,
+17
+],
+"CTU_A_4/parse": [
+2.21,
+14
+],
+"CTU_B_4/default": [
+1.71,
+17
+],
+"CTU_B_4/parse": [
+19.53,
+17
+],
+"CTU_C_4/default": [
+0.63,
+17
+],
+"CTU_C_4/parse": [
+2.37,
+8
+],
+"CUBEMAP_A_3/default": [
+1.82,
+16
+],
+"CUBEMAP_A_3/parse": [
+24.88,
+2
+],
+"CUBEMAP_B_3/default": [
+2.21,
+14
+],
+"CUBEMAP_B_3/parse": [
+15.75,
+2
+],
+"CUBEMAP_C_3/default": [
+2.39,
+15
+],
+"CUBEMAP_C_3/parse": [
+21.18,
+2
+],
+"CodingToolsSets_A_2/default": [
+0.15,
+2
+],
+"CodingToolsSets_A_2/parse": [
+0.27,
+2
+],
+"CodingToolsSets_B_2/default": [
+0.23,
+9
+],
+"CodingToolsSets_B_2/parse": [
+0.65,
+9
+],
+"CodingToolsSets_C_2/default": [
+0.4,
+2
+],
+"CodingToolsSets_C_2/parse": [
+0.58,
+2
+],
+"CodingToolsSets_D_2/default": [
+0.31,
+9
+],
+"CodingToolsSets_D_2/parse": [
+1.15,
+9
+],
+"CodingToolsSets_E_1/default": [
+0.34,
+9
+],
+"CodingToolsSets_E_1/parse": [
+0.67,
+9
+],
+"DCI_A_3/default": [
+0.21,
+2
+],
+"DCI_A_3/parse": [
+0.63,
+2
+],
+"DCI_B_3/default": [
+0.58,
+2
+],
+"DCI_B_3/parse": [
+0.73,
+2
+],
+"DEBLOCKING_A_3/default": [
+0.69,
+17
+],
+"DEBLOCKING_A_3/parse": [
+1.65,
+17
+],
+"DEBLOCKING_B_2/default": [
+1.56,
+17
+],
+"DEBLOCKING_B_2/parse": [
+8.14,
+65
+],
+"DEBLOCKING_C_3/default": [
+0.65,
+17
+],
+"DEBLOCKING_C_3/parse": [
+1.14,
+17
+],
+"DEBLOCKING_E_3/default": [
+0.44,
+8
+],
+"DEBLOCKING_E_3/parse": [
+0.47,
+8
+],
+"DEBLOCKING_F_2/default": [
+0.95,
+17
+],
+"DEBLOCKING_F_2/parse": [
+2.49,
+17
+],
+"DMVR_A_3/default": [
+0.56,
+9
+],
+"DMVR_A_3/parse": [
+1.12,
+9
+],
+"DMVR_B_4/default": [
+0.34,
+11
+],
+"DMVR_B_4/parse": [
+0.74,
+11
+],
+"DPB_A_2/default": [
+1.25,
+17
+],
+"DPB_A_2/parse": [
+1.93,
+17
+],
+"DPB_B_2/default": [
+0.38,
+5
+],
+"DPB_B_2/parse": [
+0.81,
+5
+],
+"DQ_A_3/default": [
+0.45,
+17
+],
+"DQ_A_3/parse": [
+1.52,
+5
+],
+"DQ_B_3/default": [
+1.22,
+17
+],
+"DQ_B_3/parse": [
+6.07,
+2
+],
+"ENT444HIGHTIER_A_3/default": [
+1.21,
+3
+],
+"ENT444HIGHTIER_A_3/parse": [
+20.03,
+2
+],
+"ENT444HIGHTIER_B_3/default": [
+0.77,
+3
+],
+"ENT444HIGHTIER_B_3/parse": [
+13.05,
+2
+],
+"ENT444HIGHTIER_C_3/default": [
+1.77,
+3
+],
+"ENT444HIGHTIER_C_3/parse": [
+51.94,
+2
+],
+"ENT444HIGHTIER_D_3/default": [
+1.65,
+3
+],
+"ENT444HIGHTIER_D_3/parse": [
+59.84,
+2
+],
+"ENT444MAINTIER_A_3/default": [
+0.71,
+3
+],
+"ENT444MAINTIER_A_3/parse": [
+10.66,
+2
+],
+"ENT444MAINTIER_B_3/default": [
+1.21,
+3
+],
+"ENT444MAINTIER_B_3/parse": [
+17.17,
+2
+],
+"ENT444MAINTIER_C_3/default": [
+1.21,
+3
+],
+"ENT444MAINTIER_C_3/parse": [
+47.8,
+2
+],
+"ENT444MAINTIER_D_3/default": [
+1.6,
+3
+],
+"ENT444MAINTIER_D_3/parse": [
+40.16,
+3
+],
+"ENTHIGHTIER_A_3/default": [
+0.68,
+3
+],
+"ENTHIGHTIER_A_3/parse": [
+9.15,
+2
+],
+"ENTHIGHTIER_B_3/default": [
+0.67,
+3
+],
+"ENTHIGHTIER_B_3/parse": [
+12.81,
+2
+],
+"ENTHIGHTIER_C_3/default": [
+0.96,
+3
+],
+"ENTHIGHTIER_C_3/parse": [
+30.78,
+2
+],
+"ENTHIGHTIER_D_3/default": [
+0.89,
+3
+],
+"ENTHIGHTIER_D_3/parse": [
+31.59,
+3
+],
+"ENTMAINTIER_A_3/default": [
+0.64,
+3
+],
+"ENTMAINTIER_A_3/parse": [
+5.99,
+2
+],
+"ENTMAINTIER_B_3/default": [
+0.4,
+3
+],
+"ENTMAINTIER_B_3/parse": [
+7.89,
+2
+],
+"ENTMAINTIER_C_3/default": [
+0.74,
+3
+],
+"ENTMAINTIER_C_3/parse": [
+15.84,
+3
+],
+"ENTMAINTIER_D_3/default": [
+0.75,
+3
+],
+"ENTMAINTIER_D_3/parse": [
+14.85,
+3
+],
+"ENTROPY_A_2/default": [
+5.21,
+60
+],
+"ENTROPY_A_2/parse": [
+18.47,
+60
+],
+"ENTROPY_B_2/default": [
+0.52,
+17
+],
+"ENTROPY_B_2/parse": [
+1.21,
+17
+],
+"ENTROPY_C_1/default": [
+1.0,
+17
+],
+"ENTROPY_C_1/parse": [
+3.59,
+17
+],
+"ERP_A_3/default": [
+1.4,
+17
+],
+"ERP_A_3/parse": [
+8.71,
+2
+],
+"FIELD_A_4/default": [
+1.2,
+0
+],
+"FIELD_A_4/parse": [
+1.84,
+0
+],
+"FIELD_B_2/default": [
+0.53,
+0
+],
+"FIELD_B_2/parse": [
+1.38,
+0
+],
+"FILLER_A_1/default": [
+0.51,
+17
+],
+"FILLER_A_1/parse": [
+1.45,
+17
+],
+"GDR_A_2/default": [
+1.66,
+17
+],
+"GDR_A_2/parse": [
+3.31,
+16
+],
+"GDR_B_2/default": [
+2.9,
+17
+],
+"GDR_B_2/parse": [
+4.56,
+17
+],
+"GDR_C_2/default": [
+1.65,
+11
+],
+"GDR_C_2/parse": [
+2.84,
+11
+],
+"GDR_D_1/default": [
+1.81,
+17
+],
+"GDR_D_1/parse": [
+0.91,
+17
+],
+"GPM_A_3/default": [
+0.41,
+17
+],
+"GPM_A_3/parse": [
+1.22,
+17
+],
+"GPM_B_1/default": [
+0.8,
+17
+],
+"GPM_B_1/parse": [
+2.17,
+17
+],
+"HLG_A_4/default": [
+2.09,
+11
+],
+"HLG_A_4/parse": [
+2.89,
+2
+],
+"HLG_B_4/default": [
+2.25,
+15
+],
+"HLG_B_4/parse": [
+4.35,
+2
+],
+"HRD_A_3/default": [
+0.5,
+17
+],
+"HRD_A_3/parse": [
+3.07,
+17
+],
+"HRD_B_2/default": [
+1.18,
+17
+],
+"HRD_B_2/parse": [
+1.26,
+17
+],
+"IBC_A_2/default": [
+0.59,
+17
+],
+"IBC_A_2/parse": [
+1.33,
+17
+],
+"IBC_B_2/default": [
+0.53,
+17
+],
+"IBC_B_2/parse": [
+1.87,
+17
+],
+"IBC_C_2/default": [
+0.45,
+17
+],
+"IBC_C_2/parse": [
+1.18,
+17
+],
+"IBC_D_2/default": [
+0.63,
+17
+],
+"IBC_D_2/parse": [
+1.35,
+17
+],
+"IBC_E_1/default": [
+0.62,
+11
+],
+"IBC_E_1/parse": [
+0.64,
+11
+],
+"IP_A_2/default": [
+0.42,
+8
+],
+"IP_A_2/parse": [
+1.19,
+8
+],
+"IP_B_1/default": [
+1.13,
+19
+],
+"IP_B_1/parse": [
+3.6,
+19
+],
+"ISP_A_3/default": [
+0.76,
+17
+],
+"ISP_A_3/parse": [
+1.72,
+13
+],
+"ISP_B_3/default": [
+1.62,
+17
+],
+"ISP_B_3/parse": [
+8.75,
+17
+],
+"JCCR_A_2/default": [
+0.24,
+3
+],
+"JCCR_A_2/parse": [
+1.38,
+3
+],
+"JCCR_B_2/default": [
+0.57,
+3
+],
+"JCCR_B_2/parse": [
+5.33,
+3
+],
+"JCCR_C_3/default": [
+0.62,
+17
+],
+"JCCR_C_3/parse": [
+2.32,
+17
+],
+"JCCR_D_3/default": [
+10.42,
+480
+],
+"JCCR_D_3/parse": [
+3.66,
+17
+],
+"JCCR_E_1/default": [
+0.42,
+3
+],
+"JCCR_E_1/parse": [
+0.64,
+3
+],
+"JCCR_F_1/default": [
+0.41,
+3
+],
+"JCCR_F_1/parse": [
+5.14,
+3
+],
+"LFNST_A_4/default": [
+0.43,
+17
+],
+"LFNST_A_4/parse": [
+2.2,
+17
+],
+"LFNST_B_4/default": [
+0.71,
+17
+],
+"LFNST_B_4/parse": [
+1.16,
+17
+],
+"LFNST_C_3/default": [
+0.98,
+17
+],
+"LFNST_C_3/parse": [
+2.41,
+17
+],
+"LFNST_D_3/default": [
+1.69,
+17
+],
+"LFNST_D_3/parse": [
+39.21,
+300
+],
+"LMCS_A_3/default": [
+1.3,
+17
+],
+"LMCS_A_3/parse": [
+2.57,
+17
+],
+"LMCS_B_2/default": [
+2.66,
+17
+],
+"LMCS_B_2/parse": [
+2.15,
+17
+],
+"LMCS_C_1/default": [
+1.12,
+17
+],
+"LMCS_C_1/parse": [
+1.74,
+17
+],
+"LOSSLESS_A_3/default": [
+1.92,
+17
+],
+"LOSSLESS_A_3/parse": [
+5.41,
+2
+],
+"LOSSLESS_B_3/default": [
+1.47,
+17
+],
+"LOSSLESS_B_3/parse": [
+5.38,
+2
+],
+"LTRP_A_3/default": [
+1.35,
+17
+],
+"LTRP_A_3/parse": [
+1.4,
+17
+],
+"MERGE_A_2/default": [
+0.7,
+10
+],
+"MERGE_A_2/parse": [
+2.03,
+5
+],
+"MERGE_B_2/default": [
+0.71,
+10
+],
+"MERGE_B_2/parse": [
+3.31,
+8
+],
+"MERGE_C_2/default": [
+0.66,
+10
+],
+"MERGE_C_2/parse": [
+4.49,
+10
+],
+"MERGE_D_2/default": [
+0.46,
+10
+],
+"MERGE_D_2/parse": [
+2.88,
+6
+],
+"MERGE_E_2/default": [
+0.73,
+10
+],
+"MERGE_E_2/parse": [
+2.13,
+5
+],
+"MERGE_F_2/default": [
+5.32,
+65
+],
+"MERGE_F_2/parse": [
+5.98,
+15
+],
+"MERGE_G_2/default": [
+4.1,
+65
+],
+"MERGE_G_2/parse": [
+7.97,
+15
+],
+"MERGE_H_2/default": [
+3.98,
+65
+],
+"MERGE_H_2/parse": [
+7.4,
+17
+],
+"MERGE_I_2/default": [
+4.72,
+65
+],
+"MERGE_I_2/parse": [
+5.24,
+14
+],
+"MERGE_J_2/default": [
+4.03,
+65
+],
+"MERGE_J_2/parse": [
+4.58,
+17
+],
+"MIP_A_3/default": [
+0.54,
+17
+],
+"MIP_A_3/parse": [
+1.86,
+17
+],
+"MIP_B_3/default": [
+1.13,
+17
+],
+"MIP_B_3/parse": [
+0.95,
+17
+],
+"MMVD_A_3/default": [
+1.13,
+17
+],
+"MMVD_A_3/parse": [
+4.4,
+2
+],
+"MNUT_A_4/default": [
+1.15,
+17
+],
+"MNUT_A_4/parse": [
+1.65,
+6
+],
+"MNUT_B_3/default": [
+0.67,
+17
+],
+"MNUT_B_3/parse": [
+17.13,
+17
+],
+"MPM_A_3/default": [
+2.75,
+12
+],
+"MPM_A_3/parse": [
+3.22,
+2
+],
+"MRLP_A_2/default": [
+0.79,
+16
+],
+"MRLP_A_2/parse": [
+3.22,
+2
+],
+"MRLP_B_2/default": [
+0.61,
+16
+],
+"MRLP_B_2/parse": [
+2.76,
+2
+],
+"MTS_A_4/default": [
+0.38,
+17
+],
+"MTS_A_4/parse": [
+0.83,
+17
+],
+"MTS_B_4/default": [
+0.87,
+17
+],
+"MTS_B_4/parse": [
+2.91,
+17
+],
+"MTS_LFNST_A_4/default": [
+1.05,
+17
+],
+"MTS_LFNST_A_4/parse": [
+2.62,
+6
+],
+"MTS_LFNST_B_4/default": [
+0.75,
+17
+],
+"MTS_LFNST_B_4/parse": [
+2.99,
+6
+],
+"MVCOMP_A_2/default": [
+0.58,
+17
+],
+"MVCOMP_A_2/parse": [
+0.93,
+17
+],
+"OPI_A_1/default": [
+0.46,
+17
+],
+"OPI_A_1/parse": [
+1.17,
+17
+],
+"PDPC_A_3/default": [
+1.51,
+17
+],
+"PDPC_A_3/parse": [
+5.45,
+2
+],
+"PDPC_B_3/default": [
+1.25,
+17
+],
+"PDPC_B_3/parse": [
+5.66,
+2
+],
+"PDPC_C_2/default": [
+2.6,
+17
+],
+"PDPC_C_2/parse": [
+4.15,
+2
+],
+"PHSH_B_1/default": [
+0.27,
+6
+],
+"PHSH_B_1/parse": [
+0.7,
+6
+],
+"PMERGE_A_1/default": [
+0.71,
+17
+],
+"PMERGE_A_1/parse": [
+1.9,
+17
+],
+"PMERGE_B_1/default": [
+0.58,
+17
+],
+"PMERGE_B_1/parse": [
+1.9,
+17
+],
+"PMERGE_C_1/default": [
+0.75,
+17
+],
+"PMERGE_C_1/parse": [
+1.25,
+17
+],
+"PMERGE_D_1/default": [
+0.7,
+17
+],
+"PMERGE_D_1/parse": [
+1.93,
+17
+],
+"PMERGE_E_1/default": [
+0.72,
+17
+],
+"PMERGE_E_1/parse": [
+2.84,
+17
+],
+"POC_A_1/default": [
+1.06,
+17
+],
+"POC_A_1/parse": [
+3.3,
+2
+],
+"POUT_A_2/default": [
+0.45,
+8
+],
+"POUT_A_2/parse": [
+1.37,
+8
+],
+"PPS_A_1/default": [
+1.25,
+17
+],
+"PPS_A_1/parse": [
+7.14,
+17
+],
+"PPS_B_1/default": [
+1.05,
+17
+],
+"PPS_B_1/parse": [
+1.24,
+17
+],
+"PPS_C_1/default": [
+0.62,
+17
+],
+"PPS_C_1/parse": [
+2.06,
+14
+],
+"PQ_A_1/default": [
+1.27,
+17
+],
+"PQ_A_1/parse": [
+2.72,
+2
+],
+"PROF_A_3/default": [
+0.86,
+16
+],
+"PROF_A_3/parse": [
+3.7,
+16
+],
+"PROF_B_3/default": [
+0.51,
+16
+],
+"PROF_B_3/parse": [
+1.36,
+16
+],
+"PSEXT_A_2/default": [
+0.78,
+9
+],
+"PSEXT_A_2/parse": [
+7.73,
+2
+],
+"PSEXT_B_2/default": [
+1.18,
+9
+],
+"PSEXT_B_2/parse": [
+9.61,
+2
+],
+"QTBTT_A_4/default": [
+0.64,
+17
+],
+"QTBTT_A_4/parse": [
+3.36,
+2
+],
+"QUANT_A_2/default": [
+0.54,
+5
+],
+"QUANT_A_2/parse": [
+0.8,
+5
+],
+"QUANT_B_2/default": [
+0.89,
+17
+],
+"QUANT_B_2/parse": [
+1.93,
+17
+],
+"QUANT_C_2/default": [
+0.65,
+3
+],
+"QUANT_C_2/parse": [
+2.91,
+3
+],
+"QUANT_D_4/default": [
+0.26,
+3
+],
+"QUANT_D_4/parse": [
+1.64,
+3
+],
+"QUANT_E_1/default": [
+0.58,
+17
+],
+"QUANT_E_1/parse": [
+1.3,
+17
+],
+"RAP_A_1/default": [
+0.11,
+1
+],
+"RAP_A_1/parse": [
+0.17,
+1
+],
+"RAP_B_1/default": [
+0.59,
+17
+],
+"RAP_B_1/parse": [
+1.41,
+33
+],
+"RAP_C_1/default": [
+0.71,
+17
+],
+"RAP_C_1/parse": [
+1.9,
+65
+],
+"RAP_D_1/default": [
+0.62,
+17
+],
+"RAP_D_1/parse": [
+1.33,
+33
+],
+"RPL_A_2/default": [
+0.9,
+17
+],
+"RPL_A_2/parse": [
+0.77,
+17
+],
+"RPR_A_4/default": [
+0.45,
+4
+],
+"RPR_A_4/parse": [
+0.97,
+4
+],
+"RPR_B_3/default": [
+0.67,
+4
+],
+"RPR_B_3/parse": [
+0.54,
+4
+],
+"RPR_C_3/default": [
+0.43,
+4
+],
+"RPR_C_3/parse": [
+1.0,
+4
+],
+"RPR_D_1/default": [
+0.57,
+8
+],
+"RPR_D_1/parse": [
+1.84,
+8
+],
+"SAO_A_3/default": [
+0.84,
+17
+],
+"SAO_A_3/parse": [
+2.5,
+2
+],
+"SAO_B_3/default": [
+1.59,
+17
+],
+"SAO_B_3/parse": [
+2.66,
+2
+],
+"SAO_C_3/default": [
+1.9,
+17
+],
+"SAO_C_3/parse": [
+2.27,
+2
+],
+"SBT_A_2/default": [
+0.77,
+17
+],
+"SBT_A_2/parse": [
+2.16,
+17
+],
+"SCALING_A_1/default": [
+0.87,
+17
+],
+"SCALING_A_1/parse": [
+2.55,
+17
+],
+"SCALING_B_1/default": [
+1.69,
+17
+],
+"SCALING_B_1/parse": [
+1.88,
+17
+],
+"SCALING_C_1/default": [
+1.42,
+16
+],
+"SCALING_C_1/parse": [
+3.49,
+16
+],
+"SDH_A_2/default": [
+1.25,
+17
+],
+"SDH_A_2/parse": [
+5.87,
+2
+],
+"SLICES_A_3/default": [
+0.85,
+17
+],
+"SLICES_A_3/parse": [
+1.73,
+17
+],
+"SMVD_A_2/default": [
+0.61,
+10
+],
+"SMVD_A_2/parse": [
+2.88,
+2
+],
+"SPS_A_1/default": [
+1.28,
+17
+],
+"SPS_A_1/parse": [
+4.74,
+4
+],
+"SPS_B_1/default": [
+0.51,
+17
+],
+"SPS_B_1/parse": [
+4.33,
+5
+],
+"SPS_C_1/default": [
+1.01,
+17
+],
+"SPS_C_1/parse": [
+1.72,
+5
+],
+"STILL444_A_1/default": [
+0.17,
+1
+],
+"STILL444_A_1/parse": [
+1.21,
+1
+],
+"STILL_A_1/default": [
+0.18,
+1
+],
+"STILL_A_1/parse": [
+0.8,
+1
+],
+"SUBPIC_A_3/default": [
+1.03,
+4
+],
+"SUBPIC_A_3/parse": [
+1.04,
+2
+],
+"SUBPIC_B_3/default": [
+0.67,
+17
+],
+"SUBPIC_B_3/parse": [
+2.24,
+7
+],
+"SUBPIC_C_1/default": [
+1.53,
+17
+],
+"SUBPIC_C_1/parse": [
+3.85,
+10
+],
+"SUBPIC_D_1/default": [
+2.24,
+17
+],
+"SUBPIC_D_1/parse": [
+4.88,
+11
+],
+"SUBPIC_E_1/default": [
+2.71,
+17
+],
+"SUBPIC_E_1/parse": [
+3.83,
+10
+],
+"SUFAPS_A_1/default": [
+0.56,
+17
+],
+"SUFAPS_A_1/parse": [
+1.29,
+17
+],
+"SbTMVP_A_3/default": [
+1.36,
+17
+],
+"SbTMVP_A_3/parse": [
+3.18,
+12
+],
+"SbTMVP_B_3/default": [
+0.43,
+17
+],
+"SbTMVP_B_3/parse": [
+1.05,
+17
+],
+"TEMPSCAL_A_4/default": [
+1.11,
+17
+],
+"TEMPSCAL_A_4/parse": [
+5.08,
+2
+],
+"TEMPSCAL_B_7/default": [
+1.32,
+17
+],
+"TEMPSCAL_B_7/parse": [
+3.04,
+2
+],
+"TEMPSCAL_C_4/default": [
+0.53,
+17
+],
+"TEMPSCAL_C_4/parse": [
+6.1,
+2
+],
+"TILE_A_2/default": [
+0.98,
+9
+],
+"TILE_A_2/parse": [
+7.34,
+9
+],
+"TILE_B_2/default": [
+1.07,
+9
+],
+"TILE_B_2/parse": [
+2.96,
+9
+],
+"TILE_C_2/default": [
+0.95,
+9
+],
+"TILE_C_2/parse": [
+3.95,
+9
+],
+"TILE_D_2/default": [
+0.95,
+9
+],
+"TILE_D_2/parse": [
+3.16,
+9
+],
+"TILE_E_2/default": [
+0.84,
+9
+],
+"TILE_E_2/parse": [
+2.93,
+9
+],
+"TILE_F_2/default": [
+1.17,
+9
+],
+"TILE_F_2/parse": [
+2.36,
+9
+],
+"TILE_G_2/default": [
+0.96,
+9
+],
+"TILE_G_2/parse": [
+1.7,
+8
+],
+"TMVP_A_3/default": [
+1.8,
+17
+],
+"TMVP_A_3/parse": [
+4.23,
+2
+],
+"TMVP_B_3/default": [
+0.85,
+17
+],
+"TMVP_B_3/parse": [
+4.23,
+2
+],
+"TMVP_C_3/default": [
+1.5,
+17
+],
+"TMVP_C_3/parse": [
+6.65,
+2
+],
+"TMVP_D_3/default": [
+1.5,
+17
+],
+"TMVP_D_3/parse": [
+3.53,
+2
+],
+"TRANS_A_2/default": [
+2.71,
+12
+],
+"TRANS_A_2/parse": [
+20.5,
+2
+],
+"TRANS_B_2/default": [
+2.94,
+12
+],
+"TRANS_B_2/parse": [
+17.8,
+2
+],
+"TRANS_C_4/default": [
+1.25,
+15
+],
+"TRANS_C_4/parse": [
+7.55,
+2
+],
+"TRANS_D_4/default": [
+2.65,
+13
+],
+"TRANS_D_4/parse": [
+11.71,
+2
+],
+"TREE_A_3/default": [
+0.77,
+17
+],
+"TREE_A_3/parse": [
+20.75,
+2
+],
+"TREE_B_3/default": [
+1.39,
+17
+],
+"TREE_B_3/parse": [
+20.69,
+2
+],
+"TREE_C_3/default": [
+1.51,
+17
+],
+"TREE_C_3/parse": [
+4.18,
+2
+],
+"VIRTUAL_A_3/default": [
+2.65,
+17
+],
+"VIRTUAL_A_3/parse": [
+8.36,
+2
+],
+"VIRTUAL_B_3/default": [
+2.5,
+13
+],
+"VIRTUAL_B_3/parse": [
+11.25,
+2
+],
+"WPP_A_3/default": [
+0.69,
+17
+],
+"WPP_A_3/parse": [
+3.15,
+2
+],
+"WPP_B_2/default": [
+1.8,
+17
+],
+"WPP_B_2/parse": [
+3.86,
+2
+],
+"WP_A_3/default": [
+0.49,
+17
+],
+"WP_A_3/parse": [
+2.4,
+17
+],
+"WP_B_3/default": [
+0.66,
+17
+],
+"WP_B_3/parse": [
+1.54,
+17
+],
+"WRAP_A_4/default": [
+0.51,
+9
+],
+"WRAP_A_4/parse": [
+2.64,
+9
+],
+"WRAP_B_4/default": [
+0.91,
+17
+],
+"WRAP_B_4/parse": [
+2.4,
+17
+],
+"WRAP_C_4/default": [
+0.85,
+9
+],
+"WRAP_C_4/parse": [
+3.8,
+9
+],
+"WRAP_D_4/default": [
+0.75,
+9
+],
+"WRAP_D_4/parse": [
+0.98,
+9
+],
+"bee600/default": [
+13.09,
+0
+],
+"bee600/parse": [
+17.78,
+0
+],
+"cpu_path": [
+31.22,
+0
+],
+"movie_bee_1608/default": [
+22.42,
+0
+],
+"movie_bee_1608/parse": [
+33.11,
+0
+],
+"movie_conan_1080p/default": [
+14.62,
+0
+],
+"movie_conan_1080p/parse": [
+31.49,
+0
+],
+"movie_topgun_1080p/default": [
+7.78,
+0
+],
+"movie_topgun_1080p/parse": [
+15.31,
+0
+],
+"stress_s_1366x766_c64/default": [
+1.74,
+0
+],
+"stress_s_1366x766_c64/parse": [
+2.84,
+0
+],
+"stress_s_136x72/default": [
+1.45,
+0
+],
+"stress_s_136x72/parse": [
+1.79,
+0
+],
+"stress_s_1918x1078/default": [
+2.09,
+0
+],
+"stress_s_1918x1078/parse": [
+2.67,
+0
+],
+"stress_s_3838x2158_med/default": [
+2.02,
+0
+],
+"stress_s_3838x2158_med/parse": [
+6.35,
+0
+],
+"stress_s_718x406_c32/default": [
+1.19,
+0
+],
+"stress_s_718x406_c32/parse": [
+1.42,
+0
+],
+"stress_s_8k/default": [
+5.18,
+0
+],
+"stress_s_8k/parse": [
+7.26,
+0
+],
+"stress_s_mixed/default": [
+1.29,
+0
+],
+"stress_s_mixed/parse": [
+2.82,
+0
+],
+"stress_s_switch/default": [
+2.4,
+0
+],
+"stress_s_switch/parse": [
+6.07,
+0
+],
+"tool_affall_1080p/default": [
+0.66,
+6
+],
+"tool_affall_1080p/parse": [
+1.9,
+6
+],
+"tool_affine_1080p/default": [
+0.66,
+6
+],
+"tool_affine_1080p/parse": [
+1.9,
+6
+],
+"tool_affnoprof_1080p/default": [
+0.78,
+6
+],
+"tool_affnoprof_1080p/parse": [
+2.1,
+6
+],
+"tool_bcw_1080p/default": [
+0.74,
+6
+],
+"tool_bcw_1080p/parse": [
+2.78,
+6
+],
+"tool_bdof_1080p/default": [
+0.77,
+6
+],
+"tool_bdof_1080p/parse": [
+2.07,
+6
+],
+"tool_bdofall_1080p/default": [
+0.86,
+6
+],
+"tool_bdofall_1080p/parse": [
+1.94,
+6
+],
+"tool_bdofnodmvr_1080p/default": [
+0.49,
+6
+],
+"tool_bdofnodmvr_1080p/parse": [
+2.46,
+6
+],
+"tool_both_1080p/default": [
+0.91,
+6
+],
+"tool_both_1080p/parse": [
+1.82,
+6
+],
+"tool_ciip_1080p/default": [
+0.77,
+6
+],
+"tool_ciip_1080p/parse": [
+3.72,
+6
+],
+"tool_ciip_4k/default": [
+1.3,
+6
+],
+"tool_ciip_4k/parse": [
+2.15,
+6
+],
+"tool_ciip_mtt/default": [
+0.74,
+6
+],
+"tool_ciip_mtt/parse": [
+3.63,
+6
+],
+"tool_fg_1080p/default": [
+0.6,
+6
+],
+"tool_fg_1080p/parse": [
+1.59,
+6
+],
+"tool_fg_1906/default": [
+0.55,
+6
+],
+"tool_fg_1906/parse": [
+0.99,
+6
+],
+"tool_fg_8bit/default": [
+0.56,
+6
+],
+"tool_fg_8bit/parse": [
+2.79,
+6
+],
+"tool_fg_crop/default": [
+0.79,
+6
+],
+"tool_fg_crop/parse": [
+1.37,
+6
+],
+"tool_fg_tg4k/default": [
+1.63,
+6
+],
+"tool_fg_tg4k/parse": [
+1.98,
+6
+],
+"tool_fg_tg4k_b/default": [
+1.89,
+6
+],
+"tool_fg_tg4k_b/parse": [
+1.82,
+6
+],
+"tool_gpm_1080p/default": [
+0.86,
+6
+],
+"tool_gpm_1080p/parse": [
+1.92,
+6
+],
+"tool_gpmall_1080p/default": [
+0.78,
+6
+],
+"tool_gpmall_1080p/parse": [
+1.9,
+6
+],
+"tool_inter8bit_ctu64/default": [
+0.45,
+6
+],
+"tool_inter8bit_ctu64/parse": [
+2.17,
+6
+],
+"tool_interall_4k/default": [
+1.48,
+6
+],
+"tool_interall_4k/parse": [
+3.06,
+6
+],
+"tool_isp_1080p/default": [
+0.81,
+6
+],
+"tool_isp_1080p/parse": [
+3.79,
+6
+],
+"tool_isp_ai_4k/default": [
+1.32,
+6
+],
+"tool_isp_ai_4k/parse": [
+3.35,
+6
+],
+"tool_isp_med_ai/default": [
+0.66,
+4
+],
+"tool_isp_med_ai/parse": [
+2.36,
+4
+],
+"tool_lfnst_1080p/default": [
+0.72,
+6
+],
+"tool_lfnst_1080p/parse": [
+3.81,
+6
+],
+"tool_lfnst_med_ai/default": [
+0.53,
+4
+],
+"tool_lfnst_med_ai/parse": [
+3.2,
+4
+],
+"tool_lmcs_1080p/default": [
+0.68,
+6
+],
+"tool_lmcs_1080p/parse": [
+3.1,
+6
+],
+"tool_mip_1080p/default": [
+0.75,
+6
+],
+"tool_mip_1080p/parse": [
+3.43,
+6
+],
+"tool_mip_8bit_ctu64/default": [
+0.55,
+6
+],
+"tool_mip_8bit_ctu64/parse": [
+1.79,
+6
+],
+"tool_mip_ai_4k/default": [
+1.18,
+6
+],
+"tool_mip_ai_4k/parse": [
+3.53,
+6
+],
+"tool_mrl_1080p/default": [
+0.6,
+6
+],
+"tool_mrl_1080p/parse": [
+4.33,
+6
+],
+"tool_mrl_ai_4k/default": [
+1.35,
+6
+],
+"tool_mrl_ai_4k/parse": [
+2.97,
+6
+],
+"tool_sbt_1080p/default": [
+0.53,
+6
+],
+"tool_sbt_1080p/parse": [
+2.84,
+6
+],
+"tool_sbtmvp_1080p/default": [
+0.77,
+6
+],
+"tool_sbtmvp_1080p/parse": [
+1.95,
+6
+],
+"vq1080/default": [
+3.67,
+96
+],
+"vq1080/parse": [
+5.08,
+96
+],
+"vq1080_1200_t2/default": [
+10.06,
+0
+],
+"vq1080_1200_t2/parse": [
+19.09,
+0
+],
+"vq1080_4800/default": [
+24.22,
+0
+],
+"vq1080_4800/parse": [
+49.92,
+0
+],
+"vq4k/default": [
+3.34,
+32
+],
+"vq4k/parse": [
+6.25,
+32
+],
+"vq4k_1200/default": [
+15.41,
+0
+],
+"vq4k_1200/parse": [
+19.46,
+0
+],
+"vq4k_600_t2/default": [
+10.3,
+0
+],
+"vq4k_600_t2/parse": [
+17.11,
+0
+]
+}

@@ -1,0 +1,10 @@
+# the exes under test (vvdecapp_<name>.exe, vvdecbatch_<name>.exe) and what the checks and measurements write
+*.exe
+*.obj
+*_check.txt
+*_fast.txt
+check_*_qa.txt
+check_*_streams.txt
+check_*_work/
+fastcheck_logs/
+stress.lock
