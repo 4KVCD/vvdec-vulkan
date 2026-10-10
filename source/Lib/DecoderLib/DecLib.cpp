@@ -112,6 +112,16 @@ DecLib::DecLib()
 #endif
 }
 
+#if VVDEC_VULKAN
+// Whether the GPU parses the pictures ahead of their reconstruction (VVDEC_GPU_PARSE=2, with the GPU's front end and a
+// parse queue)
+static bool gpuParsesAhead( const gpu::Context& gpu )
+{
+  const gpu::Options& options = gpu.options();
+  return options.parseDrives && options.frontEnd && !options.frontEndCheck && gpu.parseQueue();
+}
+#endif
+
 void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocator& userAllocator, ErrHandlingFlags errHandlingFlags, bool useGpu )
 {
   // run constructor again to ensure all variables, especially in DecLibParser have been reset
@@ -163,9 +173,15 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
   // ahead holds its buffers (1080p 13 MB, 4K 44 MB): peak commit 1080p 793 ->
   // 633 MB, 4K 2546 -> 2014 MB. 8 saves 60 MB more at 1080p but is slower
   // there (634 vs 657 fps).
+  //
+  // With the GPU's parse ahead, 64: a picture waiting for its reconstruction holds only what the parse left (its
+  // records and levels; stand-ins of its planes), and the window hides the long serial parse of the intra pictures
+  // (~190 ms at 1080p, ~500 ms at 4K) behind the reconstruction of the pictures before (VideoQ, 16 threads: 1080p
+  // 180.7 -> 251.6 fps, 4K 71.5 -> 97.1 fps; peak commit 724 -> 1009 MB and 1897 -> 2403 MB; the first frame 0.2 s
+  // later. 96: 5-7% faster still, for 110 / 280 MB more; 8 instances or 32 pictures parsed at a time: no faster.)
   if( m_gpu && defaultParseDelay )
   {
-    parserFrameDelay  = std::min( parserFrameDelay, 12 );
+    parserFrameDelay  = gpuParsesAhead( *m_gpu ) ? 64 : std::min( parserFrameDelay, 12 );
     m_parseFrameDelay = parserFrameDelay;
   }
 #endif
@@ -208,8 +224,7 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
   }
 #if VVDEC_VULKAN
   // VVDEC_GPU_PARSE=2: the GPU parses the pictures ahead of their reconstruction, on the parse queue
-  const gpu::Options* options = m_gpu ? &m_gpu->options() : nullptr;
-  if( options && options->parseDrives && options->frontEnd && !options->frontEndCheck && m_gpu->parseQueue() )
+  if( m_gpu && gpuParsesAhead( *m_gpu ) )
   {
     ThreadPool* pool  = m_decodeThreadPool.get();
     m_gpuParseService = std::make_unique<gpu::ParseService>( m_gpu, [pool]() { pool->wakeUp(); } );
