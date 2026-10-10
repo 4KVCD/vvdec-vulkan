@@ -280,15 +280,22 @@ void CodingStructure::rebindPicBufs()
   else                                                    m_rec_wrap.destroy();
 }
 
-void CodingStructure::allocTempInternals()
+void CodingStructure::allocTempInternals( bool cuMap )
 {
   const ptrdiff_t ctuCuMapSize    = pcv->num4x4CtuBlks;
   const ptrdiff_t ctuColMiMapSize = pcv->num8x8CtuBlks;
 
-  const ptrdiff_t newCuMapSize = ctuCuMapSize * pcv->sizeInCtus * 2;
+  const ptrdiff_t newCuMapSize = cuMap ? ctuCuMapSize * pcv->sizeInCtus * 2 : 0;
   if( m_cuMapSize != newCuMapSize )
   {
-    m_cuMap     = m_cuMapCache ? m_cuMapCache->get( newCuMapSize ) : std::make_unique<CodingUnit*[]>( newCuMapSize );
+    if( newCuMapSize == 0 )
+    {
+      m_cuMap.reset();
+    }
+    else
+    {
+      m_cuMap = m_cuMapCache ? m_cuMapCache->get( newCuMapSize ) : std::make_unique<CodingUnit*[]>( newCuMapSize );
+    }
     m_cuMapSize = newCuMapSize;
     m_cuMapZero = true;
   }
@@ -402,7 +409,7 @@ void CodingStructure::initStructData( bool clearColMotion )
   m_ctuWidthLog2[1] = m_ctuWidthLog2[0]; // same for luma and chroma, because of the 2x2 blocks
 
   memset( NO_WARNING_class_memaccess( m_ctuData.get() ),             0, sizeof( CtuData             ) * m_ctuDataSize );
-  if( !m_cuMapZero )
+  if( !m_cuMapZero && m_cuMap )
   {
     memset( NO_WARNING_class_memaccess( m_cuMap.get() ),             0, sizeof( CodingUnit*         ) * m_cuMapSize );
   }
@@ -433,7 +440,7 @@ void CodingStructure::initStructData( bool clearColMotion )
 
       for( int j = 0; j < 2; j++ )
       {
-        m_ctuData[i].cuPtr[j] = &m_cuMap[( 2 * i + j ) * ctuCuMapSize];
+        m_ctuData[i].cuPtr[j] = m_cuMap ? &m_cuMap[( 2 * i + j ) * ctuCuMapSize] : nullptr;
       }
 
       m_ctuData[i].colMotion         = &m_colMiMap[i * ctuColMiMapSize];

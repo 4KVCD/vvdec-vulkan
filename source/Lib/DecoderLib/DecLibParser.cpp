@@ -1112,8 +1112,14 @@ void DecLibParser::xActivateParameterSets( const int layerId )
     // assign these fields already, because they are needed by PicListManager::getPicListRange() and Slice::applyReferencePictureSet()
     m_pcParsePic->poc          = m_apcSlicePilot->getPOC();
     m_pcParsePic->eNalUnitType = m_apcSlicePilot->getNalUnitType();
-    // the colocated motion cleared by the first parse task, off this thread
-    m_pcParsePic->finalInit( &m_cuChunkCache, &m_tuChunkCache, &m_cuMapCache, sps, pps, m_picHeader, alfApss, lmcsAPS, scalingListAPS, true, false );
+    // the colocated motion cleared by the first parse task, off this thread; no CU map for a picture the GPU parses
+#if VVDEC_VULKAN
+    const bool gpuParses = m_gpuParseService && gpu::GpuRecon::parsesPictures( m_pcParsePic->gpuMemory, *sps );
+#else
+    const bool gpuParses = false;
+#endif
+    m_pcParsePic->finalInit( &m_cuChunkCache, &m_tuChunkCache, &m_cuMapCache, sps, pps, m_picHeader, alfApss, lmcsAPS, scalingListAPS, true, false,
+                             !gpuParses );
 
 #if !DISABLE_CONFROMANCE_CHECK
     m_apcSlicePilot->checkLeadingPictureRestrictions( m_dpbReferencePics );

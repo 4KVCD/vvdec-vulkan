@@ -89,14 +89,20 @@ static void ensureParseBuffer( Context* ctx, Buffer& buf, size_t size, MemKind k
 
 bool GpuRecon::parsesPicture( const Picture& pic, const SPS& sps )
 {
+  // (the colocated motion in the GPU's memory too: the coding structure takes the picture's allocator for it)
+  return pic.cs && pic.cs->colMiAllocator && parsesPictures( pic.gpuMemory, sps );
+}
+
+bool GpuRecon::parsesPictures( const UserAllocator* gpuMemory, const SPS& sps )
+{
   // The GPU parses a picture instead of the CPU only when the GPU front end takes it, which needs every pass on the
-  // GPU: a sequence within interSupported (which covers intra prediction and the residuals), the colocated motion
-  // in the GPU's memory, and the GPU front end requested. The parse runs on a queue of its own.
-  if( !pic.gpuMemory || !pic.cs || !pic.cs->colMiAllocator )
+  // GPU: a sequence within interSupported (which covers intra prediction and the residuals), the picture in the
+  // GPU's memory, and the GPU front end requested. The parse runs on a queue of its own.
+  if( !gpuMemory )
   {
     return false;
   }
-  const Context* ctx     = static_cast<const Context*>( pic.gpuMemory->opaque );
+  const Context* ctx     = static_cast<const Context*>( gpuMemory->opaque );
   const Options& options = ctx->options();
   return options.parseDrives && options.frontEnd && !options.frontEndCheck && ctx->parseQueue() && interSupported( sps );
 }

@@ -172,6 +172,9 @@ public:
   // The ParseService parses it then, and the front end takes its records from the picture's ParseSlot
   // (PictureJobs::parsed).
   static bool parsesPicture( const Picture& pic, const SPS& sps );
+  // The same before the picture's coding structure is set up (Picture::finalInit), for a picture whose buffers
+  // gpuMemory allocates (Picture::gpuMemory)
+  static bool parsesPictures( const UserAllocator* gpuMemory, const SPS& sps );
 
   // --- The check of the GPU parse (VVDEC_GPU_PARSE=1; GpuReconParse.cpp) ---
   // After endCompute, compares the GPU's parse of the picture (PictureJobs::parse) with the CPU's: the records (cus,

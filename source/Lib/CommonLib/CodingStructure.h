@@ -228,7 +228,8 @@ public:
   void initStructData( bool clearColMotion = true );
   void clearColMotion();
 
-  void allocTempInternals();
+  // cuMap: the CU map (a CodingUnit pointer a 4x4 block), which a picture the GPU parses never uses
+  void allocTempInternals( bool cuMap = true );
   void deallocTempInternals();
 
   void createInternals(const UnitArea& _unit);
