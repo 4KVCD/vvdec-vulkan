@@ -289,12 +289,26 @@ bool Context::init()
     }
   }
 
-  const float priority = 1.0f;
-  const float asyncPriorities[kMaxAsync + 2] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
-  m_asyncCount = m_asyncFamily != UINT32_MAX ? int( std::min<uint32_t>( families[m_asyncFamily].queueCount, uint32_t( kMaxAsync ) ) ) : 0;
+  const float    priority = 1.0f;
+  const float    asyncPriorities[2 * kMaxAsync] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+  const uint32_t asyncFamilySize = m_asyncFamily != UINT32_MAX ? families[m_asyncFamily].queueCount : 0;
+  m_asyncCount = int( std::min<uint32_t>( asyncFamilySize, uint32_t( kMaxAsync ) ) );
   // the parse queue: one more of the family's when it has one (AMD's has 8); then the parse's copies' queue, one more
-  const bool ownParseQueue = m_asyncCount > 0 && families[m_asyncFamily].queueCount > uint32_t( m_asyncCount );
-  const bool ownCopyQueue  = ownParseQueue && families[m_asyncFamily].queueCount > uint32_t( m_asyncCount + 1 );
+  const bool ownParseQueue = m_asyncCount > 0 && asyncFamilySize > uint32_t( m_asyncCount );
+  const bool ownCopyQueue  = ownParseQueue && asyncFamilySize > uint32_t( m_asyncCount + 1 );
+  // Where the family has twice the front ends' queues (AMD's 8), the front ends take the odd queues and the parse and
+  // its copies the even ones. Windows runs AMD's async family on two compute engines, each queue on the engine of its
+  // index's parity, and the queues of an engine take turns at their submissions: a parse step (several ms) held up the
+  // front ends that shared its engine (Top Gun slower 1080p +1.6 to +2.5%, Beekeeper 4K +1.0%).
+  const bool split = ownCopyQueue && m_asyncCount == kMaxAsync && asyncFamilySize >= uint32_t( 2 * kMaxAsync );
+  uint32_t   asyncIndex[kMaxAsync];
+  for( int i = 0; i < m_asyncCount; i++ )
+  {
+    asyncIndex[i] = split ? uint32_t( 2 * i + 1 ) : uint32_t( i );
+  }
+  const uint32_t parseIndex  = split ? 0u : uint32_t( m_asyncCount );
+  const uint32_t copyIndex   = split ? 2u : uint32_t( m_asyncCount + 1 );
+  const uint32_t asyncQueues = split ? uint32_t( 2 * kMaxAsync ) : uint32_t( m_asyncCount + ( ownParseQueue ? 1 : 0 ) + ( ownCopyQueue ? 1 : 0 ) );
   VkDeviceQueueCreateInfo queueInfos[3] = { { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO }, { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO },
                                             { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO } };
   uint32_t numQueueInfos = 0;
@@ -303,7 +317,7 @@ bool Context::init()
     if( family != UINT32_MAX )
     {
       queueInfos[numQueueInfos].queueFamilyIndex = family;
-      queueInfos[numQueueInfos].queueCount       = family == m_asyncFamily ? uint32_t( m_asyncCount + ( ownParseQueue ? 1 : 0 ) + ( ownCopyQueue ? 1 : 0 ) ) : 1;
+      queueInfos[numQueueInfos].queueCount       = family == m_asyncFamily ? asyncQueues : 1;
       queueInfos[numQueueInfos].pQueuePriorities = family == m_asyncFamily ? asyncPriorities : &priority;
       numQueueInfos++;
     }
@@ -446,11 +460,11 @@ bool Context::init()
   {
     for( int i = 0; i < m_asyncCount; i++ )
     {
-      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, uint32_t( i ), &m_asyncQueues[i] );
+      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, asyncIndex[i], &m_asyncQueues[i] );
     }
     if( ownParseQueue )
     {
-      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, uint32_t( m_asyncCount ), &m_parseQueue );
+      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, parseIndex, &m_parseQueue );
     }
     else
     {
@@ -459,7 +473,7 @@ bool Context::init()
     }
     if( ownCopyQueue )
     {
-      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, uint32_t( m_asyncCount + 1 ), &m_parseCopyQueue );
+      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, copyIndex, &m_parseCopyQueue );
     }
     else
     {
