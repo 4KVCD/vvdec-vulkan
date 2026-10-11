@@ -502,12 +502,16 @@ void rprBlock( int tid, int slot, int comp, int bx, int by, int ox, int oy, int 
 // horizontal passes. Once luma is done, the chroma windows take the luma
 // windows' place.
 #define YW 23                             // a luma window's side: 16 + 7
-#define YS 24                             // stored row length: a window row from its first sample (23 used)
+#define YS 23                             // stored row length: a window row from its first sample
 #define CWD 11                            // a chroma window's side: 8 + 3
-#define CS 16                             // stored row length: 4 aligned 4-sample loads
+#define CS 12                             // stored row length: a window row from its first sample (11 used)
 #define WY_AT( l ) ( ( l ) * YW * YS )
 #define WORK_AT ( 2 * YW * YS )
 #define WC_AT( b ) ( ( b ) * CWD * CS )   // b: 2 * list + chroma component - 1
+#define CH_AT WC_AT( 4 )                  // the chroma filters' horizontal passes, after the chroma windows (4 x 88)
+// BDOF's predictions (s_bdof) lie past what the pool holds while they are in use: the generic path's filters (s_ref,
+// s_tmp: 897 values) and tile16's chroma (windows and horizontal passes: 880 values)
+#define BDOF_AT ( ( 16 + 7 ) * ( 16 + 7 ) + ( 16 + 7 ) * 16 )
 // (the affine variant holds the reference samples of up to 16 subblocks, 9 x 9 each)
 #if AFFINE
 groupshared int16_t s_pool[16 * 81];
@@ -518,7 +522,13 @@ groupshared int16_t s_pool[WORK_AT + 2 * 20 * 20];
 #define s_tmp( i ) int( s_pool[TMP_AT + ( i )] )
 #define s_bil0( i ) int( s_pool[BIL0_AT + ( i )] )
 #define s_bil1( i ) int( s_pool[BIL1_AT + ( i )] )
-groupshared int  s_sad[25];
+// DMVR's SADs, and BDOF's sums (s_bsum) once DMVR is done with them
+#if BDOF
+groupshared int  s_ints[16 * 5];
+#else
+groupshared int  s_ints[25];
+#endif
+#define s_sad s_ints
 groupshared int2 s_delta;
 
 int log2Int( int v )
@@ -944,14 +954,13 @@ int2 clipStorage( int2 mv )
 // inside the tile stand in). The two predictions are then averaged with the offset's correction.
 // --------------------------------------------------------------------------------------------------------------------
 #define BS 18                                     // a list's row length in s_bdof: the tile (16 at most) plus border
-groupshared int16_t s_bdof[2 * BS * BS];
-groupshared int     s_bsum[16 * 5];               // per 4x4: sums of |gx|, |gy|, di*sgn(gx), di*sgn(gy), gx*sgn(gy)
-groupshared int2    s_bv[16];                     // (vx, vy) per 4x4 block
+#define s_bdof( i ) s_pool[BDOF_AT + ( i )]       // (2 * BS * BS values)
+#define s_bsum s_ints                             // per 4x4: sums of |gx|, |gy|, di*sgn(gx), di*sgn(gy), gx*sgn(gy)
 groupshared int     s_minCost;                    // DMVR's best cost (BDOF applies only where it is 2 w h or more)
 
 int bdofP( int list, int x, int y )   // (x, y): -1 .. w, -1 .. h
 {
-  return int( s_bdof[list * BS * BS + ( y + 1 ) * BS + x + 1] );
+  return int( s_bdof( list * BS * BS + ( y + 1 ) * BS + x + 1 ) );
 }
 
 // The gradients at (x, y) inside the tile, from the samples around it (including the border's).
@@ -995,7 +1004,7 @@ void bdofStore( int tid, int list, int w, int h, int pred[PER_THREAD], int slot,
     const int t = tid + THREADS * k;
     if( t < w * h )
     {
-      s_bdof[list * BS * BS + ( ( t >> log2W ) + 1 ) * BS + ( t & ( w - 1 ) ) + 1] = int16_t( pred[k] );
+      s_bdof( list * BS * BS + ( ( t >> log2W ) + 1 ) * BS + ( t & ( w - 1 ) ) + 1 ) = int16_t( pred[k] );
     }
   }
   const int ring = 2 * ( w + 2 ) + 2 * h;
@@ -1006,7 +1015,7 @@ void bdofStore( int tid, int list, int w, int h, int pred[PER_THREAD], int slot,
   {
     const int2 b = bdofBorderAt( r, w, h );
     const int  v = refSample( ref, 0, baseX + b.x + 1 - xOff, baseY + b.y + 1 - yOff, windowed, window, wrap );
-    s_bdof[list * BS * BS + ( b.y + 1 ) * BS + b.x + 1] = bdofBorderValue( v );
+    s_bdof( list * BS * BS + ( b.y + 1 ) * BS + b.x + 1 ) = bdofBorderValue( v );
   }
 }
 
@@ -1078,11 +1087,7 @@ void bdofApply( int tid, int w, int h, out int result[PER_THREAD] )
     bdofAddSums( tid >> 2, tid & 3, w, h );
   }
   GroupMemoryBarrierWithGroupSync();
-  if( tid < nsb )
-  {
-    s_bv[tid] = bdofOffset( tid );
-  }
-  GroupMemoryBarrierWithGroupSync();
+  // (each thread works out the offsets of its samples' blocks: no barrier to share them)
   const int log2W = log2Int( w );
   for( int k = 0; k < PER_THREAD; k++ )
   {
@@ -1092,7 +1097,7 @@ void bdofApply( int tid, int w, int h, out int result[PER_THREAD] )
     {
       const int i = t & ( w - 1 );
       const int j = t >> log2W;
-      result[k]   = bdofSample( i, j, s_bv[( j >> 2 ) * nsx + ( i >> 2 )] );
+      result[k]   = bdofSample( i, j, bdofOffset( ( j >> 2 ) * nsx + ( i >> 2 ) ) );
     }
   }
 }
@@ -1346,10 +1351,34 @@ int bilinearW( int p, int xFrac, int yFrac, int shift )
 }
 
 #if BDOF
-// tile16's bdofStore: the thread's four luma predictions (j, i0 .. i0 + 3) of each list into s_bdof, and the border
-// from the lists' windows (the window's sample (3, 3) lies at the merge motion's integer position), clamped into the
-// window when DMVR's refinement moved the integer position, as the prefetch's padding is.
-void tile16BdofStore( int tid, int j, int i0, int4 predY[2], int2 mvs[2], int2 mvR[2], bool clampY[2] )
+// tile16's BDOF border: the thread's share of the border around both lists' predictions (2 x 68 samples, the k-th at
+// ring place tid + THREADS k), from the lists' windows (the window's sample (3, 3) lies at the merge motion's integer
+// position), clamped into the window when DMVR's refinement moved the integer position, as the prefetch's padding is.
+// Read while the luma windows are there; tile16BdofStore stores it with the predictions once they are gone.
+static const int kTileRing = 2 * ( 16 + 2 ) + 2 * 16;
+void tile16BdofBorder( int tid, int2 mvs[2], int2 mvR[2], bool clampY[2], out int16_t border[3] )
+{
+  [unroll]
+  for( int k = 0; k < 3; k++ )
+  {
+    const int r = min( tid + THREADS * k, 2 * kTileRing - 1 );
+    // (the list is picked with selects: an array indexed per lane would go to scratch memory)
+    const int  s       = r >= kTileRing ? 1 : 0;
+    const int2 m       = s == 0 ? mvR[0] : mvR[1];
+    const int2 merge   = s == 0 ? mvs[0] : mvs[1];
+    const bool clampIt = s == 0 ? clampY[0] : clampY[1];
+    const int2 b       = bdofBorderAt( r - kTileRing * s, 16, 16 );
+    const int  xOff    = ( m.x & 15 ) < 8 ? 1 : 0;
+    const int  yOff    = ( m.y & 15 ) < 8 ? 1 : 0;
+    const int  c       = 3 + ( m.x >> 4 ) - ( merge.x >> 4 ) + b.x + 1 - xOff;
+    const int  row     = 3 + ( m.y >> 4 ) - ( merge.y >> 4 ) + b.y + 1 - yOff;
+    border[k]          = bdofBorderValue( winY( s == 0 ? WY_AT( 0 ) : WY_AT( 1 ), row, c, clampIt ) );
+  }
+}
+
+// tile16's bdofStore: the thread's four luma predictions (j, i0 .. i0 + 3) of each list into s_bdof, and its share of
+// the border (tile16BdofBorder)
+void tile16BdofStore( int tid, int j, int i0, int4 predY[2], int16_t border[3] )
 {
   [unroll]
   for( int s = 0; s < 2; s++ )
@@ -1357,23 +1386,19 @@ void tile16BdofStore( int tid, int j, int i0, int4 predY[2], int2 mvs[2], int2 m
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
-      s_bdof[s * BS * BS + ( j + 1 ) * BS + i0 + o + 1] = int16_t( predY[s][o] );
+      s_bdof( s * BS * BS + ( j + 1 ) * BS + i0 + o + 1 ) = int16_t( predY[s][o] );
     }
   }
-  const int ring = 2 * ( 16 + 2 ) + 2 * 16;
-  for( int r = tid; r < 2 * ring; r += THREADS )
+  [unroll]
+  for( int k = 0; k < 3; k++ )
   {
-    // (the list is picked with selects: an array indexed per lane would go to scratch memory)
-    const int  s       = r >= ring ? 1 : 0;
-    const int2 m       = s == 0 ? mvR[0] : mvR[1];
-    const int2 merge   = s == 0 ? mvs[0] : mvs[1];
-    const bool clampIt = s == 0 ? clampY[0] : clampY[1];
-    const int2 b       = bdofBorderAt( r - ring * s, 16, 16 );
-    const int  xOff    = ( m.x & 15 ) < 8 ? 1 : 0;
-    const int  yOff    = ( m.y & 15 ) < 8 ? 1 : 0;
-    const int  c       = 3 + ( m.x >> 4 ) - ( merge.x >> 4 ) + b.x + 1 - xOff;
-    const int  row     = 3 + ( m.y >> 4 ) - ( merge.y >> 4 ) + b.y + 1 - yOff;
-    s_bdof[s * BS * BS + ( b.y + 1 ) * BS + b.x + 1] = bdofBorderValue( winY( s == 0 ? WY_AT( 0 ) : WY_AT( 1 ), row, c, clampIt ) );
+    const int r = tid + THREADS * k;
+    if( r < 2 * kTileRing )
+    {
+      const int  s = r >= kTileRing ? 1 : 0;
+      const int2 b = bdofBorderAt( r - kTileRing * s, 16, 16 );
+      s_bdof( s * BS * BS + ( b.y + 1 ) * BS + b.x + 1 ) = border[k];
+    }
   }
 }
 
@@ -1524,10 +1549,6 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     s_sad[tid] = 0;
   }
 #if BDOF
-  for( int i = tid; i < 16 * 5; i += THREADS )
-  {
-    s_bsum[i] = 0;
-  }
   int dmvrCost = 2 * 16 * 16;   // (without DMVR, BDOF applies wherever the tile's flag says)
 #endif
   GroupMemoryBarrierWithGroupSync();
@@ -1672,18 +1693,24 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     }
   }
 #if BDOF
-  // BDOF: both predictions and their border into s_bdof while the windows are still there; the 4x4 blocks' sums
-  // after the barrier, their offsets after the next one, and the corrected samples at the end.
+  // BDOF: the border read now, from the luma windows; after the barrier, both predictions and the border into s_bdof
+  // (the luma passes' part of the pool, free then) and the sums zeroed; the 4x4 blocks' sums after the next barrier,
+  // and the corrected samples, each thread with its block's offset, after the one after.
+  int16_t border[3];
   if( bdof )
   {
-    tile16BdofStore( tid, j, i0, predY, mvs, mvR, clampY );
+    tile16BdofBorder( tid, mvs, mvR, clampY, border );
   }
 #endif
   GroupMemoryBarrierWithGroupSync();   // the luma windows are read; the chroma windows replace them
 #if BDOF
   if( bdof )
   {
-    bdofAddSums( tid >> 2, tid & 3, 16, 16 );
+    tile16BdofStore( tid, j, i0, predY, border );
+    for( int i = tid; i < 16 * 5; i += THREADS )
+    {
+      s_bsum[i] = 0;
+    }
   }
 #endif
 
@@ -1698,19 +1725,26 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
       const int rem  = task - 88 * s;
       const int comp = rem >= 44 ? 1 : 0;
       const int rem2 = rem - 44 * comp;
-      const int at   = WC_AT( 2 * s + comp ) + ( rem2 >> 2 ) * CS + 4 * ( rem2 & 3 );
-      const uint2 v  = cChunk[k];
-      s_pool[at]     = int16_t( v.x );
-      s_pool[at + 1] = int16_t( v.x >> 16 );
-      s_pool[at + 2] = int16_t( v.y );
-      s_pool[at + 3] = int16_t( v.y >> 16 );
+      // (the row from the window's first sample: the chunk's samples before it, and past the row's room, are dropped)
+      const int   at   = WC_AT( 2 * s + comp ) + ( rem2 >> 2 ) * CS;
+      const int   c0   = 4 * ( rem2 & 3 ) - ( s == 0 ? leadC[0] : leadC[1] );
+      const uint2 v    = cChunk[k];
+      const uint  w[2] = { v.x, v.y };
+      [unroll]
+      for( int m = 0; m < 4; m++ )
+      {
+        if( uint( c0 + m ) < uint( CS ) )
+        {
+          s_pool[at + c0 + m] = int16_t( w[m >> 1] >> ( 16 * ( m & 1 ) ) );
+        }
+      }
     }
   }
   GroupMemoryBarrierWithGroupSync();
 #if BDOF
-  if( bdof && tid < 16 )
+  if( bdof )
   {
-    s_bv[tid] = bdofOffset( tid );
+    bdofAddSums( tid >> 2, tid & 3, 16, 16 );
   }
 #endif
   int16_t cxC[2][4], cyC[2][4];
@@ -1741,7 +1775,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
         const int gg   = g - 44 * comp;
         const int r    = gg >> 2;
         const int gi   = ( gg & 3 ) << 1;
-        const int at   = WC_AT( 2 * s + comp ) + leadC[s];
+        const int at   = WC_AT( 2 * s + comp );
         int       w[5];
         [unroll]
         for( int e = 0; e < 5; e++ )
@@ -1757,7 +1791,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
           {
             sum += int( cxC[s][k] ) * w[o + k];
           }
-          s_pool[WORK_AT + 88 * ( 2 * s + comp ) + r * 8 + gi + o] = int16_t( ( sum + offset1 ) >> shift1 );
+          s_pool[CH_AT + 88 * ( 2 * s + comp ) + r * 8 + gi + o] = int16_t( ( sum + offset1 ) >> shift1 );
         }
       }
     }
@@ -1769,7 +1803,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     if( s < lists )
     {
-      predC[s] = chromaPred( WC_AT( 2 * s + cc ) + leadC[s], WORK_AT + 88 * ( 2 * s + cc ), cj, ci0, crx0[s], cry0[s], clampC[s], mvR[s].x & 31,
+      predC[s] = chromaPred( WC_AT( 2 * s + cc ), CH_AT + 88 * ( 2 * s + cc ), cj, ci0, crx0[s], cry0[s], clampC[s], mvR[s].x & 31,
                              mvR[s].y & 31, cxC[s], cyC[s], bi );
     }
   }
@@ -1786,7 +1820,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
 #if BDOF
   if( bdof )
   {
-    const int2 v = s_bv[( j >> 2 ) * 4 + ( i0 >> 2 )];
+    const int2 v = bdofOffset( ( j >> 2 ) * 4 + ( i0 >> 2 ) );
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
