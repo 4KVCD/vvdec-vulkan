@@ -76,12 +76,28 @@ static constexpr size_t   kParseTotals       = 16;        // the CUs and TUs, th
 static constexpr size_t   kGroupsPerRow      = 32768;     // the shaders take group.y as rows of 32768 workgroups
 
 // The service: each picture's dispatches in one submission (one, so that a picture is handed over as soon as it is
-// parsed), the pictures parsed at a time; the buffers of the parse results kept for reuse, in each size. The parse
-// waves slow each other: with 16 at a time the intra picture that starts VideoQ 1080p parsed in 800 ms (~190 ms alone)
-// while the first frame waited for it. 8 at a time decode the slower-preset films as fast as 12 (1080p 298.7 / 299.4
-// fps, 4K 132.8 / 132.4) with 70-75 MB less memory for the slots' results; 6 are slower (1080p 282.8), and so are 4.
+// parsed), the pictures parsed at a time; the buffers of the parse results kept for reuse, in each size.
+// The pictures in parse: at least kMinParsing, and more while their substreams number fewer than kStreamsInParse (up
+// to kMaxParsing). Each step has a workgroup per substream, of which two fit a compute unit: fewer substreams leave
+// them idle (Top Gun slower 1080p, 18 substreams a picture: 8 pictures 299.3 fps, 10 314.1, 12 314.9, 14 314.1;
+// Beekeeper slower 4K, 26 a picture: 8 139.4, 12 139.6, 16 139.1). Each picture in parse holds its results' buffers
+// (1080p: 10 pictures 73 MB more commit than 8). With 16 at a time the intra picture that starts VideoQ 1080p parsed
+// in 800 ms (~190 ms alone) while the first frame waited for it.
 static constexpr uint32_t kStepsPerSubmission = 1;
-static constexpr size_t   kMaxParsing         = 8;
+static constexpr size_t   kMinParsing         = 8;
+static constexpr size_t   kMaxParsing         = 16;
+static constexpr size_t   kStreamsInParse     = 180;
+
+// The substreams of a picture's slices (each slice's entry points + 1), the workgroups of its parse steps
+static size_t substreamsOf( const Picture* pic )
+{
+  size_t streams = 0;
+  for( const Slice* slice: pic->slices )
+  {
+    streams += size_t( slice->getNumEntryPoints() ) + 1;
+  }
+  return streams;
+}
 
 // The push constants of parse.slang
 struct ParsePush
@@ -630,7 +646,18 @@ void ParseService::run()
         }
         std::sort( m_waiting.begin(), m_waiting.end(),
                    []( const Picture* a, const Picture* b ) { return a->decodingOrderNumber < b->decodingOrderNumber; } );
-        const size_t count = std::min( m_waiting.size(), kMaxParsing - std::min( kMaxParsing, m_parsing.size() ) );
+        size_t streams = 0;
+        for( const ParseSlot* slot: m_parsing )
+        {
+          streams += slot->input().numStreams;
+        }
+        size_t count = 0;
+        while( count < m_waiting.size() && m_parsing.size() + count < kMaxParsing
+               && ( m_parsing.size() + count < kMinParsing || streams < kStreamsInParse ) )
+        {
+          streams += substreamsOf( m_waiting[count] );
+          count++;
+        }
         starting.assign( m_waiting.begin(), m_waiting.begin() + count );
         m_waiting.erase( m_waiting.begin(), m_waiting.begin() + count );
       }
