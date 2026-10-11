@@ -758,12 +758,12 @@ groupshared int  s_coef[kCoefWords];
 // 0 there when they have no template to add to.
 static const int kTplWords = kCodedPositions / 4;
 groupshared uint s_tpl[kTplWords + 32];
-groupshared uint s_out[1024];    // its levels to write, in decoding order: position | level << 16
-static const int kFinalWords = kCodedPositions / 2;
-groupshared uint s_final[kFinalWords];   // its levels at their positions, as int16, 2 per word, for writeLevels
-// (s_coef, s_tpl and s_final are zero whenever a block starts: after each block, writeLevels clears what it set)
+// With dependent quantization, a bit per position: the level is 2 |q| less 1 there (the quantizer's state was 2 or 3)
+static const int kDqWords = kCodedPositions / 32;
+groupshared uint s_dqBits[kDqWords];
+// (s_coef, s_tpl and s_dqBits are zero whenever a block starts: after each block, writeLevels clears what it set)
 
-static int g_outCount;   // the levels in s_out
+static int g_outCount;   // the block's nonzero levels
 
 // Lane arrays (laneValue, setLane). Of the current block, its scans as s_scanTab holds them, word k in thread k: the
 // scan inside a group (g_innerScan), and the scan of the groups (up to 64 words: g_groupScan0, then g_groupScan1);
@@ -856,7 +856,7 @@ int tbAreaAfterCoefZeroOut( int t, int comp, int w, int h )
   return min( 32, w ) * min( 32, h );
 }
 
-// Sets g_cc up for TU t's block of component comp, as CoeffCodingContext's constructor does, and empties s_out.
+// Sets g_cc up for TU t's block of component comp, as CoeffCodingContext's constructor does, and zeroes g_outCount.
 // (vvdec's residual_coding and the constructor also clear the block's levels and templates; here s_coef and s_tpl are
 // already zero, as writeLevels clears them after each block.)
 void initCctx( int t, int comp, bool signHide )
@@ -926,7 +926,7 @@ uint groupScanWord( int k )
   return k < 32 ? laneValue( g_groupScan0, uint( k ) ) : laneValue( g_groupScan1, uint( k - 32 ) );
 }
 
-// Zeroes s_coef, s_tpl and s_final when the workgroup starts; writeLevels keeps them zero between blocks from then on
+// Zeroes s_coef, s_tpl and s_dqBits when the workgroup starts; writeLevels keeps them zero between blocks from then on
 void clearResidualMemory()
 {
   for( int i = g_lane; i < kCoefWords; i += 32 )
@@ -937,9 +937,9 @@ void clearResidualMemory()
   {
     s_tpl[i] = 0;
   }
-  for( int i = g_lane; i < kFinalWords; i += 32 )
+  for( int i = g_lane; i < kDqWords; i += 32 )
   {
-    s_final[i] = 0;
+    s_dqBits[i] = 0;
   }
   GroupMemoryBarrierWithGroupSync();
 }
@@ -1021,9 +1021,9 @@ int ctxOffsetAbs()
   return offset;
 }
 
-// The sum of the levels in blkPos's template (the positions one and two to its right, one and two below it, and
-// below-right of it), less 5 * baseLevel, clipped to 0..31 (CoeffCodingContext::templateAbsSum); it picks the Rice
-// parameter
+// The sum of the levels' magnitudes in blkPos's template (the positions one and two to its right, one and two below
+// it, and below-right of it), less 5 * baseLevel, clipped to 0..31 (CoeffCodingContext::templateAbsSum); it picks
+// the Rice parameter
 int templateAbsSum( int blkPos, int baseLevel )
 {
   const int posY = blkPos >> g_cc.log2W;
@@ -1032,29 +1032,29 @@ int templateAbsSum( int blkPos, int baseLevel )
   int       sum  = 0;
   if( posX + 2 < w )
   {
-    sum += uni( s_coef[blkPos + 1] );
-    sum += uni( s_coef[blkPos + 2] );
+    sum += abs( uni( s_coef[blkPos + 1] ) );
+    sum += abs( uni( s_coef[blkPos + 2] ) );
     if( posY + 1 < g_cc.height )
     {
-      sum += uni( s_coef[blkPos + w + 1] );
+      sum += abs( uni( s_coef[blkPos + w + 1] ) );
     }
   }
   else if( posX + 1 < w )
   {
-    sum += uni( s_coef[blkPos + 1] );
+    sum += abs( uni( s_coef[blkPos + 1] ) );
     if( posY + 1 < g_cc.height )
     {
-      sum += uni( s_coef[blkPos + w + 1] );
+      sum += abs( uni( s_coef[blkPos + w + 1] ) );
     }
   }
   if( posY + 2 < g_cc.height )
   {
-    sum += uni( s_coef[blkPos + w] );
-    sum += uni( s_coef[blkPos + 2 * w] );
+    sum += abs( uni( s_coef[blkPos + w] ) );
+    sum += abs( uni( s_coef[blkPos + 2 * w] ) );
   }
   else if( posY + 1 < g_cc.height )
   {
-    sum += uni( s_coef[blkPos + w] );
+    sum += abs( uni( s_coef[blkPos + w] ) );
   }
   return max( min( sum - 5 * baseLevel, 31 ), 0 );
 }
@@ -1115,8 +1115,8 @@ int lastSigCoeff( int comp )
   return min( scanPos, g_cc.maxNumCoeff - 1 );
 }
 
-// Parses the current coefficient group of a regular (not transform skip) block and appends its nonzero levels to
-// s_out (CABACReader::residual_coding_subblock). state is dependent quantization's state, carried from group to
+// Parses the current coefficient group of a regular (not transform skip) block and puts its nonzero levels, signed,
+// into s_coef (CABACReader::residual_coding_subblock). state is dependent quantization's state, carried from group to
 // group; stateTransTab is its transition table (0 without dependent quantization). Returns the number of nonzero
 // levels.
 int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
@@ -1243,16 +1243,19 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
   {
     signs = ( signs << 1 ) + uint( sumAbsLevels & 1 );
   }
-  // The signed levels into s_out, thread j writing the j-th level decoded. With dependent quantization a level q is
-  // stored as 2 * |q|, minus 1 when the quantizer's state at its position was 2 or 3 (the bits of stateVal), as vvdec
-  // stores it. The first level decoded has the highest bit in signs and stateVal.
+  // The signs into s_coef, thread j taking the j-th level decoded. With dependent quantization vvdec stores a level q
+  // as 2 * |q|, minus 1 when the quantizer's state at its position was 2 or 3 (the bits of stateVal): s_coef keeps
+  // |q| for the later groups' templates, s_dqBits the bit, and writeLevels works the level out. The first level
+  // decoded has the highest bit in signs and stateVal.
   if( g_lane < numNonZero )
   {
     const uint bit = uint( numNonZero - 1 - g_lane );
     const int  c   = g_sigAbs;
-    const int  a   = depQuant ? c * 2 - int( ( stateVal >> bit ) & 1u ) : c;
-    const int  v   = ( ( signs >> bit ) & 1u ) != 0 ? -a : a;
-    s_out[g_outCount + g_lane] = uint( g_sigPos ) | ( uint( v ) << 16 );
+    s_coef[g_sigPos] = ( ( signs >> bit ) & 1u ) != 0 ? -c : c;
+    if( depQuant && ( ( stateVal >> bit ) & 1u ) != 0 )
+    {
+      InterlockedOr( s_dqBits[g_sigPos >> 5], 1u << uint( g_sigPos & 31 ) );
+    }
   }
   g_outCount += numNonZero;
   return numNonZero;
@@ -1351,9 +1354,9 @@ int decDeriveModCoeff( int rightPixel, int belowPixel, int absCoeff )
   return absCoeff - ( absCoeff <= pred1 ? 1 : 0 );
 }
 
-// Parses the current coefficient group of a transform skip block, in forward scan order, and appends its nonzero
-// levels to s_out (CABACReader::residual_coding_subblockTS); maxX and maxY grow to the largest x and y of a nonzero
-// level
+// Parses the current coefficient group of a transform skip block, in forward scan order, and leaves its nonzero
+// levels, signed, in s_coef (CABACReader::residual_coding_subblockTS); maxX and maxY grow to the largest x and y of a
+// nonzero level
 void residualCodingSubblockTS( inout int maxX, inout int maxY )
 {
   const int lastPos     = g_cc.maxSubPos;   // (vvdec's code names this minSubPos)
@@ -1466,7 +1469,7 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
     }
     s_coef[pos] = tcoeff;
   }
-  // The signed levels: into s_coef (the contexts of the later groups read them) and s_out, and the largest x and y
+  // The signed levels into s_coef (the contexts of the later groups read them), and the largest x and y
   for( int k = 0; k < numNonZero; k++ )
   {
     const int pos      = laneValue( g_sigPos, k );
@@ -1475,26 +1478,26 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
     maxY               = max( maxY, pos >> g_cc.log2W );
     const int v        = ( signPattern & 1u ) != 0 ? -absCoeff : absCoeff;
     s_coef[pos]        = v;
-    s_out[g_outCount]  = uint( pos ) | ( uint( v ) << 16 );
     g_outCount++;
     signPattern >>= 1;
   }
 }
 
-// Writes the levels (s_out) of TU t's block b of component comp over the rectangle [0, w) x [0, h), zeros included (w
-// is at most 32), into pc.levels: the rectangle's rows one after the other, in the substream's chunk (past the room,
-// pc.levelCap, the chunks are only counted, like the records: the host then parses the picture again with more).
+// Writes the levels (s_coef; with dependent quantization, dq, 2 |q| less s_dqBits' bit) of TU t's block b of component
+// comp over the rectangle [0, w) x [0, h), zeros included (w is at most 32), into pc.levels: the rectangle's rows one
+// after the other, in the substream's chunk (past the room, pc.levelCap, the chunks are only counted, like the
+// records: the host then parses the picture again with more).
 // Every level outside the rectangle is zero and is not written: the transforms read no further than the rectangle.
 // The TU's record keeps the place and the rows' width. Then clears the shared memory that the block used.
 // (writeLevelsBody does the work; this wrapper times it for PROFILE.)
-void writeLevels( int t, int comp, int4 b, int w, int h )
+void writeLevels( int t, int comp, int4 b, int w, int h, bool dq )
 {
   PROF_BEGIN( levelsStart );
-  writeLevelsBody( t, comp, b, w, h );
+  writeLevelsBody( t, comp, b, w, h, dq );
   PROF_END( kProfLevels, levelsStart );
 }
 
-void writeLevelsBody( int t, int comp, int4 b, int w, int h )
+void writeLevelsBody( int t, int comp, int4 b, int w, int h, bool dq )
 {
   const int pw = comp == 0 ? g_width : g_width >> g_csx;
   const int ph = comp == 0 ? g_height : g_height >> g_csy;
@@ -1518,64 +1521,45 @@ void writeLevelsBody( int t, int comp, int4 b, int w, int h )
   g_levelsAt     += size;
   const bool room = at + size <= uint( pc.levelCap );
   setTuLevels( t, comp, at, w );
-  // Put the levels into s_final at their positions, a level a thread (s_final is zero there: an OR sets the half)
-  for( int i = g_lane; i < g_outCount; i += 32 )
+  // Each thread takes one column of the rectangle (its lane's): writes its levels when there is room, then zeroes
+  // s_coef there and the s_tpl words (every level the block has, and every template its levels added to, lie inside
+  // the rectangle: the templates are above and left of their levels)
+  for( int u = g_lane; u < h << 5; u += 32 )
   {
-    const uint e   = s_out[i];
-    const uint pos = e & 0xffffu;
-    InterlockedOr( s_final[pos >> 1], ( e >> 16 ) << ( ( pos & 1u ) * 16u ) );
-  }
-  GroupMemoryBarrierWithGroupSync();
-  // Each thread writes one column of the rectangle (its lane's)
-  if( room )
-  {
-    for( int u = g_lane; u < h << 5; u += 32 )
+    const int x = u & 31;
+    const int y = u >> 5;
+    if( x >= w )
     {
-      const int     x   = u & 31;
-      const int     y   = u >> 5;
-      if( x >= w )
-      {
-        continue;
-      }
-      const int     pos = ( y << g_cc.log2W ) + x;
-      const int16_t v   = int16_t( int( s_final[pos >> 1] << ( 16u - ( uint( pos ) & 1u ) * 16u ) ) >> 16 );
-      pc.levels[at + uint( y * w + x )] = v;
+      continue;
     }
-  }
-  GroupMemoryBarrierWithGroupSync();
-  // Clear what the block set, a level a thread: s_final and s_coef at its levels' positions, and the s_tpl words of
-  // the templates its levels were added to (absVal1stPass)
-  const int wb = g_cc.width;
-  for( int i = g_lane; i < g_outCount; i += 32 )
-  {
-    const int pos  = int( s_out[i] & 0xffffu );
-    const int posY = pos >> g_cc.log2W;
-    const int posX = pos & ( wb - 1 );
-    s_final[pos >> 1] = 0u;
-    s_coef[pos]       = 0;
-    s_tpl[pos >> 2]   = 0u;
-    if( posY > 1 )
+    const int pos = ( y << g_cc.log2W ) + x;
+    int       v   = s_coef[pos];
+    if( dq && v != 0 )
     {
-      s_tpl[( pos - 2 * wb ) >> 2] = 0u;
+      const int a = 2 * abs( v ) - int( ( s_dqBits[pos >> 5] >> uint( pos & 31 ) ) & 1u );
+      v           = v < 0 ? -a : a;
     }
-    if( posY > 0 && posX > 0 )
+    if( room )
     {
-      s_tpl[( pos - wb - 1 ) >> 2] = 0u;
+      pc.levels[at + uint( y * w + x )] = int16_t( v );
     }
-    if( posY > 0 )
+    s_coef[pos] = 0;
+    if( ( x & 3 ) == 0 )
     {
-      s_tpl[( pos - wb ) >> 2] = 0u;
-    }
-    if( posX > 1 )
-    {
-      s_tpl[( pos - 2 ) >> 2] = 0u;
-    }
-    if( posX > 0 )
-    {
-      s_tpl[( pos - 1 ) >> 2] = 0u;
+      s_tpl[pos >> 2] = 0u;
     }
   }
   GroupMemoryBarrierWithGroupSync();
+  if( dq )
+  {
+    // (the words of s_dqBits up to the rectangle's last position)
+    const int words = ( ( ( h - 1 ) << g_cc.log2W ) + w + 31 ) >> 5;
+    for( int i = g_lane; i < words; i += 32 )
+    {
+      s_dqBits[i] = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+  }
 }
 
 // Parses transform_skip_flag of TU t's component comp, when TU::isTSAllowed allows it (CABACReader::ts_flag), and
@@ -1620,7 +1604,7 @@ void residualCodingTS( int t, int comp )
     setMaxScanPos( t, comp, maxX, maxY );
   }
   const int4 b = tuBlock( t, comp );
-  writeLevels( t, comp, b, b.z, b.w );
+  writeLevels( t, comp, b, b.z, b.w, false );
 }
 
 // CABACReader::residual_coding of TU t's block of comp; this wrapper times residualCodingBody for PROFILE
@@ -1720,7 +1704,7 @@ void residualCodingBody( int t, int comp, inout CuCtx ctx )
     maxX = ( maxX + 1 ) << g_cc.log2CGW;
     maxY = ( maxY + 1 ) << g_cc.log2CGH;
   }
-  writeLevels( t, comp, tuBlock( t, comp ), maxX, maxY );
+  writeLevels( t, comp, tuBlock( t, comp ), maxX, maxY, depQuant );
   if( g_cc.scanPosLast == 0 )
   {
     setMaxScanPos( t, comp, 0, 0 );
