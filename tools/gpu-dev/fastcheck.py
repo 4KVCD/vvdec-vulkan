@@ -12,9 +12,12 @@
 #
 # Tiers:
 #   smoke (each change, about a minute): one stream per conformance family (its quickest), cut to ~3 s of decoding
-#         (at most 17 frames); every tool stream's first 6 frames; VideoQ 1080p 96 frames and 4K 32 frames;
-#   wide  (now and then): every conformance stream and tool stream, each cut to ~6 s of decoding; VideoQ cut;
-#   full  (milestones): everything whole, plus check.sh's QA round (VideoQ 4800 / 1200 frames at 16 and 2 threads,
+#         (at most 17 frames); every tool stream's first 6 frames; the slower-preset cuts (Beekeeper 4K 98 frames,
+#         Top Gun 1080p 114 frames: most VVC tools on real content);
+#   wide  (now and then): every conformance stream and tool stream, each cut to ~6 s of decoding; the slower-preset
+#         cuts, the long slower-preset streams' first frames (Beekeeper 240, Top Gun 600); VideoQ cut;
+#   full  (milestones): everything whole (the long slower-preset streams: Beekeeper 600 frames, Top Gun 1200), plus
+#         check.sh's QA round (VideoQ 4800 / 1200 frames at 16 and 2 threads,
 #         The Beekeeper, the films, the stress streams; CRC-32C against crc_refs.txt) and the CPU path.
 # Modes: default (the CPU parses), parse (VVDEC_GPU_PARSE=2: the GPU parses); each mode has its own workers.
 # Scheduling: longest first (times remembered in fastcheck_times.json), at most --lanes decodes at a time, within a
@@ -109,11 +112,17 @@ def tool_streams():
     return out
 
 
-# The QA streams with per-frame references (refs/<name>.opl): name -> (bitstream, frames for the references, MD5 of
-# upstream's output for those frames)
+# The QA streams with per-frame references (refs/<name>.opl): name -> (bitstream, frames for the references or None
+# for all, MD5 of upstream's output for those frames). The slower-preset encodes use most VVC tools (affine, GPM,
+# SbTMVP, BDOF, CIIP, MIP, ISP, LFNST...); the cuts are 3-4 s from the middle of the films (their first frames are
+# black), made with ffmpeg -ss 100 -t 3 (4 for Top Gun) -c copy -bsf:v vvc_mp4toannexb.
 QA_REF_STREAMS = {
     'videoq_1080p': (os.path.join(B, 'videoq_1080p.266'), 1200, '43129838872aad31ab351a48acbff9fa'),
     'videoq_4K': (os.path.join(B, 'videoq_4K.266'), 1200, 'a868a35c72f1772e2660eca4ac89ea7e'),
+    'beekeeper_slower_4K': (os.path.join(B, 'beekeeper_slower_4K.266'), 600, 'a41ee6ab48b3841549b3c598f37ed478'),
+    'topgun_slower_1080p': (os.path.join(B, 'topgun_slower_1080p.266'), 1200, '7e641f2d4270a8e7fbe95e3eaeedf066'),
+    'bee_slower_cut': (os.path.join(B, 'bee_slower_cut.266'), None, 'c391b05c7d31ce408d26eeb4707acb47'),
+    'tg_slower_cut': (os.path.join(B, 'tg_slower_cut.266'), None, 'c1c68a15e8d15a3be2a36c2657b1cbfa'),
 }
 
 
@@ -125,7 +134,8 @@ def make_refs():
     for job, (bit, extra, md5) in tool_streams().items():
         jobs.append((job, [UPSTREAM, '-b', bit, '-dph', '11', '-md5', md5, '-v', '3'] + extra))
     for job, (bit, frames, md5) in QA_REF_STREAMS.items():
-        jobs.append((job, [UPSTREAM, '-b', bit, '-f', str(frames), '-dph', '11', '-md5', md5, '-v', '3']))
+        cut = ['-f', str(frames)] if frames else []
+        jobs.append((job, [UPSTREAM, '-b', bit] + cut + ['-dph', '11', '-md5', md5, '-v', '3']))
     running = []
     failed = 0
     while jobs or running:
@@ -262,11 +272,17 @@ def build_jobs():
             refs = read_opl(os.path.join(REFS, t + '.opl'))
             fg = 1 if '-fg' in extra else 0
             jobs.append(Job(f'{t}/{mode}', bit, mode, tool_frames if tool_frames and tool_frames < len(refs) else None, refs, film_grain=fg))
-        if tier in ('smoke', 'wide'):
-            n1080, n4k = (96, 32) if tier == 'smoke' else (600, 240)
-            jobs.append(Job(f'vq1080/{mode}', QA_REF_STREAMS['videoq_1080p'][0], mode, n1080, read_opl(os.path.join(REFS, 'videoq_1080p.opl'))))
-            jobs.append(Job(f'vq4k/{mode}', QA_REF_STREAMS['videoq_4K'][0], mode, n4k, read_opl(os.path.join(REFS, 'videoq_4K.opl'))))
-        else:
+        # the slower-preset cuts whole in every tier; the long streams' first frames in the wide tier, all in the full one
+        for s in ('bee_slower_cut', 'tg_slower_cut'):
+            jobs.append(Job(f'{s}/{mode}', QA_REF_STREAMS[s][0], mode, None, read_opl(os.path.join(REFS, s + '.opl'))))
+        if tier != 'smoke':
+            for s in ('beekeeper_slower_4K', 'topgun_slower_1080p'):
+                frames = (240 if '4K' in s else 600) if tier == 'wide' else None
+                jobs.append(Job(f'{s}/{mode}', QA_REF_STREAMS[s][0], mode, frames, read_opl(os.path.join(REFS, s + '.opl'))))
+        if tier == 'wide':
+            jobs.append(Job(f'vq1080/{mode}', QA_REF_STREAMS['videoq_1080p'][0], mode, 600, read_opl(os.path.join(REFS, 'videoq_1080p.opl'))))
+            jobs.append(Job(f'vq4k/{mode}', QA_REF_STREAMS['videoq_4K'][0], mode, 240, read_opl(os.path.join(REFS, 'videoq_4K.opl'))))
+        elif tier == 'full':
             jobs += qa_jobs(mode)
     if tier == 'full':
         jobs.append(cpu_path_job())   # the CPU path, against upstream's MD5 of the whole output
@@ -517,6 +533,8 @@ def main():
             times[j.jid] = [round(j.seconds, 2), j.frames or (len(j.refs) if j.app is None else 0)]
     json.dump(times, open(TIMES, 'w'), indent=0, sort_keys=True)
     passed = sum(1 for j in jobs if j.result == 'PASS')
+    timed = sorted((j for j in jobs if hasattr(j, 'seconds')), key=lambda j: -j.seconds)
+    print('  longest: ' + ', '.join(f'{j.jid} {j.seconds:.1f} s' for j in timed[:6]), flush=True)
     lines = [f'{name}: {tier}, modes {",".join(modes)}: {passed} PASS of {len(jobs)} decodes; {(time.time() - t0) / 60:.1f} min']
     for j in failed:
         lines.append(f'{j.jid}: {j.result}; alone: {alone.get(j.jid)}')

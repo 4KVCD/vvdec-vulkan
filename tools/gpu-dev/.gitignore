@@ -8,3 +8,4 @@ check_*_streams.txt
 check_*_work/
 fastcheck_logs/
 stress.lock
+ab_logs/
