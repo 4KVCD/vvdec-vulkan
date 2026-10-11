@@ -63,6 +63,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #pragma once
 
+#include "GpuArena.h"
 #include "GpuContext.h"
 #include "GpuFrontEnd.h"
 #include "GpuParse.h"
@@ -85,7 +86,7 @@ namespace gpu
 {
 
 // The buffers a parse stages its records in, before the compaction puts them in raster order (GPU memory): the CU and
-// TU records and their meta words. The ParseService takes them from its bins for each picture, with room for the
+// TU records and their meta words. The ParseService takes them from its arena for each picture, with room for the
 // picture's kind.
 struct StagedRecords
 {
@@ -255,10 +256,9 @@ private:
   void           run();                                    // the thread
   ParseSlot*     takeSlot();                               // a slot no picture uses, or a new one
   ParsedPicture* takeParsed();                             // a parse result no picture holds, or a new one
-  Buffer         takeBuffer( size_t size );                // GPU memory for records, from the bins
-  void           giveBuffer( Buffer& buf );                // back into the bins
-  StagedRecords  takeStaged( size_t cus, size_t tus );     // room for a parse's staged records, from the bins
-  void           giveSlot( ParseSlot* slot );              // the slot's buffers back into the bins, the slot free
+  StagedRecords  takeStaged( size_t cus, size_t tus );     // room for a parse's staged records, from the arena
+  void           giveRecords( ParseSlot* slot );           // the slot's records and levels back to the arena
+  void           giveSlot( ParseSlot* slot );              // the same, and the slot free
   void           startPicture( Picture* pic );             // its slot set up, among the pictures parsed
   size_t         levelRoom( const Picture& pic ) const;    // the room for its levels when its parse starts
   // The finished pictures' records copied (a submission on the copies' queue), then all the pictures' steps (one on
@@ -285,9 +285,11 @@ private:
   std::vector<std::pair<ParseSlot*, ParsedPicture*>> m_copying;
   std::vector<std::unique_ptr<ParsedPicture>>        m_results;   // all of them (the thread's)
   std::vector<ParsedPicture*>                        m_freeResults;   // reusable (the thread's)
-  // GPU memory for the results' records, kept for reuse: bin b holds buffers of 2^b bytes (64 KB at least)
-  static constexpr int kBins = 40;
-  std::vector<Buffer>  m_bins[kBins];
+  // GPU memory for the records and levels, staged and in the results; a tick for each picture started. A chunk with
+  // no records for kIdlePictures pictures is freed: memory the stream no longer needs goes back (the records of
+  // larger pictures than now), while a chunk in use now and then stays.
+  static constexpr uint64_t kIdlePictures = 64;
+  RangeArena                m_records;
   // the most records a picture of each kind had so far: the other pictures, intra ones
   size_t                  m_maxCus[2] = {}, m_maxTus[2] = {};
   size_t                  m_maxLevels[2] = {};   // the most levels a picture had so far: the other pictures, intra ones

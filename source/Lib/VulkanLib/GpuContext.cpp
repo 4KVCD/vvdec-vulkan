@@ -1123,6 +1123,7 @@ Buffer Context::alloc( size_t size, MemKind kind )
 
 void Context::free( Buffer& buf )
 {
+  CHECK_FATAL( buf.isRange(), "Vulkan: a range of a larger buffer freed as a buffer (RangeArena::give takes it back)" );
   if( buf.buffer )
   {
     m_api.vkDestroyBuffer( m_device, buf.buffer, nullptr );

@@ -452,7 +452,7 @@ void ParseSlot::recordLevelsCopy( VkCommandBuffer cmd, const Buffer& levels ) co
 {
   if( m_numLevels > 0 )
   {
-    const VkBufferCopy region{ 0, 0, m_numLevels * sizeof( int16_t ) };
+    const VkBufferCopy region{ m_levels.offset, levels.offset, m_numLevels * sizeof( int16_t ) };
     m_ctx->api().vkCmdCopyBuffer( cmd, m_levels.buffer, levels.buffer, 1, &region );
   }
 }
@@ -543,7 +543,8 @@ void applyParsedSaoAlf( CodingStructure& cs, const ParsedPicture& parsed )
 // ParseService: the pictures parsed ahead of their reconstruction
 // ====================================================================================================================
 
-ParseService::ParseService( Context* ctx, std::function<void()> wakeUp ) : m_ctx( ctx ), m_wakeUp( std::move( wakeUp ) )
+ParseService::ParseService( Context* ctx, std::function<void()> wakeUp )
+  : m_ctx( ctx ), m_wakeUp( std::move( wakeUp ) ), m_records( ctx, kIdlePictures )
 {
   CHECK( !ctx->parseQueue(), "Vulkan: the GPU parse ahead of the reconstruction needs an async compute queue" );
   m_pool = m_ctx->createCommandPool( m_ctx->asyncFamily() );
@@ -569,21 +570,13 @@ ParseService::~ParseService()
   }
   m_wake.notify_all();
   m_thread.join();
+  // the records and levels that slots still hold back to the arena first (a slot frees what it holds as buffers of
+  // its own); the results' go with the arena
+  for( const auto& slot: m_slots )
+  {
+    giveRecords( slot.get() );
+  }
   m_slots.clear();
-  for( const auto& result: m_results )
-  {
-    for( Buffer* buf: { &result->m_cus, &result->m_tus, &result->m_ctus, &result->m_levels } )
-    {
-      m_ctx->free( *buf );
-    }
-  }
-  for( auto& bin: m_bins )
-  {
-    for( Buffer& buf: bin )
-    {
-      m_ctx->free( buf );
-    }
-  }
   m_ctx->free( m_profBuf );
   m_ctx->destroyFence( m_fence );
   m_ctx->destroyCommandPool( m_pool );
@@ -713,14 +706,14 @@ ParseSlot* ParseService::takeSlot()
 
 ParsedPicture* ParseService::takeParsed()
 {
-  // the results given back become free, their buffers back in the bins
+  // the results given back become free, their records back to the arena
   {
     std::lock_guard<std::mutex> lock( m_mutex );
     for( ParsedPicture* result: m_released )
     {
       for( Buffer* buf: { &result->m_cus, &result->m_tus, &result->m_ctus, &result->m_levels } )
       {
-        giveBuffer( *buf );
+        m_records.give( *buf );
       }
       m_freeResults.push_back( result );
     }
@@ -736,57 +729,29 @@ ParsedPicture* ParseService::takeParsed()
   return m_results.back().get();
 }
 
-Buffer ParseService::takeBuffer( size_t size )
-{
-  int bin = 16;
-  while( ( size_t( 1 ) << bin ) < size )
-  {
-    bin++;
-  }
-  if( !m_bins[bin].empty() )
-  {
-    const Buffer buf = m_bins[bin].back();
-    m_bins[bin].pop_back();
-    return buf;
-  }
-  return m_ctx->alloc( size_t( 1 ) << bin, MemKind::Device );
-}
-
-void ParseService::giveBuffer( Buffer& buf )
-{
-  if( !buf.valid() )
-  {
-    return;
-  }
-  int bin = 16;
-  while( ( size_t( 1 ) << bin ) < buf.size )
-  {
-    bin++;
-  }
-  // kept, never freed: GPU memory allocated and freed costs the parse thread a fraction of a millisecond a buffer,
-  // between the steps, while the parse queue waits; the bins hold no more than were in use at once
-  m_bins[bin].push_back( buf );
-  buf = Buffer();
-}
-
 StagedRecords ParseService::takeStaged( size_t cus, size_t tus )
 {
   StagedRecords staged;
-  staged.cus    = takeBuffer( std::max<size_t>( cus, 1 ) * sizeof( CuRecord ) );
-  staged.cuMeta = takeBuffer( std::max<size_t>( cus, 1 ) * sizeof( uint32_t ) );
-  staged.tus    = takeBuffer( std::max<size_t>( tus, 1 ) * sizeof( TuRecord ) );
-  staged.tuMeta = takeBuffer( std::max<size_t>( tus, 1 ) * sizeof( uint32_t ) );
+  staged.cus    = m_records.take( std::max<size_t>( cus, 1 ) * sizeof( CuRecord ) );
+  staged.cuMeta = m_records.take( std::max<size_t>( cus, 1 ) * sizeof( uint32_t ) );
+  staged.tus    = m_records.take( std::max<size_t>( tus, 1 ) * sizeof( TuRecord ) );
+  staged.tuMeta = m_records.take( std::max<size_t>( tus, 1 ) * sizeof( uint32_t ) );
   return staged;
 }
 
-void ParseService::giveSlot( ParseSlot* slot )
+void ParseService::giveRecords( ParseSlot* slot )
 {
   StagedRecords staged = slot->takeStaged();
   Buffer        levels = slot->takeLevels();
   for( Buffer* buf: { &staged.cus, &staged.tus, &staged.cuMeta, &staged.tuMeta, &levels } )
   {
-    giveBuffer( *buf );
+    m_records.give( *buf );
   }
+}
+
+void ParseService::giveSlot( ParseSlot* slot )
+{
+  giveRecords( slot );
   m_free.push_back( slot );
 }
 
@@ -798,7 +763,7 @@ static bool intraPicture( const Picture& pic )
 
 // The room for a picture's staged records (its CUs' or its TUs'): a quarter more than the most a picture of its kind
 // had so far; before the first, 32 a CTU for an intra picture (VideoQ's have up to 23 with the dual tree), 8 for the
-// others (VideoQ's have 2 to 4; a guess too big stays in the bins). A picture with more is parsed again (Overflow).
+// others (VideoQ's have 2 to 4). A picture with more is parsed again (Overflow).
 static size_t recordRoom( size_t most, size_t ctus, bool intra )
 {
   return most > 0 ? most * 5 / 4 + 64 : ctus * ( intra ? 32 : 8 );
@@ -814,25 +779,38 @@ size_t ParseService::levelRoom( const Picture& pic ) const
                                    : 0;
   const size_t         samples = luma + 2 * chroma;
   // a quarter more than the most a picture of its kind had so far; before the first, half the samples for an intra
-  // picture, a 32nd for the others (whose levels are few: a guess too big would stay in the bins); at most twice the
-  // samples (the substreams take the levels in chunks, whose ends may stay unused)
+  // picture, a 32nd for the others (whose levels are few); at most twice the samples (the substreams take the levels
+  // in chunks, whose ends may stay unused)
   const bool   intra = intraPicture( pic );
   const size_t most  = m_maxLevels[intra ? 1 : 0];
   const size_t room  = most > 0 ? most * 5 / 4 + 4096 : ( intra ? samples / 2 : samples / 32 );
   return std::min( room, 2 * samples + 65536 );
 }
 
+// The size of the arena's chunks for a picture's records: twice its luma samples in bytes, in steps of 1 MB, at most
+// 8 MB. (Replays of the parse's takes and gives: Beekeeper slower 4K, up to 96 MB of records and levels at once, held
+// 105 MB in 8 MB chunks, 112 MB in 16 MB ones, 128 MB in 32 MB ones; Top Gun slower 1080p, up to 76 MB at once, held
+// 80 MB in 4 MB chunks.)
+static VkDeviceSize chunkSize( const Picture& pic )
+{
+  constexpr VkDeviceSize kMB  = VkDeviceSize( 1 ) << 20;
+  const VkDeviceSize     luma = VkDeviceSize( pic.cs->pcv->lumaWidth ) * pic.cs->pcv->lumaHeight;
+  return std::min( ( 2 * luma + kMB - 1 ) / kMB * kMB, 8 * kMB );
+}
+
 void ParseService::startPicture( Picture* pic )
 {
+  m_records.setChunkSize( chunkSize( *pic ) );
+  m_records.tick();
   ParseSlot* slot = takeSlot();
   slot->picture   = pic;
   slot->setProfile( m_prof );
-  // room for the records and the levels of a picture of its kind, from the bins
+  // room for the records and the levels of a picture of its kind, from the arena
   const bool   intra = intraPicture( *pic );
   const size_t ctus  = pic->cs->pcv->sizeInCtus;
   const size_t cus   = recordRoom( m_maxCus[intra ? 1 : 0], ctus, intra );
   const size_t tus   = recordRoom( m_maxTus[intra ? 1 : 0], ctus, intra );
-  if( !slot->prepare( *pic->cs, takeStaged( cus, tus ), takeBuffer( levelRoom( *pic ) * sizeof( int16_t ) ) ) )
+  if( !slot->prepare( *pic->cs, takeStaged( cus, tus ), m_records.take( levelRoom( *pic ) * sizeof( int16_t ) ) ) )
   {
     giveSlot( slot );
     {
@@ -960,9 +938,9 @@ void ParseService::finishPictures()
       const size_t  room   = std::max( slot->levelsCounted() * 5 / 4 + 4096, levels.size / sizeof( int16_t ) );
       for( Buffer* buf: { &staged.cus, &staged.tus, &staged.cuMeta, &staged.tuMeta, &levels } )
       {
-        giveBuffer( *buf );
+        m_records.give( *buf );
       }
-      slot->restart( takeStaged( cus, tus ), takeBuffer( room * sizeof( int16_t ) ) );
+      slot->restart( takeStaged( cus, tus ), m_records.take( room * sizeof( int16_t ) ) );
       std::lock_guard<std::mutex> lock( m_mutex );
       m_stats.restarts++;
       i++;
@@ -1003,11 +981,11 @@ void ParseService::finishPictures()
       const uint32_t* words = slot->saoAlf( int( ctu ) );
       std::copy( words, words + ParsedPicture::kSaoAlfWords, result->m_saoAlf.begin() + ctu * ParsedPicture::kSaoAlfWords );
     }
-    result->m_cus  = takeBuffer( std::max<size_t>( result->m_numCus, 1 ) * sizeof( CuRecord ) );
-    result->m_tus  = takeBuffer( std::max<size_t>( result->m_numTus, 1 ) * sizeof( TuRecord ) );
-    result->m_ctus      = takeBuffer( slot->numCtus() * sizeof( CtuRecord ) );
+    result->m_cus       = m_records.take( std::max<size_t>( result->m_numCus, 1 ) * sizeof( CuRecord ) );
+    result->m_tus       = m_records.take( std::max<size_t>( result->m_numTus, 1 ) * sizeof( TuRecord ) );
+    result->m_ctus      = m_records.take( slot->numCtus() * sizeof( CtuRecord ) );
     result->m_numLevels = slot->numLevels();
-    result->m_levels    = takeBuffer( std::max<size_t>( result->m_numLevels, 1 ) * sizeof( int16_t ) );
+    result->m_levels    = m_records.take( std::max<size_t>( result->m_numLevels, 1 ) * sizeof( int16_t ) );
     m_copying.emplace_back( slot, result );
   }
 }

@@ -113,8 +113,11 @@ struct Buffer
   VkDeviceAddress addr   = 0;         // the address the shaders use
   MemKind         kind   = MemKind::Device;
   VkDeviceSize    memorySize = 0;     // the size of the memory allocated for the buffer (at least size)
+  // Where the buffer's bytes start in buffer: 0, but for a range of a larger buffer (RangeArena), which owns no memory
+  VkDeviceSize    offset = 0;
 
   bool valid() const { return buffer != VK_NULL_HANDLE; }
+  bool isRange() const { return buffer != VK_NULL_HANDLE && memory == VK_NULL_HANDLE; }
 };
 
 // The GPU path's settings from the environment variables (README.md), read once when the context is made.
@@ -148,7 +151,7 @@ public:
   VkDevice       device() const { return m_device; }
   const Options& options() const { return m_options; }
 
-  // Allocates a buffer (throws on failure) and frees one.
+  // Allocates a buffer (throws on failure) and frees one (not a range of a RangeArena's: give() takes those back).
   Buffer alloc( size_t size, MemKind kind );
   void   free( Buffer& buf );
 
