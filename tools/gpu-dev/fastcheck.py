@@ -62,6 +62,11 @@ budget = int(opts['--budget'])
 only = re.compile(opts['--only']) if opts['--only'] else None
 batch_exe = opts['--batch'] or os.path.join(os.path.dirname(exe), os.path.basename(exe).replace('vvdecapp', 'vvdecbatch'))
 MODE_ENV = {'default': {}, 'parse': {'VVDEC_GPU_PARSE': '2'}}
+# The compiled pipelines' file of this program (ab_steady.py uses the same): the decoder starts its file anew when the
+# shaders differ, so programs sharing one would compile every shader again whenever another ran in between.
+CACHE = os.path.join(os.environ['LOCALAPPDATA'], 'vvdec', 'tools', name + '.bin')
+os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+os.environ['VVDEC_GPU_CACHE'] = CACHE
 FIELD_STREAMS = {'FIELD_A_4', 'FIELD_B_2'}   # (vvdecbatch does not hash field pictures: these use vvdecapp's MD5)
 HASH_RE = re.compile(r'frame (\d+)\s+\[MD5:([0-9a-f,]+)\]')
 
