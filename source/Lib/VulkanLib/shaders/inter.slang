@@ -935,6 +935,169 @@ int2 clipStorage( int2 mv )
   return int2( clamp( mv.x, -( 1 << 17 ), ( 1 << 17 ) - 1 ), clamp( mv.y, -( 1 << 17 ), ( 1 << 17 ) - 1 ) );
 }
 
+#if BDOF
+// --------------------------------------------------------------------------------------------------------------------
+// BDOF, bi-directional optical flow (vvdec's applyBiOptFlow, BiOptFlowCore, gradFilterCore). s_bdof holds each list's
+// 14-bit luma prediction of the tile plus a one-sample border, which comes from the reference's integer samples
+// nearest the motion (xPredInterBlk). Each 4x4 block's motion offset (vx, vy) follows from the gradients and the
+// differences over the 6 x 6 samples around it (where those fall in the border, the nearest samples and gradients
+// inside the tile stand in). The two predictions are then averaged with the offset's correction.
+// --------------------------------------------------------------------------------------------------------------------
+#define BS 18                                     // a list's row length in s_bdof: the tile (16 at most) plus border
+groupshared int16_t s_bdof[2 * BS * BS];
+groupshared int     s_bsum[16 * 5];               // per 4x4: sums of |gx|, |gy|, di*sgn(gx), di*sgn(gy), gx*sgn(gy)
+groupshared int2    s_bv[16];                     // (vx, vy) per 4x4 block
+groupshared int     s_minCost;                    // DMVR's best cost (BDOF applies only where it is 2 w h or more)
+
+int bdofP( int list, int x, int y )   // (x, y): -1 .. w, -1 .. h
+{
+  return int( s_bdof[list * BS * BS + ( y + 1 ) * BS + x + 1] );
+}
+
+// The gradients at (x, y) inside the tile, from the samples around it (including the border's).
+int2 bdofGrad( int list, int x, int y )
+{
+  return int2( ( bdofP( list, x + 1, y ) >> 6 ) - ( bdofP( list, x - 1, y ) >> 6 ), ( bdofP( list, x, y + 1 ) >> 6 ) - ( bdofP( list, x, y - 1 ) >> 6 ) );
+}
+
+// The place (bx, by) of the border's sample r around a w x h tile: the rows above and below, then the columns left
+// and right (2 (w + 2) + 2 h samples).
+int2 bdofBorderAt( int r, int w, int h )
+{
+  if( r < w + 2 )
+  {
+    return int2( r - 1, -1 );
+  }
+  if( r < 2 * ( w + 2 ) )
+  {
+    return int2( r - ( w + 2 ) - 1, h );
+  }
+  if( r < 2 * ( w + 2 ) + h )
+  {
+    return int2( -1, r - 2 * ( w + 2 ) );
+  }
+  return int2( w, r - 2 * ( w + 2 ) - h );
+}
+
+// A border sample of s_bdof from the reference's sample v: at 14 bits.
+int16_t bdofBorderValue( int v )
+{
+  return int16_t( v * ( 1 << max( 2, 14 - pc.bitDepth ) ) - IF_INTERNAL_OFFS );
+}
+
+// Stores a list's prediction in s_bdof: the thread's samples, plus the border from the reference's samples nearest
+// the motion (fractions below 8 round down), at 14 bits; (baseX, baseY) is the integer position of the prediction.
+void bdofStore( int tid, int list, int w, int h, int pred[PER_THREAD], int slot, int baseX, int baseY, int2 mv, bool windowed, int4 window, bool wrap )
+{
+  const int log2W = log2Int( w );
+  for( int k = 0; k < PER_THREAD; k++ )
+  {
+    const int t = tid + THREADS * k;
+    if( t < w * h )
+    {
+      s_bdof[list * BS * BS + ( ( t >> log2W ) + 1 ) * BS + ( t & ( w - 1 ) ) + 1] = int16_t( pred[k] );
+    }
+  }
+  const int ring = 2 * ( w + 2 ) + 2 * h;
+  const int xOff = ( mv.x & 15 ) < 8 ? 1 : 0;
+  const int yOff = ( mv.y & 15 ) < 8 ? 1 : 0;
+  int16_t*  ref  = refPlane( slot, 0 );
+  for( int r = tid; r < ring; r += THREADS )
+  {
+    const int2 b = bdofBorderAt( r, w, h );
+    const int  v = refSample( ref, 0, baseX + b.x + 1 - xOff, baseY + b.y + 1 - yOff, windowed, window, wrap );
+    s_bdof[list * BS * BS + ( b.y + 1 ) * BS + b.x + 1] = bdofBorderValue( v );
+  }
+}
+
+// Adds part q (q = 0 .. 3, nine samples) of the sums over the 6 x 6 window of the tile's 4x4 block sb into s_bsum,
+// which starts zeroed.
+void bdofAddSums( int sb, int q, int w, int h )
+{
+  const int nsx   = w >> 2;
+  const int sx    = sb % nsx;
+  const int sy    = sb / nsx;
+  int       absGX = 0, absGY = 0, dIX = 0, dIY = 0, signGX = 0;
+  for( int p = q * 9; p < q * 9 + 9; p++ )
+  {
+    const int  cx = clamp( 4 * sx - 1 + p % 6, 0, w - 1 );
+    const int  cy = clamp( 4 * sy - 1 + p / 6, 0, h - 1 );
+    const int2 g0 = bdofGrad( 0, cx, cy );
+    const int2 g1 = bdofGrad( 1, cx, cy );
+    const int  gx = ( g0.x + g1.x ) >> 1;
+    const int  gy = ( g0.y + g1.y ) >> 1;
+    const int  di = ( bdofP( 1, cx, cy ) >> 4 ) - ( bdofP( 0, cx, cy ) >> 4 );
+    absGX  += abs( gx );
+    absGY  += abs( gy );
+    dIX    += gx < 0 ? -di : ( gx == 0 ? 0 : di );
+    dIY    += gy < 0 ? -di : ( gy == 0 ? 0 : di );
+    signGX += gy < 0 ? -gx : ( gy == 0 ? 0 : gx );
+  }
+  InterlockedAdd( s_bsum[sb * 5], absGX );
+  InterlockedAdd( s_bsum[sb * 5 + 1], absGY );
+  InterlockedAdd( s_bsum[sb * 5 + 2], dIX );
+  InterlockedAdd( s_bsum[sb * 5 + 3], dIY );
+  InterlockedAdd( s_bsum[sb * 5 + 4], signGX );
+}
+
+// The motion offset (vx, vy) of the tile's 4x4 block sb, from its sums in s_bsum.
+int2 bdofOffset( int sb )
+{
+  const int absGX  = s_bsum[sb * 5];
+  const int absGY  = s_bsum[sb * 5 + 1];
+  const int dIX    = s_bsum[sb * 5 + 2];
+  const int dIY    = s_bsum[sb * 5 + 3];
+  const int signGX = s_bsum[sb * 5 + 4];
+  // rightShiftMSB: shift right by the position of the denominator's highest bit
+  const int vx   = absGX == 0 ? 0 : clamp( ( dIX * 4 ) >> firstbithigh( uint( absGX ) ), -15, 15 );
+  const int data = ( ( vx * ( signGX >> 12 ) ) * 4096 + vx * ( signGX & 4095 ) ) >> 1;
+  const int vy   = absGY == 0 ? 0 : clamp( ( dIY * 4 - data ) >> firstbithigh( uint( absGY ) ), -15, 15 );
+  return int2( vx, vy );
+}
+
+// The tile's sample (i, j): the average of the two predictions with the correction of its block's offset v.
+int bdofSample( int i, int j, int2 v )
+{
+  const int  shiftNum = 15 - pc.bitDepth;
+  const int  offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
+  const int  maxVal   = ( 1 << pc.bitDepth ) - 1;
+  const int2 g0       = bdofGrad( 0, i, j );
+  const int2 g1       = bdofGrad( 1, i, j );
+  const int  b        = v.x * ( g0.x - g1.x ) + v.y * ( g0.y - g1.y );
+  return clip3( 0, maxVal, int( int16_t( ( bdofP( 0, i, j ) + bdofP( 1, i, j ) + b + offset ) >> shiftNum ) ) );
+}
+
+// After both lists' bdofStore and a barrier: corrects and averages the thread's samples of the tile.
+void bdofApply( int tid, int w, int h, out int result[PER_THREAD] )
+{
+  const int nsx = w >> 2;
+  const int nsb = nsx * ( h >> 2 );
+  // The sums over each 4x4 block's 6 x 6 window: four threads per 4x4 block, nine samples each.
+  if( tid < 4 * nsb )
+  {
+    bdofAddSums( tid >> 2, tid & 3, w, h );
+  }
+  GroupMemoryBarrierWithGroupSync();
+  if( tid < nsb )
+  {
+    s_bv[tid] = bdofOffset( tid );
+  }
+  GroupMemoryBarrierWithGroupSync();
+  const int log2W = log2Int( w );
+  for( int k = 0; k < PER_THREAD; k++ )
+  {
+    const int t = tid + THREADS * k;
+    result[k]   = 0;
+    if( t < w * h )
+    {
+      const int i = t & ( w - 1 );
+      const int j = t >> log2W;
+      result[k]   = bdofSample( i, j, s_bv[( j >> 2 ) * nsx + ( i >> 2 )] );
+    }
+  }
+}
+#endif
+
 // --------------------------------------------------------------------------------------------------------------------
 // tile16: a 16x16 tile whose reference samples all lie inside the picture (nearly every tile). All its global reads
 // are issued at once, in aligned loads of 16 and 8 bytes, before the first wait for memory: each list's luma window
@@ -942,6 +1105,8 @@ int2 clipStorage( int2 mv )
 // both read inside it), the chroma windows of 11 x 11, and the residuals. DMVR and the filters then work from shared
 // memory. (Reading and waiting one sample at a time, a tile waited for memory some 50 times; the shader is
 // latency-bound: with a third fewer waves per SIMD it ran a third slower.)
+// In the inter_bdof variant, tile16 also applies BDOF: its steps run in the phases between tile16's barriers, so
+// that a BDOF tile waits at no more barriers than another tile.
 // --------------------------------------------------------------------------------------------------------------------
 
 // Sample (r, c) of the window whose sample (0, 0) is at index at; clamped into the window when DMVR's refinement
@@ -1180,6 +1345,50 @@ int bilinearW( int p, int xFrac, int yFrac, int shift )
   return ( int( c0y ) * int( t0 ) + int( c1y ) * int( t1 ) + 8 ) >> 4;
 }
 
+#if BDOF
+// tile16's bdofStore: the thread's four luma predictions (j, i0 .. i0 + 3) of each list into s_bdof, and the border
+// from the lists' windows (the window's sample (3, 3) lies at the merge motion's integer position), clamped into the
+// window when DMVR's refinement moved the integer position, as the prefetch's padding is.
+void tile16BdofStore( int tid, int j, int i0, int4 predY[2], int2 mvs[2], int2 mvR[2], bool clampY[2] )
+{
+  [unroll]
+  for( int s = 0; s < 2; s++ )
+  {
+    [unroll]
+    for( int o = 0; o < 4; o++ )
+    {
+      s_bdof[s * BS * BS + ( j + 1 ) * BS + i0 + o + 1] = int16_t( predY[s][o] );
+    }
+  }
+  const int ring = 2 * ( 16 + 2 ) + 2 * 16;
+  for( int r = tid; r < 2 * ring; r += THREADS )
+  {
+    // (the list is picked with selects: an array indexed per lane would go to scratch memory)
+    const int  s       = r >= ring ? 1 : 0;
+    const int2 m       = s == 0 ? mvR[0] : mvR[1];
+    const int2 merge   = s == 0 ? mvs[0] : mvs[1];
+    const bool clampIt = s == 0 ? clampY[0] : clampY[1];
+    const int2 b       = bdofBorderAt( r - ring * s, 16, 16 );
+    const int  xOff    = ( m.x & 15 ) < 8 ? 1 : 0;
+    const int  yOff    = ( m.y & 15 ) < 8 ? 1 : 0;
+    const int  c       = 3 + ( m.x >> 4 ) - ( merge.x >> 4 ) + b.x + 1 - xOff;
+    const int  row     = 3 + ( m.y >> 4 ) - ( merge.y >> 4 ) + b.y + 1 - yOff;
+    s_bdof[s * BS * BS + ( b.y + 1 ) * BS + b.x + 1] = bdofBorderValue( winY( s == 0 ? WY_AT( 0 ) : WY_AT( 1 ), row, c, clampIt ) );
+  }
+}
+
+// DMVR's best cost (the centre's reduced by a quarter), from the SADs in s_sad: BDOF applies only from 2 w h on.
+int dmvrMinCost( int centre )
+{
+  int minCost = centre;
+  for( int i = 0; i < 25; i++ )
+  {
+    minCost = min( minCost, sadOr( i, centre ) );
+  }
+  return minCost;
+}
+#endif
+
 // Whether tile16 may take the tile: each list's windows must lie inside the picture.
 bool tile16Inside( int x, int y, int flags, int2 mv0, int2 mv1 )
 {
@@ -1314,6 +1523,13 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     s_sad[tid] = 0;
   }
+#if BDOF
+  for( int i = tid; i < 16 * 5; i += THREADS )
+  {
+    s_bsum[i] = 0;
+  }
+  int dmvrCost = 2 * 16 * 16;   // (without DMVR, BDOF applies wherever the tile's flag says)
+#endif
   GroupMemoryBarrierWithGroupSync();
 
   // DMVR, as xProcessDMVR: the centre's SAD first. When it is small enough (83% of VideoQ's subblocks) there is no
@@ -1338,7 +1554,8 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
       InterlockedAdd( s_sad[12], waveSum );
     }
     GroupMemoryBarrierWithGroupSync();
-    const bool search = s_sad[12] - ( s_sad[12] >> 2 ) >= 16 * 16;
+    const int  centre = s_sad[12] - ( s_sad[12] >> 2 );
+    const bool search = centre >= 16 * 16;
     if( search )
     {
       // All the bilinear predictions of the 20 x 20 samples from the merge motion minus 2 samples (the windows'
@@ -1366,7 +1583,10 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     }
     // Every thread works out the refinement itself (so none waits for another), from the SADs with the centre's
     // reduced by a quarter.
-    const int2 delta = search ? dmvrDeltaFrom( s_sad[12] - ( s_sad[12] >> 2 ) ) : int2( 0, 0 );
+    const int2 delta = search ? dmvrDeltaFrom( centre ) : int2( 0, 0 );
+#if BDOF
+    dmvrCost = search ? dmvrMinCost( centre ) : centre;
+#endif
     // Threads 0 .. 15 write the refined motion where TMVP reads it (the 8x8 grid) into the colocated motion, which
     // colmotion.slang (GPU front end) or DecCu's storeDmvrMotion (CPU front end) stored before, one int each; threads
     // 16 and 17 write vvdec's DMVR MV cache.
@@ -1389,6 +1609,9 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     mvR[0] = clipStorage( mv0 + delta );
     mvR[1] = clipStorage( mv1 - delta );
   }
+#if BDOF
+  const bool bdof = ( flags & FLAG_BDOF ) != 0 && dmvrCost >= 2 * 16 * 16;
+#endif
 
   // Luma: the horizontal passes of the 2-D filters, 23 rows of 16 samples in groups of 4.
   int16_t cxY[2][8], cyY[2][8];
@@ -1448,7 +1671,21 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
       predY[s] = lumaPred( WY_AT( s ), WORK_AT + 368 * s, j, i0, rx0[s], ry0[s], clampY[s], mvR[s].x & 15, mvR[s].y & 15, cxY[s], cyY[s], bi );
     }
   }
+#if BDOF
+  // BDOF: both predictions and their border into s_bdof while the windows are still there; the 4x4 blocks' sums
+  // after the barrier, their offsets after the next one, and the corrected samples at the end.
+  if( bdof )
+  {
+    tile16BdofStore( tid, j, i0, predY, mvs, mvR, clampY );
+  }
+#endif
   GroupMemoryBarrierWithGroupSync();   // the luma windows are read; the chroma windows replace them
+#if BDOF
+  if( bdof )
+  {
+    bdofAddSums( tid >> 2, tid & 3, 16, 16 );
+  }
+#endif
 
   // Chroma: store the windows in shared memory, then the horizontal passes of the 2-D filters, 11 rows of 8 in pairs.
   [unroll]
@@ -1470,6 +1707,12 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     }
   }
   GroupMemoryBarrierWithGroupSync();
+#if BDOF
+  if( bdof && tid < 16 )
+  {
+    s_bv[tid] = bdofOffset( tid );
+  }
+#endif
   int16_t cxC[2][4], cyC[2][4];
   int     crx0[2], cry0[2];
   bool    clampC[2];
@@ -1540,6 +1783,17 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     vy[o] = bi ? biAverage( predY[0][o], predY[1][o], flags, bcwW1, shiftNum, offset, maxVal ) : predY[0][o];
   }
+#if BDOF
+  if( bdof )
+  {
+    const int2 v = s_bv[( j >> 2 ) * 4 + ( i0 >> 2 )];
+    [unroll]
+    for( int o = 0; o < 4; o++ )
+    {
+      vy[o] = bdofSample( i0 + o, j, v );
+    }
+  }
+#endif
   if( ( flags & FLAG_LUMA_MAP ) != 0 )
   {
     vy = int4( pc.lmcsFwd[vy.x], pc.lmcsFwd[vy.y], pc.lmcsFwd[vy.z], pc.lmcsFwd[vy.w] );
@@ -1566,147 +1820,6 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   *(uint*)( cc == 0 ? outCb : outCr ) = uint( vc.x & 0xffff ) | uint( vc.y ) << 16;
 }
 
-#if BDOF
-// --------------------------------------------------------------------------------------------------------------------
-// BDOF, bi-directional optical flow (vvdec's applyBiOptFlow, BiOptFlowCore, gradFilterCore). s_bdof holds each list's
-// 14-bit luma prediction of the tile plus a one-sample border, which comes from the reference's integer samples
-// nearest the motion (xPredInterBlk). Each 4x4 block's motion offset (vx, vy) follows from the gradients and the
-// differences over the 6 x 6 samples around it (where those fall in the border, the nearest samples and gradients
-// inside the tile stand in). The two predictions are then averaged with the offset's correction.
-// --------------------------------------------------------------------------------------------------------------------
-#define BS 18                                     // a list's row length in s_bdof: the tile (16 at most) plus border
-groupshared int16_t s_bdof[2 * BS * BS];
-groupshared int     s_bsum[16 * 5];               // per 4x4: sums of |gx|, |gy|, di*sgn(gx), di*sgn(gy), gx*sgn(gy)
-groupshared int2    s_bv[16];                     // (vx, vy) per 4x4 block
-groupshared int     s_minCost;                    // DMVR's best cost (BDOF applies only where it is 2 w h or more)
-
-int bdofP( int list, int x, int y )   // (x, y): -1 .. w, -1 .. h
-{
-  return int( s_bdof[list * BS * BS + ( y + 1 ) * BS + x + 1] );
-}
-
-// The gradients at (x, y) inside the tile, from the samples around it (including the border's).
-int2 bdofGrad( int list, int x, int y )
-{
-  return int2( ( bdofP( list, x + 1, y ) >> 6 ) - ( bdofP( list, x - 1, y ) >> 6 ), ( bdofP( list, x, y + 1 ) >> 6 ) - ( bdofP( list, x, y - 1 ) >> 6 ) );
-}
-
-// Stores a list's prediction in s_bdof: the thread's samples, plus the border from the reference's samples nearest
-// the motion (fractions below 8 round down), at 14 bits; (baseX, baseY) is the integer position of the prediction.
-void bdofStore( int tid, int list, int w, int h, int pred[PER_THREAD], int slot, int baseX, int baseY, int2 mv, bool windowed, int4 window, bool wrap )
-{
-  const int log2W = log2Int( w );
-  for( int k = 0; k < PER_THREAD; k++ )
-  {
-    const int t = tid + THREADS * k;
-    if( t < w * h )
-    {
-      s_bdof[list * BS * BS + ( ( t >> log2W ) + 1 ) * BS + ( t & ( w - 1 ) ) + 1] = int16_t( pred[k] );
-    }
-  }
-  const int ring  = 2 * ( w + 2 ) + 2 * h;   // the rows above and below, then the columns left and right
-  const int xOff  = ( mv.x & 15 ) < 8 ? 1 : 0;
-  const int yOff  = ( mv.y & 15 ) < 8 ? 1 : 0;
-  const int shift = max( 2, 14 - pc.bitDepth );
-  int16_t*  ref   = refPlane( slot, 0 );
-  for( int r = tid; r < ring; r += THREADS )
-  {
-    int bx, by;
-    if( r < w + 2 )
-    {
-      bx = r - 1;
-      by = -1;
-    }
-    else if( r < 2 * ( w + 2 ) )
-    {
-      bx = r - ( w + 2 ) - 1;
-      by = h;
-    }
-    else if( r < 2 * ( w + 2 ) + h )
-    {
-      bx = -1;
-      by = r - 2 * ( w + 2 );
-    }
-    else
-    {
-      bx = w;
-      by = r - 2 * ( w + 2 ) - h;
-    }
-    const int v = refSample( ref, 0, baseX + bx + 1 - xOff, baseY + by + 1 - yOff, windowed, window, wrap );
-    s_bdof[list * BS * BS + ( by + 1 ) * BS + bx + 1] = int16_t( v * ( 1 << shift ) - IF_INTERNAL_OFFS );
-  }
-}
-
-// After both lists' bdofStore and a barrier: corrects and averages the thread's samples of the tile.
-void bdofApply( int tid, int w, int h, out int result[PER_THREAD] )
-{
-  const int nsx = w >> 2;
-  const int nsb = nsx * ( h >> 2 );
-  // The sums over each 4x4 block's 6 x 6 window: four threads per 4x4 block, nine samples each.
-  if( tid < 4 * nsb )
-  {
-    const int sb = tid >> 2;
-    const int q  = tid & 3;
-    const int sx = sb % nsx;
-    const int sy = sb / nsx;
-    int       absGX = 0, absGY = 0, dIX = 0, dIY = 0, signGX = 0;
-    for( int p = q * 9; p < q * 9 + 9; p++ )
-    {
-      const int  cx = clamp( 4 * sx - 1 + p % 6, 0, w - 1 );
-      const int  cy = clamp( 4 * sy - 1 + p / 6, 0, h - 1 );
-      const int2 g0 = bdofGrad( 0, cx, cy );
-      const int2 g1 = bdofGrad( 1, cx, cy );
-      const int  gx = ( g0.x + g1.x ) >> 1;
-      const int  gy = ( g0.y + g1.y ) >> 1;
-      const int  di = ( bdofP( 1, cx, cy ) >> 4 ) - ( bdofP( 0, cx, cy ) >> 4 );
-      absGX  += abs( gx );
-      absGY  += abs( gy );
-      dIX    += gx < 0 ? -di : ( gx == 0 ? 0 : di );
-      dIY    += gy < 0 ? -di : ( gy == 0 ? 0 : di );
-      signGX += gy < 0 ? -gx : ( gy == 0 ? 0 : gx );
-    }
-    InterlockedAdd( s_bsum[sb * 5], absGX );
-    InterlockedAdd( s_bsum[sb * 5 + 1], absGY );
-    InterlockedAdd( s_bsum[sb * 5 + 2], dIX );
-    InterlockedAdd( s_bsum[sb * 5 + 3], dIY );
-    InterlockedAdd( s_bsum[sb * 5 + 4], signGX );
-  }
-  GroupMemoryBarrierWithGroupSync();
-  if( tid < nsb )
-  {
-    const int absGX  = s_bsum[tid * 5];
-    const int absGY  = s_bsum[tid * 5 + 1];
-    const int dIX    = s_bsum[tid * 5 + 2];
-    const int dIY    = s_bsum[tid * 5 + 3];
-    const int signGX = s_bsum[tid * 5 + 4];
-    // rightShiftMSB: shift right by the position of the denominator's highest bit
-    const int vx   = absGX == 0 ? 0 : clamp( ( dIX * 4 ) >> firstbithigh( uint( absGX ) ), -15, 15 );
-    const int data = ( ( vx * ( signGX >> 12 ) ) * 4096 + vx * ( signGX & 4095 ) ) >> 1;
-    const int vy   = absGY == 0 ? 0 : clamp( ( dIY * 4 - data ) >> firstbithigh( uint( absGY ) ), -15, 15 );
-    s_bv[tid]      = int2( vx, vy );
-  }
-  GroupMemoryBarrierWithGroupSync();
-  const int log2W    = log2Int( w );
-  const int shiftNum = 15 - pc.bitDepth;
-  const int offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
-  const int maxVal   = ( 1 << pc.bitDepth ) - 1;
-  for( int k = 0; k < PER_THREAD; k++ )
-  {
-    const int t = tid + THREADS * k;
-    result[k]   = 0;
-    if( t < w * h )
-    {
-      const int  i  = t & ( w - 1 );
-      const int  j  = t >> log2W;
-      const int2 v  = s_bv[( j >> 2 ) * nsx + ( i >> 2 )];
-      const int2 g0 = bdofGrad( 0, i, j );
-      const int2 g1 = bdofGrad( 1, i, j );
-      const int  b  = v.x * ( g0.x - g1.x ) + v.y * ( g0.y - g1.y );
-      result[k]     = clip3( 0, maxVal, int( int16_t( ( bdofP( 0, i, j ) + bdofP( 1, i, j ) + b + offset ) >> shiftNum ) ) );
-    }
-  }
-}
-#endif
 
 #if AFFINE
 // --------------------------------------------------------------------------------------------------------------------
@@ -2246,7 +2359,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const bool dmvr  = ( flags & FLAG_DMVR ) != 0;
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
-  if( !BDOF && ( flags & ( FLAG_GEO | FLAG_WP ) ) == 0 && pc.wide != 0 && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
+  if( ( flags & ( FLAG_GEO | FLAG_WP ) ) == 0 && pc.wide != 0 && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
   {
     tile16( tid, index, job, x, y, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel );
     return;
