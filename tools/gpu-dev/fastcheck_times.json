@@ -1,10 +1,10 @@
 {
 "10b400_A_2/default": [
-0.44,
+0.49,
 17
 ],
 "10b400_A_2/parse": [
-1.3,
+1.74,
 17
 ],
 "10b400_B_2/default": [
@@ -24,11 +24,11 @@
 3
 ],
 "10b422_B_5/default": [
-0.34,
+0.2,
 3
 ],
 "10b422_B_5/parse": [
-0.46,
+0.6,
 3
 ],
 "10b422_C_5/default": [
@@ -64,11 +64,11 @@
 17
 ],
 "10b444_A_3/default": [
-1.62,
+1.88,
 17
 ],
 "10b444_A_3/parse": [
-5.24,
+5.38,
 2
 ],
 "10b444_B_3/default": [
@@ -80,12 +80,12 @@
 2
 ],
 "8b400_A_2/default": [
-0.6,
+0.48,
 17
 ],
 "8b400_A_2/parse": [
-1.71,
-13
+1.77,
+14
 ],
 "8b400_B_2/default": [
 0.94,
@@ -100,11 +100,11 @@
 17
 ],
 "8b420_A_2/parse": [
-2.55,
-17
+1.97,
+14
 ],
 "8b420_B_2/default": [
-1.11,
+0.94,
 17
 ],
 "8b420_B_2/parse": [
@@ -120,11 +120,11 @@
 3
 ],
 "8b422_B_5/default": [
-0.4,
+0.19,
 3
 ],
 "8b422_B_5/parse": [
-0.65,
+0.55,
 3
 ],
 "8b422_C_5/default": [
@@ -160,7 +160,7 @@
 17
 ],
 "ACTPIC_A_3/default": [
-0.48,
+0.44,
 17
 ],
 "ACTPIC_A_3/parse": [
@@ -180,7 +180,7 @@
 17
 ],
 "ACTPIC_C_3/parse": [
-1.05,
+1.51,
 17
 ],
 "AFF_A_2/default": [
@@ -188,11 +188,11 @@
 10
 ],
 "AFF_A_2/parse": [
-2.22,
+2.11,
 2
 ],
 "AFF_B_2/default": [
-0.68,
+0.65,
 10
 ],
 "AFF_B_2/parse": [
@@ -200,7 +200,7 @@
 2
 ],
 "ALF_A_3/default": [
-0.44,
+0.18,
 3
 ],
 "ALF_A_3/parse": [
@@ -208,11 +208,11 @@
 3
 ],
 "ALF_B_3/default": [
-0.25,
+0.57,
 3
 ],
 "ALF_B_3/parse": [
-0.36,
+0.76,
 3
 ],
 "ALF_C_3/default": [
@@ -220,11 +220,11 @@
 4
 ],
 "ALF_C_3/parse": [
-0.75,
+0.57,
 4
 ],
 "ALF_D_2/default": [
-0.41,
+0.65,
 8
 ],
 "ALF_D_2/parse": [
@@ -236,11 +236,11 @@
 17
 ],
 "AMVR_A_3/parse": [
-2.34,
+2.23,
 2
 ],
 "AMVR_B_3/default": [
-1.1,
+1.31,
 17
 ],
 "AMVR_B_3/parse": [
@@ -248,15 +248,15 @@
 2
 ],
 "APSALF_A_2/default": [
-0.37,
+0.46,
 8
 ],
 "APSALF_A_2/parse": [
-2.08,
-8
+1.71,
+7
 ],
 "APSLMCS_A_3/default": [
-1.18,
+0.92,
 17
 ],
 "APSLMCS_A_3/parse": [
@@ -284,7 +284,7 @@
 17
 ],
 "APSLMCS_D_1/parse": [
-1.5,
+2.09,
 17
 ],
 "APSLMCS_E_1/default": [
@@ -308,48 +308,48 @@
 17
 ],
 "APSMULT_B_4/parse": [
-1.64,
+1.26,
 17
 ],
 "AUD_A_3/default": [
-0.7,
+0.61,
 17
 ],
 "AUD_A_3/parse": [
-2.45,
+2.35,
 2
 ],
 "BCW_A_4/default": [
-1.04,
+0.91,
 17
 ],
 "BCW_A_4/parse": [
-4.64,
+3.75,
 2
 ],
 "BDOF_A_4/default": [
-1.0,
+2.04,
 17
 ],
 "BDOF_A_4/parse": [
-4.27,
+4.5,
 2
 ],
 "BDPCM_A_2/default": [
-0.34,
+0.4,
 3
 ],
 "BDPCM_A_2/parse": [
-1.55,
-3
+2.33,
+2
 ],
 "BOUNDARY_A_3/default": [
-0.54,
+0.51,
 17
 ],
 "BOUNDARY_A_3/parse": [
-2.67,
-9
+1.92,
+4
 ],
 "BUMP_A_2/default": [
 1.22,
@@ -368,11 +368,11 @@
 17
 ],
 "BUMP_C_2/default": [
-0.49,
+0.42,
 17
 ],
 "BUMP_C_2/parse": [
-1.76,
+1.32,
 17
 ],
 "CCALF_A_3/default": [
@@ -388,11 +388,11 @@
 17
 ],
 "CCALF_B_3/parse": [
-9.58,
+5.02,
 2
 ],
 "CCALF_C_3/default": [
-1.14,
+1.03,
 17
 ],
 "CCALF_C_3/parse": [
@@ -404,23 +404,23 @@
 17
 ],
 "CCALF_D_3/parse": [
-8.65,
+9.73,
 2
 ],
 "CCLM_A_2/default": [
-0.39,
+0.37,
 7
 ],
 "CCLM_A_2/parse": [
-0.83,
+0.66,
 7
 ],
 "CIIP_A_4/default": [
-1.1,
+0.88,
 17
 ],
 "CIIP_A_4/parse": [
-2.6,
+1.76,
 2
 ],
 "CROP_A_4/default": [
@@ -436,24 +436,24 @@
 17
 ],
 "CROP_B_4/parse": [
-4.04,
+3.44,
 2
 ],
 "CST_A_4/default": [
-1.94,
+0.57,
 17
 ],
 "CST_A_4/parse": [
-2.67,
+2.52,
 2
 ],
 "CTU_A_4/default": [
-0.67,
+0.6,
 17
 ],
 "CTU_A_4/parse": [
 2.25,
-17
+12
 ],
 "CTU_B_4/default": [
 1.71,
@@ -472,8 +472,8 @@
 8
 ],
 "CUBEMAP_A_3/default": [
-1.93,
-17
+1.85,
+14
 ],
 "CUBEMAP_A_3/parse": [
 24.88,
@@ -484,7 +484,7 @@
 14
 ],
 "CUBEMAP_B_3/parse": [
-9.57,
+13.53,
 2
 ],
 "CUBEMAP_C_3/default": [
@@ -496,11 +496,11 @@
 2
 ],
 "CodingToolsSets_A_2/default": [
-0.1,
+0.91,
 2
 ],
 "CodingToolsSets_A_2/parse": [
-0.37,
+14.34,
 2
 ],
 "CodingToolsSets_B_2/default": [
@@ -508,7 +508,7 @@
 9
 ],
 "CodingToolsSets_B_2/parse": [
-0.65,
+0.7,
 9
 ],
 "CodingToolsSets_C_2/default": [
@@ -516,7 +516,7 @@
 2
 ],
 "CodingToolsSets_C_2/parse": [
-0.58,
+7.42,
 2
 ],
 "CodingToolsSets_D_2/default": [
@@ -532,15 +532,15 @@
 9
 ],
 "CodingToolsSets_E_1/parse": [
-0.67,
+1.94,
 9
 ],
 "DCI_A_3/default": [
-0.18,
+0.27,
 2
 ],
 "DCI_A_3/parse": [
-0.46,
+0.37,
 2
 ],
 "DCI_B_3/default": [
@@ -552,7 +552,7 @@
 2
 ],
 "DEBLOCKING_A_3/default": [
-0.86,
+0.55,
 17
 ],
 "DEBLOCKING_A_3/parse": [
@@ -576,11 +576,11 @@
 17
 ],
 "DEBLOCKING_E_3/default": [
-0.68,
+0.88,
 8
 ],
 "DEBLOCKING_E_3/parse": [
-0.86,
+0.65,
 8
 ],
 "DEBLOCKING_F_2/default": [
@@ -600,11 +600,11 @@
 9
 ],
 "DMVR_B_4/default": [
-0.33,
+0.21,
 11
 ],
 "DMVR_B_4/parse": [
-0.43,
+0.98,
 11
 ],
 "DPB_A_2/default": [
@@ -616,20 +616,20 @@
 17
 ],
 "DPB_B_2/default": [
-0.66,
+0.46,
 5
 ],
 "DPB_B_2/parse": [
-0.66,
+0.67,
 5
 ],
 "DQ_A_3/default": [
-0.85,
+0.57,
 17
 ],
 "DQ_A_3/parse": [
-2.62,
-13
+2.32,
+6
 ],
 "DQ_B_3/default": [
 1.67,
@@ -648,7 +648,7 @@
 2
 ],
 "ENT444HIGHTIER_B_3/default": [
-0.92,
+0.86,
 3
 ],
 "ENT444HIGHTIER_B_3/parse": [
@@ -672,7 +672,7 @@
 2
 ],
 "ENT444MAINTIER_A_3/default": [
-0.75,
+0.87,
 3
 ],
 "ENT444MAINTIER_A_3/parse": [
@@ -684,7 +684,7 @@
 3
 ],
 "ENT444MAINTIER_B_3/parse": [
-17.17,
+14.61,
 2
 ],
 "ENT444MAINTIER_C_3/default": [
@@ -704,7 +704,7 @@
 3
 ],
 "ENTHIGHTIER_A_3/default": [
-0.68,
+0.56,
 3
 ],
 "ENTHIGHTIER_A_3/parse": [
@@ -716,7 +716,7 @@
 3
 ],
 "ENTHIGHTIER_B_3/parse": [
-12.63,
+7.49,
 2
 ],
 "ENTHIGHTIER_C_3/default": [
@@ -740,11 +740,11 @@
 3
 ],
 "ENTMAINTIER_A_3/parse": [
-6.79,
+7.11,
 2
 ],
 "ENTMAINTIER_B_3/default": [
-0.42,
+0.47,
 3
 ],
 "ENTMAINTIER_B_3/parse": [
@@ -776,11 +776,11 @@
 60
 ],
 "ENTROPY_B_2/default": [
-0.54,
+0.37,
 17
 ],
 "ENTROPY_B_2/parse": [
-1.59,
+1.01,
 17
 ],
 "ENTROPY_C_1/default": [
@@ -792,11 +792,11 @@
 17
 ],
 "ERP_A_3/default": [
-1.53,
+1.8,
 17
 ],
 "ERP_A_3/parse": [
-6.94,
+10.88,
 2
 ],
 "FIELD_A_4/default": [
@@ -808,19 +808,19 @@
 0
 ],
 "FIELD_B_2/default": [
-1.15,
+1.24,
 0
 ],
 "FIELD_B_2/parse": [
-2.09,
+1.6,
 0
 ],
 "FILLER_A_1/default": [
-0.81,
+0.6,
 17
 ],
 "FILLER_A_1/parse": [
-1.97,
+1.76,
 17
 ],
 "GDR_A_2/default": [
@@ -848,19 +848,19 @@
 11
 ],
 "GDR_D_1/default": [
-0.84,
+1.02,
 17
 ],
 "GDR_D_1/parse": [
-1.32,
+1.51,
 17
 ],
 "GPM_A_3/default": [
-0.55,
+0.6,
 17
 ],
 "GPM_A_3/parse": [
-1.46,
+1.39,
 17
 ],
 "GPM_B_1/default": [
@@ -876,12 +876,12 @@
 10
 ],
 "HLG_A_4/parse": [
-2.58,
+3.26,
 2
 ],
 "HLG_B_4/default": [
-1.44,
-10
+1.96,
+14
 ],
 "HLG_B_4/parse": [
 4.35,
@@ -896,23 +896,23 @@
 17
 ],
 "HRD_B_2/default": [
-0.65,
+0.52,
 17
 ],
 "HRD_B_2/parse": [
-2.08,
-17
+1.93,
+15
 ],
 "IBC_A_2/default": [
-0.59,
+0.37,
 17
 ],
 "IBC_A_2/parse": [
-1.33,
+1.43,
 17
 ],
 "IBC_B_2/default": [
-0.54,
+0.76,
 17
 ],
 "IBC_B_2/parse": [
@@ -924,7 +924,7 @@
 17
 ],
 "IBC_C_2/parse": [
-1.15,
+1.5,
 17
 ],
 "IBC_D_2/default": [
@@ -944,12 +944,12 @@
 11
 ],
 "IP_A_2/default": [
-0.5,
+0.32,
 8
 ],
 "IP_A_2/parse": [
-1.56,
-8
+1.16,
+6
 ],
 "IP_B_1/default": [
 1.13,
@@ -960,11 +960,11 @@
 19
 ],
 "ISP_A_3/default": [
-0.56,
+0.55,
 17
 ],
 "ISP_A_3/parse": [
-1.92,
+1.93,
 12
 ],
 "ISP_B_3/default": [
@@ -976,7 +976,7 @@
 17
 ],
 "JCCR_A_2/default": [
-0.26,
+0.45,
 3
 ],
 "JCCR_A_2/parse": [
@@ -1012,11 +1012,11 @@
 3
 ],
 "JCCR_E_1/parse": [
-0.81,
+0.77,
 3
 ],
 "JCCR_F_1/default": [
-0.41,
+0.4,
 3
 ],
 "JCCR_F_1/parse": [
@@ -1024,7 +1024,7 @@
 3
 ],
 "LFNST_A_4/default": [
-0.45,
+0.7,
 17
 ],
 "LFNST_A_4/parse": [
@@ -1036,7 +1036,7 @@
 17
 ],
 "LFNST_B_4/parse": [
-1.36,
+1.75,
 17
 ],
 "LFNST_C_3/default": [
@@ -1072,11 +1072,11 @@
 15
 ],
 "LMCS_C_1/default": [
-1.01,
+1.05,
 17
 ],
 "LMCS_C_1/parse": [
-1.83,
+1.68,
 17
 ],
 "LOSSLESS_A_3/default": [
@@ -1088,28 +1088,28 @@
 2
 ],
 "LOSSLESS_B_3/default": [
-0.94,
+0.59,
 17
 ],
 "LOSSLESS_B_3/parse": [
-1.96,
+5.29,
 2
 ],
 "LTRP_A_3/default": [
-0.7,
+0.35,
 17
 ],
 "LTRP_A_3/parse": [
-1.57,
-17
+1.36,
+16
 ],
 "MERGE_A_2/default": [
 0.7,
 10
 ],
 "MERGE_A_2/parse": [
-2.61,
-4
+2.7,
+3
 ],
 "MERGE_B_2/default": [
 0.71,
@@ -1120,7 +1120,7 @@
 4
 ],
 "MERGE_C_2/default": [
-0.38,
+0.63,
 10
 ],
 "MERGE_C_2/parse": [
@@ -1132,16 +1132,16 @@
 10
 ],
 "MERGE_D_2/parse": [
-2.28,
-4
+1.99,
+3
 ],
 "MERGE_E_2/default": [
 0.73,
 10
 ],
 "MERGE_E_2/parse": [
-2.56,
-4
+3.77,
+3
 ],
 "MERGE_F_2/default": [
 5.32,
@@ -1172,8 +1172,8 @@
 65
 ],
 "MERGE_I_2/parse": [
-5.24,
-14
+3.41,
+5
 ],
 "MERGE_J_2/default": [
 4.03,
@@ -1184,11 +1184,11 @@
 7
 ],
 "MIP_A_3/default": [
-0.76,
+0.33,
 17
 ],
 "MIP_A_3/parse": [
-1.24,
+1.04,
 17
 ],
 "MIP_B_3/default": [
@@ -1200,11 +1200,11 @@
 17
 ],
 "MMVD_A_3/default": [
-1.08,
+1.1,
 17
 ],
 "MMVD_A_3/parse": [
-3.24,
+2.42,
 2
 ],
 "MNUT_A_4/default": [
@@ -1212,11 +1212,11 @@
 17
 ],
 "MNUT_A_4/parse": [
-16.07,
+14.87,
 2
 ],
 "MNUT_B_3/default": [
-0.69,
+0.59,
 17
 ],
 "MNUT_B_3/parse": [
@@ -1224,11 +1224,11 @@
 2
 ],
 "MPM_A_3/default": [
-1.71,
-10
+1.93,
+9
 ],
 "MPM_A_3/parse": [
-2.57,
+3.76,
 2
 ],
 "MRLP_A_2/default": [
@@ -1236,11 +1236,11 @@
 16
 ],
 "MRLP_A_2/parse": [
-3.22,
+3.08,
 2
 ],
 "MRLP_B_2/default": [
-0.4,
+0.43,
 16
 ],
 "MRLP_B_2/parse": [
@@ -1252,11 +1252,11 @@
 17
 ],
 "MTS_A_4/parse": [
-1.08,
+1.43,
 17
 ],
 "MTS_B_4/default": [
-0.72,
+0.67,
 17
 ],
 "MTS_B_4/parse": [
@@ -1268,31 +1268,31 @@
 17
 ],
 "MTS_LFNST_A_4/parse": [
-3.2,
-5
+2.39,
+3
 ],
 "MTS_LFNST_B_4/default": [
-0.35,
+0.69,
 17
 ],
 "MTS_LFNST_B_4/parse": [
-2.29,
-7
+2.73,
+4
 ],
 "MVCOMP_A_2/default": [
-0.52,
+0.72,
 17
 ],
 "MVCOMP_A_2/parse": [
-1.33,
+1.08,
 17
 ],
 "OPI_A_1/default": [
-0.38,
+0.43,
 17
 ],
 "OPI_A_1/parse": [
-1.35,
+1.5,
 17
 ],
 "PDPC_A_3/default": [
@@ -1300,11 +1300,11 @@
 17
 ],
 "PDPC_A_3/parse": [
-2.58,
+5.75,
 2
 ],
 "PDPC_B_3/default": [
-0.95,
+0.83,
 17
 ],
 "PDPC_B_3/parse": [
@@ -1316,7 +1316,7 @@
 17
 ],
 "PDPC_C_2/parse": [
-5.52,
+2.13,
 2
 ],
 "PHSH_B_1/default": [
@@ -1324,7 +1324,7 @@
 6
 ],
 "PHSH_B_1/parse": [
-0.69,
+0.55,
 6
 ],
 "PMERGE_A_1/default": [
@@ -1332,7 +1332,7 @@
 17
 ],
 "PMERGE_A_1/parse": [
-1.45,
+1.6,
 17
 ],
 "PMERGE_B_1/default": [
@@ -1344,7 +1344,7 @@
 17
 ],
 "PMERGE_C_1/default": [
-0.75,
+0.51,
 17
 ],
 "PMERGE_C_1/parse": [
@@ -1360,7 +1360,7 @@
 17
 ],
 "PMERGE_E_1/default": [
-0.53,
+0.76,
 17
 ],
 "PMERGE_E_1/parse": [
@@ -1368,19 +1368,19 @@
 17
 ],
 "POC_A_1/default": [
-0.97,
+0.9,
 17
 ],
 "POC_A_1/parse": [
-3.4,
+2.59,
 2
 ],
 "POUT_A_2/default": [
-0.53,
+0.5,
 8
 ],
 "POUT_A_2/parse": [
-0.83,
+1.04,
 8
 ],
 "PPS_A_1/default": [
@@ -1396,11 +1396,11 @@
 17
 ],
 "PPS_B_1/parse": [
-1.64,
-17
+1.75,
+15
 ],
 "PPS_C_1/default": [
-0.62,
+0.58,
 17
 ],
 "PPS_C_1/parse": [
@@ -1408,15 +1408,15 @@
 14
 ],
 "PQ_A_1/default": [
-1.13,
+0.89,
 17
 ],
 "PQ_A_1/parse": [
-2.52,
+2.35,
 2
 ],
 "PROF_A_3/default": [
-0.37,
+0.4,
 16
 ],
 "PROF_A_3/parse": [
@@ -1440,27 +1440,27 @@
 2
 ],
 "PSEXT_B_2/default": [
-1.96,
+0.75,
 9
 ],
 "PSEXT_B_2/parse": [
-8.37,
+9.28,
 2
 ],
 "QTBTT_A_4/default": [
-0.76,
+0.78,
 17
 ],
 "QTBTT_A_4/parse": [
-3.8,
+1.52,
 2
 ],
 "QUANT_A_2/default": [
-0.43,
+0.95,
 5
 ],
 "QUANT_A_2/parse": [
-0.87,
+0.84,
 5
 ],
 "QUANT_B_2/default": [
@@ -1480,7 +1480,7 @@
 3
 ],
 "QUANT_D_4/default": [
-0.56,
+0.28,
 3
 ],
 "QUANT_D_4/parse": [
@@ -1496,11 +1496,11 @@
 17
 ],
 "RAP_A_1/default": [
-0.06,
+0.09,
 1
 ],
 "RAP_A_1/parse": [
-0.17,
+0.14,
 1
 ],
 "RAP_B_1/default": [
@@ -1528,15 +1528,15 @@
 33
 ],
 "RPL_A_2/default": [
-0.71,
+1.56,
 17
 ],
 "RPL_A_2/parse": [
-1.48,
+1.18,
 17
 ],
 "RPR_A_4/default": [
-0.34,
+0.31,
 4
 ],
 "RPR_A_4/parse": [
@@ -1556,7 +1556,7 @@
 4
 ],
 "RPR_C_3/parse": [
-0.88,
+0.96,
 4
 ],
 "RPR_D_1/default": [
@@ -1576,11 +1576,11 @@
 2
 ],
 "SAO_B_3/default": [
-1.05,
+0.83,
 17
 ],
 "SAO_B_3/parse": [
-2.84,
+2.47,
 2
 ],
 "SAO_C_3/default": [
@@ -1592,15 +1592,15 @@
 2
 ],
 "SBT_A_2/default": [
-0.68,
+0.75,
 17
 ],
 "SBT_A_2/parse": [
-1.76,
+1.63,
 17
 ],
 "SCALING_A_1/default": [
-0.51,
+0.6,
 17
 ],
 "SCALING_A_1/parse": [
@@ -1612,8 +1612,8 @@
 17
 ],
 "SCALING_B_1/parse": [
-1.87,
-17
+1.9,
+15
 ],
 "SCALING_C_1/default": [
 1.42,
@@ -1624,27 +1624,27 @@
 16
 ],
 "SDH_A_2/default": [
-1.31,
+1.24,
 17
 ],
 "SDH_A_2/parse": [
-4.23,
+4.42,
 2
 ],
 "SLICES_A_3/default": [
-1.01,
+0.96,
 17
 ],
 "SLICES_A_3/parse": [
-2.13,
-15
+1.81,
+14
 ],
 "SMVD_A_2/default": [
-0.68,
+0.57,
 10
 ],
 "SMVD_A_2/parse": [
-2.92,
+2.73,
 2
 ],
 "SPS_A_1/default": [
@@ -1660,31 +1660,31 @@
 17
 ],
 "SPS_B_1/parse": [
-4.33,
-5
+2.62,
+2
 ],
 "SPS_C_1/default": [
-0.57,
+0.42,
 17
 ],
 "SPS_C_1/parse": [
-2.83,
-4
+2.53,
+2
 ],
 "STILL444_A_1/default": [
-0.18,
+0.16,
 1
 ],
 "STILL444_A_1/parse": [
-1.67,
+1.32,
 1
 ],
 "STILL_A_1/default": [
-0.13,
+0.9,
 1
 ],
 "STILL_A_1/parse": [
-1.02,
+0.69,
 1
 ],
 "SUBPIC_A_3/default": [
@@ -1692,8 +1692,8 @@
 4
 ],
 "SUBPIC_A_3/parse": [
-1.17,
-3
+1.85,
+2
 ],
 "SUBPIC_B_3/default": [
 3.82,
@@ -1712,8 +1712,8 @@
 10
 ],
 "SUBPIC_D_1/default": [
-2.24,
-17
+2.46,
+15
 ],
 "SUBPIC_D_1/parse": [
 4.88,
@@ -1728,15 +1728,15 @@
 10
 ],
 "SUFAPS_A_1/default": [
-1.17,
+0.45,
 17
 ],
 "SUFAPS_A_1/parse": [
-1.11,
+1.0,
 17
 ],
 "SbTMVP_A_3/default": [
-0.67,
+0.48,
 17
 ],
 "SbTMVP_A_3/parse": [
@@ -1748,8 +1748,8 @@
 17
 ],
 "SbTMVP_B_3/parse": [
-2.29,
-16
+1.57,
+14
 ],
 "TEMPSCAL_A_4/default": [
 1.11,
@@ -1764,11 +1764,11 @@
 17
 ],
 "TEMPSCAL_B_7/parse": [
-3.25,
+3.99,
 2
 ],
 "TEMPSCAL_C_4/default": [
-0.68,
+0.58,
 17
 ],
 "TEMPSCAL_C_4/parse": [
@@ -1808,7 +1808,7 @@
 9
 ],
 "TILE_E_2/default": [
-0.77,
+0.76,
 9
 ],
 "TILE_E_2/parse": [
@@ -1828,7 +1828,7 @@
 9
 ],
 "TILE_G_2/parse": [
-1.71,
+1.59,
 9
 ],
 "TMVP_A_3/default": [
@@ -1848,7 +1848,7 @@
 2
 ],
 "TMVP_C_3/default": [
-0.8,
+0.91,
 17
 ],
 "TMVP_C_3/parse": [
@@ -1860,7 +1860,7 @@
 17
 ],
 "TMVP_D_3/parse": [
-4.37,
+4.81,
 2
 ],
 "TRANS_A_2/default": [
@@ -1880,8 +1880,8 @@
 2
 ],
 "TRANS_C_4/default": [
-1.36,
-17
+2.28,
+13
 ],
 "TRANS_C_4/parse": [
 14.83,
@@ -1892,11 +1892,11 @@
 13
 ],
 "TRANS_D_4/parse": [
-4.57,
+4.88,
 2
 ],
 "TREE_A_3/default": [
-0.74,
+0.43,
 17
 ],
 "TREE_A_3/parse": [
@@ -1916,7 +1916,7 @@
 17
 ],
 "TREE_C_3/parse": [
-2.27,
+3.15,
 2
 ],
 "VIRTUAL_A_3/default": [
@@ -1924,23 +1924,23 @@
 11
 ],
 "VIRTUAL_A_3/parse": [
-7.26,
+11.44,
 2
 ],
 "VIRTUAL_B_3/default": [
-1.24,
-8
+1.99,
+14
 ],
 "VIRTUAL_B_3/parse": [
 14.23,
 2
 ],
 "WPP_A_3/default": [
-0.77,
+0.65,
 17
 ],
 "WPP_A_3/parse": [
-2.72,
+2.69,
 2
 ],
 "WPP_B_2/default": [
@@ -1960,11 +1960,11 @@
 17
 ],
 "WP_B_3/default": [
-0.52,
+0.88,
 17
 ],
 "WP_B_3/parse": [
-1.21,
+1.28,
 17
 ],
 "WRAP_A_4/default": [
@@ -1996,7 +1996,7 @@
 9
 ],
 "WRAP_D_4/parse": [
-1.17,
+0.94,
 9
 ],
 "bee600/default": [
@@ -2008,11 +2008,11 @@
 0
 ],
 "bee_slower_cut/default": [
-8.47,
+8.94,
 98
 ],
 "bee_slower_cut/parse": [
-11.67,
+10.85,
 98
 ],
 "cpu_path": [
@@ -2108,91 +2108,91 @@
 0
 ],
 "tg_slower_cut/default": [
-5.47,
+4.74,
 114
 ],
 "tg_slower_cut/parse": [
-5.88,
+5.62,
 114
 ],
 "tool_affall_1080p/default": [
-0.78,
+0.67,
 6
 ],
 "tool_affall_1080p/parse": [
-2.32,
+1.7,
 6
 ],
 "tool_affine_1080p/default": [
-0.82,
+1.02,
 6
 ],
 "tool_affine_1080p/parse": [
-2.26,
+2.49,
 6
 ],
 "tool_affnoprof_1080p/default": [
-0.71,
+0.66,
 6
 ],
 "tool_affnoprof_1080p/parse": [
-2.47,
+2.15,
 6
 ],
 "tool_bcw_1080p/default": [
-0.83,
+0.52,
 6
 ],
 "tool_bcw_1080p/parse": [
-2.69,
+1.52,
 6
 ],
 "tool_bdof_1080p/default": [
-0.86,
+0.73,
 6
 ],
 "tool_bdof_1080p/parse": [
-2.4,
+2.01,
 6
 ],
 "tool_bdofall_1080p/default": [
-1.05,
+0.62,
 6
 ],
 "tool_bdofall_1080p/parse": [
-16.71,
+16.01,
 6
 ],
 "tool_bdofnodmvr_1080p/default": [
-0.51,
+0.56,
 6
 ],
 "tool_bdofnodmvr_1080p/parse": [
-2.58,
+2.14,
 6
 ],
 "tool_both_1080p/default": [
-0.71,
+0.7,
 6
 ],
 "tool_both_1080p/parse": [
-2.31,
+1.89,
 6
 ],
 "tool_ciip_1080p/default": [
-0.65,
+0.59,
 6
 ],
 "tool_ciip_1080p/parse": [
-3.52,
+4.7,
 6
 ],
 "tool_ciip_4k/default": [
-0.78,
+1.5,
 6
 ],
 "tool_ciip_4k/parse": [
-1.59,
+2.12,
 6
 ],
 "tool_ciip_mtt/default": [
@@ -2200,191 +2200,191 @@
 6
 ],
 "tool_ciip_mtt/parse": [
-6.14,
+5.51,
 6
 ],
 "tool_fg_1080p/default": [
-0.6,
+0.64,
 6
 ],
 "tool_fg_1080p/parse": [
-2.24,
+1.79,
 6
 ],
 "tool_fg_1906/default": [
-0.79,
+0.59,
 6
 ],
 "tool_fg_1906/parse": [
-1.37,
-6
-],
-"tool_fg_8bit/default": [
-0.86,
-6
-],
-"tool_fg_8bit/parse": [
-5.65,
-6
-],
-"tool_fg_crop/default": [
-0.44,
-6
-],
-"tool_fg_crop/parse": [
-1.39,
-6
-],
-"tool_fg_tg4k/default": [
-1.26,
-6
-],
-"tool_fg_tg4k/parse": [
-1.65,
-6
-],
-"tool_fg_tg4k_b/default": [
-1.03,
-6
-],
-"tool_fg_tg4k_b/parse": [
-1.74,
-6
-],
-"tool_gpm_1080p/default": [
-0.55,
-6
-],
-"tool_gpm_1080p/parse": [
-2.01,
-6
-],
-"tool_gpmall_1080p/default": [
-0.73,
-6
-],
-"tool_gpmall_1080p/parse": [
-2.2,
-6
-],
-"tool_inter8bit_ctu64/default": [
-0.45,
-6
-],
-"tool_inter8bit_ctu64/parse": [
-1.56,
-6
-],
-"tool_interall_4k/default": [
-1.15,
-6
-],
-"tool_interall_4k/parse": [
-2.11,
-6
-],
-"tool_isp_1080p/default": [
-0.72,
-6
-],
-"tool_isp_1080p/parse": [
-4.43,
-6
-],
-"tool_isp_ai_4k/default": [
-1.12,
-6
-],
-"tool_isp_ai_4k/parse": [
-2.32,
-6
-],
-"tool_isp_med_ai/default": [
-0.41,
-4
-],
-"tool_isp_med_ai/parse": [
-2.15,
-4
-],
-"tool_lfnst_1080p/default": [
-0.67,
-6
-],
-"tool_lfnst_1080p/parse": [
-18.58,
-6
-],
-"tool_lfnst_med_ai/default": [
-0.39,
-4
-],
-"tool_lfnst_med_ai/parse": [
-2.0,
-4
-],
-"tool_lmcs_1080p/default": [
-0.66,
-6
-],
-"tool_lmcs_1080p/parse": [
-3.2,
-6
-],
-"tool_mip_1080p/default": [
-0.71,
-6
-],
-"tool_mip_1080p/parse": [
-18.27,
-6
-],
-"tool_mip_8bit_ctu64/default": [
-0.51,
-6
-],
-"tool_mip_8bit_ctu64/parse": [
-1.69,
-6
-],
-"tool_mip_ai_4k/default": [
 1.11,
 6
 ],
+"tool_fg_8bit/default": [
+0.88,
+6
+],
+"tool_fg_8bit/parse": [
+3.21,
+6
+],
+"tool_fg_crop/default": [
+0.55,
+6
+],
+"tool_fg_crop/parse": [
+1.57,
+6
+],
+"tool_fg_tg4k/default": [
+1.49,
+6
+],
+"tool_fg_tg4k/parse": [
+2.27,
+6
+],
+"tool_fg_tg4k_b/default": [
+1.81,
+6
+],
+"tool_fg_tg4k_b/parse": [
+2.13,
+6
+],
+"tool_gpm_1080p/default": [
+0.82,
+6
+],
+"tool_gpm_1080p/parse": [
+1.68,
+6
+],
+"tool_gpmall_1080p/default": [
+0.76,
+6
+],
+"tool_gpmall_1080p/parse": [
+1.64,
+6
+],
+"tool_inter8bit_ctu64/default": [
+0.59,
+6
+],
+"tool_inter8bit_ctu64/parse": [
+1.91,
+6
+],
+"tool_interall_4k/default": [
+1.39,
+6
+],
+"tool_interall_4k/parse": [
+2.3,
+6
+],
+"tool_isp_1080p/default": [
+0.62,
+6
+],
+"tool_isp_1080p/parse": [
+4.38,
+6
+],
+"tool_isp_ai_4k/default": [
+1.52,
+6
+],
+"tool_isp_ai_4k/parse": [
+2.42,
+6
+],
+"tool_isp_med_ai/default": [
+0.38,
+4
+],
+"tool_isp_med_ai/parse": [
+1.75,
+4
+],
+"tool_lfnst_1080p/default": [
+0.61,
+6
+],
+"tool_lfnst_1080p/parse": [
+17.13,
+6
+],
+"tool_lfnst_med_ai/default": [
+0.43,
+4
+],
+"tool_lfnst_med_ai/parse": [
+1.8,
+4
+],
+"tool_lmcs_1080p/default": [
+0.75,
+6
+],
+"tool_lmcs_1080p/parse": [
+3.87,
+6
+],
+"tool_mip_1080p/default": [
+0.74,
+6
+],
+"tool_mip_1080p/parse": [
+17.15,
+6
+],
+"tool_mip_8bit_ctu64/default": [
+0.42,
+6
+],
+"tool_mip_8bit_ctu64/parse": [
+1.17,
+6
+],
+"tool_mip_ai_4k/default": [
+1.54,
+6
+],
 "tool_mip_ai_4k/parse": [
-1.99,
+2.35,
 6
 ],
 "tool_mrl_1080p/default": [
-0.47,
+0.65,
 6
 ],
 "tool_mrl_1080p/parse": [
-5.14,
+3.56,
 6
 ],
 "tool_mrl_ai_4k/default": [
-1.23,
+1.35,
 6
 ],
 "tool_mrl_ai_4k/parse": [
-2.59,
+2.95,
 6
 ],
 "tool_sbt_1080p/default": [
-0.49,
+0.53,
 6
 ],
 "tool_sbt_1080p/parse": [
-2.26,
+2.79,
 6
 ],
 "tool_sbtmvp_1080p/default": [
-0.81,
+0.68,
 6
 ],
 "tool_sbtmvp_1080p/parse": [
-2.62,
+1.82,
 6
 ],
 "vq1080/default": [
