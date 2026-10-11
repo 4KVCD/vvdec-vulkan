@@ -73,8 +73,8 @@ The next picture's front end reads the refined motion through TMVP, which is why
 pictures' first parts.
 
 **Pass order inside the picture**: residuals (`trafo.slang`) -> inter prediction (`inter.slang`) -> intra prediction
-in dependency waves (`intra.slang`) -> LMCS inverse mapping (`lmcs.slang`) -> deblocking (`deblock.slang`) -> SAO
-(`sao.slang`) -> ALF and CC-ALF (`alf.slang`). Film grain (`filmgrain.slang`, `GpuFilmGrain`) is applied to the
+in dependency waves (`intra.slang`) -> LMCS inverse mapping (`lmcs.slang`) -> deblocking (`deblock.slang`) -> SAO,
+in place on the CTUs that use it (`sao.slang`) -> ALF and CC-ALF (`alf.slang`). Film grain (`filmgrain.slang`, `GpuFilmGrain`) is applied to the
 output frames, not to the reference pictures.
 
 ## Glossary
@@ -82,8 +82,8 @@ output frames, not to the reference pictures.
 - **host plane / twin**: every picture plane lives in host memory that the GPU can reach (`hostPictureAllocator`),
   where vvdec's CPU code reads and writes it. Its **twin** is a copy in the GPU's own memory, where the GPU
   reconstructs the picture and keeps it as a reference picture.
-- **scratch planes**: picture-sized GPU memory taken from a pool for SAO's and ALF's output; after ALF they become
-  the picture's twin.
+- **scratch planes**: picture-sized GPU memory taken from a pool for ALF's output; after ALF they become the
+  picture's twin.
 - **first part / rest**: the two command buffers of a picture's work on the compute queue (see above).
 - **front end**: everything between parsing and reconstruction: motion derivation, deblocking parameters, job
   lists, intra order, deblocking edges.

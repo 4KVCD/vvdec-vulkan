@@ -208,7 +208,7 @@ GpuRecon::~GpuRecon()
   m_ctx->destroySemaphore( m_frontEnd2Done );
   m_ctx->destroyCommandPool( m_poolFrontEnd );
   m_ctx->destroyCommandPool( m_pool );
-  for( Buffer* buf: { &m_params, &m_refs, &m_dmvr, &m_intraSync, &m_subpics, &m_lmcs, &m_defer, &m_scaling, &m_tables.transform, &m_tables.lfnst,
+  for( Buffer* buf: { &m_params, &m_refs, &m_dmvr, &m_intraSync, &m_subpics, &m_lmcs, &m_defer, &m_saoRing, &m_scaling, &m_tables.transform, &m_tables.lfnst,
                       &m_tables.mip, &m_tables.geoWeights, &m_cpuJobs.trafo, &m_cpuJobs.inter, &m_cpuJobs.intra, &m_cpuJobs.earlyTrafo,
                       &m_cpuJobs.earlyInter, &m_cpuJobs.edges } )
   {
@@ -1008,21 +1008,17 @@ bool GpuRecon::recordInLoopFilters( const CodingStructure& cs, const PictureJobs
     static const std::vector<EdgeLists> noEdges;
     recordDeblock( cs, sets[cur], deblockParams(), jobs.useFrontEnd ? noEdges : *jobs.edges );   // in place
   }
-  if( sao || alf )
-  {
-    sets[1] = scratchPlanes( pic );
-  }
   if( sao )
   {
     if( deblock )
     {
       computeBarrier();
     }
-    recordSao( cs, sets[cur], sets[1 - cur], saoParams() );
-    cur = 1 - cur;
+    recordSao( cs, sets[cur], saoParams() );   // in place
   }
   if( alf )
   {
+    sets[1] = scratchPlanes( pic );
     if( deblock || sao )
     {
       computeBarrier();

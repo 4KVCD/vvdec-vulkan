@@ -335,8 +335,10 @@ struct AlfPush
 // The push constants of sao.slang
 struct SaoPush
 {
-  VkDeviceAddress src, dst, ctus;
-  int32_t         srcStride, dstStride, width, height, ctuWidth, ctuHeight, widthInCtus, comp, bitDepth, scaleX, scaleY;
+  VkDeviceAddress plane0, plane1, plane2, ctus, list;
+  int32_t         count;
+  VkDeviceAddress ring;
+  int32_t         stride0, stride12, width, height, ctuWidth, ctuHeight, widthInCtus, bitDepth, scaleX, scaleY, ringSlot, pass, aligned;
   int32_t         numVbVer, numVbHor, vbVer[3], vbHor[3];
 };
 
@@ -362,10 +364,16 @@ static void setVirtualBoundaries( const PicHeader& picHeader, Push& push )
 }
 
 // SAO's parameters: per CTU and component, 8 int16_t (sao.slang): the type (-1: off), the band position, the
-// neighbours' availability, then the four offsets
+// neighbours' availability, then the four offsets. Then the list of the CTUs' components whose SAO is on, the ones
+// sao.slang filters: per entry a uint32_t, the CTU's raster index | the component << 24.
+static size_t saoListOffset( const CodingStructure& cs )
+{
+  return size_t( cs.pcv->sizeInCtus ) * 3 * 8 * sizeof( int16_t );
+}
+
 size_t GpuRecon::saoParamSize( const CodingStructure& cs )
 {
-  return ( size_t( cs.pcv->sizeInCtus ) * 3 * 8 * sizeof( int16_t ) + 255 ) & ~size_t( 255 );
+  return ( saoListOffset( cs ) + size_t( cs.pcv->sizeInCtus ) * 3 * sizeof( uint32_t ) + 255 ) & ~size_t( 255 );
 }
 
 bool GpuRecon::prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8_t* base )
@@ -373,7 +381,8 @@ bool GpuRecon::prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8
   const int numCtus = (int) cs.pcv->sizeInCtus;
   const int numComp = (int) getNumberValidComponents( cs.pcv->chrFormat );
   int16_t*  ctus    = reinterpret_cast<int16_t*>( base );
-  bool      any     = false;
+  uint32_t* list    = reinterpret_cast<uint32_t*>( base + saoListOffset( cs ) );
+  uint32_t  entries = 0;
 
   // in raster order: a merged CTU copies the parameters of its left or above neighbour
   for( int ctuIdx = 0; ctuIdx < numCtus; ctuIdx++ )
@@ -400,8 +409,8 @@ bool GpuRecon::prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8
       {
         avail = sao.neighbourAvailability( cs, ctuIdx );
       }
-      any    = true;
-      ctu[0] = int16_t( offset.typeIdc );
+      list[entries++] = uint32_t( ctuIdx ) | uint32_t( comp ) << 24;
+      ctu[0]          = int16_t( offset.typeIdc );
       ctu[2] = avail;
       if( offset.typeIdc == SAO_TYPE_BO )
       {
@@ -420,50 +429,60 @@ bool GpuRecon::prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8
       }
     }
   }
-  return any;
+  m_prepared.saoEntries = entries;
+  return entries > 0;
 }
 
-void GpuRecon::recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params )
+void GpuRecon::recordSao( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params )
 {
   const PreCalcValues& pcv = *cs.pcv;
+  // Per list entry, a ring: the rows above and below the CTU (its width and 2 samples more each), the columns left and
+  // right of it
+  const int    ringSlot = 2 * ( int( pcv.maxCUWidth ) + 2 ) + 2 * int( pcv.maxCUHeight );
+  const size_t ringSize = size_t( m_prepared.saoEntries ) * size_t( ringSlot ) * sizeof( int16_t );
+  if( m_saoRing.size < ringSize )
+  {
+    m_ctx->free( m_saoRing );
+    m_saoRing = m_ctx->alloc( ( ringSize + 65535 ) & ~size_t( 65535 ), MemKind::Device );
+  }
+  SaoPush push{};
+  push.plane0       = planes.addr[COMPONENT_Y];
+  push.plane1       = planes.addr[COMPONENT_Cb];
+  push.plane2       = planes.addr[COMPONENT_Cr];
+  push.ctus         = params;
+  push.list         = params + saoListOffset( cs );
+  push.count        = int32_t( m_prepared.saoEntries );
+  push.ring         = m_saoRing.addr;
+  push.stride0      = planes.stride[COMPONENT_Y];
+  push.stride12     = planes.stride[COMPONENT_Cb];
+  push.width        = pcv.lumaWidth;
+  push.height       = pcv.lumaHeight;
+  push.ctuWidth     = pcv.maxCUWidth;
+  push.ctuHeight    = pcv.maxCUHeight;
+  push.widthInCtus  = pcv.widthInCtus;
+  push.bitDepth     = cs.sps->getBitDepth();
+  push.scaleX       = getComponentScaleX( COMPONENT_Cb, pcv.chrFormat );
+  push.scaleY       = getComponentScaleY( COMPONENT_Cb, pcv.chrFormat );
+  push.ringSlot     = ringSlot;
+  setVirtualBoundaries( *cs.picHeader, push );
+  // the planes whose groups of 4 samples the shader may load and store whole (8-byte aligned)
   for( int comp = 0; comp < (int) getNumberValidComponents( pcv.chrFormat ); comp++ )
   {
-    const ComponentID compID = ComponentID( comp );
-    SaoPush           push{};
-    push.src         = src.addr[compID];
-    push.dst         = dst.addr[compID];
-    push.ctus        = params;
-    push.srcStride   = src.stride[compID];
-    push.dstStride   = dst.stride[compID];
-    push.width       = pcv.lumaWidth >> getComponentScaleX( compID, pcv.chrFormat );
-    push.height      = pcv.lumaHeight >> getComponentScaleY( compID, pcv.chrFormat );
-    push.ctuWidth    = pcv.maxCUWidth >> getComponentScaleX( compID, pcv.chrFormat );
-    push.ctuHeight   = pcv.maxCUHeight >> getComponentScaleY( compID, pcv.chrFormat );
-    push.widthInCtus = pcv.widthInCtus;
-    push.comp        = comp;
-    push.bitDepth    = cs.sps->getBitDepth();
-    push.scaleX      = getComponentScaleX( compID, pcv.chrFormat );
-    push.scaleY      = getComponentScaleY( compID, pcv.chrFormat );
-    setVirtualBoundaries( *cs.picHeader, push );
-    // Eight samples a thread (sao_vec8) where the rows and the parameters allow 16-byte loads and stores: rows that
-    // start 16-byte aligned, and room in each row for the eight samples read from the last thread's start (a chroma
-    // row may end 4 samples into them); else one sample a thread
-    const int  rowRoom = ( push.width + 7 ) & ~7;
-    const bool vec8    = push.src % 16 == 0 && push.dst % 16 == 0 && params % 16 == 0 && push.srcStride % 8 == 0 && push.dstStride % 8 == 0
-                      && push.width % 4 == 0 && push.srcStride >= rowRoom && push.dstStride >= rowRoom;
-    bind( vec8 ? kShader_sao_vec8 : kShader_sao );
-    pushConstants( push );
-    if( vec8 )
+    if( planes.addr[comp] % 8 == 0 && planes.stride[comp] % 4 == 0 )
     {
-      // a workgroup per 64x8 samples
-      dispatchGroups( uint32_t( ( push.width + 63 ) / 64 ), uint32_t( ( push.height + 7 ) / 8 ) );
-    }
-    else
-    {
-      // a workgroup per 16x16 samples
-      dispatchGroups( uint32_t( ( push.width + 15 ) / 16 ), uint32_t( ( push.height + 15 ) / 16 ) );
+      push.aligned |= 1 << comp;
     }
   }
+  CHECK( getNumberValidComponents( pcv.chrFormat ) > 1 && planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
+  // pass 0 saves the rings, pass 1 filters the CTUs in place: a workgroup per entry each
+  bind( kShader_sao );
+  push.pass = 0;
+  pushConstants( push );
+  dispatchJobs( m_prepared.saoEntries );
+  computeBarrier();
+  push.pass = 1;
+  pushConstants( push );
+  dispatchJobs( m_prepared.saoEntries );
   mark( "sao" );
 }
 

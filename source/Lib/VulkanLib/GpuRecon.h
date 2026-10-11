@@ -267,9 +267,8 @@ private:
   // The first part: the picture's planes uploaded (when the CPU made the residuals), the front end (without the
   // async queue), the residuals and inter prediction.
   void recordFirstPart( const CodingStructure& cs, const PictureJobs& jobs, const PelStorage& pic, const Planes& planes, bool frontEndAsync );
-  // The in-loop filters, from planes (the picture's twin) on: deblocking in place, then SAO and ALF, each from one
-  // set of planes to the other (the twin and the scratch planes). Returns whether the result ended in the scratch
-  // planes.
+  // The in-loop filters, from planes (the picture's twin) on: deblocking and SAO in place, then ALF from the twin
+  // into the scratch planes. Returns whether the result ended in the scratch planes.
   bool recordInLoopFilters( const CodingStructure& cs, const PictureJobs& jobs, const PelStorage& pic, const Planes& planes, bool alf );
 
   // --- The GPU front end (GpuReconFrontEnd.cpp) ---
@@ -345,7 +344,8 @@ private:
   // Deblocking, in place. edges: the CPU front end's edge lists per CTU (unused with the GPU front end).
   void recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params, const std::vector<EdgeLists>& edges );
   void uploadCpuEdges( const std::vector<EdgeLists>& edges, size_t first[5] );   // first: each list's first edge, then the total
-  void recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
+  // SAO in place, on the CTUs whose SAO is on (sao.slang)
+  void recordSao( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params );
   void recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
 
   // --- State ---
@@ -410,6 +410,7 @@ private:
     bool           deblock   = false, sao = false;
     bool           alfBounds = false;   // ALF's BOUNDS variants are needed (a CTU is split or clipped)
     size_t         dbSize = 0, alfSize = 0, saoSize = 0, lmcsSize = 0;
+    uint32_t       saoEntries = 0;      // the CTUs' components whose SAO is on (prepareSao's list)
   } m_prepared;
   std::vector<uint32_t> m_dequantOffsets;   // setDequantOffsets
   // LMCS (setPicture): its tables (the forward and inverse luma mappings, int16_t, then the chroma scales, int32_t)
@@ -418,6 +419,8 @@ private:
   Buffer m_lmcs;
   // The planes inter prediction keeps some predictions aside in, for intra jobs (LMCS's chroma scaling, CIIP)
   Buffer m_defer;
+  // SAO's rings (recordSao): the deblocked samples around each CTU it filters
+  Buffer m_saoRing;
   Planes m_deferPlanes{};
   // The dequantization matrices of explicit scaling lists (setPicture), a byte per factor
   bool   m_scalingOn = false;
