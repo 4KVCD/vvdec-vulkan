@@ -1718,27 +1718,67 @@ uint* waveRow( int c, int j )
   return pc.waveMap + c * planeSize + j * waveWidth( c );
 }
 
-// WaveMap::maxIn computed by the 32 threads of a row's workgroup (lane is the calling thread's), each thread taking
-// every 32nd unit; every thread gets the highest wave in the rectangle.
-int waveMaxInP( int c, int x, int y, int width, int height, int lane )
+// A rectangle of component c's map in units (WaveMap::maxIn's): its first unit (x0, y0), its width, its number of
+// units (0: empty)
+struct MapRect
 {
-  if( x + width <= 0 || y + height <= 0 )
+  int c, x0, y0, cols, n;
+};
+
+// The units of component c's map that the rectangle of samples (x, y, width, height) covers, cut at the map's edges
+MapRect mapRect( int c, int x, int y, int width, int height )
+{
+  MapRect r;
+  r.c        = c;
+  r.x0       = max( x, 0 ) >> waveShiftX( c );
+  r.y0       = max( y, 0 ) >> waveShiftY( c );
+  const int x1 = min( ( x + width - 1 ) >> waveShiftX( c ), waveWidth( c ) - 1 );
+  const int y1 = min( ( y + height - 1 ) >> waveShiftY( c ), waveHeight( c ) - 1 );
+  r.cols     = x1 - r.x0 + 1;
+  r.n        = x + width > 0 && y + height > 0 && r.cols > 0 && y1 >= r.y0 ? r.cols * ( y1 - r.y0 + 1 ) : 0;
+  return r;
+}
+
+MapRect noRect()
+{
+  MapRect r;
+  r.c = 0; r.x0 = 0; r.y0 = 0; r.cols = 1; r.n = 0;
+  return r;
+}
+
+// The map's entry of unit u of rectangle r (u < r.n)
+uint rectUnit( MapRect r, int u )
+{
+  const int j = r.y0 + int( ( float( u ) + 0.5f ) / float( r.cols ) );   // (exactly u / cols, since u and cols are small)
+  return waveRow( r.c, j )[r.x0 + u - ( j - r.y0 ) * r.cols];
+}
+
+// The highest wave of the thread's units of rectangle r past its first 32 (most rectangles have no more)
+int restMax( MapRect r, int lane )
+{
+  int wave = 0;
+  for( int u = lane + 32; u < r.n; u += 32 )
   {
-    return 0;
+    wave = max( wave, mapWave( rectUnit( r, u ) ) );
   }
-  const int x0   = max( x, 0 ) >> waveShiftX( c );
-  const int y0   = max( y, 0 ) >> waveShiftY( c );
-  const int x1   = min( ( x + width - 1 ) >> waveShiftX( c ), waveWidth( c ) - 1 );
-  const int y1   = min( ( y + height - 1 ) >> waveShiftY( c ), waveHeight( c ) - 1 );
-  const int cols = x1 - x0 + 1;
-  const int n    = cols > 0 && y1 >= y0 ? cols * ( y1 - y0 + 1 ) : 0;
-  int         wave = 0;
-  const float rcp  = 1.0f / float( max( cols, 1 ) );   // (exactly u / cols, since u and cols are small)
-  for( int u = lane; u < n; u += 32 )
-  {
-    const int j = y0 + int( ( float( u ) + 0.5f ) * rcp );
-    wave        = max( wave, mapWave( waveRow( c, j )[x0 + u - ( j - y0 ) * cols] ) );
-  }
+  return wave;
+}
+
+// The highest wave in five rectangles, worked out by the row's 32 threads (lane is the calling thread's): each
+// thread reads its unit of every rectangle's first 32 at once, then the rest of the larger rectangles
+int gatherMax( MapRect r0, MapRect r1, MapRect r2, MapRect r3, MapRect r4, int lane )
+{
+  const uint v0 = lane < r0.n ? rectUnit( r0, lane ) : 0u;
+  const uint v1 = lane < r1.n ? rectUnit( r1, lane ) : 0u;
+  const uint v2 = lane < r2.n ? rectUnit( r2, lane ) : 0u;
+  const uint v3 = lane < r3.n ? rectUnit( r3, lane ) : 0u;
+  const uint v4 = lane < r4.n ? rectUnit( r4, lane ) : 0u;
+  int wave = max( max( max( mapWave( v0 ), mapWave( v1 ) ), max( mapWave( v2 ), mapWave( v3 ) ) ), mapWave( v4 ) );
+  wave     = max( wave, restMax( r0, lane ) );
+  wave     = max( wave, restMax( r1, lane ) );
+  wave     = max( wave, restMax( r2, lane ) );
+  wave     = max( wave, restMax( r3, lane ) );
+  wave     = max( wave, restMax( r4, lane ) );
   return WaveActiveMax( wave );
 }
 
@@ -1759,9 +1799,22 @@ void waveSetP( int c, int x, int y, int width, int height, int wave, int lane )
   }
 }
 
-// Sets a job's wave to one above the highest wave of the samples it reads (the row's 32 threads work together).
-void jobWaveP( uint* job, int lane )
+// Word k of the job whose 12 words threads 0 .. 11 hold in words (one each)
+uint jobWord( uint words, int k )
 {
+  return WaveReadLaneAt( words, k );
+}
+
+// Sets a job's wave to one above the highest wave of the samples it reads (the row's 32 threads work together). The
+// job's words are in words (word k in thread k), read before (see WAVES); its wave goes to jobOut's word 7.
+void jobWaveP( uint* jobOut, uint words, int lane )
+{
+  uint job[12];
+  [unroll]
+  for( int k = 0; k < 12; k++ )
+  {
+    job[k] = k == 3 || k == 7 || k == 10 || k == 11 ? 0u : jobWord( words, k );   // (words 3, 7, 10 and 11 are not needed)
+  }
   const int  x     = int( job[0] & 0xffff );
   const int  y     = int( job[0] >> 16 );
   const int  w     = int( job[1] & 0xff );
@@ -1769,12 +1822,14 @@ void jobWaveP( uint* job, int lane )
   const int  c     = int( ( job[1] >> 16 ) & 0xff );
   const int  kind  = int( job[1] >> 24 );
   const uint flags = ( job[2] >> 8 ) & 0xff;
-  int        wave  = 0;
+  // The rectangles the job reads: IBC's block or the reference lines above and left (r0, r1), LMCS's neighbours
+  // (r2, r3), CCLM's luma (r4)
+  MapRect r0 = noRect(), r1 = noRect(), r2 = noRect(), r3 = noRect(), r4 = noRect();
   if( kind == kIntraIbc )
   {
     const int bvx = int( int16_t( job[6] & 0xffff ) );
     const int bvy = int( int16_t( job[6] >> 16 ) );
-    wave          = waveMaxInP( c, x + bvx, y + bvy, w, h, lane );
+    r0            = mapRect( c, x + bvx, y + bvy, w, h );
   }
   else if( kind != kIntraLmcs )
   {
@@ -1796,13 +1851,14 @@ void jobWaveP( uint* job, int lane )
       const int  y0      = first ? cy : y;
       const int  topLen  = first ? 2 * cw : cw + pw;
       const int  leftLen = first ? 2 * ch : ch + h;
-      wave               = max( waveMaxInP( 0, x0 - 1, y0 - 1, topLen + 1, 1, lane ), waveMaxInP( 0, x0 - 1, y0, 1, leftLen, lane ) );
+      r0                 = mapRect( 0, x0 - 1, y0 - 1, topLen + 1, 1 );
+      r1                 = mapRect( 0, x0 - 1, y0, 1, leftLen );
     }
     else
     {
       const int refLine = int( job[2] >> 24 );
-      wave = max( waveMaxInP( c, x - 1 - refLine, y - 1 - refLine, 2 * w + 1 + refLine, 1, lane ),
-                  waveMaxInP( c, x - 1 - refLine, y - refLine, 1, 2 * h + refLine, lane ) );
+      r0                = mapRect( c, x - 1 - refLine, y - 1 - refLine, 2 * w + 1 + refLine, 1 );
+      r1                = mapRect( c, x - 1 - refLine, y - refLine, 1, 2 * h + refLine );
     }
   }
   if( ( job[9] & 1 ) != 0 )
@@ -1812,22 +1868,23 @@ void jobWaveP( uint* job, int lane )
     const int count = 1 << ( ( job[9] >> 4 ) & 15 );
     if( ( job[9] & 2 ) != 0 )
     {
-      wave = max( wave, waveMaxInP( 0, ax - 1, ay, 1, count, lane ) );
+      r2 = mapRect( 0, ax - 1, ay, 1, count );
     }
     if( ( job[9] & 4 ) != 0 )
     {
-      wave = max( wave, waveMaxInP( 0, ax, ay - 1, count, 1, lane ) );
+      r3 = mapRect( 0, ax, ay - 1, count, 1 );
     }
   }
   if( kind == kIntraCclm )
   {
     const int lx    = x << pc.csx, ly = y << pc.csy, lw = w << pc.csx, lh = h << pc.csy;
     const int right = ( ( lx >> pc.log2Ctu ) + 2 ) << pc.log2Ctu;
-    wave            = max( wave, waveMaxInP( 0, lx - 4, ly - 4, min( 2 * lw + 8, right - ( lx - 4 ) ), 2 * lh + 8, lane ) );
+    r4              = mapRect( 0, lx - 4, ly - 4, min( 2 * lw + 8, right - ( lx - 4 ) ), 2 * lh + 8 );
   }
+  const int wave = gatherMax( r0, r1, r2, r3, r4, lane );
   if( lane == 0 )
   {
-    job[7] = uint( wave + 1 );
+    jobOut[7] = uint( wave + 1 );
   }
   waveSetP( c, x, y, w, h, wave + 1, lane );
 }
@@ -1897,9 +1954,16 @@ void main( uint3 local : SV_GroupThreadID )
         }
         AllMemoryBarrierWithGroupSync();
       }
+      // Each job's 12 words in one read (word k by thread k), the next job's while this one runs
+      uint next = lane < 12 ? pc.intra[range.x * 12 + lane] : 0u;
       for( int j = range.x; j < range.y; j++ )
       {
-        jobWaveP( pc.intra + j * 12, lane );
+        const uint words = next;
+        if( j + 1 < range.y )
+        {
+          next = lane < 12 ? pc.intra[( j + 1 ) * 12 + lane] : 0u;   // (the next job's, while this one runs)
+        }
+        jobWaveP( pc.intra + j * 12, words, lane );
         // (the job's wave-map units are written before the next job reads them)
         workgroupBarrierAll();
       }
