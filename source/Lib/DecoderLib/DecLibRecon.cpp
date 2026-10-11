@@ -503,7 +503,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   const PPS * pps = cs.pps.get();
 
   // The threads' resources and the GPU's commands are made with the instance's first picture, so that an idle
-  // instance holds none (with the GPU and the CPU front end, pictures up to 1080p use two of the four instances).
+  // instance holds none (with the GPU and the CPU front end, pictures up to 1080p use two of the three instances).
 #if VVDEC_VULKAN
   if( m_gpu && !m_gpuRecon )
   {

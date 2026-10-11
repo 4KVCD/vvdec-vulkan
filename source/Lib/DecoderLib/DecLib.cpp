@@ -197,11 +197,14 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
 
 #if VVDEC_VULKAN
   // with the GPU, more pictures in reconstruction at a time: the GPU finishes
-  // one while the CPU readies the next ones (VideoQ 4K: 2 -> 4 instances,
-  // 107 -> 126 fps; 5 no better, 8 worse)
+  // one while the CPU readies the next ones. Three: with the GPU's front end
+  // the slower-preset films decode as fast as with four (Top Gun 1080p 315.1
+  // vs 311.6 fps, Beekeeper 4K 142.3 vs 140.2; the CPU's parse 395.6 vs 397.2
+  // and 160.4 vs 161.3), and each instance holds a picture's GPU buffers (4K:
+  // device-local peak 750 -> 668 MB)
   if( m_gpu )
   {
-    m_decLibRecon.resize( 4 );
+    m_decLibRecon.resize( 3 );
   }
 #endif
   bool upscalingEnabled = false;
@@ -931,13 +934,14 @@ void DecLib::reconPicture( Picture* pcPic )
   size_t inTurn = m_decLibRecon.size();
 #if VVDEC_VULKAN
   // with the GPU and the CPU's front end, the pictures up to 1080p take the
-  // first two only: as fast as with four (VideoQ 1080p 685 vs 675 fps; two
-  // films' 1080p within 0.5%), with two pictures fewer in reconstruction and
-  // two instances' buffers not allocated (VideoQ 1080p: peak commit 580 -> 477
-  // MB). Larger pictures take all four (3840x1608 and 4K: 1.3% and 2.0% faster
-  // than with two), and with the GPU's front end all pictures do: a picture's
-  // front end waits for its colocated picture's first part, more pictures in
-  // flight keep the GPU busy (VideoQ 1080p +9%, peak commit +140 MB).
+  // first two only: as fast as with four instances (VideoQ 1080p 685 vs 675
+  // fps; two films' 1080p within 0.5%), with fewer pictures in reconstruction
+  // and the other instances' buffers not allocated (VideoQ 1080p: peak commit
+  // 580 -> 477 MB with four). Larger pictures take them all (3840x1608 and 4K
+  // with four: 1.3% and 2.0% faster than with two), and with the GPU's front
+  // end all pictures do: a picture's front end waits for its colocated
+  // picture's first part, more pictures in flight keep the GPU busy (VideoQ
+  // 1080p, four against two: +9%, peak commit +140 MB).
   const bool gpuFrontEnd = m_gpu && m_gpu->options().frontEnd && !m_gpu->options().frontEndCheck;
   if( m_gpu && pcPic->lumaSize().area() <= 1920 * 1088 && !gpuFrontEnd )
   {
