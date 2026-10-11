@@ -119,6 +119,10 @@ public:
   void releasePlanes( Picture& pic );
   // Whether the picture has its planes (not their stand-ins)
   bool hasPlanes( const Picture& pic ) const;
+  // Locks the pool: while the lock is held, no picture's planes, stand-ins or twins change places. For a thread that
+  // reads the plane records of a picture the pool may be handling at the same time (GpuRecon::writeRefTable, the
+  // reference pictures' twins).
+  std::unique_lock<std::mutex> lockPlanes() { return std::unique_lock<std::mutex>( m_mutex ); }
 
   // --- The download of a picture whose work went to the GPU with stand-ins of its planes (Picture::gpuNeedsDownload:
   // its twins hold it): only when it is about to be output, so that the pictures waiting for their turn (in random

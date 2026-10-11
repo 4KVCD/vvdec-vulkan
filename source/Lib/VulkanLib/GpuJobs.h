@@ -395,8 +395,10 @@ struct LmcsTables
 struct CuRecord;
 struct TuRecord;
 
-// A picture's jobs, per CTU, for the passes that run on the GPU (null: the CPU ran that pass).
 class ParsedPicture;
+class PlanePool;
+
+// A picture's jobs, per CTU, for the passes that run on the GPU (null: the CPU ran that pass).
 
 struct PictureJobs
 {
@@ -424,6 +426,9 @@ struct PictureJobs
   // VVDEC_GPU_PARSE=2: the GPU parsed the picture instead of the CPU (ParseService): the front end reads its records
   // where the parse left them, and cus and tus are empty
   const ParsedPicture*                      parsed        = nullptr;
+  // VVDEC_GPU_PARSE=2: the pool that gives the pictures their planes and takes them back on other threads, moving
+  // their twins as it does (GpuRecon::writeRefTable reads the reference pictures' twins under its lock)
+  PlanePool*                                planes        = nullptr;
 };
 
 }   // namespace gpu

@@ -1612,6 +1612,7 @@ gpu::PictureJobs DecLibRecon::gpuPictureJobs( const CodingStructure& cs ) const
   jobs.earlyCtus = size_t( m_gpuEarlyRows ) * cs.pcv->widthInCtus;
   jobs.cus       = ( m_gpuFrontEndCheck || m_gpuFrontEnd ) && m_gpuIntra ? &m_gpuCuRecords : nullptr;
   jobs.tus       = &m_gpuTuRecords;
+  jobs.planes    = m_gpuPlanes;
   if( m_gpuFrontEnd )
   {
     // the GPU front end makes the jobs and the edges

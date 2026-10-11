@@ -619,9 +619,18 @@ struct RefEntry
 };
 static_assert( sizeof( RefEntry ) == 64, "the reference table laid out differently from shaders/inter.slang's" );
 
-void GpuRecon::writeRefTable( const CodingStructure& cs, const RefTable& refs, const PelStorage& pic, std::vector<const Picture*>& uploads )
+void GpuRecon::writeRefTable( const CodingStructure& cs, const PictureJobs& jobs, const PelStorage& pic, std::vector<const Picture*>& uploads )
 {
-  const size_t size = std::max<size_t>( refs.pictures().size(), 1 ) * sizeof( RefEntry );
+  // A reference picture the GPU parsed gets its planes for its output, and gives them back, on other threads
+  // (PlanePool), which moves its twins from one set of plane records to the other. Its records are read under the
+  // pool's lock, or a read could find them half swapped: a wrong address for the GPU, or a layout check failing.
+  std::unique_lock<std::mutex> lock;
+  if( jobs.planes )
+  {
+    lock = jobs.planes->lockPlanes();
+  }
+  const RefTable& refs = *jobs.refs;
+  const size_t    size = std::max<size_t>( refs.pictures().size(), 1 ) * sizeof( RefEntry );
   if( m_refs.size < size )
   {
     m_ctx->free( m_refs );
@@ -812,7 +821,7 @@ void GpuRecon::startEarlyRows( CodingStructure& cs, const PictureJobs& jobs, siz
   std::vector<const Picture*> uploads;
   if( jobs.inter )
   {
-    writeRefTable( cs, *jobs.refs, pic, uploads );
+    writeRefTable( cs, jobs, pic, uploads );
   }
   // the early rows come only with the CPU front end
   m_useFrontEnd   = false;
@@ -872,7 +881,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   {
     if( jobs.inter || ( jobs.useFrontEnd && jobs.frontEndInter ) )
     {
-      writeRefTable( cs, *jobs.refs, pic, uploads );
+      writeRefTable( cs, jobs, pic, uploads );
     }
     m_earlyRowsMarks = 0;
   }

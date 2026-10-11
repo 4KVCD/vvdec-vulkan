@@ -251,7 +251,7 @@ private:
   void     copyPlanes( const PelStorage& pic, int from, int to );
   // Writes the reference table into m_refs: the reference pictures' planes on the GPU, laid out as pic's. Appends
   // to uploads the reference pictures the CPU reconstructed (or filled in), which must be copied to the GPU first.
-  void     writeRefTable( const CodingStructure& cs, const RefTable& refs, const PelStorage& pic, std::vector<const Picture*>& uploads );
+  void     writeRefTable( const CodingStructure& cs, const PictureJobs& jobs, const PelStorage& pic, std::vector<const Picture*>& uploads );
   // With subpictures treated as pictures: writes each CTU's rectangle (its subpicture's or the picture's) into
   // m_subpics and returns its address. Otherwise returns 0.
   VkDeviceAddress subpicRects( const CodingStructure& cs );
