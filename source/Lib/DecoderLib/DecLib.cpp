@@ -217,11 +217,18 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
 #endif
   m_decLibParser.create  ( m_decodeThreadPool.get(), m_parseFrameDelay, (int) m_decLibRecon.size(), numDecThreads, errHandlingFlags );
 
+#if VVDEC_VULKAN
+  // what the instances share (the front end's ranges; with the GPU's parse, the deferred predictions' planes)
+  if( m_gpu )
+  {
+    m_gpuShared = std::make_unique<gpu::SharedReconBuffers>( m_gpu );
+  }
+#endif
   int id=0;
   for( auto &dec: m_decLibRecon )
   {
 #if VVDEC_VULKAN
-    dec.create( m_decodeThreadPool.get(), id++, upscalingEnabled, m_gpu );
+    dec.create( m_decodeThreadPool.get(), id++, upscalingEnabled, m_gpu, m_gpuShared.get() );
 #else
     dec.create( m_decodeThreadPool.get(), id++, upscalingEnabled );
 #endif
@@ -237,11 +244,9 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
     m_picListManager.setGpuPlanes( planes->standIns(), [planes]( Picture& pic ) { planes->release( pic ); },
                                    [planes]( Picture& pic ) { planes->releasePlanes( pic ); } );
     m_decLibParser.setGpuParseService( m_gpuParseService.get(), m_gpuPlanes.get() );
-    // what the instances take turns with (the deferred predictions' planes: gpu::SharedReconBuffers)
-    m_gpuShared = std::make_unique<gpu::SharedReconBuffers>( m_gpu );
     for( auto& dec: m_decLibRecon )
     {
-      dec.setGpuParseService( m_gpuParseService.get(), m_gpuPlanes.get(), m_gpuShared.get() );
+      dec.setGpuParseService( m_gpuParseService.get(), m_gpuPlanes.get() );
     }
   }
 #endif

@@ -57,6 +57,12 @@ namespace vvdec
 namespace gpu
 {
 
+VkDeviceSize RangeArena::chunkSizeFor( size_t lumaSamples )
+{
+  constexpr VkDeviceSize kMB = VkDeviceSize( 1 ) << 20;
+  return std::min( ( 2 * VkDeviceSize( lumaSamples ) + kMB - 1 ) / kMB * kMB, 8 * kMB );
+}
+
 RangeArena::~RangeArena()
 {
   for( auto& chunk: m_chunks )

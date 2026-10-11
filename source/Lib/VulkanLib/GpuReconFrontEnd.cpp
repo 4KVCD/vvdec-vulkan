@@ -319,12 +319,43 @@ void GpuRecon::ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, 
     ensureBuffer( m_ctx, m_frontEnd.tus, std::max<size_t>( numTus, 1 ) * sizeof( TuRecord ), MemKind::Upload );
     ensureBuffer( m_ctx, m_frontEnd.ctus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::Upload );
   }
+  {
+    std::lock_guard<std::mutex> lock( m_shared->frontEndMutex );
+    m_shared->frontEnd.setChunkSize( RangeArena::chunkSizeFor( size_t( pcv.lumaWidth ) * pcv.lumaHeight ) );
+  }
   ensureBuffer( m_ctx, m_frontEnd.cuMapLuma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
   ensureBuffer( m_ctx, m_frontEnd.cuMapChroma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, m_frontEnd.cuMotion, std::max<size_t>( numCus, 1 ) * 16 * sizeof( int32_t ), MemKind::Device );
+  takeFrontEnd( m_frontEnd.cuMotion, std::max<size_t>( numCus, 1 ) * 16 * sizeof( int32_t ) );
   ensureBuffer( m_ctx, m_frontEnd.motion, motionBytes( pcv ), MemKind::Device );
   // (mider.slang's progress: per CTU row and tile column, then the segments taken)
   ensureBuffer( m_ctx, m_frontEnd.rowProgress, ( size_t( pcv.heightInCtus ) * cs.pps->getNumTileColumns() + 1 ) * sizeof( uint32_t ), MemKind::Device );
+}
+
+void GpuRecon::takeFrontEnd( Buffer& buf, size_t size )
+{
+  if( buf.valid() )
+  {
+    CHECK_FATAL( buf.size < size, "Vulkan: a front end buffer taken twice for a picture, larger the second time" );
+    return;
+  }
+  std::lock_guard<std::mutex> lock( m_shared->frontEndMutex );
+  buf = m_shared->frontEnd.take( size );
+  m_frontEndRanges.push_back( &buf );
+}
+
+void GpuRecon::giveFrontEnd()
+{
+  if( m_frontEndRanges.empty() )
+  {
+    return;
+  }
+  std::lock_guard<std::mutex> lock( m_shared->frontEndMutex );
+  for( Buffer* buf: m_frontEndRanges )
+  {
+    m_shared->frontEnd.give( *buf );
+  }
+  m_frontEndRanges.clear();
+  m_shared->frontEnd.tick();   // (a picture's)
 }
 
 void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
@@ -519,7 +550,7 @@ void GpuRecon::allocateJobBuffers( const CodingStructure& cs, const PictureJobs&
   for( int k = 0; k < 3; k++ )
   {
     m_frontEnd.jobCapacity[k] = counts[k] + 64;
-    ensureBuffer( m_ctx, m_frontEnd.jobs[k], m_frontEnd.jobCapacity[k] * kJobWords[k] * sizeof( uint32_t ), MemKind::Device );
+    takeFrontEnd( m_frontEnd.jobs[k], m_frontEnd.jobCapacity[k] * kJobWords[k] * sizeof( uint32_t ) );
     if( !m_useFrontEnd )
     {
       ensureBuffer( m_ctx, m_check.jobs[k], m_frontEnd.jobCapacity[k] * kJobWords[k] * sizeof( uint32_t ), MemKind::HostCached );
@@ -541,8 +572,8 @@ void GpuRecon::allocateJobBuffers( const CodingStructure& cs, const PictureJobs&
   }
   // per CU its five job counts; per block of 256 CUs their sums, then the totals
   m_frontEnd.jobBlockCount = int( ( numCus + 255 ) / 256 );
-  ensureBuffer( m_ctx, m_frontEnd.jobCounts, std::max<size_t>( numCus, 1 ) * 5 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, m_frontEnd.jobBlocks, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ), MemKind::Device );
+  takeFrontEnd( m_frontEnd.jobCounts, std::max<size_t>( numCus, 1 ) * 5 * sizeof( uint32_t ) );
+  takeFrontEnd( m_frontEnd.jobBlocks, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ) );
   if( !m_useFrontEnd )
   {
     ensureBuffer( m_ctx, m_check.jobBlocks, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ), MemKind::HostCached );
@@ -675,13 +706,13 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
   FrontEndBuffers& fe = m_frontEnd;
   fe.sortCapacity     = bands + 64;
   fe.sortBlocks       = int( ( fe.jobCapacity[2] + 1023 ) / 1024 );
-  ensureBuffer( m_ctx, fe.sortKeys, size_t( fe.sortBlocks ) * 1024 * 2 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, fe.sortHistogram, size_t( fe.sortBlocks ) * 256 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, fe.bandAt, size_t( fe.sortBlocks ) * 1024 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, fe.bandSums, ( size_t( fe.sortBlocks ) + 1 ) * sizeof( uint32_t ), MemKind::Device );
+  takeFrontEnd( fe.sortKeys, size_t( fe.sortBlocks ) * 1024 * 2 * sizeof( uint32_t ) );
+  takeFrontEnd( fe.sortHistogram, size_t( fe.sortBlocks ) * 256 * sizeof( uint32_t ) );
+  takeFrontEnd( fe.bandAt, size_t( fe.sortBlocks ) * 1024 * sizeof( uint32_t ) );
+  takeFrontEnd( fe.bandSums, ( size_t( fe.sortBlocks ) + 1 ) * sizeof( uint32_t ) );
   ensureBuffer( m_ctx, fe.waveFirst, 65536 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, fe.sortedBands, fe.sortCapacity * sizeof( IntraJob ), MemKind::Device );
-  ensureBuffer( m_ctx, fe.bandWaits, fe.sortCapacity * sizeof( uint32_t ), MemKind::Device );
+  takeFrontEnd( fe.sortedBands, fe.sortCapacity * sizeof( IntraJob ) );
+  takeFrontEnd( fe.bandWaits, fe.sortCapacity * sizeof( uint32_t ) );
   ensureBuffer( m_ctx, fe.sortFlags, 4 * sizeof( uint32_t ), MemKind::Device );
   if( !m_useFrontEnd )
   {
@@ -737,19 +768,19 @@ void GpuRecon::copyJobsForCheck( const PictureJobs& jobs )
   memoryBarrier( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT );
   for( int k = 0; k < 3; k++ )
   {
-    VkBufferCopy region{ 0, 0, m_frontEnd.jobCapacity[k] * kJobWords[k] * sizeof( uint32_t ) };
+    VkBufferCopy region{ m_frontEnd.jobs[k].offset, 0, m_frontEnd.jobCapacity[k] * kJobWords[k] * sizeof( uint32_t ) };
     vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.jobs[k].buffer, m_check.jobs[k].buffer, 1, &region );
   }
-  VkBufferCopy blocks{ 0, 0, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ) };
+  VkBufferCopy blocks{ m_frontEnd.jobBlocks.offset, 0, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ) };
   vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.jobBlocks.buffer, m_check.jobBlocks.buffer, 1, &blocks );
   if( jobs.intra )
   {
-    VkBufferCopy sorted{ 0, 0, m_frontEnd.sortCapacity * sizeof( IntraJob ) };
+    VkBufferCopy sorted{ m_frontEnd.sortedBands.offset, 0, m_frontEnd.sortCapacity * sizeof( IntraJob ) };
     vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.sortedBands.buffer, m_check.sortedBands.buffer, 1, &sorted );
-    VkBufferCopy waits{ 0, 0, m_frontEnd.sortCapacity * sizeof( uint32_t ) };
+    VkBufferCopy waits{ m_frontEnd.bandWaits.offset, 0, m_frontEnd.sortCapacity * sizeof( uint32_t ) };
     vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.bandWaits.buffer, m_check.bandWaits.buffer, 1, &waits );
     // the band count (the last of the band sums) and the flags, as sortInfo's words 0 and 2
-    VkBufferCopy count{ size_t( m_frontEnd.sortBlocks ) * sizeof( uint32_t ), 0, sizeof( uint32_t ) };
+    VkBufferCopy count{ m_frontEnd.bandSums.offset + size_t( m_frontEnd.sortBlocks ) * sizeof( uint32_t ), 0, sizeof( uint32_t ) };
     vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.bandSums.buffer, m_check.sortInfo.buffer, 1, &count );
     VkBufferCopy flags{ 0, 2 * sizeof( uint32_t ), sizeof( uint32_t ) };
     vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.sortFlags.buffer, m_check.sortInfo.buffer, 1, &flags );
@@ -779,7 +810,7 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs )
     }
   }
   m_frontEnd.edgeCapacity = m_useFrontEnd ? m_frontEnd.capacities.edges : cpu + 64;
-  ensureBuffer( m_ctx, m_frontEnd.edges, m_frontEnd.edgeCapacity * sizeof( Edge ), MemKind::Device );
+  takeFrontEnd( m_frontEnd.edges, m_frontEnd.edgeCapacity * sizeof( Edge ) );
   ensureBuffer( m_ctx, m_frontEnd.edgeCounts, size_t( pcv.sizeInCtus ) * 4 * sizeof( uint32_t ), MemKind::Device );
   ensureBuffer( m_ctx, m_frontEnd.edgeLists, kEdgeListsWords * sizeof( uint32_t ), MemKind::Device );
   if( !m_useFrontEnd )
@@ -822,7 +853,7 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs )
   }
   // the edges and the lists' firsts and counts, to host memory for compareFrontEnd
   memoryBarrier( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT );
-  VkBufferCopy edges{ 0, 0, m_frontEnd.edgeCapacity * sizeof( Edge ) };
+  VkBufferCopy edges{ m_frontEnd.edges.offset, 0, m_frontEnd.edgeCapacity * sizeof( Edge ) };
   m_ctx->api().vkCmdCopyBuffer( m_cmd, m_frontEnd.edges.buffer, m_check.edges.buffer, 1, &edges );
   VkBufferCopy lists{ 0, 0, kEdgeListsWords * sizeof( uint32_t ) };
   m_ctx->api().vkCmdCopyBuffer( m_cmd, m_frontEnd.edgeLists.buffer, m_check.edgeLists.buffer, 1, &lists );

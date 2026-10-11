@@ -89,25 +89,36 @@ namespace gpu
 
 struct JobsPush;   // (GpuReconFrontEnd.cpp)
 
-// What a decoder's GpuRecon instances take turns with when the GPU parses the pictures (VVDEC_GPU_PARSE=2): the
-// planes inter prediction keeps predictions aside in for intra jobs (GpuRecon::m_defer). Inter prediction writes them
-// in a picture's first part and intra prediction reads them in its rest, both on the compute queue, and each part
-// begins with a barrier over the work submitted before it. So an instance needs them only from the start of a
-// picture's recording until its rest is submitted (GpuRecon::SharedTurn): the next picture's work, submitted later,
-// runs after the work that used them. Two instances recording at the same time is rare (Beekeeper slower 4K: 5
-// pictures of 600 began while another was recorded, a recording taking ~1.6 ms), while each instance's own planes
-// held 19 MB at 4K. (The front end's buffers stay each instance's own: its front end runs on the instance's async
-// queue, beside the other pictures' work.)
+// What a decoder's GpuRecon instances share:
+// - The GPU memory of the front end's buffers whose size changes with the picture (the job lists, the CUs' motion and
+//   job counts, the intra order, the edges), as ranges of a RangeArena: each picture takes ranges of its sizes as its
+//   front end is recorded and gives them back once its work is done (GpuRecon::takeFrontEnd, endCompute). So they
+//   hold what the pictures in flight need, not each instance the most any of its pictures needed (Beekeeper slower
+//   4K: 54 MB in the three instances, where three pictures in a row need at most 28 MB). The rest of the front end's
+//   buffers have a picture's size whatever its content; they stay each instance's own (shared, the front ends, which
+//   run side by side on the instances' async queues, would have to wait for each other).
+// - When the GPU parses the pictures (VVDEC_GPU_PARSE=2), the planes inter prediction keeps predictions aside in for
+//   intra jobs (GpuRecon::m_defer), which the instances take turns with. Inter prediction writes them in a picture's
+//   first part and intra prediction reads them in its rest, both on the compute queue, and each part begins with a
+//   barrier over the work submitted before it. So an instance needs them only from the start of a picture's recording
+//   until its rest is submitted (GpuRecon::SharedTurn): the next picture's work, submitted later, runs after the work
+//   that used them. Two instances recording at the same time is rare (Beekeeper slower 4K: 5 pictures of 600 began
+//   while another was recorded, a recording taking ~1.6 ms), while each instance's own planes held 19 MB at 4K.
 struct SharedReconBuffers
 {
-  explicit SharedReconBuffers( Context* context ) : ctx( context ) {}
+  explicit SharedReconBuffers( Context* context ) : ctx( context ), frontEnd( context, kIdlePictures ) {}
   ~SharedReconBuffers();   // after the instances' work is done
   SharedReconBuffers( const SharedReconBuffers& )            = delete;
   SharedReconBuffers& operator=( const SharedReconBuffers& ) = delete;
 
+  // a chunk of the front end's ranges unused for this many pictures is freed (RangeArena::tick)
+  static constexpr uint64_t kIdlePictures = 64;
+
   Context*   ctx;
   std::mutex turn;   // held by the instance recording a picture with them
   Buffer     defer;
+  std::mutex frontEndMutex;   // (the instances take and give back ranges from their threads)
+  RangeArena frontEnd;
 };
 
 // The passes whose job counts the GPU front end works out (jobs.slang, intrasort.slang, edges.slang). For pass p,
@@ -129,7 +140,8 @@ enum FrontPass
 class GpuRecon
 {
 public:
-  explicit GpuRecon( Context* context );
+  // shared: what the decoder's instances share (it outlives them)
+  GpuRecon( Context* context, SharedReconBuffers* shared );
   ~GpuRecon();
   GpuRecon( const GpuRecon& )            = delete;
   GpuRecon& operator=( const GpuRecon& ) = delete;
@@ -331,6 +343,11 @@ private:
   // The front end's buffers for a picture of numCus CUs and numTus TUs
   // records: room for the records uploaded too (the CPU's parse)
   void   ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, size_t numTus, bool records = true );
+  // Room for size bytes in buf, a buffer of the front end's whose size changes with the picture: a range the
+  // instances share (SharedReconBuffers::frontEnd), the picture's until giveFrontEnd gives the picture's ranges back,
+  // once its work is done
+  void   takeFrontEnd( Buffer& buf, size_t size );
+  void   giveFrontEnd();
   void   recordMotion( const CodingStructure& cs, size_t numCus );
   void   recordDeblockParams( const CodingStructure& cs, size_t numCus );
   void   recordJobs( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );       // passes 0 to 2
@@ -392,7 +409,8 @@ private:
   static constexpr uint32_t kMaxMarks       = 64;   // profiling marks per picture
   static constexpr uint32_t kEarlyRowsMarks = 8;    // and in the early rows' submission
 
-  Context* m_ctx;
+  Context*            m_ctx;
+  SharedReconBuffers* m_shared;   // what the decoder's instances share
 
   // The compute queue's commands
   VkCommandPool   m_pool         = VK_NULL_HANDLE;
@@ -537,6 +555,7 @@ private:
 
     void release( Context* ctx );
   } m_frontEnd;
+  std::vector<Buffer*> m_frontEndRanges;   // those of its buffers that hold shared ranges (takeFrontEnd)
 
   // The check of the GPU parse (VVDEC_GPU_PARSE=1; GpuReconParse.cpp): its parse of the picture, what it needs
   // besides, its commands

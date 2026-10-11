@@ -135,8 +135,9 @@ static Buffer uploadGeoWeights( Context* ctx )
 // Construction
 // ====================================================================================================================
 
-GpuRecon::GpuRecon( Context* context ) : m_ctx( context )
+GpuRecon::GpuRecon( Context* context, SharedReconBuffers* shared ) : m_ctx( context ), m_shared( shared )
 {
+  CHECK_FATAL( !shared, "Vulkan: a GpuRecon without the buffers the decoder's instances share" );
   // the compute queue's commands: a picture's first part, its rest and its early rows
   m_pool = m_ctx->createCommandPool( m_ctx->queueFamily() );
   VkCommandBuffer cmds[3];
@@ -218,6 +219,7 @@ GpuRecon::~GpuRecon()
   {
     m_ctx->free( buf );
   }
+  giveFrontEnd();   // (its ranges first: release frees buffers of their own)
   m_frontEnd.release( m_ctx );
   m_check.release( m_ctx );
   m_parse.release( m_ctx );
@@ -367,6 +369,7 @@ void GpuRecon::endCompute()
     THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
   }
   readTimestamps( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - m_submitted ).count() );
+  giveFrontEnd();   // (the rest done: so are the front end's parts, which the picture's parts wait for)
 }
 
 void GpuRecon::endDownload( int turn )
@@ -738,7 +741,9 @@ Mv* GpuRecon::dmvrMvCache( size_t count )
 
 void GpuRecon::setPicture( const PelStorage& pic, const LmcsTables* tables, bool defer, const int* scalingMatrices, size_t scalingCount )
 {
-  // (the instance's previous picture is done: its work no longer reads these)
+  // (the instance's previous picture is done: its work no longer reads these, nor its front end's ranges, should
+  // endCompute not have given them back)
+  giveFrontEnd();
   m_scalingOn = scalingMatrices != nullptr;
   if( scalingMatrices )
   {

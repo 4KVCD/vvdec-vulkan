@@ -87,12 +87,11 @@ class DecLib
   gpu::Context*            m_gpu = nullptr;   // the Vulkan device, when the pictures are reconstructed on the GPU
   UserAllocator            m_gpuAllocator;    // the picture buffers then: host memory the GPU reaches
   size_t                   m_reconInTurn = 0; // the reconstruction instances the pictures take in turn (fewer for small pictures)
+  std::unique_ptr<gpu::SharedReconBuffers> m_gpuShared;   // what the reconstruction instances share
   // VVDEC_GPU_PARSE=2: the GPU's parse of the pictures ahead of their reconstruction, and the planes of the pictures
   // it parses, which they have only once their work goes to the GPU
   std::unique_ptr<gpu::ParseService> m_gpuParseService;
   std::unique_ptr<gpu::PlanePool>    m_gpuPlanes;
-  // and the buffers the reconstruction instances take turns with while each records a picture it parsed
-  std::unique_ptr<gpu::SharedReconBuffers> m_gpuShared;
 #endif
 
 public:

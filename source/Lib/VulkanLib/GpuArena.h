@@ -75,6 +75,11 @@ public:
 
   // The size of the chunks allocated from now on (a range larger than that gets a chunk of its own)
   void   setChunkSize( VkDeviceSize size ) { m_chunkSize = size; }
+  // The chunks' size for pictures of lumaSamples samples: twice that in bytes, in steps of 1 MB, at most 8 MB.
+  // (Replays of the parse's takes and gives: Beekeeper slower 4K, up to 96 MB of records and levels at once, held
+  // 105 MB in 8 MB chunks, 112 MB in 16 MB ones, 128 MB in 32 MB ones; Top Gun slower 1080p, up to 76 MB at once, held
+  // 80 MB in 4 MB chunks.)
+  static VkDeviceSize chunkSizeFor( size_t lumaSamples );
   // A range of GPU memory (MemKind::Device) of at least size bytes, in steps of kAlign
   Buffer take( VkDeviceSize size );
   // Takes the range back, for the next takes: the GPU must be done with it (or have its work on it queued before

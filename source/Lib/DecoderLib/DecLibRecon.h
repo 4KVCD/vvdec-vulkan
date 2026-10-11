@@ -198,7 +198,7 @@ private:
   gpu::ParseService* m_gpuParseService = nullptr;
   bool               m_gpuParseDrives  = false;
   gpu::PlanePool*    m_gpuPlanes       = nullptr;   // the planes of the pictures the GPU parses (DecLib's)
-  // the buffers the instances take turns with while each records a picture the GPU parsed (DecLib's)
+  // what the decoder's instances share (DecLib's)
   gpu::SharedReconBuffers* m_gpuShared = nullptr;
   // which of the current picture's passes run on the GPU (setUpGpuPicture)
   bool m_gpuFilters  = false;   // its in-loop filters
@@ -252,12 +252,13 @@ public:
   CLASS_COPY_MOVE_DELETE( DecLibRecon )
 
 #if VVDEC_VULKAN
-  void create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled, gpu::Context* gpu = nullptr );
-  void setGpuParseService( gpu::ParseService* service, gpu::PlanePool* planes, gpu::SharedReconBuffers* shared )
+  // shared: what the decoder's instances share (gpu::SharedReconBuffers), with the GPU
+  void create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled, gpu::Context* gpu = nullptr,
+               gpu::SharedReconBuffers* shared = nullptr );
+  void setGpuParseService( gpu::ParseService* service, gpu::PlanePool* planes )
   {
     m_gpuParseService = service;
     m_gpuPlanes       = planes;
-    m_gpuShared       = shared;
   }
 #else
   void create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled );

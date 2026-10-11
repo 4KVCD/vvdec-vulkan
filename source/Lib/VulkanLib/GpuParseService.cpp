@@ -823,20 +823,9 @@ ParseService::Counts ParseService::startRoom( const Picture& pic ) const
   return room;
 }
 
-// The size of the arena's chunks for a picture's records: twice its luma samples in bytes, in steps of 1 MB, at most
-// 8 MB. (Replays of the parse's takes and gives: Beekeeper slower 4K, up to 96 MB of records and levels at once, held
-// 105 MB in 8 MB chunks, 112 MB in 16 MB ones, 128 MB in 32 MB ones; Top Gun slower 1080p, up to 76 MB at once, held
-// 80 MB in 4 MB chunks.)
-static VkDeviceSize chunkSize( const Picture& pic )
-{
-  constexpr VkDeviceSize kMB  = VkDeviceSize( 1 ) << 20;
-  const VkDeviceSize     luma = VkDeviceSize( pic.cs->pcv->lumaWidth ) * pic.cs->pcv->lumaHeight;
-  return std::min( ( 2 * luma + kMB - 1 ) / kMB * kMB, 8 * kMB );
-}
-
 void ParseService::startPicture( Picture* pic )
 {
-  m_records.setChunkSize( chunkSize( *pic ) );
+  m_records.setChunkSize( RangeArena::chunkSizeFor( size_t( pic->cs->pcv->lumaWidth ) * pic->cs->pcv->lumaHeight ) );
   m_records.tick();
   ParseSlot* slot = takeSlot();
   slot->picture   = pic;

@@ -144,7 +144,7 @@ DecLibRecon::DecLibRecon()
 }
 
 #if VVDEC_VULKAN
-void DecLibRecon::create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled, gpu::Context* gpu )
+void DecLibRecon::create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled, gpu::Context* gpu, gpu::SharedReconBuffers* shared )
 #else
 void DecLibRecon::create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled )
 #endif
@@ -154,7 +154,8 @@ void DecLibRecon::create( ThreadPool* threadPool, unsigned instanceId, bool upsc
   new( this ) DecLibRecon;
 
 #if VVDEC_VULKAN
-  m_gpu = gpu;   // m_gpuRecon made with the instance's first picture (decompressPicture)
+  m_gpu       = gpu;   // m_gpuRecon made with the instance's first picture (decompressPicture)
+  m_gpuShared = shared;
 #endif
 
 
@@ -507,7 +508,7 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
 #if VVDEC_VULKAN
   if( m_gpu && !m_gpuRecon )
   {
-    m_gpuRecon             = std::make_unique<gpu::GpuRecon>( m_gpu );
+    m_gpuRecon             = std::make_unique<gpu::GpuRecon>( m_gpu, m_gpuShared );
     m_gpuFrontEndCheck     = m_gpu->options().frontEndCheck;
     m_gpuFrontEndRequested = m_gpu->options().frontEnd && !m_gpu->options().frontEndCheck;
     m_gpuParse             = m_gpu->options().parse && m_gpuFrontEndRequested;
