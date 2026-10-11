@@ -68,6 +68,8 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "GpuFrontEnd.h"
 #include "GpuParse.h"
 
+#include "CommonLib/CommonDef.h"
+
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -260,7 +262,13 @@ private:
   void           giveRecords( ParseSlot* slot );           // the slot's records and levels back to the arena
   void           giveSlot( ParseSlot* slot );              // the same, and the slot free
   void           startPicture( Picture* pic );             // its slot set up, among the pictures parsed
-  size_t         levelRoom( const Picture& pic ) const;    // the room for its levels when its parse starts
+  // A picture's records and levels, counted by its parse (with its slice data's bytes), or the room for them
+  struct Counts
+  {
+    size_t cus = 0, tus = 0, levels = 0, bytes = 0;
+    void   raise( const Counts& counts );   // each to the larger of the two
+  };
+  Counts         startRoom( const Picture& pic ) const;    // the room its parse starts with
   // The finished pictures' records copied (a submission on the copies' queue), then all the pictures' steps (one on
   // the parse queue), both waited for: the copied pictures are handed over as soon as the copy is done
   void           submit();
@@ -290,9 +298,9 @@ private:
   // larger pictures than now), while a chunk in use now and then stays.
   static constexpr uint64_t kIdlePictures = 64;
   RangeArena                m_records;
-  // the most records a picture of each kind had so far: the other pictures, intra ones
-  size_t                  m_maxCus[2] = {}, m_maxTus[2] = {};
-  size_t                  m_maxLevels[2] = {};   // the most levels a picture had so far: the other pictures, intra ones
+  // the most records and levels a picture had so far (startRoom): of the intra pictures, of the others, of the others
+  // in each temporal layer
+  Counts                  m_mostIntra, m_mostInter, m_mostLayer[MAX_TLAYER];
   VkCommandPool           m_pool  = VK_NULL_HANDLE;   // the steps' submission
   VkCommandBuffer         m_cmd   = VK_NULL_HANDLE;
   VkFence                 m_fence = VK_NULL_HANDLE;

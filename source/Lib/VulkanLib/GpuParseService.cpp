@@ -73,6 +73,7 @@ static constexpr uint32_t kParseMaxStalls    = 4;         // submissions in a ro
 static constexpr uint32_t kParseLocalBits    = 12;        // a meta word: the CTU above the record's place in the CTU
 static constexpr size_t   kParseCounters     = 8;         // the staged CUs and TUs, the room of the 5 job lists, the levels
 static constexpr size_t   kParseTotals       = 16;        // the CUs and TUs, then the counters (compaction pass 0)
+static constexpr size_t   kParseLevelChunk   = 4096;      // parse.slang's kLevelChunk: the levels a substream takes at a time
 static constexpr size_t   kGroupsPerRow      = 32768;     // the shaders take group.y as rows of 32768 workgroups
 
 // The service: each picture's dispatches in one submission (one, so that a picture is handed over as soon as it is
@@ -761,30 +762,65 @@ static bool intraPicture( const Picture& pic )
   return std::all_of( pic.slices.begin(), pic.slices.end(), []( const Slice* s ) { return s->isIntra(); } );
 }
 
-// The room for a picture's staged records (its CUs' or its TUs'): a quarter more than the most a picture of its kind
-// had so far; before the first, 32 a CTU for an intra picture (VideoQ's have up to 23 with the dual tree), 8 for the
-// others (VideoQ's have 2 to 4). A picture with more is parsed again (Overflow).
-static size_t recordRoom( size_t most, size_t ctus, bool intra )
+void ParseService::Counts::raise( const Counts& counts )
 {
-  return most > 0 ? most * 5 / 4 + 64 : ctus * ( intra ? 32 : 8 );
+  cus    = std::max( cus, counts.cus );
+  tus    = std::max( tus, counts.tus );
+  levels = std::max( levels, counts.levels );
+  bytes  = std::max( bytes, counts.bytes );
 }
 
-size_t ParseService::levelRoom( const Picture& pic ) const
+// The bytes of a picture's slice data
+static size_t sliceDataBytes( const Picture& pic )
 {
-  // all the levels a picture can have: one a sample of each plane
+  size_t bytes = 0;
+  for( const Slice* slice: pic.slices )
+  {
+    bytes += slice->parseTaskParams.gpuSliceData.size();
+  }
+  return bytes;
+}
+
+// The room a picture's parse starts with, for its staged records (CUs, TUs) and its levels. A picture with more is
+// parsed again (Overflow). The room is the most the pictures of its kind had so far (each count on its own), with
+// some to spare, and scaled up when the picture has more slice data than any of them had (by the ratio of the bytes,
+// at most 16):
+// - an intra picture: a quarter more than the intra pictures had;
+// - another picture: twice what the pictures of its temporal layer had, which are alike (Beekeeper slower 4K: layer 0
+//   up to 17,000 CUs, layer 5 up to 1,800); before its layer's first, a quarter more than any such picture had;
+// - before the first of its kind: 32 records a CTU for an intra picture (VideoQ's have up to 23 with the dual tree),
+//   8 for the others (VideoQ's have 2 to 4); half the samples' levels for an intra picture, a 32nd for the others.
+// The levels' room is at least a chunk a substream (each takes its levels in chunks), and at most twice the samples.
+// (The parse's counts replayed: Beekeeper slower 4K, a picture's room 2.75 MB with a quarter more than the most of its
+// kind, 1.27 MB with this, the pictures parsed again 14 and none; Top Gun slower 1080p, 2.14 and 0.88 MB, 6 and 1.)
+ParseService::Counts ParseService::startRoom( const Picture& pic ) const
+{
   const PreCalcValues& pcv     = *pic.cs->pcv;
   const size_t         luma    = size_t( pcv.lumaWidth ) * pcv.lumaHeight;
   const size_t         chroma  = isChromaEnabled( pcv.chrFormat )
                                    ? luma >> ( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) + getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) )
                                    : 0;
   const size_t         samples = luma + 2 * chroma;
-  // a quarter more than the most a picture of its kind had so far; before the first, half the samples for an intra
-  // picture, a 32nd for the others (whose levels are few); at most twice the samples (the substreams take the levels
-  // in chunks, whose ends may stay unused)
-  const bool   intra = intraPicture( pic );
-  const size_t most  = m_maxLevels[intra ? 1 : 0];
-  const size_t room  = most > 0 ? most * 5 / 4 + 4096 : ( intra ? samples / 2 : samples / 32 );
-  return std::min( room, 2 * samples + 65536 );
+  const size_t         ctus    = pcv.sizeInCtus;
+  const bool           intra   = intraPicture( pic );
+  const Counts*        layer   = !intra && pic.tempLayer < MAX_TLAYER ? &m_mostLayer[pic.tempLayer] : nullptr;
+  const Counts*        kind    = intra ? &m_mostIntra : &m_mostInter;
+  const Counts*        most    = layer && layer->cus > 0 ? layer : ( kind->cus > 0 ? kind : nullptr );
+  Counts               room;
+  if( most )
+  {
+    const double more  = std::min( std::max( 1.0, double( sliceDataBytes( pic ) ) / double( std::max<size_t>( most->bytes, 1 ) ) ), 16.0 );
+    const double scale = ( most == layer ? 2.0 : 1.25 ) * more;
+    room.cus           = size_t( double( most->cus ) * scale ) + 64;
+    room.tus           = size_t( double( most->tus ) * scale ) + 64;
+    room.levels        = size_t( double( most->levels ) * scale ) + kParseLevelChunk;
+  }
+  else
+  {
+    room = { ctus * ( intra ? 32 : 8 ), ctus * ( intra ? 32 : 8 ), intra ? samples / 2 : samples / 32 };
+  }
+  room.levels = std::min( std::max( room.levels, substreamsOf( &pic ) * kParseLevelChunk ), 2 * samples + 65536 );
+  return room;
 }
 
 // The size of the arena's chunks for a picture's records: twice its luma samples in bytes, in steps of 1 MB, at most
@@ -806,11 +842,8 @@ void ParseService::startPicture( Picture* pic )
   slot->picture   = pic;
   slot->setProfile( m_prof );
   // room for the records and the levels of a picture of its kind, from the arena
-  const bool   intra = intraPicture( *pic );
-  const size_t ctus  = pic->cs->pcv->sizeInCtus;
-  const size_t cus   = recordRoom( m_maxCus[intra ? 1 : 0], ctus, intra );
-  const size_t tus   = recordRoom( m_maxTus[intra ? 1 : 0], ctus, intra );
-  if( !slot->prepare( *pic->cs, takeStaged( cus, tus ), m_records.take( levelRoom( *pic ) * sizeof( int16_t ) ) ) )
+  const Counts room = startRoom( *pic );
+  if( !slot->prepare( *pic->cs, takeStaged( room.cus, room.tus ), m_records.take( room.levels * sizeof( int16_t ) ) ) )
   {
     giveSlot( slot );
     {
@@ -950,18 +983,28 @@ void ParseService::finishPictures()
     const bool failed = progress != ParseSlot::Progress::Done;
     if( !failed )
     {
-      // the most records and levels a picture of its kind had: the room the next ones' slots start with
-      const int kind    = intraPicture( *slot->picture ) ? 1 : 0;
-      m_maxCus[kind]    = std::max( m_maxCus[kind], slot->numCus() );
-      m_maxTus[kind]    = std::max( m_maxTus[kind], slot->numTus() );
-      m_maxLevels[kind] = std::max( m_maxLevels[kind], slot->numLevels() );
+      // the most records and levels a picture of its kind had: the room the next ones' parses start with
+      const Picture& pic = *slot->picture;
+      const Counts   counts{ slot->numCus(), slot->numTus(), slot->numLevels(), sliceDataBytes( pic ) };
+      if( intraPicture( pic ) )
+      {
+        m_mostIntra.raise( counts );
+      }
+      else
+      {
+        m_mostInter.raise( counts );
+        if( pic.tempLayer < MAX_TLAYER )
+        {
+          m_mostLayer[pic.tempLayer].raise( counts );
+        }
+      }
     }
     {
       std::lock_guard<std::mutex> lock( m_mutex );
       m_stats.runs += slot->runs();
       m_stats.errors += failed ? 1 : 0;
-      m_stats.maxCus = int64_t( std::max( m_maxCus[0], m_maxCus[1] ) );
-      m_stats.maxTus = int64_t( std::max( m_maxTus[0], m_maxTus[1] ) );
+      m_stats.maxCus = int64_t( std::max( m_mostIntra.cus, m_mostInter.cus ) );
+      m_stats.maxTus = int64_t( std::max( m_mostIntra.tus, m_mostInter.tus ) );
     }
     if( failed )
     {
