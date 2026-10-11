@@ -13,6 +13,8 @@
 //          overall totals.
 // 2 WRITE: one thread per CU writes the CU's jobs (each intra job's wave is
 //          left at 0).
+//          In both, the jobs of an SbTMVP CU's sub-PUs are made by the whole
+//          workgroup together (sbtmvpJobs).
 // 3 WAVES: sets each intra job's wave, in decoding order: one above the
 //          highest wave of the samples the job reads, where inter's samples
 //          are wave 0 (GpuJobs.h's WaveMap). One 32-thread workgroup per CTU
@@ -471,18 +473,33 @@ void emitTrafo( inout Out o, uint w[12] )
   o.n[0]++;
 }
 
+// The thread's CU, when it is an SbTMVP CU: interJobs leaves the jobs of its sub-PUs' motion compensation to
+// sbtmvpJobs, with their flags and the CU's BCW index.
+static bool g_sb      = false;
+static uint g_sbFlags = 0;
+static int  g_sbBcw   = 0;
+
+// Writes an inter job at index at of the inter buffer, if there is room.
+void writeInter( int at, uint w[12] )
+{
+  if( at < pc.capInter )
+  {
+    uint* p = pc.inter + at * 12;
+    for( int i = 0; i < 12; i++ )
+    {
+      p[i] = w[i];
+    }
+  }
+}
+
 // Adds an inter job to its list: BDOF jobs (3), affine pairs (4), or the regular jobs (1).
 void emitInter( inout Out o, uint w[12] )
 {
   const uint flags = w[1] >> 16;
   const int  list  = ( flags & kInterAffine ) != 0 ? 4 : ( flags & kInterBdof ) != 0 ? 3 : 1;
-  if( o.write && o.base[list] + o.n[list] < pc.capInter )
+  if( o.write )
   {
-    uint* p = pc.inter + ( o.base[list] + o.n[list] ) * 12;
-    for( int i = 0; i < 12; i++ )
-    {
-      p[i] = w[i];
-    }
+    writeInter( o.base[list] + o.n[list], w );
   }
   o.n[list]++;
 }
@@ -490,13 +507,9 @@ void emitInter( inout Out o, uint w[12] )
 // Adds the second job of an affine pair (InterJob::setAffine's next), right after the first.
 void emitAffineNext( inout Out o, uint w[12] )
 {
-  if( o.write && o.base[4] + o.n[4] < pc.capInter )
+  if( o.write )
   {
-    uint* p = pc.inter + ( o.base[4] + o.n[4] ) * 12;
-    for( int i = 0; i < 12; i++ )
-    {
-      p[i] = w[i];
-    }
+    writeInter( o.base[4] + o.n[4], w );
   }
   o.n[4]++;
 }
@@ -1249,12 +1262,12 @@ bool bdofCondition( Cu cu, Motion m, uint* slice, uint* jslice )
   return !refScaled( jslice, 0, m.refIdx[0] ) && !refScaled( jslice, 1, m.refIdx[1] );
 }
 
-// gpuWp: sets the job's weighted-prediction parameters (flags holds the job's lists and its DMVR and BDOF bits)
-void wpJob( Cu cu, Motion m, uint* jslice, int refIdx0, int refIdx1, uint flags, inout uint w[12] )
+// gpuWp: sets the job's weighted-prediction parameters (flags holds the job's lists and its DMVR and BDOF bits; bcw is
+// the CU's BCW index). GPM's jobs, which gpuWp leaves without, do not come here.
+void wpJob( int bcw, uint* jslice, int refIdx0, int refIdx1, uint flags, inout uint w[12] )
 {
   const int st = sliceType( jslice );
-  if( ( cu.flags & kGeo ) != 0 || ( flags & ( kInterDmvr | kInterBdof ) ) != 0
-      || !( ( ( pc.ph & kPpsWpBi ) != 0 && st == 0 && m.bcw == 0 ) || ( ( pc.ph & kPpsWp ) != 0 && st == 1 ) ) )
+  if( ( flags & ( kInterDmvr | kInterBdof ) ) != 0 || !( ( ( pc.ph & kPpsWpBi ) != 0 && st == 0 && bcw == 0 ) || ( ( pc.ph & kPpsWp ) != 0 && st == 1 ) ) )
   {
     return;
   }
@@ -1287,26 +1300,57 @@ void wpJob( Cu cu, Motion m, uint* jslice, int refIdx0, int refIdx1, uint flags,
   w[11] = ( uint( offset[1][0] ) & 255 ) | ( uint( offset[1][1] ) & 255 ) << 8 | ( uint( offset[1][2] ) & 255 ) << 16 | uint( n == 2 ) << 24;
 }
 
-// Emits the jobs of a block that motionCompensation predicts with one motion, in tiles of up to 16 x 16.
-void mcBlock( Cu cu, Motion m, uint* slice, uint* jslice, uint flags, int bx, int by, int bw, int bh, int refIdx0, int refIdx1, int2 mv0, int2 mv1,
-              bool subPu, inout Out o )
+// The lists of a block that motionCompensation predicts with one motion, and their references' slots. A bi-prediction
+// from one picture with one vector predicts from list 0 alone, unless DMVR refines it or the weighted bi-prediction
+// weighs the lists.
+uint mcLists( uint* slice, uint* jslice, int refIdx0, int refIdx1, int2 mv0, int2 mv1, bool dmvr, out int ref0, out int ref1 )
 {
-  uint bflags = flags;
-  int  ref0 = 0, ref1 = 0;
+  uint lists = 0;
+  ref0       = 0;
+  ref1       = 0;
   if( refIdx0 >= 0 )
   {
-    bflags |= kInterL0;
+    lists |= kInterL0;
     ref0 = refSlot( jslice, 0, refIdx0 );
   }
   if( refIdx1 >= 0 )
   {
-    bflags |= kInterL1;
+    lists |= kInterL1;
     ref1 = refSlot( jslice, 1, refIdx1 );
   }
-  const bool dmvr = !subPu && dmvrCondition( cu, m, slice, jslice ) && !( refIdx0 >= 0 && refScaled( jslice, 0, refIdx0 ) )
+  if( !dmvr && refIdx0 >= 0 && refIdx1 >= 0 && isInterB( slice ) && ( pc.ph & kPpsWpBi ) == 0 && refPoc( slice, 0, refIdx0 ) == refPoc( slice, 1, refIdx1 )
+      && all( mv0 == mv1 ) )
+  {
+    lists &= ~kInterL1;
+  }
+  return lists;
+}
+
+// The job of a tile of such a block: the tile at (x, y), the block at (bx, by) and bw wide (the reach of the clip of
+// the motion). bflags holds the block's flags, bcw the CU's BCW index; ciip: a CIIP CU's block, which has no BCW.
+void mcTile( uint bflags, int bcw, bool ciip, uint* jslice, int x, int y, int tileW, int tileH, int bx, int by, int bw, int2 mv0, int2 mv1,
+             int ref0, int ref1, int refIdx0, int refIdx1, int dmvrIndex, inout uint w[12] )
+{
+  setInter( w, x, y, tileW, tileH, bflags, mv0, mv1, bx, by, ref0, ref1, dmvrIndex );
+  w[7] |= uint( bw ) << 20;   // setClipWidth
+  if( ( bflags & kInterL1 ) != 0 && ( bflags & kInterL0 ) != 0 && bcw != 0 && !ciip )
+  {
+    w[1] |= kInterBcw << 16;
+    w[7] |= ( pc.tables[T_BCW1 + bcw] + 2 ) << 16;
+  }
+  wpJob( bcw, jslice, refIdx0, refIdx1, bflags, w );
+}
+
+// Emits the jobs of a translational CU's block, which motionCompensation predicts with one motion, in tiles of up to
+// 16 x 16.
+void mcBlock( Cu cu, Motion m, uint* slice, uint* jslice, uint flags, int bx, int by, int bw, int bh, int refIdx0, int refIdx1, int2 mv0, int2 mv1,
+              inout Out o )
+{
+  const bool dmvr = dmvrCondition( cu, m, slice, jslice ) && !( refIdx0 >= 0 && refScaled( jslice, 0, refIdx0 ) )
                     && !( refIdx1 >= 0 && refScaled( jslice, 1, refIdx1 ) );
-  const bool bi   = refIdx0 >= 0 && refIdx1 >= 0;
-  if( !subPu && bdofCondition( cu, m, slice, jslice ) )
+  int        ref0, ref1;
+  uint       bflags = flags | mcLists( slice, jslice, refIdx0, refIdx1, mv0, mv1, dmvr, ref0, ref1 );
+  if( bdofCondition( cu, m, slice, jslice ) )
   {
     bflags |= kInterBdof;
   }
@@ -1314,27 +1358,16 @@ void mcBlock( Cu cu, Motion m, uint* slice, uint* jslice, uint flags, int bx, in
   {
     bflags |= kInterDmvr;
   }
-  else if( bi && isInterB( slice ) && ( pc.ph & kPpsWpBi ) == 0 && refPoc( slice, 0, refIdx0 ) == refPoc( slice, 1, refIdx1 ) && all( mv0 == mv1 ) )
-  {
-    bflags &= ~kInterL1;
-  }
-  const bool bcw   = ( bflags & kInterL1 ) != 0 && ( bflags & kInterL0 ) != 0 && m.bcw != 0 && ( cu.flags & kCiip ) == 0;
-  const int  tileW = min( bw, 16 );
-  const int  tileH = min( bh, 16 );
-  int        num   = 0;
+  const int tileW = min( bw, 16 );
+  const int tileH = min( bh, 16 );
+  int       num   = 0;
   for( int y = by; y < by + bh; y += tileH )
   {
     for( int x = bx; x < bx + bw; x += tileW )
     {
       uint w[12];
-      setInter( w, x, y, tileW, tileH, bflags, mv0, mv1, bx, by, ref0, ref1, dmvr ? cu.dmvrOff + num : 0 );
-      w[7] |= uint( bw ) << 20;   // setClipWidth
-      if( bcw )
-      {
-        w[1] |= kInterBcw << 16;
-        w[7] |= ( pc.tables[T_BCW1 + m.bcw] + 2 ) << 16;
-      }
-      wpJob( cu, m, jslice, refIdx0, refIdx1, bflags, w );
+      mcTile( bflags, m.bcw, ( cu.flags & kCiip ) != 0, jslice, x, y, tileW, tileH, bx, by, bw, mv0, mv1, ref0, ref1, refIdx0, refIdx1,
+              dmvr ? cu.dmvrOff + num : 0, w );
       emitInter( o, w );
       num++;
     }
@@ -1353,23 +1386,6 @@ void motionAt( int2 pos, out int ref[2], out int2 mv[2] )
   const uint w       = uint( mi[4] );
   ref[0]             = int( int8_t( w & 0xff ) );
   ref[1]             = int( int8_t( ( w >> 8 ) & 0xff ) );
-}
-
-// MotionInfo::operator==
-bool sameMotion( int2 pos0, int2 pos1 )
-{
-  int  r0[2], r1[2];
-  int2 m0[2], m1[2];
-  motionAt( pos0, r0, m0 );
-  motionAt( pos1, r1, m1 );
-  for( int l = 0; l < 2; l++ )
-  {
-    if( r0[l] != r1[l] || ( r0[l] >= 0 && any( m0[l] != m1[l] ) ) )
-    {
-      return false;
-    }
-  }
-  return true;
 }
 
 // xGpuCiipJobs
@@ -1589,7 +1605,7 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
           w[1] |= kInterBcw << 16;
           w[7] |= ( pc.tables[T_BCW1 + m.bcw] + 2 ) << 16;
         }
-        wpJob( cu, m, jslice, m.refIdx[0], m.refIdx[1], aflags, w );
+        wpJob( m.bcw, jslice, m.refIdx[0], m.refIdx[1], aflags, w );
         uint next[12];
         clearJob( next );
         // InterJob::setAffine
@@ -1610,68 +1626,14 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
   }
   else if( m.mrgType == MRG_TYPE_SUBPU_ATMVP )
   {
-    // SbTMVP: neighbouring sub-PUs with the same motion are joined (xSubPuMC)
-    const int  numPartLine = max( y4.z >> 3, 1 );
-    const int  numPartCol  = max( y4.w >> 3, 1 );
-    const int  puHeight    = numPartCol == 1 ? y4.w : 8;
-    const int  puWidth     = numPartLine == 1 ? y4.z : 8;
-    const bool verMC       = y4.w > y4.z;
-    const int  fstStart    = !verMC ? y4.y : y4.x;
-    const int  secStart    = !verMC ? y4.x : y4.y;
-    const int  fstEnd      = !verMC ? y4.y + y4.w : y4.x + y4.z;
-    const int  secEnd      = !verMC ? y4.x + y4.z : y4.y + y4.w;
-    const int  fstStep     = !verMC ? puHeight : puWidth;
-    const int  secStep     = !verMC ? puWidth : puHeight;
-    const bool scaled      = refScaled( jslice, 0, 0 ) || ( sliceType( jslice ) == 0 ? refScaled( jslice, 1, 0 ) : false );
-    for( int fst = fstStart; fst < fstEnd; fst += fstStep )
-    {
-      for( int sec = secStart; sec < secEnd; sec += secStep )
-      {
-        int       x      = !verMC ? sec : fst;
-        int       y      = !verMC ? fst : sec;
-        const int2 at    = int2( x, y );
-        int       length = secStep;
-        int       later  = sec + secStep;
-        while( later < secEnd )
-        {
-          const int2 lp = !verMC ? int2( later, fst ) : int2( fst, later );
-          if( !scaled && sameMotion( lp, at ) )
-          {
-            length += secStep;
-          }
-          else
-          {
-            break;
-          }
-          later += secStep;
-        }
-        int  ref[2];
-        int2 mv[2];
-        motionAt( at, ref, mv );
-        int dx = !verMC ? length : puWidth;
-        int dy = !verMC ? puHeight : length;
-        if( !verMC && ( dx & 15 ) != 0 && dx > 16 )
-        {
-          const int dxPart = dx & ~15;
-          mcBlock( cu, m, slice, jslice, flags, x, y, dxPart, dy, ref[0], ref[1], mv[0], mv[1], true, o );
-          x += dxPart;
-          dx -= dxPart;
-        }
-        else if( verMC && ( dy & 15 ) != 0 && dy > 16 )
-        {
-          const int dyPart = dy & ~15;
-          mcBlock( cu, m, slice, jslice, flags, x, y, dx, dyPart, ref[0], ref[1], mv[0], mv[1], true, o );
-          y += dyPart;
-          dy -= dyPart;
-        }
-        mcBlock( cu, m, slice, jslice, flags, x, y, dx, dy, ref[0], ref[1], mv[0], mv[1], true, o );
-        sec = later - secStep;
-      }
-    }
+    // SbTMVP: the workgroup makes the jobs of the sub-PUs' motion compensation together (sbtmvpJobs)
+    g_sb      = true;
+    g_sbFlags = flags;
+    g_sbBcw   = m.bcw;
   }
   else
   {
-    mcBlock( cu, m, slice, jslice, flags, y4.x, y4.y, y4.z, y4.w, m.refIdx[0], m.refIdx[1], m.mv[0][0], m.mv[1][0], false, o );
+    mcBlock( cu, m, slice, jslice, flags, y4.x, y4.y, y4.z, y4.w, m.refIdx[0], m.refIdx[1], m.mv[0][0], m.mv[1][0], o );
   }
 
   if( ( cu.flags & kCiip ) != 0 )
@@ -1950,6 +1912,124 @@ void main( uint3 local : SV_GroupThreadID )
   }
 }
 #else
+// SbTMVP's motion compensation (xSubPuMC). An SbTMVP CU's 8x8 sub-PUs are joined along the CU's longer side where their
+// motion is the same, and each joined run is predicted in tiles of 16 samples along that side (the last tile 8, where
+// the run's length is odd). A thread that made a large CU's jobs alone held up its wave for long: up to 256 sub-PUs,
+// each read and compared after the one before. So the workgroup makes them together, an SbTMVP CU at a time: a thread
+// per sub-PU reads the sub-PU's motion, compares it with the motion of the sub-PU before it, and makes the job that
+// starts at its sub-PU, if one does.
+groupshared int  s_sbOwner[256];   // the threads whose CUs are SbTMVP CUs
+groupshared int4 s_sbCu[2];        // the CU at hand: its luma block; its CTU, its jobs' flags, its BCW index, its first job
+groupshared int4 s_sbMv[256];      // per sub-PU, line by line along the runs: its vectors (list 0's x, y, list 1's x, y)
+groupshared uint s_sbRef[256];     // and its reference indices (list 0's | list 1's << 8, 8 bits each)
+groupshared uint s_sbJoined[16];   // per line: bit k, the line's sub-PU k has the motion of sub-PU k - 1
+
+// MotionInfo::operator== on two sub-PUs of s_sbMv and s_sbRef: the vectors of the lists they use
+bool sameSubPuMotion( int a, int b )
+{
+  const uint r = s_sbRef[a];
+  if( r != s_sbRef[b] )
+  {
+    return false;
+  }
+  const int4 ma = s_sbMv[a];
+  const int4 mb = s_sbMv[b];
+  return ( ( r & 0xff ) == 0xff || all( ma.xy == mb.xy ) ) && ( ( r >> 8 ) == 0xff || all( ma.zw == mb.zw ) );
+}
+
+// The jobs of the SbTMVP CUs of the workgroup's threads (g_sb), counted into their threads' Out and, in WRITE, written.
+// All the threads call it, in uniform control flow.
+void sbtmvpJobs( int tid, int index, inout Out o )
+{
+  uint       numSb;
+  const uint at = workgroupPrefixSum( g_sb ? 1u : 0u, tid, numSb );
+  if( g_sb )
+  {
+    s_sbOwner[at] = tid;
+  }
+  for( uint i = 0; i < numSb; i++ )
+  {
+    GroupMemoryBarrierWithGroupSync();   // (s_sbOwner written; the shared state of the CU before read)
+    const int owner = s_sbOwner[i];
+    if( tid == owner )
+    {
+      const Cu cu = loadCu( index );
+      s_sbCu[0]   = cu.blk[0];
+      s_sbCu[1]   = int4( cu.ctu, int( g_sbFlags ), g_sbBcw, o.base[1] + o.n[1] );
+    }
+    if( tid < 16 )
+    {
+      s_sbJoined[tid] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const int4 y4     = s_sbCu[0];
+    const int4 info   = s_sbCu[1];
+    const bool verMC  = y4.w > y4.z;                     // the runs go down the CU's columns
+    const int  n1     = ( verMC ? y4.w : y4.z ) >> 3;   // the sub-PUs of a line
+    const int  k      = tid & ( n1 - 1 );               // the thread's sub-PU: its place in its line, and its line
+    const int  line   = tid >> log2Of( n1 );
+    const bool mine   = tid < ( y4.z >> 3 ) * ( y4.w >> 3 );
+    const int  x      = y4.x + 8 * ( verMC ? line : k );
+    const int  y      = y4.y + 8 * ( verMC ? k : line );
+    uint*      slice  = sliceOfCtu( info.x );
+    uint*      jslice = jobSliceOfCtu( info.x );
+    if( mine )
+    {
+      int  ref[2];
+      int2 mv[2];
+      motionAt( int2( x, y ), ref, mv );
+      s_sbMv[tid]  = int4( mv[0], mv[1] );
+      s_sbRef[tid] = ( uint( ref[0] ) & 0xff ) | ( uint( ref[1] ) & 0xff ) << 8;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // (with a scaled reference picture no sub-PUs are joined)
+    const bool scaled = refScaled( jslice, 0, 0 ) || ( sliceType( jslice ) == 0 && refScaled( jslice, 1, 0 ) );
+    if( mine && k > 0 && !scaled && sameSubPuMotion( tid, tid - 1 ) )
+    {
+      InterlockedOr( s_sbJoined[line], 1u << k );
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // The sub-PU's run: from the line's sub-PU s up to e (exclusive). Its jobs start at every second sub-PU from s.
+    const uint joined = mine ? s_sbJoined[line] : 0u;
+    const uint upTo   = ( 2u << k ) - 1;
+    const int  s      = int( firstbithigh( ~joined & upTo ) );
+    const uint after  = ~joined & ( ( 1u << n1 ) - 1 ) & ~upTo;
+    const int  e      = after != 0 ? int( firstbitlow( after ) ) : n1;
+    const bool starts = mine && ( ( k - s ) & 1 ) == 0;
+    uint       numJobs;
+    const uint job = workgroupPrefixSum( starts ? 1u : 0u, tid, numJobs );
+    if( tid == owner )
+    {
+      o.n[1] += int( numJobs );
+    }
+    if( o.write && starts )
+    {
+      // The tile of two sub-PUs, in the block of the run's even length; or the run's last sub-PU alone, in its own
+      // block, where the length is odd. The run's motion is its first sub-PU's.
+      const bool alone   = ( ( e - s ) & 1 ) != 0 && k == e - 1;
+      const int  from    = alone ? k : s;   // the block's first sub-PU, and its length
+      const int  length  = alone ? 1 : ( e - s ) & ~1;
+      const int  first   = line * n1 + s;
+      const int4 mv      = s_sbMv[first];
+      const uint r       = s_sbRef[first];
+      const int  refIdx0 = int( int8_t( r & 0xff ) );
+      const int  refIdx1 = int( int8_t( r >> 8 ) );
+      int        ref0, ref1;
+      const uint bflags  = uint( info.y ) | mcLists( slice, jslice, refIdx0, refIdx1, mv.xy, mv.zw, false, ref0, ref1 );
+      uint       w[12];
+      if( !verMC )
+      {
+        mcTile( bflags, info.z, false, jslice, x, y, alone ? 8 : 16, 8, y4.x + 8 * from, y, 8 * length, mv.xy, mv.zw, ref0, ref1, refIdx0, refIdx1, 0, w );
+      }
+      else
+      {
+        mcTile( bflags, info.z, false, jslice, x, y, 8, alone ? 8 : 16, x, y4.y + 8 * from, 8, mv.xy, mv.zw, ref0, ref1, refIdx0, refIdx1, 0, w );
+      }
+      writeInter( info.w + int( job ), w );
+    }
+  }
+}
+
 [shader( "compute" )]
 [numthreads( 256, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
@@ -2026,6 +2106,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   {
     cuJobs( index, o );
   }
+  sbtmvpJobs( tid, index, o );
   if( COUNT_ONLY || pc.pass == 0 )
   {
     // COUNT: store the CU's offsets within its block, and the block's totals.
