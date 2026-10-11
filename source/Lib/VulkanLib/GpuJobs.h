@@ -397,6 +397,7 @@ struct TuRecord;
 
 class ParsedPicture;
 class PlanePool;
+struct SharedReconBuffers;
 
 // A picture's jobs, per CTU, for the passes that run on the GPU (null: the CPU ran that pass).
 
@@ -429,6 +430,8 @@ struct PictureJobs
   // VVDEC_GPU_PARSE=2: the pool that gives the pictures their planes and takes them back on other threads, moving
   // their twins as it does (GpuRecon::writeRefTable reads the reference pictures' twins under its lock)
   PlanePool*                                planes        = nullptr;
+  // VVDEC_GPU_PARSE=2: the buffers the decoder's instances take turns with, each while it records a picture
+  SharedReconBuffers*                       shared        = nullptr;
 };
 
 }   // namespace gpu

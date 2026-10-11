@@ -198,6 +198,8 @@ private:
   gpu::ParseService* m_gpuParseService = nullptr;
   bool               m_gpuParseDrives  = false;
   gpu::PlanePool*    m_gpuPlanes       = nullptr;   // the planes of the pictures the GPU parses (DecLib's)
+  // the buffers the instances take turns with while each records a picture the GPU parsed (DecLib's)
+  gpu::SharedReconBuffers* m_gpuShared = nullptr;
   // which of the current picture's passes run on the GPU (setUpGpuPicture)
   bool m_gpuFilters  = false;   // its in-loop filters
   bool m_gpuIntra    = false;   // and its intra and IBC blocks
@@ -251,10 +253,11 @@ public:
 
 #if VVDEC_VULKAN
   void create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled, gpu::Context* gpu = nullptr );
-  void setGpuParseService( gpu::ParseService* service, gpu::PlanePool* planes )
+  void setGpuParseService( gpu::ParseService* service, gpu::PlanePool* planes, gpu::SharedReconBuffers* shared )
   {
     m_gpuParseService = service;
     m_gpuPlanes       = planes;
+    m_gpuShared       = shared;
   }
 #else
   void create( ThreadPool* threadPool, unsigned instanceId, bool upscaleOutputEnabled );

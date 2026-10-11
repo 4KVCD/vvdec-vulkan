@@ -91,6 +91,8 @@ class DecLib
   // it parses, which they have only once their work goes to the GPU
   std::unique_ptr<gpu::ParseService> m_gpuParseService;
   std::unique_ptr<gpu::PlanePool>    m_gpuPlanes;
+  // and the buffers the reconstruction instances take turns with while each records a picture it parsed
+  std::unique_ptr<gpu::SharedReconBuffers> m_gpuShared;
 #endif
 
 public:

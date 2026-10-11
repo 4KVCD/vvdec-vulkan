@@ -237,9 +237,11 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
     m_picListManager.setGpuPlanes( planes->standIns(), [planes]( Picture& pic ) { planes->release( pic ); },
                                    [planes]( Picture& pic ) { planes->releasePlanes( pic ); } );
     m_decLibParser.setGpuParseService( m_gpuParseService.get(), m_gpuPlanes.get() );
+    // what the instances take turns with (the deferred predictions' planes: gpu::SharedReconBuffers)
+    m_gpuShared = std::make_unique<gpu::SharedReconBuffers>( m_gpu );
     for( auto& dec: m_decLibRecon )
     {
-      dec.setGpuParseService( m_gpuParseService.get(), m_gpuPlanes.get() );
+      dec.setGpuParseService( m_gpuParseService.get(), m_gpuPlanes.get(), m_gpuShared.get() );
     }
   }
 #endif
@@ -431,6 +433,7 @@ void DecLib::destroy()
   }
 
 #if VVDEC_VULKAN
+  m_gpuShared.reset();   // (as the instances' own buffers: their work is done)
   if( m_gpuPlanes )
   {
     m_gpuPlanes->waitDownloads();   // (the downloads started ahead write into planes freed now)

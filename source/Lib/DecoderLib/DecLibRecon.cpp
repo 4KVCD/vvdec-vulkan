@@ -1700,6 +1700,7 @@ bool DecLibRecon::queueGpuTask( int, void* taskParam )
   }
   gpu::PictureJobs jobs = dec->gpuPictureJobs( cs );
   jobs.parsed           = parsed;
+  jobs.shared           = parsed ? dec->m_gpuShared : nullptr;   // (with the GPU's front end: no early rows)
   // With DMVR and the CPU front end, the GPU stores the refined motion for TMVP in the first part (the CTU tasks
   // stored the rest), which the next pictures' CTU tasks wait for.
   const bool refine = dec->m_gpuInter && cs.picture->stillReferenced && !dec->m_gpuFrontEnd;

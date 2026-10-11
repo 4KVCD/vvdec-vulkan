@@ -768,28 +768,61 @@ void GpuRecon::setPicture( const PelStorage& pic, const LmcsTables* tables, bool
     memcpy( m_lmcs.mapped + m_lmcsCount * sizeof( int16_t ), tables->inv.data(), m_lmcsCount * sizeof( int16_t ) );
     memcpy( m_lmcs.mapped + m_lmcsCount * 2 * sizeof( int16_t ), tables->chromaScale.data(), m_lmcsCount * sizeof( int32_t ) );
   }
-  if( defer )
+  m_deferOn = defer;   // (bindDeferPlanes gives them room when the picture's work is recorded)
+}
+
+void GpuRecon::bindDeferPlanes( const PelStorage& pic )
+{
+  if( !m_deferOn )
   {
-    // the planes inter prediction keeps predictions aside in, laid out as the picture's planes (from their first
-    // sample)
-    size_t size = 0;
-    size_t at[MAX_NUM_COMPONENT];
-    for( size_t comp = 0; comp < pic.bufs.size(); comp++ )
-    {
-      at[comp] = size;
-      size    += ( size_t( pic.bufs[comp].stride ) * pic.bufs[comp].height * sizeof( Pel ) + 255 ) & ~size_t( 255 );
-    }
-    if( m_defer.size < size )
-    {
-      m_ctx->free( m_defer );
-      m_defer = m_ctx->alloc( size, MemKind::Device );
-    }
-    for( size_t comp = 0; comp < pic.bufs.size(); comp++ )
-    {
-      m_deferPlanes.addr[comp]   = m_defer.addr + at[comp];
-      m_deferPlanes.stride[comp] = pic.bufs[comp].stride;
-    }
+    return;
   }
+  // the planes inter prediction keeps predictions aside in, laid out as the picture's planes (from their first
+  // sample)
+  size_t size = 0;
+  size_t at[MAX_NUM_COMPONENT];
+  for( size_t comp = 0; comp < pic.bufs.size(); comp++ )
+  {
+    at[comp] = size;
+    size    += ( size_t( pic.bufs[comp].stride ) * pic.bufs[comp].height * sizeof( Pel ) + 255 ) & ~size_t( 255 );
+  }
+  if( m_defer.size < size )
+  {
+    m_ctx->free( m_defer );
+    m_defer = m_ctx->alloc( size, MemKind::Device );
+  }
+  for( size_t comp = 0; comp < pic.bufs.size(); comp++ )
+  {
+    m_deferPlanes.addr[comp]   = m_defer.addr + at[comp];
+    m_deferPlanes.stride[comp] = pic.bufs[comp].stride;
+  }
+}
+
+GpuRecon::SharedTurn::SharedTurn( GpuRecon& recon, SharedReconBuffers* shared ) : m_recon( recon ), m_shared( shared )
+{
+  if( m_shared )
+  {
+    m_lock = std::unique_lock<std::mutex>( m_shared->turn );
+    swapBuffers();
+  }
+}
+
+GpuRecon::SharedTurn::~SharedTurn()
+{
+  if( m_shared )
+  {
+    swapBuffers();   // (the instance's own back, before the lock goes)
+  }
+}
+
+void GpuRecon::SharedTurn::swapBuffers()
+{
+  std::swap( m_recon.m_defer, m_shared->defer );
+}
+
+SharedReconBuffers::~SharedReconBuffers()
+{
+  ctx->free( defer );
 }
 
 void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf )
@@ -823,10 +856,12 @@ void GpuRecon::startEarlyRows( CodingStructure& cs, const PictureJobs& jobs, siz
   {
     writeRefTable( cs, jobs, pic, uploads );
   }
-  // the early rows come only with the CPU front end
+  // the early rows come only with the CPU front end, which shares nothing (their work comes before startPicture's)
+  CHECK_FATAL( jobs.shared, "Vulkan: the early rows of a picture with shared buffers" );
   m_useFrontEnd   = false;
   m_frontEndTrafo = false;
   m_frontEndInter = false;
+  bindDeferPlanes( pic );
 
   // The early rows' commands, after what earlier submissions wrote. The pool is reset: the instance's previous
   // picture is done.
@@ -864,6 +899,8 @@ void GpuRecon::startEarlyRows( CodingStructure& cs, const PictureJobs& jobs, siz
 int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
                             PelStorage& pic, bool waitFirst )
 {
+  // With the GPU's parse, what the instances share, held until the picture's rest is submitted (the return)
+  const SharedTurn turn( *this, jobs.shared );
   if( m_prepared.picture != cs.picture )
   {
     prepareFilters( cs, deblock, sao, alf );
@@ -872,6 +909,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   m_useFrontEnd      = jobs.useFrontEnd;
   m_frontEndTrafo    = jobs.frontEndTrafo;
   m_frontEndInter    = jobs.frontEndInter;
+  bindDeferPlanes( pic );
 
   // After the early rows (startEarlyRows), the command pool is already reset, the reference table written and the
   // reference pictures uploaded.

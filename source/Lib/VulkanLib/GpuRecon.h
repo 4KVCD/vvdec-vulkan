@@ -59,6 +59,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <mutex>
 
 #include "GpuContext.h"
 #include "GpuFrontEnd.h"
@@ -87,6 +88,27 @@ namespace gpu
 {
 
 struct JobsPush;   // (GpuReconFrontEnd.cpp)
+
+// What a decoder's GpuRecon instances take turns with when the GPU parses the pictures (VVDEC_GPU_PARSE=2): the
+// planes inter prediction keeps predictions aside in for intra jobs (GpuRecon::m_defer). Inter prediction writes them
+// in a picture's first part and intra prediction reads them in its rest, both on the compute queue, and each part
+// begins with a barrier over the work submitted before it. So an instance needs them only from the start of a
+// picture's recording until its rest is submitted (GpuRecon::SharedTurn): the next picture's work, submitted later,
+// runs after the work that used them. Two instances recording at the same time is rare (Beekeeper slower 4K: 5
+// pictures of 600 began while another was recorded, a recording taking ~1.6 ms), while each instance's own planes
+// held 19 MB at 4K. (The front end's buffers stay each instance's own: its front end runs on the instance's async
+// queue, beside the other pictures' work.)
+struct SharedReconBuffers
+{
+  explicit SharedReconBuffers( Context* context ) : ctx( context ) {}
+  ~SharedReconBuffers();   // after the instances' work is done
+  SharedReconBuffers( const SharedReconBuffers& )            = delete;
+  SharedReconBuffers& operator=( const SharedReconBuffers& ) = delete;
+
+  Context*   ctx;
+  std::mutex turn;   // held by the instance recording a picture with them
+  Buffer     defer;
+};
 
 // The passes whose job counts the GPU front end works out (jobs.slang, intrasort.slang, edges.slang). For pass p,
 // the front end's argument buffer holds the pass's indirect dispatch (3 words) at word 3 * p, and its job count and
@@ -193,6 +215,24 @@ private:
   };
   // Where a picture's planes are, for copyPlanes: in host memory, in the twin, or in the scratch planes.
   enum { kHost, kTwin, kScratch };
+
+  // While it lives, the instance holds what the instances share (SharedReconBuffers) in place of its own (swapped in,
+  // and back at the end); with nothing to share, nothing changes.
+  class SharedTurn
+  {
+  public:
+    SharedTurn( GpuRecon& recon, SharedReconBuffers* shared );
+    ~SharedTurn();
+    SharedTurn( const SharedTurn& )            = delete;
+    SharedTurn& operator=( const SharedTurn& ) = delete;
+
+  private:
+    void swapBuffers();
+
+    GpuRecon&                    m_recon;
+    SharedReconBuffers*          m_shared;
+    std::unique_lock<std::mutex> m_lock;
+  };
 
   // --- Commands and submissions (GpuRecon.cpp) ---
   // Begins recording m_cmd. With resetPool, the command pool is reset first, and the commands start with a barrier
@@ -417,11 +457,15 @@ private:
   bool   m_lmcsOn    = false;
   size_t m_lmcsCount = 0;   // the entries of a table
   Buffer m_lmcs;
-  // The planes inter prediction keeps some predictions aside in, for intra jobs (LMCS's chroma scaling, CIIP)
+  // The planes inter prediction keeps some predictions aside in, for intra jobs (LMCS's chroma scaling, CIIP): the
+  // instance's own, or the shared ones (SharedTurn). Whether the picture needs them (setPicture); bindDeferPlanes
+  // gives them room for the picture and puts m_deferPlanes there, as its work is recorded.
   Buffer m_defer;
+  bool   m_deferOn = false;
+  Planes m_deferPlanes{};
+  void   bindDeferPlanes( const PelStorage& pic );
   // SAO's rings (recordSao): the deblocked samples around each CTU it filters
   Buffer m_saoRing;
-  Planes m_deferPlanes{};
   // The dequantization matrices of explicit scaling lists (setPicture), a byte per factor
   bool   m_scalingOn = false;
   Buffer m_scaling;
