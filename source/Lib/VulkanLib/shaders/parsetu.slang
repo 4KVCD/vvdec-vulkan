@@ -1628,6 +1628,8 @@ void residualCoding( int t, int comp, inout CuCtx ctx )
 {
   PROF_BEGIN( resStart );
   residualCodingBody( t, comp, ctx );
+  // The block is done with: zeroing its state ends its values' lives here, as codingUnitAtPart does for the CU's
+  g_cc = (Cctx) 0;
   PROF_END( kProfResidual, resStart );
   PROF_COUNT( kProfBlocks, 1 );
   PROF_COUNT( kProfLevelsN, g_outCount );

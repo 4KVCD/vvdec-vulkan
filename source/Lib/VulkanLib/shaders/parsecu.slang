@@ -326,6 +326,9 @@ void codingUnitAtPart( inout CuCtx ctx )
   stageRecords();
   writeCuInfo();
   PROF_END( kProfRecords, recStart );
+  // The CU is done with. Zeroing its state ends its values' lives here: otherwise the coding tree's loop carries them
+  // to the next CU, which sets them all anew, and with the scalar registers full they are spilled and reloaded.
+  g_cu = (Cu) 0;
 }
 
 // --------------------------------------------------------------------------------------------------------------------
