@@ -30,7 +30,6 @@ set( VVDEC_GPU_SHADERS
   "jobs_waves|jobs|WAVES=1"
   "edges|edges"
   "intrasort|intrasort"
-  "colmotion|colmotion"
   "parse|parse"
   "parse_prof|parse|PROFILE=1"
   "parse_ctu64|parse|MAX_CTU=64"

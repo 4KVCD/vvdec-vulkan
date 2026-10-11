@@ -1069,7 +1069,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       // it has refined it.
       if( !ctuData.slice->isIntra() && param->common.gpuInter )
       {
-        if( cs.picture->stillReferenced && !param->common.gpuFrontEnd )   // (with the GPU front end, colmotion.slang stores it)
+        if( cs.picture->stillReferenced && !param->common.gpuFrontEnd )   // (with the GPU front end, mider.slang stores it)
         {
           decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskColMotion( cs, ctuRsAddr );
         }

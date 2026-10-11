@@ -1588,7 +1588,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     dmvrCost = search ? dmvrMinCost( centre ) : centre;
 #endif
     // Threads 0 .. 15 write the refined motion where TMVP reads it (the 8x8 grid) into the colocated motion, which
-    // colmotion.slang (GPU front end) or DecCu's storeDmvrMotion (CPU front end) stored before, one int each; threads
+    // mider.slang (GPU front end) or DecCu's storeDmvrMotion (CPU front end) stored before, one int each; threads
     // 16 and 17 write vvdec's DMVR MV cache.
     if( tid < 16 )
     {
@@ -2529,7 +2529,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       pc.dmvr[index8 * 2 + 1] = delta.y;
       s_delta                = delta;
       // Write the refined motion where TMVP reads it (the 8x8 grid) into the
-      // colocated motion, which colmotion.slang (GPU front end) or DecCu's
+      // colocated motion, which mider.slang (GPU front end) or DecCu's
       // storeDmvrMotion (CPU front end) stored before.
       const int2 m0   = mv0 + delta;
       const int2 m1   = mv1 - delta;

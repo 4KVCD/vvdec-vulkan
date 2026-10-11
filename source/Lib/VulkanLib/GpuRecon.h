@@ -293,7 +293,6 @@ private:
   // records: room for the records uploaded too (the CPU's parse)
   void   ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, size_t numTus, bool records = true );
   void   recordMotion( const CodingStructure& cs, size_t numCus );
-  void   recordColMotion( const CodingStructure& cs );
   void   recordDeblockParams( const CodingStructure& cs, size_t numCus );
   void   recordJobs( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );       // passes 0 to 2
   void   recordJobWaves( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );   // pass 3 (no barrier after)

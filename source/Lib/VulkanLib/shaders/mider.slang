@@ -59,6 +59,11 @@ struct Params
   int           csx;        // chroma subsampling shifts
   int           csy;
   int           tileCols;   // the picture's tile columns (the segments of a CTU row)
+  int           colOn;      // 1: the picture's colocated motion goes to colMotion
+  // out: the picture's colocated motion, as vvdec's storeColMotion keeps it: per CTU, an entry of 5 words per 8x8
+  // block, the motion of the block's top-left 4x4 block. TMVP in later pictures reads it; inter.slang writes DMVR's
+  // refined motion into it afterwards.
+  int*          colMotion;
 };
 
 [[vk::push_constant]] Params pc;
@@ -2738,6 +2743,25 @@ void main( uint3 local : SV_GroupThreadID )
     if( g_lane == 0 )
     {
       pc.progress[segment].store( uint( col + 1 - span.x ), MemoryOrder.Release );
+    }
+    // The CTU's colocated motion, from its now final motion. After the progress, as the rows below do not read it,
+    // and in this pass rather than one of its own: the front end's first part waits for every pass in it.
+    if( pc.colOn != 0 )
+    {
+      const int across8  = 1 << ( pc.log2Ctu - 3 );
+      const int num8x8   = across8 * across8;
+      const int ctuSize4 = 1 << ( pc.log2Ctu - 2 );
+      for( int e = g_lane; e < num8x8; e += 32 )
+      {
+        const int x4  = ( e & ( across8 - 1 ) ) * 2;
+        const int y4  = ( e >> ( pc.log2Ctu - 3 ) ) * 2;
+        int*      src = pc.motion + ( ctu * ctuSize4 * ctuSize4 + y4 * ctuSize4 + x4 ) * 5;
+        int*      dst = pc.colMotion + ( ctu * num8x8 + e ) * 5;
+        for( int k = 0; k < 5; k++ )
+        {
+          dst[k] = src[k];
+        }
+      }
     }
   }
 }

@@ -66,16 +66,10 @@ struct MiderPush
   VkDeviceAddress cus, ctus, slices, cuMap, cuMotion, motion, progress, subpics;
   int32_t         numCus, widthInCtus, heightInCtus, log2Ctu, width, height, widthIn4, plevel, wpp, maxNumMergeCand, subpicOn, sps;
   VkDeviceAddress cuMapC;
-  int32_t         csx, csy, tileCols, unused;
+  int32_t         csx, csy, tileCols, colOn;
+  VkDeviceAddress colMotion;
 };
-static_assert( sizeof( MiderPush ) == 136, "MiderPush: the layout of mider.slang's Params" );
-
-// The push constants of colmotion.slang
-struct ColMotionPush
-{
-  VkDeviceAddress motion, colMotion;
-  int32_t         count, log2Ctu, num8x8;
-};
+static_assert( sizeof( MiderPush ) == 144, "MiderPush: the layout of mider.slang's Params" );
 
 // The push constants of dbparams.slang
 struct DbParamsPush
@@ -362,6 +356,9 @@ void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
   push.csx             = chroma ? int32_t( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
   push.csy             = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
   push.tileCols        = int32_t( cs.pps->getNumTileColumns() );
+  // mider also writes the picture's colocated motion (but not in the check mode, which copies the motion to the host)
+  push.colOn           = m_useFrontEnd && cs.m_colMiAllocation ? 1 : 0;
+  push.colMotion       = push.colOn ? static_cast<HostPlane*>( cs.m_colMiAllocation )->host.addr : 0;
 
   // the segments' progress from zero
   m_ctx->api().vkCmdFillBuffer( m_cmd, m_frontEnd.rowProgress.buffer, 0, VK_WHOLE_SIZE, 0 );
@@ -377,38 +374,14 @@ void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
   const bool lite = !sps.getUseGeo() && !sps.getUseAffine() && !sps.getSBTMVPEnabledFlag();
   dispatch( lite ? kShader_mider_lite : kShader_mider, push, uint32_t( pcv.heightInCtus ) * uint32_t( push.tileCols ) );
   mark( "mider" );
-  // The 4x4 blocks' motion goes into the picture's colocated motion (colmotion.slang), or in the check mode to host
-  // memory.
+  // In the check mode the 4x4 blocks' motion goes to host memory (otherwise mider wrote the colocated motion).
   memoryBarrier( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                  VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT );
-  if( m_useFrontEnd )
-  {
-    recordColMotion( cs );
-    mark( "colmotion" );
-  }
-  else
+  if( !m_useFrontEnd )
   {
     VkBufferCopy region{ 0, 0, motionBytes( pcv ) };
     m_ctx->api().vkCmdCopyBuffer( m_cmd, m_frontEnd.motion.buffer, m_check.motion.buffer, 1, &region );
   }
-}
-
-void GpuRecon::recordColMotion( const CodingStructure& cs )
-{
-  if( !cs.m_colMiAllocation )
-  {
-    return;
-  }
-  const PreCalcValues& pcv = *cs.pcv;
-  ColMotionPush        push{};
-  push.motion    = m_frontEnd.motion.addr;
-  push.colMotion = static_cast<HostPlane*>( cs.m_colMiAllocation )->host.addr;
-  push.count     = int32_t( pcv.sizeInCtus * pcv.num8x8CtuBlks );
-  push.log2Ctu   = int32_t( pcv.maxCUWidthLog2 );
-  push.num8x8    = int32_t( pcv.num8x8CtuBlks );
-  // one thread per 8x8 block, in rows of 1024 workgroups
-  const uint32_t groups = uint32_t( ( push.count + 63 ) / 64 );
-  dispatch( kShader_colmotion, push, std::min<uint32_t>( groups, 1024 ), ( groups + 1023 ) / 1024 );
 }
 
 void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
