@@ -6,14 +6,24 @@
 // flags -- laid out as vvdec keeps them: CTU by CTU, first the vertical edges,
 // then the horizontal ones.
 //
-// One thread per CU. A CU writes only the parameters of the edges of its own
-// blocks (the Q side of each edge), reading its neighbours' records. There are
-// two passes: first the CUs of the luma tree (or of the single tree), then the
-// CUs of the chroma tree, which add their bits to the same blocks' parameters
-// after the luma tree has written them, as vvdec processes a region's luma
-// tree before its chroma tree.
+// A CU writes only the parameters of the edges of its own blocks (the Q side
+// of each edge), reading its neighbours' records. There are three passes:
+// first the CUs of the luma tree (or of the single tree), one thread per CU;
+// then, in the variant built with SUBBLOCKS=1, one thread per 4x4 block, the
+// edges inside the luma tree's CUs whose boundary strengths vvdec works out
+// block by block (SbTMVP or affine motion, ISP's subpartitions); then the CUs
+// of the chroma tree, one thread per CU, which add their bits to the same
+// blocks' parameters after the luma tree has written them, as vvdec processes
+// a region's luma tree before its chroma tree. A CU's thread would otherwise
+// walk all of its 4x4 blocks alone (a 128x128 affine CU has about a thousand
+// boundary strengths to work out), and the pass would wait for the largest
+// of those CUs.
 
 #include "common.slang"
+
+#ifndef SUBBLOCKS
+#define SUBBLOCKS 0
+#endif
 
 struct Params
 {
@@ -38,7 +48,7 @@ struct Params
   int   csy;
   int   chroma;     // nonzero unless the format is 4:0:0
   int   qpBdOffset; // the SPS's QpBDOffset
-  int   pass;       // 0: the CUs of the luma tree (or single tree), 1: the CUs of the chroma tree
+  int   pass;       // 0: the CUs of the luma tree (or single tree), 1: the CUs of the chroma tree (unused with SUBBLOCKS)
   int   flags;      // bits: 1 loop filter across slices, 2 across tiles (PPS); 4 subpicture info present (SPS)
   int   vbPosHor[4];   // virtual boundaries: their count, then up to 3 positions in luma samples
   int   vbPosVer[4];
@@ -118,6 +128,13 @@ bool geoOf( Cu cu ) { return ( cu.flags & kGeo ) != 0; }
 bool ciipOf( Cu cu ) { return ( cu.flags & kCiip ) != 0; }
 bool mergeOf( Cu cu ) { return ( cu.flags & kMerge ) != 0; }
 bool isSepTree( Cu cu ) { return cu.treeType != 0; }
+
+// Whether the CU's motion differs from one 8x8 sub-block to the next (SbTMVP or affine).
+bool subBlockMotion( Cu cu ) { return ( mergeOf( cu ) && mergeTypeOf( cu ) == MRG_TYPE_SUBPU_ATMVP ) || affineOf( cu ); }
+
+// Whether vvdec works out the CU's boundary strengths block by block after marking its edges (refineBs): with
+// sub-block motion, and for ISP's subpartitions.
+bool refinedInside( Cu cu ) { return subBlockMotion( cu ) || cu.isp != 0; }
 
 struct Tu
 {
@@ -674,73 +691,112 @@ void filterLengthsFromTransforms( int dir, Cu cu, Tu currTu, bool bValue, bool d
 }
 
 // --------------------------------------------------------------------------------------------------------------------
-// LoopFilter::xSetEdgeFilterInsidePu, xSetMaxFilterLengthPQForCodingSubBlocks
+// LoopFilter::xSetEdgeFilterInsidePu, xSetMaxFilterLengthPQForCodingSubBlocks and the boundary strengths of a CU
+// whose motion or prediction differs inside it, one 4x4 block at a time
 // --------------------------------------------------------------------------------------------------------------------
 
-void edgeFilterInsidePu( int dir, Cu cu, int4 area, bool bValue )
+// Whether the 4x4 block g's edge in direction dir starts a transform block: calcFilterStrengths marks those edges with
+// bit 7 of sideMaxFiltLength.
+bool transformEdge( int dir, int2 g )
 {
-  int2       lp   = lfpPos( cu.chType, area.xy );
-  const int2 step = dir == EDGE_HOR ? int2( 1, 0 ) : int2( 0, 1 );
-  const int  inc  = dir == EDGE_HOR ? 4 >> scaleX( cu.chType ) : 4 >> scaleY( cu.chType );
-  for( int d = 0; d < parlSize( dir, area ); d += inc )
-  {
-    uint* ptr = lfpPtr( dir, lp.x, lp.y );
-    Lfp   lfp = loadLfp( ptr );
-    setFilterEdge( lfp, cu.chType, bValue );
-    if( bValue && lfp.bs != 0 )
-    {
-      lfp.bs |= bsSet( 3, 3 );
-    }
-    storeLfp( ptr, lfp );
-    lp += step;
-  }
+  return ( loadLfp( lfpPtr( dir, g.x, g.y ) ).sideMaxFiltLength & 128 ) != 0;
 }
 
-void filterLengthsForSubBlocks( int dir, Cu cu )
+// Whether a vertical (dir EDGE_VER) or horizontal edge at the luma position pos lies on a virtual boundary.
+bool onVirtualBoundary( int dir, int2 pos )
 {
-  const int4 y4   = cu.blk[0];
-  const int  xInc = dir == EDGE_HOR ? 4 : 8;
-  const int  yInc = dir == EDGE_HOR ? 8 : 4;
-  const int2 off  = dir == EDGE_HOR ? int2( 0, 1 ) : int2( 1, 0 );   // step to the next 4x4 block across the edges
-  for( int y = 0; y < y4.w; y += yInc )
+  const int count = dir == EDGE_VER ? pc.vbPosVer[0] : pc.vbPosHor[0];
+  for( int i = 0; i < count; i++ )
   {
-    for( int x = 0; x < y4.z; x += xInc )
+    if( ( dir == EDGE_VER ? pc.vbPosVer[1 + i] : pc.vbPosHor[1 + i] ) == perp( dir, pos ) )
     {
-      const int2 lp      = int2( ( y4.x + x ) >> 2, ( y4.y + y ) >> 2 );
-      const int  perpVal = dir == EDGE_HOR ? y : x;
-      uint*      ptr     = lfpPtr( dir, lp.x, lp.y );
-      Lfp        lfp     = loadLfp( ptr );
-      int        maxFLP, maxFLQ;
-      int        te = 0;
-      if( ( lfp.sideMaxFiltLength & 128 ) != 0 )
+      return true;
+    }
+  }
+  return false;
+}
+
+// Whether a transform edge or the CU's far edge lies within `blocks` 4x4 blocks of the sub-block edge at the 4x4 block
+// g, perpVal luma samples from the CU's left or top edge (perpVal >= 8). The CU's far edge is tested first, so that
+// the marks read always lie inside the CU.
+bool transformEdgeNear( int dir, Cu cu, int2 g, int perpVal, int blocks )
+{
+  if( perpVal + 4 * blocks >= perpSize( dir, cu.blk[0] ) )
+  {
+    return true;
+  }
+  const int2 off = dir == EDGE_HOR ? int2( 0, blocks ) : int2( blocks, 0 );
+  return transformEdge( dir, g - off ) || transformEdge( dir, g + off );
+}
+
+// xSetMaxFilterLengthPQForCodingSubBlocks for the 4x4 block g of a CU with sub-block motion, whose edge in direction
+// dir lies on the CU's 8x8 grid, perpVal luma samples from the CU's left or top edge: the edge's new
+// sideMaxFiltLength. It reads only the transform edges' marks, inside the CU, which the per-CU pass set.
+int subBlockFilterLength( int dir, Cu cu, int2 g, int perpVal, int sideMaxFiltLength )
+{
+  int maxFLP, maxFLQ;
+  int te = 0;
+  if( ( sideMaxFiltLength & 128 ) != 0 )
+  {
+    te     = 128;
+    maxFLQ = min( sideMaxFiltLength & 7, 5 );
+    maxFLP = ( sideMaxFiltLength >> 4 ) & 7;
+    if( perpVal > 0 )
+    {
+      maxFLP = min( maxFLP, 5 );
+    }
+  }
+  else if( perpVal > 0 && transformEdgeNear( dir, cu, g, perpVal, 1 ) )
+  {
+    maxFLP = maxFLQ = 1;
+  }
+  else if( perpVal > 0 && ( perpVal == 8 || transformEdgeNear( dir, cu, g, perpVal, 2 ) ) )
+  {
+    maxFLP = maxFLQ = 2;
+  }
+  else
+  {
+    maxFLP = maxFLQ = 3;
+  }
+  return ( maxFLP << 4 ) + maxFLQ + te;
+}
+
+// The edges of the 4x4 block g, inside a luma-tree CU whose boundary strengths vvdec refines (refinedInside), after the
+// per-CU pass has set the CU's transform edges. With sub-block motion, an edge on the CU's 8x8 grid is marked for
+// filtering (xSetEdgeFilterInsidePu, except on a virtual boundary) and gets its filter lengths; then every marked
+// edge gets its boundary strength. vvdec runs these steps over the whole CU, one step after the other; each block's
+// steps read and write only the block's own parameters, plus the transform marks next to it, which no step changes.
+void subBlockEdges( Cu cu, int2 g )
+{
+  const int2 pos   = g * 4;                // the block's luma position
+  const int2 local = pos - cu.blk[0].xy;   // its place in the CU
+  const bool subPu = subBlockMotion( cu );
+  for( int dir = EDGE_VER; dir <= EDGE_HOR; dir++ )
+  {
+    uint*     ptr     = lfpPtr( dir, g.x, g.y );
+    Lfp       lfp     = loadLfp( ptr );
+    const int perpVal = perp( dir, local );
+    if( subPu && ( perpVal & 7 ) == 0 )
+    {
+      if( perpVal > 0 )
       {
-        te     = 128;
-        maxFLQ = min( lfp.sideMaxFiltLength & 7, 5 );
-        maxFLP = ( lfp.sideMaxFiltLength >> 4 ) & 7;
-        if( perpVal > 0 )
+        const bool edge = !onVirtualBoundary( dir, pos );
+        setFilterEdge( lfp, cu.chType, edge );
+        if( edge && lfp.bs != 0 )
         {
-          maxFLP = min( maxFLP, 5 );
+          lfp.bs |= bsSet( 3, 3 );
         }
       }
-      else if( perpVal > 0
-               && ( ( loadLfp( lfpPtr( dir, lp.x - off.x, lp.y - off.y ) ).sideMaxFiltLength & 128 ) != 0 || perpVal + 4 >= perpSize( dir, y4 )
-                    || ( loadLfp( lfpPtr( dir, lp.x + off.x, lp.y + off.y ) ).sideMaxFiltLength & 128 ) != 0 ) )
-      {
-        maxFLP = maxFLQ = 1;
-      }
-      else if( perpVal > 0
-               && ( ( dir == EDGE_HOR ? y == 8 : x == 8 ) || ( loadLfp( lfpPtr( dir, lp.x - 2 * off.x, lp.y - 2 * off.y ) ).sideMaxFiltLength & 128 ) != 0
-                    || perpVal + 8 >= perpSize( dir, y4 ) || ( loadLfp( lfpPtr( dir, lp.x + 2 * off.x, lp.y + 2 * off.y ) ).sideMaxFiltLength & 128 ) != 0 ) )
-      {
-        maxFLP = maxFLQ = 2;
-      }
-      else
-      {
-        maxFLP = maxFLQ = 3;
-      }
-      lfp.sideMaxFiltLength = ( maxFLP << 4 ) + maxFLQ + te;
-      storeLfp( ptr, lfp );
+      lfp.sideMaxFiltLength = subBlockFilterLength( dir, cu, g, perpVal, lfp.sideMaxFiltLength );
     }
+    // (an edge on the picture's left or top boundary is never marked: it has no P side)
+    const int indexP = perpVal != 0 ? cu.index : cuAt( cu.chType, pos - ( dir == EDGE_VER ? int2( 1, 0 ) : int2( 0, 1 ) ) );
+    if( filterEdge( lfp, cu.chType ) && indexP >= 0 )
+    {
+      boundaryStrength( dir, lfp, cu, pos, indexP == cu.index ? cu : loadCu( indexP ) );
+    }
+    lfp.bs &= ~bsSet( 3, 3 );
+    storeLfp( ptr, lfp );
   }
 }
 
@@ -832,7 +888,9 @@ void calcFilterStrengths( Cu cu )
     topEdge = lfAvailable( cu, loadCu( cuAt( cu.chType, int2( area.x, area.y - 1 ) ) ) );
   }
 
-  const bool refineBs       = ( mergeOf( cu ) && mergeTypeOf( cu ) == MRG_TYPE_SUBPU_ATMVP ) || affineOf( cu ) || cu.isp != 0;
+  // A CU with sub-block motion or ISP gets only its transform edges marked here: the edges inside it and all its
+  // boundary strengths come from subBlockEdges, a thread per 4x4 block.
+  const bool refineBs       = refinedInside( cu );
   // Masks that round to the LF_PARAM_MAP's unit, a 4x4 luma block, in the channel's samples.
   const int  maskBlkX       = ~( ( 1 << ( 2 - sx ) ) - 1 );
   const int  maskBlkY       = ~( ( 1 << ( 2 - sy ) ) - 1 );
@@ -855,80 +913,38 @@ void calcFilterStrengths( Cu cu )
     filterLengthsFromTransforms( EDGE_VER, cu, tu, verEdgeFilter, !refineBs, pqSameCtuVer );
     filterLengthsFromTransforms( EDGE_HOR, cu, tu, horEdgeFilter, !refineBs, pqSameCtuHor );
   }
+}
 
-  if( !refineBs )
+#if SUBBLOCKS
+// One thread per 4x4 luma block: the edges inside a luma-tree CU with sub-block motion or ISP (a chroma-tree CU has
+// neither); blocks of other CUs, and of slices with deblocking off, are skipped.
+[shader( "compute" )]
+[numthreads( 64, 1, 1 )]
+void main( uint3 id : SV_DispatchThreadID )
+{
+  const int index     = int( id.y * 65536 + id.x );
+  const int heightIn4 = ( pc.height + 3 ) >> 2;
+  if( index >= pc.widthIn4 * heightIn4 )
   {
     return;
   }
-
-  if( ( mergeOf( cu ) && mergeTypeOf( cu ) == MRG_TYPE_SUBPU_ATMVP ) || affineOf( cu ) )
+  // (mider_cumap writes every 4x4 block's CU; the checks keep a wrong entry from sending the reads outside the
+  // picture's records)
+  const uint cuIndex = pc.cuMapL[index];
+  if( cuIndex >= uint( pc.numCus ) )
   {
-    const int4 y4 = cu.blk[0];
-    for( int off = 8; off < area.z; off += 8 )
-    {
-      const int4 mvBlockV  = int4( y4.x + off, y4.y, 8, y4.w );
-      bool       verEdge   = true;
-      bool       horUnused = true;
-      if( crossed )
-      {
-        edgeFilterParam( mvBlockV.xy, numVer, 0, ver, hor, verEdge, horUnused );
-      }
-      edgeFilterInsidePu( EDGE_VER, cu, mvBlockV, verEdge );
-    }
-    filterLengthsForSubBlocks( EDGE_VER, cu );
-    for( int off = 8; off < area.w; off += 8 )
-    {
-      const int4 mvBlockH  = int4( y4.x, y4.y + off, y4.z, 8 );
-      bool       verUnused = true;
-      bool       horEdge   = true;
-      if( crossed )
-      {
-        edgeFilterParam( mvBlockH.xy, 0, numHor, ver, hor, verUnused, horEdge );
-      }
-      edgeFilterInsidePu( EDGE_HOR, cu, mvBlockH, horEdge );
-    }
-    filterLengthsForSubBlocks( EDGE_HOR, cu );
+    return;
   }
-
-  // Compute the boundary strengths of the edges that the steps above marked.
-  const int pelsX = 4 >> sx;
-  const int pelsY = 4 >> sy;
-  for( int y = 0; y < area.w; y += pelsY )
+  const Cu   cu = loadCu( int( cuIndex ) );
+  const int2 g  = int2( index % pc.widthIn4, index / pc.widthIn4 );
+  if( cu.chType != 0 || !refinedInside( cu ) || any( g * 4 < cu.blk[0].xy ) || any( g * 4 >= cu.blk[0].xy + cu.blk[0].zw )
+      || deblockingOff( sliceOfCtu( cu.ctu ) ) )
   {
-    for( int x = 0; x < area.z; x += pelsX )
-    {
-      const int2 pos = int2( area.x + x, area.y + y );
-      const int2 lp  = lfpPos( cu.chType, pos );
-      uint*      ptr = lfpPtr( EDGE_VER, lp.x, lp.y );
-      Lfp        lfp = loadLfp( ptr );
-      if( filterEdge( lfp, cu.chType ) )
-      {
-        const Cu cuP = x != 0 ? cu : loadCu( cuAt( cu.chType, int2( area.x - 1, area.y + y ) ) );
-        boundaryStrength( EDGE_VER, lfp, cu, pos, cuP );
-      }
-      lfp.bs &= ~bsSet( 3, 3 );
-      storeLfp( ptr, lfp );
-    }
+    return;
   }
-  for( int y = 0; y < area.w; y += pelsY )
-  {
-    for( int x = 0; x < area.z; x += pelsX )
-    {
-      const int2 pos = int2( area.x + x, area.y + y );
-      const int2 lp  = lfpPos( cu.chType, pos );
-      uint*      ptr = lfpPtr( EDGE_HOR, lp.x, lp.y );
-      Lfp        lfp = loadLfp( ptr );
-      if( filterEdge( lfp, cu.chType ) )
-      {
-        const Cu cuP = y != 0 ? cu : loadCu( cuAt( cu.chType, int2( area.x + x, area.y - 1 ) ) );
-        boundaryStrength( EDGE_HOR, lfp, cu, pos, cuP );
-      }
-      lfp.bs &= ~bsSet( 3, 3 );
-      storeLfp( ptr, lfp );
-    }
-  }
+  subBlockEdges( cu, g );
 }
-
+#else
 // One thread per CU of the pass's tree; CUs in slices with deblocking off are skipped.
 [shader( "compute" )]
 [numthreads( 64, 1, 1 )]
@@ -946,3 +962,4 @@ void main( uint3 id : SV_DispatchThreadID )
   }
   calcFilterStrengths( cu );
 }
+#endif

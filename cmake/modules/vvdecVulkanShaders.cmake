@@ -24,6 +24,7 @@ set( VVDEC_GPU_SHADERS
   "mider_lite|mider|LITE=1"
   "mider_cumap|mider|CUMAP=1"
   "dbparams|dbparams"
+  "dbparams_sub|dbparams|SUBBLOCKS=1"
   "jobs|jobs"
   "jobs_waves|jobs|WAVES=1"
   "edges|edges"
