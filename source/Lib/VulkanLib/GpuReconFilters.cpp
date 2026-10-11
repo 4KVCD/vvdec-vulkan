@@ -426,7 +426,6 @@ bool GpuRecon::prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8
 void GpuRecon::recordSao( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params )
 {
   const PreCalcValues& pcv = *cs.pcv;
-  bind( kShader_sao );
   for( int comp = 0; comp < (int) getNumberValidComponents( pcv.chrFormat ); comp++ )
   {
     const ComponentID compID = ComponentID( comp );
@@ -446,9 +445,24 @@ void GpuRecon::recordSao( const CodingStructure& cs, const Planes& src, const Pl
     push.scaleX      = getComponentScaleX( compID, pcv.chrFormat );
     push.scaleY      = getComponentScaleY( compID, pcv.chrFormat );
     setVirtualBoundaries( *cs.picHeader, push );
-    // one workgroup per 16x16 samples
+    // Eight samples a thread (sao_vec8) where the rows and the parameters allow 16-byte loads and stores: rows that
+    // start 16-byte aligned, and room in each row for the eight samples read from the last thread's start (a chroma
+    // row may end 4 samples into them); else one sample a thread
+    const int  rowRoom = ( push.width + 7 ) & ~7;
+    const bool vec8    = push.src % 16 == 0 && push.dst % 16 == 0 && params % 16 == 0 && push.srcStride % 8 == 0 && push.dstStride % 8 == 0
+                      && push.width % 4 == 0 && push.srcStride >= rowRoom && push.dstStride >= rowRoom;
+    bind( vec8 ? kShader_sao_vec8 : kShader_sao );
     pushConstants( push );
-    dispatchGroups( uint32_t( ( push.width + 15 ) / 16 ), uint32_t( ( push.height + 15 ) / 16 ) );
+    if( vec8 )
+    {
+      // a workgroup per 64x8 samples
+      dispatchGroups( uint32_t( ( push.width + 63 ) / 64 ), uint32_t( ( push.height + 7 ) / 8 ) );
+    }
+    else
+    {
+      // a workgroup per 16x16 samples
+      dispatchGroups( uint32_t( ( push.width + 15 ) / 16 ), uint32_t( ( push.height + 15 ) / 16 ) );
+    }
   }
   mark( "sao" );
 }
