@@ -766,8 +766,8 @@ int DecLib::finishPicture( Picture* pcPic, MsgLevel msgl )
 
 // With the GPU's parse, the next pictures to output whose downloads start when a picture is output (PlanePool): its
 // download is usually done when its turn comes, and only these pictures and the ones the application holds have their
-// planes in host memory
-static constexpr size_t kOutputsDownloadedAhead = 3;
+// planes in host memory. (Two: as fast as three, with a picture's planes less; one was ~1-2% slower at 1080p.)
+static constexpr size_t kOutputsDownloadedAhead = 2;
 
 void DecLib::prepareOutput( Picture* pcPic )
 {
