@@ -4,11 +4,13 @@
 //
 // - CUMAP records which CU covers each 4x4 luma block of the picture (luma
 //   tree), one workgroup per CU.
-// - The main variant derives each CTU row's CUs in decoding order, one
-//   32-thread workgroup per row (the history-based candidates run along a
-//   row, starting at each tile's left edge). The rows run as a wavefront: a
-//   CTU starts once the row above is past the CTU above-right, as vvdec's
-//   MIDER tasks wait. A CU's
+// - The main variant derives the CUs of each CTU row of a tile column (a
+//   segment) in decoding order, one 32-thread workgroup per segment (the
+//   history-based candidates run along a row, starting at each tile's left
+//   edge). The segments of a tile run as a wavefront: a CTU starts once the
+//   segment above is past the CTU above-right, as vvdec's MIDER tasks wait.
+//   Tiles do not wait for each other: no CU is the neighbour of a CU in
+//   another tile. A CU's
 //   motion goes to its motion record (what vvdec keeps in the CodingUnit:
 //   control-point motion, reference indices, BCW, ...) and to the motion of
 //   its 4x4 luma blocks (vvdec's MotionInfo, CTU by CTU as vvdec keeps it),
@@ -56,6 +58,7 @@ struct Params
   uint*         cuMapC;     // the same as cuMap for the chroma tree (in a single tree, the luma tree's CUs)
   int           csx;        // chroma subsampling shifts
   int           csy;
+  int           tileCols;   // the picture's tile columns (the segments of a CTU row)
 };
 
 [[vk::push_constant]] Params pc;
@@ -2632,30 +2635,65 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 // counter), so a row waits only for rows whose workgroups already run.
 groupshared int s_row;
 
+// Tile column tc's CTU columns [x, y): the tile columns begin at the CTU columns whose records carry the flag of a
+// tile column's first CTU (row 0's records; every CTU row has the same tile columns).
+int2 tileColumnSpan( int tc )
+{
+  int2 span = int2( 0, pc.widthInCtus );
+  int  seen = 0;
+  for( int base = 0; base < pc.widthInCtus; base += 32 )
+  {
+    const int c    = base + g_lane;
+    uint      mask = WaveActiveBallot( c < pc.widthInCtus && ctuTileColStart( c ) ).x;
+    while( mask != 0 )
+    {
+      const int first = base + int( firstbitlow( mask ) );
+      if( seen == tc )
+      {
+        span.x = first;
+      }
+      else if( seen == tc + 1 )
+      {
+        span.y = first;
+      }
+      seen++;
+      mask &= mask - 1;
+    }
+  }
+  return span;
+}
+
 [shader( "compute" )]
 [numthreads( 32, 1, 1 )]
 void main( uint3 local : SV_GroupThreadID )
 {
   g_lane = int( local.x );
+  // The segments are taken in order (row by row, each row's tile columns from left to right), so that the segment
+  // above a segment was taken before it.
+  const int segments = pc.heightInCtus * pc.tileCols;
   if( g_lane == 0 )
   {
-    s_row = int( pc.progress[pc.heightInCtus].add( 1u ) );
+    s_row = int( pc.progress[segments].add( 1u ) );
   }
   GroupMemoryBarrierWithGroupSync();
-  const int row = s_row;
-  if( row >= pc.heightInCtus )
+  const int segment = s_row;
+  if( segment >= segments )
   {
     return;
   }
-  for( int col = 0; col < pc.widthInCtus; col++ )
+  const int  row       = segment / pc.tileCols;
+  const int2 span      = tileColumnSpan( segment % pc.tileCols );
+  const bool waitAbove = row > 0 && ctuTile( row * pc.widthInCtus + span.x ) == ctuTile( ( row - 1 ) * pc.widthInCtus + span.x );
+  for( int col = span.x; col < span.y; col++ )
   {
-    // Wait until the row above is past the CTU above-right (or done, at the right edge).
-    if( row > 0 )
+    // Wait until the segment above, in the same tile, is past the CTU above-right (or done, at the tile's right
+    // edge).
+    if( waitAbove )
     {
       if( g_lane == 0 )
       {
-        const uint need = uint( min( col + 2, pc.widthInCtus ) );
-        while( pc.progress[row - 1].load( MemoryOrder.Relaxed ) < need )
+        const uint need = uint( min( col + 2, span.y ) - span.x );
+        while( pc.progress[segment - pc.tileCols].load( MemoryOrder.Relaxed ) < need )
         {
         }
       }
@@ -2699,7 +2737,7 @@ void main( uint3 local : SV_GroupThreadID )
     AllMemoryBarrierWithGroupSync();   // (makes the CTU's motion visible to the rows below)
     if( g_lane == 0 )
     {
-      pc.progress[row].store( uint( col + 1 ), MemoryOrder.Release );
+      pc.progress[segment].store( uint( col + 1 - span.x ), MemoryOrder.Release );
     }
   }
 }

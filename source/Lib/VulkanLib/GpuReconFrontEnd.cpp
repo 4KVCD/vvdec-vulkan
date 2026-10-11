@@ -66,9 +66,9 @@ struct MiderPush
   VkDeviceAddress cus, ctus, slices, cuMap, cuMotion, motion, progress, subpics;
   int32_t         numCus, widthInCtus, heightInCtus, log2Ctu, width, height, widthIn4, plevel, wpp, maxNumMergeCand, subpicOn, sps;
   VkDeviceAddress cuMapC;
-  int32_t         csx, csy;
+  int32_t         csx, csy, tileCols, unused;
 };
-static_assert( sizeof( MiderPush ) == 128, "MiderPush: the layout of mider.slang's Params" );
+static_assert( sizeof( MiderPush ) == 136, "MiderPush: the layout of mider.slang's Params" );
 
 // The push constants of colmotion.slang
 struct ColMotionPush
@@ -329,7 +329,8 @@ void GpuRecon::ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, 
   ensureBuffer( m_ctx, m_frontEnd.cuMapChroma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
   ensureBuffer( m_ctx, m_frontEnd.cuMotion, std::max<size_t>( numCus, 1 ) * 16 * sizeof( int32_t ), MemKind::Device );
   ensureBuffer( m_ctx, m_frontEnd.motion, motionBytes( pcv ), MemKind::Device );
-  ensureBuffer( m_ctx, m_frontEnd.rowProgress, ( pcv.heightInCtus + 1 ) * sizeof( uint32_t ), MemKind::Device );
+  // (mider.slang's progress: per CTU row and tile column, then the segments taken)
+  ensureBuffer( m_ctx, m_frontEnd.rowProgress, ( size_t( pcv.heightInCtus ) * cs.pps->getNumTileColumns() + 1 ) * sizeof( uint32_t ), MemKind::Device );
 }
 
 void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
@@ -360,11 +361,13 @@ void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
   push.cuMapC          = m_frontEnd.cuMapChroma.addr;
   push.csx             = chroma ? int32_t( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
   push.csy             = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  push.tileCols        = int32_t( cs.pps->getNumTileColumns() );
 
-  // the CTU rows' progress from zero
+  // the segments' progress from zero
   m_ctx->api().vkCmdFillBuffer( m_cmd, m_frontEnd.rowProgress.buffer, 0, VK_WHOLE_SIZE, 0 );
   transferToComputeBarrier();
-  // each 4x4 block's CU (mider_cumap: one workgroup per CU), then the motion (mider: one workgroup per CTU row)
+  // each 4x4 block's CU (mider_cumap: one workgroup per CU), then the motion (mider: one workgroup per CTU row of each
+  // tile column)
   bind( kShader_mider_cumap );
   pushConstants( push );
   dispatchJobs( numCus );
@@ -372,7 +375,7 @@ void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
   // (the variant without GPM, affine and SbTMVP when the SPS turns them all off)
   const SPS& sps  = *cs.sps;
   const bool lite = !sps.getUseGeo() && !sps.getUseAffine() && !sps.getSBTMVPEnabledFlag();
-  dispatch( lite ? kShader_mider_lite : kShader_mider, push, uint32_t( pcv.heightInCtus ) );
+  dispatch( lite ? kShader_mider_lite : kShader_mider, push, uint32_t( pcv.heightInCtus ) * uint32_t( push.tileCols ) );
   mark( "mider" );
   // The 4x4 blocks' motion goes into the picture's colocated motion (colmotion.slang), or in the check mode to host
   // memory.
