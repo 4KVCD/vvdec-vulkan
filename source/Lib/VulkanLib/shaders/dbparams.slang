@@ -866,7 +866,12 @@ void edgeFilterParam( int2 pos, int numVer, int numHor, int3 ver, int3 hor, inou
   }
 }
 
-void calcFilterStrengths( Cu cu )
+// The threads per CU of the per-CU passes: one per direction and every kTuThreads-th TU of the CU
+static const int kTuThreads    = 4;
+static const int kThreadsPerCu = 2 * kTuThreads;
+
+// The parameters of the edges in direction dir of CU cu's TUs first, first + kTuThreads, ...
+void calcFilterStrengths( Cu cu, int dir, int first )
 {
   const int4 area = cu.blk[cu.chType];
   const int  sx   = scaleX( cu.chType );
@@ -877,15 +882,15 @@ void calcFilterStrengths( Cu cu )
   virtualBoundaries( int4( area.x << sx, area.y << sy, area.z << sx, area.w << sy ), numHor, numVer, hor, ver );
   const bool crossed = numHor > 0 || numVer > 0;
 
-  // Whether the edges at the CU's left and top are filtered (xGetLoopfilterParam).
-  bool leftEdge = false, topEdge = false;
-  if( area.x > 0 )
+  // Whether the edge at the CU's left (EDGE_VER) or top is filtered (xGetLoopfilterParam).
+  bool cuEdge = false;
+  if( dir == EDGE_VER && area.x > 0 )
   {
-    leftEdge = lfAvailable( cu, loadCu( cuAt( cu.chType, int2( area.x - 1, area.y ) ) ) );
+    cuEdge = lfAvailable( cu, loadCu( cuAt( cu.chType, int2( area.x - 1, area.y ) ) ) );
   }
-  if( area.y > 0 )
+  if( dir == EDGE_HOR && area.y > 0 )
   {
-    topEdge = lfAvailable( cu, loadCu( cuAt( cu.chType, int2( area.x, area.y - 1 ) ) ) );
+    cuEdge = lfAvailable( cu, loadCu( cuAt( cu.chType, int2( area.x, area.y - 1 ) ) ) );
   }
 
   // A CU with sub-block motion or ISP gets only its transform edges marked here: the edges inside it and all its
@@ -898,20 +903,26 @@ void calcFilterStrengths( Cu cu )
   const bool pqCuSameCtuHor = ( area.y & ( ctuMask >> sy ) ) > 0;
   const bool pqCuSameCtuVer = ( area.x & ( ctuMask >> sx ) ) > 0;
 
-  for( int t = 0; t < cu.numTus; t++ )
+  for( int t = first; t < cu.numTus; t += kTuThreads )
   {
     const Tu   tu            = loadTu( cu.firstTu + t );
     const int4 areaTu        = tu.blk[tu.chType];
-    bool       verEdgeFilter = ( areaTu.x & maskBlkX ) == area.x ? leftEdge : true;
-    bool       horEdgeFilter = ( areaTu.y & maskBlkY ) == area.y ? topEdge : true;
+    bool       verEdgeFilter = ( areaTu.x & maskBlkX ) == area.x ? cuEdge : true;
+    bool       horEdgeFilter = ( areaTu.y & maskBlkY ) == area.y ? cuEdge : true;
     const bool pqSameCtuHor  = ( areaTu.y & maskBlkY ) == area.y ? pqCuSameCtuHor : true;
     const bool pqSameCtuVer  = ( areaTu.x & maskBlkX ) == area.x ? pqCuSameCtuVer : true;
     if( crossed )
     {
       edgeFilterParam( int2( ( areaTu.x & maskBlkX ) << sx, ( areaTu.y & maskBlkY ) << sy ), numVer, numHor, ver, hor, verEdgeFilter, horEdgeFilter );
     }
-    filterLengthsFromTransforms( EDGE_VER, cu, tu, verEdgeFilter, !refineBs, pqSameCtuVer );
-    filterLengthsFromTransforms( EDGE_HOR, cu, tu, horEdgeFilter, !refineBs, pqSameCtuHor );
+    if( dir == EDGE_VER )
+    {
+      filterLengthsFromTransforms( EDGE_VER, cu, tu, verEdgeFilter, !refineBs, pqSameCtuVer );
+    }
+    else
+    {
+      filterLengthsFromTransforms( EDGE_HOR, cu, tu, horEdgeFilter, !refineBs, pqSameCtuHor );
+    }
   }
 }
 
@@ -945,21 +956,24 @@ void main( uint3 id : SV_DispatchThreadID )
   subBlockEdges( cu, g );
 }
 #else
-// One thread per CU of the pass's tree; CUs in slices with deblocking off are skipped.
+// kThreadsPerCu threads per CU of the pass's tree (a direction and every kTuThreads-th TU each); CUs in slices with
+// deblocking off are skipped.
 [shader( "compute" )]
 [numthreads( 64, 1, 1 )]
 void main( uint3 id : SV_DispatchThreadID )
 {
-  const int index = int( id.y * 65536 + id.x );
+  const int thread = int( id.y * 65536 + id.x );
+  const int index  = thread / kThreadsPerCu;
+  const int sub    = thread % kThreadsPerCu;
   if( index >= pc.numCus )
   {
     return;
   }
   Cu cu = loadCu( index );
-  if( cu.chType != pc.pass || deblockingOff( sliceOfCtu( cu.ctu ) ) )
+  if( cu.chType != pc.pass || deblockingOff( sliceOfCtu( cu.ctu ) ) || sub / 2 >= cu.numTus )
   {
     return;
   }
-  calcFilterStrengths( cu );
+  calcFilterStrengths( cu, sub & 1, sub >> 1 );
 }
 #endif

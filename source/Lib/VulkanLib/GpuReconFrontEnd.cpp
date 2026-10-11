@@ -384,6 +384,9 @@ void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
   }
 }
 
+// dbparams.slang's threads per CU in its per-CU passes (kThreadsPerCu)
+static constexpr size_t kDbParamsThreadsPerCu = 8;
+
 void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
 {
   const PreCalcValues& pcv    = *cs.pcv;
@@ -453,9 +456,9 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
       push.vbPosVer[1 + i] = int32_t( ph.getVirtualBoundariesPosX( i ) );
     }
   }
-  // Pass 0: the luma tree's CUs, one thread per CU. Then, when the SPS allows sub-block motion or ISP, the edges inside
-  // those CUs, one thread per 4x4 block (dbparams_sub). Pass 1: the chroma tree's CUs, one thread per CU. Threads in
-  // rows of 1024 workgroups.
+  // Pass 0: the luma tree's CUs, kDbParamsThreadsPerCu threads per CU. Then, when the SPS allows sub-block motion or
+  // ISP, the edges inside those CUs, one thread per 4x4 block (dbparams_sub). Pass 1: the chroma tree's CUs, as pass 0.
+  // Threads in rows of 1024 workgroups.
   const auto dispatchThreads = [&]( size_t threads ) {
     const uint32_t groups = uint32_t( ( threads + 63 ) / 64 );
     dispatchGroups( std::min<uint32_t>( groups, 1024 ), ( groups + 1023 ) / 1024 );
@@ -465,7 +468,7 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
   bind( kShader_dbparams );
   push.pass = 0;
   pushConstants( push );
-  dispatchThreads( numCus );
+  dispatchThreads( numCus * kDbParamsThreadsPerCu );
   if( sps.getUseAffine() || sps.getSBTMVPEnabledFlag() || sps.getUseISP() )
   {
     bind( kShader_dbparams_sub );
@@ -475,7 +478,7 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
   }
   push.pass = 1;
   pushConstants( push );
-  dispatchThreads( numCus );
+  dispatchThreads( numCus * kDbParamsThreadsPerCu );
   mark( "dbparams" );
   if( !m_useFrontEnd )
   {
