@@ -27,6 +27,7 @@ set( VVDEC_GPU_SHADERS
   "dbparams|dbparams"
   "dbparams_sub|dbparams|SUBBLOCKS=1"
   "jobs|jobs"
+  "jobs_count|jobs|COUNT_ONLY=1"
   "jobs_waves|jobs|WAVES=1"
   "edges|edges"
   "intrasort|intrasort"

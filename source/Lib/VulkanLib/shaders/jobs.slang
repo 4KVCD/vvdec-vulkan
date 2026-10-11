@@ -26,6 +26,12 @@
 #include "common.slang"
 #include "scan.slang"
 
+// COUNT_ONLY=1: the variant for pass 0 (jobs_count). With the writes off at compile time, the compiler drops the work
+// that only fills in the jobs' words, which COUNT has no use for: what is left decides how many jobs each list gets.
+#ifndef COUNT_ONLY
+#  define COUNT_ONLY 0
+#endif
+
 struct Params
 {
   uint* cus;         // CuRecord, 32 words each
@@ -1949,7 +1955,7 @@ void main( uint3 local : SV_GroupThreadID )
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
   const int tid = int( local.x );
-  if( pc.pass == 1 )
+  if( !COUNT_ONLY && pc.pass == 1 )
   {
     // SCAN: turn the blocks' totals into offsets; each thread takes a run of blocks.
     const int per = ( pc.numBlocks + 255 ) / 256;
@@ -2004,7 +2010,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 
   const int index = int( group.x ) * 256 + tid;
   Out       o;
-  o.write = pc.pass == 2;
+  o.write = !COUNT_ONLY && pc.pass == 2;
   for( int k = 0; k < kLists; k++ )
   {
     o.n[k]    = 0;
@@ -2020,7 +2026,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   {
     cuJobs( index, o );
   }
-  if( pc.pass == 0 )
+  if( COUNT_ONLY || pc.pass == 0 )
   {
     // COUNT: store the CU's offsets within its block, and the block's totals.
     for( int k = 0; k < kLists; k++ )

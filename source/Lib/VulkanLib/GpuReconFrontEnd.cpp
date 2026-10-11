@@ -626,12 +626,15 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, s
   vk.vkCmdFillBuffer( m_cmd, m_frontEnd.jobProgress.buffer, 0, VK_WHOLE_SIZE, 0 );
   vk.vkCmdFillBuffer( m_cmd, m_frontEnd.args.buffer, 0, VK_WHOLE_SIZE, 0 );
   transferToComputeBarrier();
-  // pass 0 counts each CU's jobs, pass 1 adds the counts up, pass 2 writes the jobs (one workgroup per 256 CUs, but
-  // one workgroup for pass 1)
-  bind( kShader_jobs );
+  // pass 0 counts each CU's jobs (jobs_count: the variant that only counts), pass 1 adds the counts up, pass 2 writes the
+  // jobs (one workgroup per 256 CUs, but one workgroup for pass 1)
   for( int pass = 0; pass < 3; pass++ )
   {
     push.pass = pass;
+    if( pass < 2 )
+    {
+      bind( pass == 0 ? kShader_jobs_count : kShader_jobs );
+    }
     pushConstants( push );
     dispatchGroups( pass == 1 ? 1u : uint32_t( std::max( m_frontEnd.jobBlockCount, 1 ) ) );
     computeBarrier();
