@@ -1,6 +1,7 @@
 # ab_steady.py <stream> <frames> <rounds> <specs...>: steady-state fps (first frame to end of decoding), the package's
 # power and energy per frame over the same span (RAPL), peak commit and working set, time to the first frame; the
-# specs alternated, 16 threads, medians.
+# specs alternated, their order reversed every other round (the package's power often drifts through a run: a spec
+# always run after another would always get less), 16 threads, medians.
 # A spec is a program name (vvdecapp_<name>.exe here) with an optional mode: <name> (the GPU parses: VVDEC_GPU_PARSE=2),
 # <name>:hyb (the CPU parses, the GPU does the rest), <name>:cpu (the CPU decoder, --gpu 0); and environment variables
 # of its own after the name: <name>+VAR=value+VAR2=value[:mode].
@@ -55,7 +56,7 @@ for spec in specs:
                    env=environment(spec), capture_output=True)
 runs = {}
 for r in range(rounds):
-    for spec in specs:
+    for spec in (specs if r % 2 == 0 else specs[::-1]):
         name, mode = program(spec), spec.partition(':')[2]
         env = environment(spec)
         gpu = '0' if mode == 'cpu' else '1'
