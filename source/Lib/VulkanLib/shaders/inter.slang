@@ -508,9 +508,9 @@ void rprBlock( int tid, int slot, int comp, int bx, int by, int ox, int oy, int 
 #define WY_AT( l ) ( ( l ) * YW * YS )
 #define WORK_AT ( 2 * YW * YS )
 #define WC_AT( b ) ( ( b ) * CWD * CS )   // b: 2 * list + chroma component - 1
-// (the affine variant's reference samples need more: 11 x 11 for each of up to 16 subblocks, 1,936 > 1,904)
+// (the affine variant holds the reference samples of up to 16 subblocks, 9 x 9 each)
 #if AFFINE
-groupshared int16_t s_pool[16 * 121];
+groupshared int16_t s_pool[16 * 81];
 #else
 groupshared int16_t s_pool[WORK_AT + 2 * 20 * 20];
 #endif
@@ -1862,13 +1862,29 @@ int2 affineClip( int2 mv, int x, int y, int w, int cuX, int cuY, out bool wrap )
   return int2( min( horMax, max( horMin, mv.x ) ), min( verMax, max( verMin, mv.y ) ) );
 }
 
+// A list's affine model from the job: its base motion, and its steps across and down. (The words are picked with
+// selects: the job's array indexed by the list would go to scratch memory.)
+int2 affineBase( uint job[24], int list )
+{
+  return list == 0 ? int2( int( job[2] ), int( job[3] ) ) : int2( int( job[4] ), int( job[5] ) );
+}
+
+int2 affineHor( uint job[24], int list )
+{
+  return list == 0 ? int2( int( job[13] ), int( job[14] ) ) : int2( int( job[17] ), int( job[18] ) );
+}
+
+int2 affineVer( uint job[24], int list )
+{
+  return list == 0 ? int2( int( job[15] ), int( job[16] ) ) : int2( int( job[19] ), int( job[20] ) );
+}
+
 // The motion of the CU's luma subblock (sx, sy).
 int2 affineMv( uint job[24], int list, int sx, int sy, int cw, int ch, bool spread )
 {
-  const int2 base = int2( int( job[2 + 2 * list] ), int( job[3 + 2 * list] ) );
-  const int  at   = 13 + 4 * list;
-  const int2 hor  = int2( int( job[at] ), int( job[at + 1] ) );
-  const int2 ver  = int2( int( job[at + 2] ), int( job[at + 3] ) );
+  const int2 base = affineBase( job, list );
+  const int2 hor  = affineHor( job, list );
+  const int2 ver  = affineVer( job, list );
   const int2 pos  = spread ? int2( cw >> 1, ch >> 1 ) : int2( 2 + 4 * sx, 2 + 4 * sy );
   const int2 v    = base + hor * pos.x + ver * pos.y;
   return clipStorage( int2( roundAffine( v.x, 7 ), roundAffine( v.y, 7 ) ) );
@@ -1885,183 +1901,209 @@ int2 affineClipScaled( int2 mv, int cuX, int cuY )
   return int2( min( horMax, max( horMin, mv.x ) ), min( verMax, max( verMin, mv.y ) ) );
 }
 
-// A list's luma prediction of the tile: the thread's samples t = tid + THREADS k, at 14 bits for a bi-prediction or
-// PROF, else final.
+// The tile's subblocks and their motion (affineMotion works them out once for the whole tile): per list, each luma
+// subblock's motion as affineClip leaves it, and whether it reads the wraparound copy; the same for each chroma
+// subblock (affineChromaMv).
+groupshared int2 s_sbMv[2][16];
+groupshared int  s_sbWrap[2][16];
+groupshared int2 s_cbMv[2][16];
+groupshared int  s_cbWrap[2][16];
+
+// A list's luma prediction of the thread's four samples, at 14 bits for a bi-prediction or PROF, else final: the
+// tile's 4x4 subblocks are shared out four threads each (the subblock tid / 4, its row tid % 4), and each thread
+// predicts its row's four samples. Each subblock's filter (the 6-tap filter vvdec uses for 4x4 blocks: kLuma4x4's
+// first and last taps are zero) reads 9 x 9 reference samples from 2 before the subblock's integer position, which
+// its four threads load into shared memory together. The 2-D filter is separable: each thread filters the six rows
+// its samples need across, then down.
 void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, int cuX, int cuY, int cw, int ch, bool spread, bool prof, bool bi,
-                 out int pred[PER_THREAD] )
+                 out int4 pred )
 {
-  const int slot = int( ( job[7] >> ( 8 * list ) ) & 255 );
+  pred              = int4( 0, 0, 0, 0 );
+  const int  slot   = int( ( job[7] >> ( 8 * list ) ) & 255 );
+  const int  nsx    = w >> 2;
+  const int  nsb    = nsx * ( h >> 2 );
+  const int  sb     = tid >> 2;   // the thread's subblock in the tile, and its row in it
+  const int  v      = tid & 3;
+  const bool mine   = sb < nsb;
+  const int  ox     = ( x - cuX ) >> 2;   // the tile's first subblock in the CU
+  const int  oy     = ( y - cuY ) >> 2;
+  const int  sx     = ox + sb % nsx;      // the thread's subblock in the CU
+  const int  sy     = oy + sb / nsx;
   if( pc.refs[slot].scaled != 0 )
   {
-    // A scaled reference (RPR): each 4x4 block by xPredInterBlkRPR with filter
-    // index 2, without PROF.
-    const RefPlanes r     = pc.refs[slot];
-    const int       log2T = firstbithigh( uint( w ) );
-    for( int k = 0; k < PER_THREAD; k++ )
+    // A scaled reference (RPR): each 4x4 block by xPredInterBlkRPR with
+    // filter index 2, without PROF.
+    const RefPlanes r = pc.refs[slot];
+    if( mine )
     {
-      const int t = tid + THREADS * k;
-      pred[k]     = 0;
-      if( t < w * h )
+      const int2 mv = affineClipScaled( affineMv( job, list, sx, sy, cw, ch, spread ), cuX, cuY );
+      [unroll]
+      for( int o = 0; o < 4; o++ )
       {
-        const int  i  = t & ( w - 1 );
-        const int  j  = t >> log2T;
-        const int  sx = ( ( x - cuX ) >> 2 ) + ( i >> 2 );
-        const int  sy = ( ( y - cuY ) >> 2 ) + ( j >> 2 );
-        const int2 mv = affineClipScaled( affineMv( job, list, sx, sy, cw, ch, spread ), cuX, cuY );
-        pred[k]       = rprSample( r, r.y, 0, cuX + 4 * sx, cuY + 4 * sy, i & 3, j & 3, mv, bi, false, 2 );
+        pred[o] = rprSample( r, r.y, 0, cuX + 4 * sx, cuY + 4 * sy, o, v, mv, bi, false, 2 );
       }
     }
     return;
   }
-  int16_t*  ref      = refPlane( slot, 0 );
-  const int nsx      = w >> 2;
-  const int nsb      = nsx * ( h >> 2 );
-  const int ox       = ( x - cuX ) >> 2;   // the tile's first subblock in the CU
-  const int oy       = ( y - cuY ) >> 2;
-  const int headRoom = max( 2, 14 - pc.bitDepth );
-  const int maxVal   = ( 1 << pc.bitDepth ) - 1;
-  const bool hi      = bi || prof;
-  const int log2W    = log2Int( w );
+  int16_t*   ref      = refPlane( slot, 0 );
+  const int  headRoom = max( 2, 14 - pc.bitDepth );
+  const int  maxVal   = ( 1 << pc.bitDepth ) - 1;
+  const bool hi       = bi || prof;
+  const int  at       = sb * 81;   // the subblock's window: (r, c) is the reference sample (r - 2, c - 2) from its position
 
-  // Each subblock's reference samples: 11 x 11, starting 3 samples before its integer position.
-  for( int s = tid; s < nsb * 121; s += THREADS )
+  // The windows: the subblock's rows v, v + 4 (and 8) from the thread
+  if( mine )
   {
-    const int  sb = s / 121;
-    const int  r  = ( s % 121 ) / 11;
-    const int  c  = s % 11;
-    const int  sx = sb % nsx;
-    const int  sy = sb / nsx;
-    bool       wrap;
-    const int2 mv = affineClip( affineMv( job, list, ox + sx, oy + sy, cw, ch, spread ), cuX + 4 * ( ox + sx ), cuY + 4 * ( oy + sy ), 4, cuX, cuY, wrap );
-    s_pool[s]     = int16_t( refAt( ref, 0, cuX + 4 * ( ox + sx ) + ( mv.x >> 4 ) - 3 + c, cuY + 4 * ( oy + sy ) + ( mv.y >> 4 ) - 3 + r, wrap ) );
+    const int2 mv   = s_sbMv[list][sb];
+    const bool wrap = s_sbWrap[list][sb] != 0;
+    const int  bx   = cuX + 4 * sx + ( mv.x >> 4 ) - 2;
+    const int  by   = cuY + 4 * sy + ( mv.y >> 4 ) - 2;
+    for( int r = v; r < 9; r += 4 )
+    {
+      [unroll]
+      for( int c = 0; c < 9; c++ )
+      {
+        s_pool[at + r * 9 + c] = int16_t( refAt( ref, 0, bx + c, by + r, wrap ) );
+      }
+    }
   }
   GroupMemoryBarrierWithGroupSync();
-  for( int k = 0; k < PER_THREAD; k++ )
+  const int2 mv    = s_sbMv[list][sb];
+  const int  xFrac = mv.x & 15;
+  const int  yFrac = mv.y & 15;
+  if( mine )
   {
-    const int t = tid + THREADS * k;
-    pred[k]     = 0;
-    if( t >= w * h )
-    {
-      continue;
-    }
-    const int  i     = t & ( w - 1 );
-    const int  j     = t >> log2W;
-    const int  sb    = ( j >> 2 ) * nsx + ( i >> 2 );
-    const int  u     = i & 3;
-    const int  v     = j & 3;
-    bool       wrap;
-    const int2 mv    = affineClip( affineMv( job, list, ox + ( i >> 2 ), oy + ( j >> 2 ), cw, ch, spread ), cuX + 4 * ( ox + ( i >> 2 ) ), cuY + 4 * ( oy + ( j >> 2 ) ), 4,
-                                   cuX, cuY, wrap );
-    const int  xFrac = mv.x & 15;
-    const int  yFrac = mv.y & 15;
-    const int  at    = sb * 121;
     if( xFrac == 0 && yFrac == 0 )
     {
-      const int s0 = int( s_pool[at + ( v + 3 ) * 11 + u + 3] );
-      pred[k]      = hi ? s0 * ( 1 << headRoom ) - IF_INTERNAL_OFFS : s0;
+      [unroll]
+      for( int o = 0; o < 4; o++ )
+      {
+        const int s0 = int( s_pool[at + ( v + 2 ) * 9 + o + 2] );
+        pred[o]      = hi ? s0 * ( 1 << headRoom ) - IF_INTERNAL_OFFS : s0;
+      }
     }
     else if( xFrac != 0 && yFrac != 0 )
     {
+      // Across: the window's rows v .. v + 5 (the filter's rows 1 .. 6), each over columns o + 0 .. o + 5
       const int shift1  = 6 - headRoom;
       const int offset1 = -IF_INTERNAL_OFFS * ( 1 << shift1 );
-      int       sum     = 0;
-      for( int r = 0; r < 8; r++ )
+      int4      across[6];
+      [unroll]
+      for( int r = 0; r < 6; r++ )
       {
-        int hs = 0;
-        for( int c = 0; c < 8; c++ )
+        int row[9];
+        [unroll]
+        for( int c = 0; c < 9; c++ )
         {
-          hs += kLuma4x4[xFrac * 8 + c] * int( s_pool[at + ( v + r ) * 11 + u + c] );
+          row[c] = int( s_pool[at + ( v + r ) * 9 + c] );
         }
-        sum += kLuma4x4[yFrac * 8 + r] * ( ( hs + offset1 ) >> shift1 );
+        [unroll]
+        for( int o = 0; o < 4; o++ )
+        {
+          int hs = 0;
+          [unroll]
+          for( int c = 1; c < 7; c++ )
+          {
+            hs += kLuma4x4[xFrac * 8 + c] * row[o + c - 1];
+          }
+          across[r][o] = ( hs + offset1 ) >> shift1;
+        }
       }
-      pred[k] = hi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
+      // Down
+      [unroll]
+      for( int o = 0; o < 4; o++ )
+      {
+        int sum = 0;
+        [unroll]
+        for( int r = 1; r < 7; r++ )
+        {
+          sum += kLuma4x4[yFrac * 8 + r] * across[r - 1][o];
+        }
+        pred[o] = hi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
+      }
     }
     else
     {
       const int shiftV = hi ? 6 - headRoom : 6;
       const int offset = hi ? -IF_INTERNAL_OFFS * ( 1 << shiftV ) : 32;
-      int       sum    = 0;
-      for( int c = 0; c < 8; c++ )
+      [unroll]
+      for( int o = 0; o < 4; o++ )
       {
-        sum += yFrac != 0 ? kLuma4x4[yFrac * 8 + c] * int( s_pool[at + ( v + c ) * 11 + u + 3] )
-                          : kLuma4x4[xFrac * 8 + c] * int( s_pool[at + ( v + 3 ) * 11 + u + c] );
+        int sum = 0;
+        [unroll]
+        for( int c = 1; c < 7; c++ )
+        {
+          sum += yFrac != 0 ? kLuma4x4[yFrac * 8 + c] * int( s_pool[at + ( v + c - 1 ) * 9 + o + 2] )
+                            : kLuma4x4[xFrac * 8 + c] * int( s_pool[at + ( v + 2 ) * 9 + o + c - 1] );
+        }
+        const int r = ( sum + offset ) >> shiftV;
+        pred[o]     = hi ? r : clip3( 0, maxVal, r );
       }
-      const int r = ( sum + offset ) >> shiftV;
-      pred[k]     = hi ? r : clip3( 0, maxVal, r );
     }
   }
   if( prof )
   {
     // PROF: each 4x4 block gets a border from the reference samples nearest its motion (within the window); then the
     // gradients inside, and each sample moves along them by its offset from the subblock's motion (dMvScaleHor / Ver)
-    for( int k = 0; k < PER_THREAD; k++ )
+    if( mine )
     {
-      const int t = tid + THREADS * k;
-      if( t < w * h )
+      [unroll]
+      for( int o = 0; o < 4; o++ )
       {
-        const int i = t & ( w - 1 );
-        const int j = t >> log2W;
-        s_ext[( ( j >> 2 ) * nsx + ( i >> 2 ) ) * 36 + ( ( j & 3 ) + 1 ) * 6 + ( i & 3 ) + 1] = int16_t( pred[k] );
+        s_ext[sb * 36 + ( v + 1 ) * 6 + o + 1] = int16_t( pred[o] );
       }
-    }
-    for( int s = tid; s < nsb * 20; s += THREADS )
-    {
-      const int sb = s / 20;
-      const int r  = s % 20;
-      int       bx, by;
-      if( r < 6 )
+      // the border's samples q = v, v + 4 .. (20 a subblock)
+      for( int q = v; q < 20; q += 4 )
       {
-        bx = r - 1;
-        by = -1;
+        int bx, by;
+        if( q < 6 )
+        {
+          bx = q - 1;
+          by = -1;
+        }
+        else if( q < 12 )
+        {
+          bx = q - 7;
+          by = 4;
+        }
+        else if( q < 16 )
+        {
+          bx = -1;
+          by = q - 12;
+        }
+        else
+        {
+          bx = 4;
+          by = q - 16;
+        }
+        const int sm = int( s_pool[at + ( by + ( yFrac >> 3 ) + 2 ) * 9 + bx + ( xFrac >> 3 ) + 2] );
+        s_ext[sb * 36 + ( by + 1 ) * 6 + bx + 1] = int16_t( sm * ( 1 << headRoom ) - IF_INTERNAL_OFFS );
       }
-      else if( r < 12 )
-      {
-        bx = r - 7;
-        by = 4;
-      }
-      else if( r < 16 )
-      {
-        bx = -1;
-        by = r - 12;
-      }
-      else
-      {
-        bx = 4;
-        by = r - 16;
-      }
-      bool       wrap;
-      const int2 mv = affineClip( affineMv( job, list, ox + sb % nsx, oy + sb / nsx, cw, ch, spread ), cuX + 4 * ( ox + sb % nsx ), cuY + 4 * ( oy + sb / nsx ), 4,
-                                  cuX, cuY, wrap );
-      const int  sm = int( s_pool[sb * 121 + ( by + ( ( mv.y & 15 ) >> 3 ) + 3 ) * 11 + bx + ( ( mv.x & 15 ) >> 3 ) + 3] );
-      s_ext[sb * 36 + ( by + 1 ) * 6 + bx + 1] = int16_t( sm * ( 1 << headRoom ) - IF_INTERNAL_OFFS );
     }
     GroupMemoryBarrierWithGroupSync();
-    const int at      = 13 + 4 * list;
-    const int quadHX  = int( job[at] ) * 4;
-    const int quadHY  = int( job[at + 1] ) * 4;
-    const int quadVX  = int( job[at + 2] ) * 4;
-    const int quadVY  = int( job[at + 3] ) * 4;
-    const int d0H     = ( ( int( job[at] ) + int( job[at + 2] ) ) * 2 ) - ( ( quadHX + quadVX ) * 2 );
-    const int d0V     = ( ( int( job[at + 1] ) + int( job[at + 3] ) ) * 2 ) - ( ( quadHY + quadVY ) * 2 );
-    const int limit   = 1 << max( pc.bitDepth + 1, 13 );
-    const int offset  = ( 1 << ( headRoom - 1 ) ) + IF_INTERNAL_OFFS;
-    for( int k = 0; k < PER_THREAD; k++ )
+    if( mine )
     {
-      const int t = tid + THREADS * k;
-      if( t < w * h )
+      const int2 hor    = affineHor( job, list );
+      const int2 ver    = affineVer( job, list );
+      const int  quadHX = hor.x * 4;
+      const int  quadHY = hor.y * 4;
+      const int  quadVX = ver.x * 4;
+      const int  quadVY = ver.y * 4;
+      const int  d0H    = ( ( hor.x + ver.x ) * 2 ) - ( ( quadHX + quadVX ) * 2 );
+      const int  d0V    = ( ( hor.y + ver.y ) * 2 ) - ( ( quadHY + quadVY ) * 2 );
+      const int limit   = 1 << max( pc.bitDepth + 1, 13 );
+      const int offset  = ( 1 << ( headRoom - 1 ) ) + IF_INTERNAL_OFFS;
+      [unroll]
+      for( int o = 0; o < 4; o++ )
       {
-        const int i   = t & ( w - 1 );
-        const int j   = t >> log2W;
-        const int u   = i & 3;
-        const int v   = j & 3;
-        const int e   = ( ( j >> 2 ) * nsx + ( i >> 2 ) ) * 36 + ( v + 1 ) * 6 + u + 1;
+        const int e   = sb * 36 + ( v + 1 ) * 6 + o + 1;
         const int gx  = ( int( s_ext[e + 1] ) >> 6 ) - ( int( s_ext[e - 1] ) >> 6 );
         const int gy  = ( int( s_ext[e + 6] ) >> 6 ) - ( int( s_ext[e - 6] ) >> 6 );
-        const int dmH = clamp( roundAffine( d0H + u * quadHX + v * quadVX, 8 ), -31, 31 );
-        const int dmV = clamp( roundAffine( d0V + u * quadHY + v * quadVY, 8 ), -31, 31 );
+        const int dmH = clamp( roundAffine( d0H + o * quadHX + v * quadVX, 8 ), -31, 31 );
+        const int dmV = clamp( roundAffine( d0V + o * quadHY + v * quadVY, 8 ), -31, 31 );
         const int dI  = clamp( dmH * gx + dmV * gy, -limit, limit - 1 );
-        const int val = int( int16_t( pred[k] + dI ) );
-        pred[k]       = bi ? val : clip3( 0, maxVal, ( val + offset ) >> headRoom );
+        const int val = int( int16_t( pred[o] + dI ) );
+        pred[o]       = bi ? val : clip3( 0, maxVal, ( val + offset ) >> headRoom );
       }
     }
   }
@@ -2141,14 +2183,14 @@ void affineChroma( int tid, uint job[24], int list, int comp, int x, int y, int 
   // Each subblock's reference samples: 7 x 7, starting 1 sample before its integer position.
   for( int s = tid; s < ncb * 49; s += THREADS )
   {
-    const int  cb  = s / 49;
-    const int  r   = ( s % 49 ) / 7;
-    const int  c   = s % 7;
-    const int  csx = ocx + cb % ncx;
-    const int  csy = ocy + cb / ncx;
-    bool       wrap;
-    const int2 mv  = affineChromaMv( job, list, csx, csy, cw, ch, spread, cuX, cuY, wrap );
-    s_pool[s]      = int16_t( refAt( ref, comp, ( cuX >> sx ) + 4 * csx + ( mv.x >> ( 4 + sx ) ) - 1 + c, ( cuY >> sy ) + 4 * csy + ( mv.y >> ( 4 + sy ) ) - 1 + r, wrap ) );
+    const int  cb   = s / 49;
+    const int  r    = ( s % 49 ) / 7;
+    const int  c    = s % 7;
+    const int  csx  = ocx + cb % ncx;
+    const int  csy  = ocy + cb / ncx;
+    const int2 mv   = s_cbMv[list][cb];
+    const bool wrap = s_cbWrap[list][cb] != 0;
+    s_pool[s]       = int16_t( refAt( ref, comp, ( cuX >> sx ) + 4 * csx + ( mv.x >> ( 4 + sx ) ) - 1 + c, ( cuY >> sy ) + 4 * csy + ( mv.y >> ( 4 + sy ) ) - 1 + r, wrap ) );
   }
   GroupMemoryBarrierWithGroupSync();
   for( int k = 0; k < PER_THREAD; k++ )
@@ -2161,8 +2203,7 @@ void affineChroma( int tid, uint job[24], int list, int comp, int x, int y, int 
     }
     const int  i     = t & ( tw - 1 );
     const int  j     = t >> log2W;
-    bool       wrap;
-    const int2 mv    = affineChromaMv( job, list, ocx + ( i >> 2 ), ocy + ( j >> 2 ), cw, ch, spread, cuX, cuY, wrap );
+    const int2 mv    = s_cbMv[list][( j >> 2 ) * ncx + ( i >> 2 )];
     // The filter's phases in 32nds (InterpolationFilter's frac << ( 1 - scale ))
     const int  xFrac = ( mv.x & ( ( 16 << sx ) - 1 ) ) << ( 1 - sx );
     const int  yFrac = ( mv.y & ( ( 16 << sy ) - 1 ) ) << ( 1 - sy );
@@ -2235,9 +2276,38 @@ void affineMain( int tid, int index )
   const bool bi     = ( flags & ( FLAG_L0 | FLAG_L1 ) ) == ( FLAG_L0 | FLAG_L1 );
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
+  // The subblocks' motion, per list: one thread each (list tid / 32; luma subblock tid % 32, or chroma tid % 32 - 16)
+  {
+    const int list = tid >> 5;
+    const int e    = tid & 31;
+    if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) != 0 )
+    {
+      const bool spread = ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
+      const int  nsx    = w >> 2;
+      const int  ncx    = ( w >> pc.scaleX ) >> 2;
+      bool       wrap;
+      if( e < 16 && e < nsx * ( h >> 2 ) )
+      {
+        const int sx       = ( ( x - cuX ) >> 2 ) + e % nsx;
+        const int sy       = ( ( y - cuY ) >> 2 ) + e / nsx;
+        s_sbMv[list][e]    = affineClip( affineMv( job, list, sx, sy, cw, ch, spread ), cuX + 4 * sx, cuY + 4 * sy, 4, cuX, cuY, wrap );
+        s_sbWrap[list][e]  = wrap ? 1 : 0;
+      }
+      else if( e >= 16 && pc.numComp > 1 && e - 16 < ncx * ( ( h >> pc.scaleY ) >> 2 ) )
+      {
+        const int c        = e - 16;
+        const int csx      = ( ( ( x - cuX ) >> pc.scaleX ) >> 2 ) + c % ncx;
+        const int csy      = ( ( ( y - cuY ) >> pc.scaleY ) >> 2 ) + c / ncx;
+        s_cbMv[list][c]    = affineChromaMv( job, list, csx, csy, cw, ch, spread, cuX, cuY, wrap );
+        s_cbWrap[list][c]  = wrap ? 1 : 0;
+      }
+    }
+  }
+  GroupMemoryBarrierWithGroupSync();
+
   // (weighted prediction starts from the 14-bit predictions, for a uni-prediction too)
   const bool hi = bi || ( flags & FLAG_WP ) != 0;
-  int        pred0[PER_THREAD], pred1[PER_THREAD];
+  int4       luma0 = int4( 0, 0, 0, 0 ), luma1 = int4( 0, 0, 0, 0 );
   for( int list = 0; list < 2; list++ )
   {
     if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) == 0 )
@@ -2246,30 +2316,33 @@ void affineMain( int tid, int index )
     }
     const bool prof   = ( ( job[12] >> ( 16 + list ) ) & 1 ) != 0;
     const bool spread = ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
-    int        p[PER_THREAD];
+    int4       p;
     affineLuma( tid, job, list, x, y, w, h, cuX, cuY, cw, ch, spread, prof, hi, p );
     if( list == 0 || ( flags & FLAG_L0 ) == 0 )
     {
-      pred0 = p;
+      luma0 = p;
     }
     else
     {
-      pred1 = p;
+      luma1 = p;
     }
   }
 
-  // Average the predictions (with BCW's weights), apply LMCS's mapping, add the residuals and write the results.
+  // Average the predictions (with BCW's weights), apply LMCS's mapping, add the residuals and write the results: the
+  // thread's four samples of its subblock's row (affineLuma).
   const int shiftNum = max( 2, 14 - pc.bitDepth ) + 1;
   const int offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
-  const int log2W    = log2Int( w );
-  for( int k = 0; k < PER_THREAD; k++ )
+  const int nsx      = w >> 2;
+  if( ( tid >> 2 ) < nsx * ( h >> 2 ) )
   {
-    const int t = tid + THREADS * k;
-    if( t < w * h )
+    const int sb  = tid >> 2;
+    const int row = y + 4 * ( sb / nsx ) + ( tid & 3 );
+    [unroll]
+    for( int o = 0; o < 4; o++ )
     {
-      const int at = ( y + ( t >> log2W ) ) * pc.stride0 + x + ( t & ( w - 1 ) );
-      int       v  = ( flags & FLAG_WP ) != 0 ? wpSample( job[8], job[11], 0, pred0[k], pred1[k], maxVal )
-                     : ( bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k] );
+      const int at = row * pc.stride0 + x + 4 * ( sb % nsx ) + o;
+      int       v  = ( flags & FLAG_WP ) != 0 ? wpSample( job[8], job[11], 0, luma0[o], luma1[o], maxVal )
+                     : ( bi ? biAverage( luma0[o], luma1[o], flags, bcwW1, shiftNum, offset, maxVal ) : luma0[o] );
       if( ( flags & FLAG_LUMA_MAP ) != 0 )
       {
         v = int( pc.lmcsFwd[v] );
@@ -2281,6 +2354,7 @@ void affineMain( int tid, int index )
       ( ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0 )[at] = int16_t( v );
     }
   }
+  int pred0[PER_THREAD], pred1[PER_THREAD];
   // The chroma, one component at a time (reusing luma's prediction arrays).
   const int tw    = w >> pc.scaleX;   // the tile's chroma size
   const int th    = h >> pc.scaleY;
