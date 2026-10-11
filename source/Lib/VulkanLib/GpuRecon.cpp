@@ -886,12 +886,12 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
     m_earlyRowsMarks = 0;
   }
 
-  // The GPU front end on the async compute queue, alongside the work submitted before -- but not for a picture the
-  // GPU parsed: the parse's waves keep the GPU busy then, and the front end's passes beside the compute queue's work
-  // slowed that more than they gained (VideoQ 4K: inter 4.6 ms a picture instead of 2.5, 116.3 -> 119.5 fps; with the
-  // CPU's parse the async queue gains, 147.3 -> 161.5 fps). That picture's first part holds its front end, and waits
-  // for its parsed records itself.
-  const bool frontEndAsync = jobs.useFrontEnd && jobs.cus && !jobs.parsed && m_cmdFrontEnd1 != VK_NULL_HANDLE;
+  // The GPU front end on the async compute queue, beside the work submitted before: its passes are latency-bound (a
+  // few waves each, the motion derivation one per CTU row), and the reconstruction of the pictures before keeps the
+  // GPU busy meanwhile. Part 1 of a picture the GPU parsed waits there for the picture's parsed records
+  // (recordFrontEndAsync). Otherwise the first part holds the front end (and for a picture the GPU parsed, waits for
+  // its records itself).
+  const bool frontEndAsync = jobs.useFrontEnd && jobs.cus && m_cmdFrontEnd1 != VK_NULL_HANDLE;
   if( frontEndAsync )
   {
     recordFrontEndAsync( cs, jobs );
