@@ -435,8 +435,8 @@ private:
   };
 
 public:
-  // shortBusyWait: idle threads block at once (and the last one after 1 ms),
-  // for decoders that leave the CPU idle while they wait for a GPU
+  // shortBusyWait: idle threads block at once (and the last one after 1 ms; until then it sleeps briefly between its
+  // looks for a task), for decoders that leave the CPU idle while they wait for a GPU
   ThreadPool( int numThreads = 1, const char *threadPoolName = nullptr, bool shortBusyWait = false );
   ~ThreadPool();
 
@@ -536,6 +536,7 @@ private:
   std::string              m_poolName;
   std::chrono::microseconds m_busyWaitTimeMin;   // an idle thread spins this long, then blocks
   std::chrono::microseconds m_busyWaitTimeMax;   // the last one this long
+  std::chrono::microseconds m_idleSleep;         // the last one sleeps this long between its looks (0: yields)
   std::atomic_bool         m_exitThreads{ false };
   std::vector<std::thread> m_threads;
   ChunkedTaskQueue         m_tasks;

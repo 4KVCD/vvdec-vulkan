@@ -47,11 +47,38 @@ POSSIBILITY OF SUCH DAMAGE.
 #if __linux
 # include <pthread.h>
 #endif
+#ifdef _WIN32
+# ifndef NOMINMAX
+#  define NOMINMAX
+# endif
+# include <windows.h>
+# undef ERROR   // (windows.h's; vvdec's MsgLevel has its own)
+#endif
 
 
 namespace vvdec
 {
 using namespace std::chrono_literals;
+
+// Sleeps about the time given. Windows' Sleep() and std::this_thread::sleep_for wait a whole timer tick (1 to 15.6
+// ms) at least: a high-resolution waitable timer sleeps the microseconds asked for.
+static void sleepBriefly( std::chrono::microseconds time )
+{
+#ifdef _WIN32
+  thread_local HANDLE timer = CreateWaitableTimerExW( nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS );
+  if( !timer )
+  {
+    std::this_thread::yield();
+    return;
+  }
+  LARGE_INTEGER due;
+  due.QuadPart = -10LL * time.count();   // (relative, in units of 100 ns)
+  SetWaitableTimer( timer, &due, 0, nullptr, nullptr, FALSE );
+  WaitForSingleObject( timer, INFINITE );
+#else
+  std::this_thread::sleep_for( time );
+#endif
+}
 
 std::mutex Barrier::s_exceptionLock{};
 
@@ -62,6 +89,14 @@ static std::chrono::microseconds busyWaitTimeMin( bool shortBusyWait )
   if( env )
     return std::chrono::microseconds( int( atof( env ) * 1000 ) );
   return shortBusyWait ? std::chrono::microseconds( 0 ) : std::chrono::microseconds( 1ms );
+}
+
+// With the GPU (shortBusyWait), the idle thread that keeps looking for tasks while the others block sleeps this long
+// between its looks. Some task waiting for the GPU (a fence) is nearly always running then, so the pool never pauses,
+// and that thread, yielding, kept a core busy: Top Gun slower 1080p took 3.8 ms of CPU a frame, 1.1 ms with 50 us.
+static std::chrono::microseconds idleSleep( bool shortBusyWait )
+{
+  return shortBusyWait ? std::chrono::microseconds( 50 ) : std::chrono::microseconds( 0 );
 }
 
 // block last waiting thread after this time (shortBusyWait: 1 ms)
@@ -102,6 +137,7 @@ ThreadPool::ThreadPool( int numThreads, const char* threadPoolName, bool shortBu
   : m_poolName( threadPoolName )
   , m_busyWaitTimeMin( busyWaitTimeMin( shortBusyWait ) )
   , m_busyWaitTimeMax( busyWaitTimeMax( shortBusyWait ) )
+  , m_idleSleep( idleSleep( shortBusyWait ) )
   , m_threads( numThreads < 0 ? std::thread::hardware_concurrency() : numThreads )
   , m_poolPause( m_threads.size() )
 {
@@ -226,7 +262,14 @@ void ThreadPool::threadProc( int threadId )
         {
           if( !didBlock )
           {
-            std::this_thread::yield();
+            if( idleLock.owns_lock() && m_idleSleep.count() > 0 )
+            {
+              sleepBriefly( m_idleSleep );
+            }
+            else
+            {
+              std::this_thread::yield();
+            }
           }
           didBlock = false;
 
