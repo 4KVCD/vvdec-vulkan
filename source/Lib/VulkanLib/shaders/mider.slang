@@ -2692,12 +2692,12 @@ void main( uint3 local : SV_GroupThreadID )
   for( int col = span.x; col < span.y; col++ )
   {
     // Wait until the segment above, in the same tile, is past the CTU above-right (or done, at the tile's right
-    // edge).
+    // edge). With WPP the CTU above-right is out of the CUs' reach (cuAt): past the CTU above is enough.
     if( waitAbove )
     {
       if( g_lane == 0 )
       {
-        const uint need = uint( min( col + 2, span.y ) - span.x );
+        const uint need = uint( min( col + 2 - pc.wpp, span.y ) - span.x );
         while( pc.progress[segment - pc.tileCols].load( MemoryOrder.Relaxed ) < need )
         {
         }
