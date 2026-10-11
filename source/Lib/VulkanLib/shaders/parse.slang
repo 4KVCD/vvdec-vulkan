@@ -857,6 +857,11 @@ void saveContexts( int slot )
 
 groupshared int s_parsed;   // ctuParsed's answer, which thread 0 shares with the others
 
+// How many times ctuParsed polls: about as long as a CTU takes to parse. A wave that waits longer keeps issuing loads
+// and instructions that the reconstruction's passes on the other queues need; the substream resumes in the next
+// dispatch instead.
+static const int kCtuParsedPolls = 1 << 7;
+
 // Whether another substream's CTU is parsed, so that its records, map entries, ctuOut words and saved contexts can be
 // read. Thread 0 polls the CTU's flag for a short while, as the other substream may be parsing the CTU in this very
 // dispatch.
@@ -865,11 +870,11 @@ bool ctuParsed( int ctu )
   if( g_lane == 0 )
   {
     int spins = 0;
-    while( pc.sync[2 + ctu].load( MemoryOrder.Relaxed ) == 0 && spins < ( 1 << 14 ) )
+    while( pc.sync[2 + ctu].load( MemoryOrder.Relaxed ) == 0 && spins < kCtuParsedPolls )
     {
       spins++;
     }
-    s_parsed = spins < ( 1 << 14 ) ? 1 : 0;
+    s_parsed = spins < kCtuParsedPolls ? 1 : 0;
   }
   AllMemoryBarrierWithGroupSync();
   return uni( s_parsed ) != 0;
