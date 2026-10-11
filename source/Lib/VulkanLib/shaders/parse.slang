@@ -70,7 +70,7 @@ struct Params
   uint*         cus;       // out: the staged CU records (32 words each), pc.cuCap of them at most
   uint*         tus;       // out: the staged TU records (16 words each), pc.tuCap of them at most
   uint*         ctuOut;    // out: kCtuOutWords words per CTU: its numbers of CUs and TUs, SAO's and ALF's parameters
-  // Per CTU, the map entries (word pairs, see s_map) of its bottom row of 4x4 luma blocks: 32 of the luma tree, then
+  // Per CTU, the map entries (word pairs, see mapGet) of its bottom row of 4x4 luma blocks: 32 of the luma tree, then
   // 32 of the chroma tree. The CTU below reads them.
   uint2*        bottomRows;
   // out: the coefficient levels, each coded block's rectangle (writeLevels) with its rows one after the other, in the
@@ -933,7 +933,7 @@ void beginCtu()
   }
   for( int i = g_lane; i < 2 * kMapChannel; i += 32 )
   {
-    s_map[i] = uint2( 0, 0 );
+    mapSet( i, uint2( 0, 0 ) );
   }
   for( int i = g_lane; i < 2 * kMapRow; i += 32 )
   {
@@ -955,8 +955,8 @@ void endCtu()
   {
     const int ch = i / kMapRow;
     const int j  = i % kMapRow;
-    pc.bottomRows[bottomRowsAt( g_ctu, i )] = s_map[ch * kMapChannel + last * kMapRow + j];
-    s_left[i]                               = s_map[ch * kMapChannel + j * kMapRow + last];
+    pc.bottomRows[bottomRowsAt( g_ctu, i )] = mapGet( ch * kMapChannel + last * kMapRow + j );
+    s_left[i]                               = mapGet( ch * kMapChannel + j * kMapRow + last );
   }
   GroupMemoryBarrierWithGroupSync();
 }

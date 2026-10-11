@@ -749,10 +749,11 @@ void mtsIdx( inout CuCtx ctx )
 // kCodedPositions: 32 rows of 64. (The shared memory here is sized to that: the parse's workgroups stay resident for
 // long, and what they take the reconstruction's shaders cannot have.)
 static const int kCodedPositions = 32 * 64;
-// its levels: absolute (regular coding) or signed (transform skip); and zeros two rows of 64 further, which
-// templateAbsSum reads below the last coded row
+// its levels, in 16 bits: absolute while their group is parsed (regular coding), signed once it is (and in transform
+// skip blocks); and zeros two rows of 64 further, which templateAbsSum reads below the last coded row. (A magnitude of
+// 2^15 is stored as -2^15 and reads back right through abs(); a conforming stream has no level of +2^15.)
 static const int kCoefWords = kCodedPositions + 2 * 64;
-groupshared int  s_coef[kCoefWords];
+groupshared int16_t s_coef[kCoefWords];
 // CtxTpl, a byte per position: the sum of the absolute first-pass levels in the position's template | the number of
 // nonzero ones << 5. After the templates' kTplWords words, one word a thread, never read: absVal1stPass's threads add
 // 0 there when they have no template to add to.
@@ -931,7 +932,7 @@ void clearResidualMemory()
 {
   for( int i = g_lane; i < kCoefWords; i += 32 )
   {
-    s_coef[i] = 0;
+    s_coef[i] = int16_t( 0 );
   }
   for( int i = g_lane; i < kTplWords; i += 32 )
   {
@@ -996,7 +997,7 @@ int sigCtxIdAbs( int blkPos, int state )
 // compiler run the whole parse as vector code.
 void absVal1stPass( int blkPos, int absLevel1 )
 {
-  s_coef[blkPos] = absLevel1;
+  s_coef[blkPos] = int16_t( absLevel1 );
   const int  posY = blkPos >> g_cc.log2W;
   const int  posX = blkPos & ( g_cc.width - 1 );
   const int  w    = g_cc.width;
@@ -1032,29 +1033,29 @@ int templateAbsSum( int blkPos, int baseLevel )
   int       sum  = 0;
   if( posX + 2 < w )
   {
-    sum += abs( uni( s_coef[blkPos + 1] ) );
-    sum += abs( uni( s_coef[blkPos + 2] ) );
+    sum += abs( uni( int( s_coef[blkPos + 1] ) ) );
+    sum += abs( uni( int( s_coef[blkPos + 2] ) ) );
     if( posY + 1 < g_cc.height )
     {
-      sum += abs( uni( s_coef[blkPos + w + 1] ) );
+      sum += abs( uni( int( s_coef[blkPos + w + 1] ) ) );
     }
   }
   else if( posX + 1 < w )
   {
-    sum += abs( uni( s_coef[blkPos + 1] ) );
+    sum += abs( uni( int( s_coef[blkPos + 1] ) ) );
     if( posY + 1 < g_cc.height )
     {
-      sum += abs( uni( s_coef[blkPos + w + 1] ) );
+      sum += abs( uni( int( s_coef[blkPos + w + 1] ) ) );
     }
   }
   if( posY + 2 < g_cc.height )
   {
-    sum += abs( uni( s_coef[blkPos + w] ) );
-    sum += abs( uni( s_coef[blkPos + 2 * w] ) );
+    sum += abs( uni( int( s_coef[blkPos + w] ) ) );
+    sum += abs( uni( int( s_coef[blkPos + 2 * w] ) ) );
   }
   else if( posY + 1 < g_cc.height )
   {
-    sum += abs( uni( s_coef[blkPos + w] ) );
+    sum += abs( uni( int( s_coef[blkPos + w] ) ) );
   }
   return max( min( sum - 5 * baseLevel, 31 ), 0 );
 }
@@ -1207,7 +1208,7 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
       const int rem     = int( decodeRemAbsEP( ricePar, COEF_REMAIN_BIN_REDUCTION, g_cc.maxLog2TrRange ) );
       const int level   = laneValue( g_sigAbs, sig ) + ( rem << 1 );
       g_sigAbs          = setLane( g_sigAbs, sig, level );
-      s_coef[pos]       = level;
+      s_coef[pos]       = int16_t( level );
       sumAbsLevels += rem << 1;
     }
   }
@@ -1224,7 +1225,7 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
     state            = ( stateTransTab >> ( ( state << 2 ) + ( ( tcoeff & 1 ) << 1 ) ) ) & 3;
     if( tcoeff != 0 )
     {
-      s_coef[blkPos] = tcoeff;
+      s_coef[blkPos] = int16_t( tcoeff );
       stateVal       = uint( sub1 ) | ( stateVal << 1 );
       g_sigPos       = setLane( g_sigPos, numNonZero, blkPos );
       g_sigAbs       = setLane( g_sigAbs, numNonZero, tcoeff );
@@ -1251,7 +1252,7 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
   {
     const uint bit = uint( numNonZero - 1 - g_lane );
     const int  c   = g_sigAbs;
-    s_coef[g_sigPos] = ( ( signs >> bit ) & 1u ) != 0 ? -c : c;
+    s_coef[g_sigPos] = int16_t( ( ( signs >> bit ) & 1u ) != 0 ? -c : c );
     if( depQuant && ( ( stateVal >> bit ) & 1u ) != 0 )
     {
       InterlockedOr( s_dqBits[g_sigPos >> 5], 1u << uint( g_sigPos & 31 ) );
@@ -1265,7 +1266,7 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
 // right and below ones (rightPixel, belowPixel). coefAt is the level dx positions to the left and dy rows above.
 int coefAt( int blkPos, int dx, int dy )
 {
-  return uni( s_coef[blkPos - dx - dy * g_cc.width] );
+  return uni( int( s_coef[blkPos - dx - dy * g_cc.width] ) );
 }
 
 // The context of transform skip's sig_coeff_flag: how many of the two neighbours are nonzero
@@ -1405,7 +1406,7 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
         parFlag = decodeBin( CTX_TsParFlag );
         g_cc.numCtxBins--;
       }
-      s_coef[blkPos] = ( sign != 0 ? -1 : 1 ) * int( 1 + parFlag + gt1Flag );
+      s_coef[blkPos] = int16_t( ( sign != 0 ? -1 : 1 ) * int( 1 + parFlag + gt1Flag ) );
     }
     lastScanPosPass1 = nextSigPos;
   }
@@ -1413,7 +1414,7 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
   for( int scanPos = firstSigPos; scanPos <= lastPos && g_cc.numCtxBins >= 4; scanPos++ )
   {
     const int pos    = blockPos( scanPos );
-    int       tcoeff = uni( s_coef[pos] );
+    int       tcoeff = uni( int( s_coef[pos] ) );
     int       cutoffVal = 2;
     for( int i = 0; i < 4; i++ )
     {
@@ -1429,7 +1430,7 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
       }
       cutoffVal += 2;
     }
-    s_coef[pos]      = tcoeff;
+    s_coef[pos]      = int16_t( tcoeff );
     lastScanPosPass2 = scanPos;
   }
   // Third pass: abs_remainder (Rice parameter 1); the positions the first pass did not reach get their whole level
@@ -1438,7 +1439,7 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
   for( int scanPos = firstSigPos; scanPos <= lastPos; scanPos++ )
   {
     const int pos       = blockPos( scanPos );
-    int       tcoeff    = uni( s_coef[pos] );
+    int       tcoeff    = uni( int( s_coef[pos] ) );
     const int cutoffVal = scanPos <= lastScanPosPass2 ? 10 : ( scanPos <= lastScanPosPass1 ? 2 : 0 );
     if( tcoeff < 0 )
     {
@@ -1467,17 +1468,17 @@ void residualCodingSubblockTS( inout int maxX, inout int maxY )
         tcoeff          = decDeriveModCoeff( right, below, tcoeff );
       }
     }
-    s_coef[pos] = tcoeff;
+    s_coef[pos] = int16_t( tcoeff );
   }
   // The signed levels into s_coef (the contexts of the later groups read them), and the largest x and y
   for( int k = 0; k < numNonZero; k++ )
   {
     const int pos      = laneValue( g_sigPos, k );
-    const int absCoeff = uni( s_coef[pos] );
+    const int absCoeff = uni( int( s_coef[pos] ) );
     maxX               = max( maxX, pos & ( g_cc.width - 1 ) );
     maxY               = max( maxY, pos >> g_cc.log2W );
     const int v        = ( signPattern & 1u ) != 0 ? -absCoeff : absCoeff;
-    s_coef[pos]        = v;
+    s_coef[pos]        = int16_t( v );
     g_outCount++;
     signPattern >>= 1;
   }
@@ -1533,7 +1534,7 @@ void writeLevelsBody( int t, int comp, int4 b, int w, int h, bool dq )
       continue;
     }
     const int pos = ( y << g_cc.log2W ) + x;
-    int       v   = s_coef[pos];
+    int       v   = int( s_coef[pos] );
     if( dq && v != 0 )
     {
       const int a = 2 * abs( v ) - int( ( s_dqBits[pos >> 5] >> uint( pos & 31 ) ) & 1u );
@@ -1543,7 +1544,7 @@ void writeLevelsBody( int t, int comp, int4 b, int w, int h, bool dq )
     {
       pc.levels[at + uint( y * w + x )] = int16_t( v );
     }
-    s_coef[pos] = 0;
+    s_coef[pos] = int16_t( 0 );
     if( ( x & 3 ) == 0 )
     {
       s_tpl[pos >> 2] = 0u;

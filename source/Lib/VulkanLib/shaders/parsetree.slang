@@ -9,10 +9,10 @@
 
 // --------------------------------------------------------------------------------------------------------------------
 // The maps of the CUs parsed so far around the CTU. Each holds a word pair per 4x4 luma block that describes the CU
-// covering it: s_map covers the CTU itself, with one map per channel type (the luma tree's CUs and the chroma tree's;
-// a single tree's CUs are in both); s_above covers the bottom row of 4x4 blocks of the CTU above, and s_left the
-// right column of the CTU to the left. An entry is zero where no CU has been parsed, and in CTUs out of reach (another
-// slice or tile). The word pair:
+// covering it: s_mapX and s_mapY (mapGet, mapSet) cover the CTU itself, with one map per channel type (the luma
+// tree's CUs and the chroma tree's; a single tree's CUs are in both); s_above covers the bottom row of 4x4 blocks of
+// the CTU above, and s_left the right column of the CTU to the left. An entry is zero where no CU has been parsed,
+// and in CTUs out of reach (another slice or tile). The word pair:
 //   x: the CU's index in its CTU + 1 (12 bits) | prediction mode << 12 | skip << 14 | affine << 15 | MIP << 16 |
 //      ISP mode << 17 | QT depth << 19 | depth << 22 | log2 width << 26 | log2 height << 29, the size being that of
 //      the CU's block of the map's channel type, in that channel's samples
@@ -28,7 +28,21 @@
 #endif
 static const int kMapRow     = MAX_CTU / 4;         // a channel type's map: entries per row (one a 4x4 block)
 static const int kMapChannel = kMapRow * kMapRow;   // entries per channel type
-groupshared uint2 s_map[2 * kMapChannel];   // [channel type][y >> 2][x >> 2], from the CTU's top-left corner
+// [channel type][y >> 2][x >> 2], from the CTU's top-left corner: an entry's first word in s_mapX, its second (which
+// holds 16 bits: the intra mode and the QP, see writeCuInfo) in s_mapY
+groupshared uint     s_mapX[2 * kMapChannel];
+groupshared uint16_t s_mapY[2 * kMapChannel];
+
+uint2 mapGet( int i )
+{
+  return uint2( s_mapX[i], uint( s_mapY[i] ) );
+}
+
+void mapSet( int i, uint2 v )
+{
+  s_mapX[i] = v.x;
+  s_mapY[i] = uint16_t( v.y );
+}
 groupshared uint2 s_above[2 * kMapRow];     // [channel type][x >> 2]: the bottom row of the CTU above
 groupshared uint2 s_left[2 * kMapRow];      // [channel type][y >> 2]: the right column of the CTU to the left
 
@@ -127,7 +141,7 @@ uint2 cuAt( int x, int y, int ch )
   const int dy = y - ( g_ctuY << g_log2Ctu );
   if( dx >= 0 && dy >= 0 && dx < g_ctuSize && dy < g_ctuSize )
   {
-    return uni( s_map[ch * kMapChannel + ( dy >> 2 ) * kMapRow + ( dx >> 2 )] );
+    return uni( mapGet( ch * kMapChannel + ( dy >> 2 ) * kMapRow + ( dx >> 2 ) ) );
   }
   if( dy < 0 && dy >= -4 && dx >= 0 && dx < g_ctuSize )
   {
