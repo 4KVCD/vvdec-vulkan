@@ -114,6 +114,12 @@ static constexpr size_t   kMaxAhead           = 48;
 // pictures before them (Top Gun slower 1080p -1.4%).
 static constexpr size_t   kSerialStreams      = 2;
 static constexpr size_t   kSerialIntraInParse = 2;
+// In an all-intra stream without WPP every picture's parse is one such long chain, and the parse holds the whole decode
+// back. So while every picture in parse is a serial intra picture, more of them parse side by side, up to
+// kMaxSerialIntraParsing. Each one holds its parse room (4K: ~25 MB of GPU memory). With 24 instead of 16 the all-intra
+// 4K streams decode 32% to 39% faster at 15 W for 250 to 300 MB more memory; 32 is no faster. (Random-access streams
+// without WPP gain nothing from more pictures in parse.)
+static constexpr size_t   kMaxSerialIntraParsing = 24;
 
 // The bytes of a picture's largest substream (its parse's longest)
 static uint32_t largestStreamBytes( const ParseInput& in )
@@ -712,11 +718,19 @@ void ParseService::run()
         {
           streams += slot->input().numStreams;
         }
-        const size_t ahead = m_parsing.size() + held();
-        size_t       count = 0;
-        while( count < m_waiting.size() && m_parsing.size() + count < kMaxParsing
-               && ( m_parsing.size() + count < kMinParsing || streams < kStreamsInParse ) && ahead + count < kMaxAhead )
+        const size_t ahead          = m_parsing.size() + held();
+        bool         allSerialIntra = std::all_of( m_parsing.begin(), m_parsing.end(),
+                                                   []( const ParseSlot* slot ) { return serialIntraPicture( *slot->picture ); } );
+        size_t       count          = 0;
+        while( count < m_waiting.size() && ahead + count < kMaxAhead )
         {
+          const size_t inParse = m_parsing.size() + count;
+          allSerialIntra       = allSerialIntra && serialIntraPicture( *m_waiting[count] );
+          const size_t cap     = allSerialIntra ? kMaxSerialIntraParsing : kMaxParsing;
+          if( inParse >= cap || ( inParse >= kMinParsing && streams >= kStreamsInParse ) )
+          {
+            break;
+          }
           streams += substreamsOf( m_waiting[count] );
           count++;
         }
