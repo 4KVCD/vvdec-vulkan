@@ -64,15 +64,18 @@ namespace gpu
 static constexpr size_t   kParseStateWords   = 1024;      // kStateWords
 static constexpr size_t   kParseStateNextCtu = 0;         // kStK: the substream's next CTU
 static constexpr size_t   kParseStateDone    = 1;         // kStDone: the substream is parsed (or given up)
-// The bins per substream and dispatch (a CU counts as 32): a few ms alone. Longer submissions on the parse queue hold
-// up the pictures' front ends on the async compute queues (VideoQ 1080p, 2^16 bins: a picture's GPU work took 16 ms
-// from its submission instead of 7, 115 fps; 2^13: 7.8 ms, 149 fps; 2^14 as fast, 4K 46 -> 54 fps; 2^12: slower
-// again, from the many submissions). With few substreams in parse (kFewStreams at most: pictures without WPP or
-// tiles parse as one substream each), all of them large (a substream of kLargeStreamBytes or more each: ~15 bins a
-// byte, so more than two steps of 2^16 bins), the steps take kParseBinBudgetFew: a 4K all-intra picture has ~1.5M
-// bins, and short steps left the GPU idle between the submissions (isp_ai_4k: 2^14 21.4 fps, 2^16 25.1). Beside a
-// small picture they don't: it would wait for the long step's end to be handed over, and the pictures after it to
-// start (VVenC random access without WPP: fg_videoq 1080p, 2^16 109.0 fps, 2^14 207.4; VideoQ 1080p 240.5 / 326.7).
+// The bins per substream and dispatch (a CU counts as 32). A step's workgroups hold their compute units' shared memory
+// (two of them fill a unit's) for as long as the step runs, and the steps run one after another, a submission each:
+// shorter steps cost more submissions, but decode faster, as if the reconstruction's passes on the other queues got
+// in between more often (15 W, 2^12 against 2^14: Beekeeper slower 4K +3.8%, Top Gun slower 1080p +4.5%, Conan
+// 1080p +39%, Top Gun 1080p +21%, the film grain stream fg_tg4k +0.6%; 2^13 about as fast on the slower streams but
+// +24% / +15% on Conan and Top Gun; 2^10 Conan -20% from 2^12; 2^15 -6%). With few substreams in parse (kFewStreams
+// at most: pictures without WPP or tiles parse as one substream each), all of them large (a substream of
+// kLargeStreamBytes or more each: ~15 bins a byte, so more than two steps of 2^16 bins), the steps take
+// kParseBinBudgetFew: a 4K all-intra picture has ~1.5M bins, and short steps left the GPU idle between the
+// submissions (isp_ai_4k: 2^14 21.4 fps, 2^16 25.1). Beside a small picture they don't: it would wait for the long
+// step's end to be handed over, and the pictures after it to start (VVenC random access without WPP: fg_videoq 1080p,
+// 2^16 109.0 fps, 2^14 207.4).
 static constexpr int32_t  kParseBinBudget    = ParseSlot::kStepBins;
 static constexpr int32_t  kParseBinBudgetFew = 1 << 16;
 static constexpr size_t   kFewStreams        = 32;
@@ -96,6 +99,13 @@ static constexpr uint32_t kStepsPerSubmission = 1;
 static constexpr size_t   kMinParsing         = 8;
 static constexpr size_t   kMaxParsing         = 16;
 static constexpr size_t   kStreamsInParse     = 180;
+// The pictures in parse and the parse results not given back yet (their reconstruction still to read them) together:
+// no more start while this many are. With short steps the parse runs far ahead of the reconstruction (up to ~100
+// pictures as the decode starts), and its lead hides the long parses of intra pictures, but every picture parsed ahead
+// holds its records. 48 keeps most of the lead's speed for a little memory (15 W, Top Gun slower 1080p: no cap 394.7
+// fps and 221 MB of GPU memory at the peak, 48: 392.0 and 213 MB, 32: 382.6 and 205 MB, 24: 374.9; Beekeeper slower
+// 4K: 172.9 / 543, 48: 172.0 / 503, 32: 170.6 / 498).
+static constexpr size_t   kMaxAhead           = 48;
 
 // The bytes of a picture's largest substream (its parse's longest)
 static uint32_t largestStreamBytes( const ParseInput& in )
@@ -625,6 +635,7 @@ void ParseService::release( ParsedPicture* parsed )
   std::lock_guard<std::mutex> lock( m_mutex );
   parsed->picture = nullptr;
   m_released.push_back( parsed );
+  m_wake.notify_one();   // (a picture waiting for room ahead may start: kMaxAhead)
 }
 
 ParseStats ParseService::stats() const
@@ -652,7 +663,11 @@ void ParseService::run()
       std::vector<Picture*> starting;
       {
         std::unique_lock<std::mutex> lock( m_mutex );
-        m_wake.wait( lock, [&]() { return m_stop || !m_parsing.empty() || !m_copying.empty() || !m_waiting.empty(); } );
+        // (the results handed over or being copied, which their pictures have not given back: kMaxAhead)
+        const auto held = [&]() { return m_results.size() - m_freeResults.size() - m_released.size(); };
+        m_wake.wait( lock, [&]() {
+          return m_stop || !m_parsing.empty() || !m_copying.empty() || ( !m_waiting.empty() && m_parsing.size() + held() < kMaxAhead );
+        } );
         if( m_stop )
         {
           return;
@@ -664,9 +679,10 @@ void ParseService::run()
         {
           streams += slot->input().numStreams;
         }
-        size_t count = 0;
+        const size_t ahead = m_parsing.size() + held();
+        size_t       count = 0;
         while( count < m_waiting.size() && m_parsing.size() + count < kMaxParsing
-               && ( m_parsing.size() + count < kMinParsing || streams < kStreamsInParse ) )
+               && ( m_parsing.size() + count < kMinParsing || streams < kStreamsInParse ) && ahead + count < kMaxAhead )
         {
           streams += substreamsOf( m_waiting[count] );
           count++;

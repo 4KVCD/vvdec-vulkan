@@ -115,7 +115,7 @@ public:
   void recordClear( VkCommandBuffer cmd );
   // Records into cmd one dispatch of the parse: each substream parsed from where it stopped up to binBudget bins (a
   // CU counts as 32): kStepBins, or more when ParseService has few substreams in parse
-  static constexpr int32_t kStepBins = 1 << 14;
+  static constexpr int32_t kStepBins = 1 << 12;
   void recordStep( VkCommandBuffer cmd, int32_t binBudget = kStepBins ) const;
   // Records into cmd the compaction's first pass, which does its work once every CTU is parsed: each CTU's record
   // (its first CU and TU in raster order) and the totals
