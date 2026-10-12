@@ -117,6 +117,10 @@ static_assert( sizeof( EdgesPush ) == 96, "EdgesPush: the layout of edges.slang'
 static constexpr size_t kJobWords[3] = { sizeof( TrafoJob ) / sizeof( uint32_t ), sizeof( InterJob ) / sizeof( uint32_t ), sizeof( IntraJob ) / sizeof( uint32_t ) };
 // The words of the passes' dispatch arguments and job counts (FrontPass)
 static constexpr size_t kArgsWords = 64;
+// Where intrasort.slang's SMALL pass writes the dispatch arguments of its other passes in those words (its kArgs*):
+// those of a workgroup per block of jobs, and those of a single workgroup
+static constexpr size_t kSortArgsBlocks = 50;
+static constexpr size_t kSortArgsSingle = 53;
 // The words of the edge lists' firsts and counts (four lists of 2 words, and one more)
 static constexpr size_t kEdgeListsWords = 9;
 
@@ -739,25 +743,32 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
   push.numBlocks = fe.sortBlocks;
   push.capacity  = int32_t( fe.sortCapacity );
   bind( kShader_intrasort );
-  const auto pass = [&]( int p, int shift, uint32_t groups ) {
+  // SMALL (pass 7) sorts up to 1024 jobs alone, and writes the workgroups of the passes after it: none then, else a
+  // workgroup per block (or one)
+  push.pass  = 7;
+  push.shift = 0;
+  pushConstants( push );
+  dispatchGroups( 1 );
+  indirectBarrier();
+  const auto pass = [&]( int p, int shift, bool perBlock ) {
     push.pass  = p;
     push.shift = shift;
     pushConstants( push );
-    dispatchGroups( groups );
+    m_ctx->api().vkCmdDispatchIndirect( m_cmd, fe.args.buffer, ( perBlock ? kSortArgsBlocks : kSortArgsSingle ) * sizeof( uint32_t ) );
     computeBarrier();
   };
   // the radix sort by wave, two digits of 8 bits (passes 0 to 2: histograms, their sums, the scatter); then the
   // bands (passes 3 to 6)
   for( int shift = 0; shift <= 8; shift += 8 )
   {
-    pass( 0, shift, uint32_t( fe.sortBlocks ) );
-    pass( 1, shift, 1 );
-    pass( 2, shift, uint32_t( fe.sortBlocks ) );
+    pass( 0, shift, true );
+    pass( 1, shift, false );
+    pass( 2, shift, true );
   }
-  pass( 3, 0, uint32_t( fe.sortBlocks ) );
-  pass( 4, 0, 1 );
-  pass( 5, 0, uint32_t( fe.sortBlocks ) );
-  pass( 6, 0, uint32_t( fe.sortBlocks ) );
+  pass( 3, 0, true );
+  pass( 4, 0, false );
+  pass( 5, 0, true );
+  pass( 6, 0, true );
   mark( "intrasort" );
 }
 

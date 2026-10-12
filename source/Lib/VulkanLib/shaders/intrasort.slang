@@ -18,6 +18,9 @@
 // 5 PLACE:   one workgroup per block writes each sorted job's bands at the job's offset, and records the first band
 //            of each wave where the wave begins (waveFirst);
 // 6 WAITS:   one workgroup per block writes each band's wait: the first band of the band's wave.
+// 7 SMALL:   runs first, one workgroup: with at most 1024 jobs (a B-picture's few intra jobs) it does all of the
+//            above itself, and gives passes 0 to 6 (dispatched indirectly) no workgroups; with more, it gives them
+//            theirs. (Ten dispatches with a barrier after each took ~0.18 ms of the front end for a few jobs.)
 
 #include "common.slang"
 
@@ -38,13 +41,19 @@ struct Params
   int           pass;
   int           shift;      // shift of the current digit: 0 or 8
   int           capacity;   // room in sorted and waits, in bands
-  uint*         args;       // BSCAN: the front end's indirect arguments (GpuRecon's m_frontArgs) for intra's pass
+  uint*         args;       // the front end's indirect arguments (GpuRecon's m_frontEnd.args): intra's pass (BSCAN,
+                            // SMALL), and passes 0 to 6's (SMALL: kArgsBlocks, kArgsSingle)
 };
 
 [[vk::push_constant]] Params pc;
 
 static const int kBand  = 256;
 static const int kBlock = 1024;
+
+// Where SMALL writes the indirect arguments of passes 0 to 6 in pc.args (GpuReconFrontEnd.cpp's kSortArgs*): the
+// passes of a workgroup per block (HIST, SCATTER, BANDS, PLACE, WAITS), and those of a single workgroup (SCAN, BSCAN)
+static const int kArgsBlocks = 50;
+static const int kArgsSingle = 53;
 
 int  bandRows( uint* job ) { return max( 1, kBand / int( job[1] & 0xff ) ); }
 int  bandsOf( uint* job ) { const int rows = bandRows( job ); return ( int( ( job[1] >> 8 ) & 0xff ) + rows - 1 ) / rows; }
@@ -77,6 +86,130 @@ uint scan1024( int tid )
   return total;
 }
 
+// Sorts the 1024 entries of s_scan in increasing order, in place (a bitonic sort)
+void sort1024( int tid )
+{
+  for( int k = 2; k <= 1024; k <<= 1 )
+  {
+    for( int j = k >> 1; j > 0; j >>= 1 )
+    {
+      const int other = tid ^ j;
+      if( other > tid )
+      {
+        const uint a      = s_scan[tid];
+        const uint b      = s_scan[other];
+        const bool rising = ( tid & k ) == 0;   // the direction of this run of k entries
+        if( rising == ( a > b ) )
+        {
+          s_scan[tid]   = b;
+          s_scan[other] = a;
+        }
+      }
+      GroupMemoryBarrierWithGroupSync();
+    }
+  }
+}
+
+// SMALL (pass 7, one workgroup): see the passes above. The jobs are sorted as keys wave << 10 | job, so that the jobs'
+// order breaks the ties (a stable sort by wave; with at most 1024 jobs, the waves stay below 1024 too: each wave is one
+// above an earlier job's). In sorted order, an exclusive prefix sum of the jobs' bands gives each job's first band, and
+// a running maximum of the places where the wave changes gives the first job of each job's wave, whose first band is
+// the wait of the job's bands.
+void smallSort( int tid, uint n )
+{
+  const bool small = n <= uint( kBlock );
+  if( tid == 0 )
+  {
+    pc.args[kArgsBlocks]     = small ? 0u : uint( pc.numBlocks );
+    pc.args[kArgsBlocks + 1] = 1u;
+    pc.args[kArgsBlocks + 2] = 1u;
+    pc.args[kArgsSingle]     = small ? 0u : 1u;
+    pc.args[kArgsSingle + 1] = 1u;
+    pc.args[kArgsSingle + 2] = 1u;
+  }
+  if( !small )
+  {
+    return;
+  }
+  // (the sorted keys' places below n hold the jobs: the other places' keys are the largest)
+  const bool valid = uint( tid ) < n;
+  if( valid )
+  {
+    const uint wave = waveOf( uint( tid ) );
+    if( wave >= 256u )
+    {
+      pc.flags[1].store( 1u );   // (as HIST sets it)
+    }
+    s_scan[tid] = min( wave, 0xffffu ) << 10 | uint( tid );   // (below the padding's keys, whatever the wave)
+  }
+  else
+  {
+    s_scan[tid] = 0xffffffffu;
+  }
+  GroupMemoryBarrierWithGroupSync();
+  sort1024( tid );
+  const uint key      = s_scan[tid];
+  const uint prevWave = tid > 0 ? s_scan[tid - 1] >> 10 : 0xffffffffu;
+  GroupMemoryBarrierWithGroupSync();
+  const uint index = key & 1023u;
+  const uint wave  = key >> 10;
+
+  // each sorted job's first band
+  s_scan[tid] = valid ? uint( bandsOf( pc.jobs + index * 12 ) ) : 0u;
+  GroupMemoryBarrierWithGroupSync();
+  const uint total = scan1024( tid );
+  const uint first = s_scan[tid];
+  GroupMemoryBarrierWithGroupSync();
+
+  // the first job of each job's wave (where its wave begins), and that job's first band
+  s_scan[tid] = valid && wave != prevWave ? uint( tid ) : 0u;
+  GroupMemoryBarrierWithGroupSync();
+  for( int d = 1; d < 1024; d <<= 1 )
+  {
+    const uint v = tid >= d ? s_scan[tid - d] : 0u;
+    GroupMemoryBarrierWithGroupSync();
+    s_scan[tid] = max( s_scan[tid], v );
+    GroupMemoryBarrierWithGroupSync();
+  }
+  const uint waveStart = s_scan[tid];
+  GroupMemoryBarrierWithGroupSync();
+  s_scan[tid] = first;
+  GroupMemoryBarrierWithGroupSync();
+  const uint wait = s_scan[waveStart];
+
+  // the job's bands (as PLACE writes them) and their waits (as WAITS does)
+  if( valid )
+  {
+    uint*     job  = pc.jobs + index * 12;
+    const int rows = bandRows( job );
+    const int h    = int( ( job[1] >> 8 ) & 0xff );
+    uint      at   = first;
+    for( int r = 0; r < h; r += rows, at++ )
+    {
+      if( at < uint( pc.capacity ) )
+      {
+        uint* band = pc.sorted + at * 12;
+        for( int k = 0; k < 12; k++ )
+        {
+          band[k] = job[k];
+        }
+        band[7]      = uint( r ) | uint( min( rows, h - r ) ) << 16;
+        pc.waits[at] = wait;
+      }
+    }
+  }
+  // the number of bands and intra's indirect arguments (as BSCAN stores them)
+  if( tid == 0 )
+  {
+    pc.bandSums[pc.numBlocks] = total;
+    pc.args[12]               = min( total, 32768u );
+    pc.args[13]               = ( total + 32767u ) / 32768u;
+    pc.args[14]               = 1;
+    pc.args[40]               = total;
+    pc.args[41]               = 0;
+  }
+}
+
 [shader( "compute" )]
 [numthreads( 1024, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
@@ -87,6 +220,12 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   uint*      src   = pc.shift == 0 ? pc.keysA : pc.keysB;   // this digit's input; digit 0 reads the jobs in order
   uint*      dst   = pc.shift == 0 ? pc.keysB : pc.keysA;
   const uint i     = uint( block * kBlock + tid );
+
+  if( pc.pass == 7 )
+  {
+    smallSort( tid, n );
+    return;
+  }
 
   // (the second digit's passes when it is 0 for every job; SCATTER copies the keys below)
   const bool secondDigitZero = pc.shift != 0 && pc.flags[1].load() == 0;
