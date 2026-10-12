@@ -800,10 +800,31 @@ bool neighbourMotion( int cuIdx, int x, int y, out Motion m )
   return true;
 }
 
+// The words neighbourAt reads for a spatial neighbour at (x, y): the CU map's and the 4x4 block's motion. mergeCandidates
+// reads them for all five of its neighbours before it looks at any, so that the CU waits for memory once rather than
+// five times in a row. A place outside the picture reads the nearest block's words, which neighbourAt does not use.
+struct NeighbourWords
+{
+  int  idx;
+  int4 mv;
+  uint w;
+};
+
+NeighbourWords fetchNeighbour( int x, int y )
+{
+  const int      cx = clamp( x, 0, pc.width - 1 ), cy = clamp( y, 0, pc.height - 1 );
+  int*           mi = motionPtr( cx, cy );
+  NeighbourWords n;
+  n.idx = int( pc.cuMap[( cy >> 2 ) * pc.widthIn4 + ( cx >> 2 )] );
+  n.mv  = int4( mi[0], mi[1], mi[2], mi[3] );
+  n.w   = uint( mi[4] );
+  return n;
+}
+
 // cuAt and neighbourMotion for a spatial neighbour at (x, y) next to the CU (in the CU's CTU or one of the four
-// around it). The CU map's word and the block's motion are read together. A translational CU's BCW and half-sample
-// flag come from its block (where spanMotion put them); for other kinds, from the CU's motion record.
-bool neighbourAt( Cur cur, int x, int y, out int cuIdx, out Motion m )
+// around it), from its words (fetchNeighbour). A translational CU's BCW and half-sample flag come from its block (where
+// spanMotion put them); for other kinds, from the CU's motion record.
+bool neighbourAt( Cur cur, int x, int y, NeighbourWords n, out int cuIdx, out Motion m )
 {
   m     = noMotion();
   cuIdx = -1;
@@ -811,10 +832,9 @@ bool neighbourAt( Cur cur, int x, int y, out int cuIdx, out Motion m )
   {
     return false;
   }
-  const int  idx   = int( pc.cuMap[( y >> 2 ) * pc.widthIn4 + ( x >> 2 )] );
-  int*       mi    = motionPtr( x, y );
-  const int4 mv    = int4( mi[0], mi[1], mi[2], mi[3] );
-  const uint w     = uint( mi[4] );
+  const int  idx   = n.idx;
+  const int4 mv    = n.mv;
+  const uint w     = n.w;
   const int  xdiff = ( x >> pc.log2Ctu ) - ( cur.cu.x >> pc.log2Ctu );
   const int  ydiff = ( y >> pc.log2Ctu ) - ( cur.cu.y >> pc.log2Ctu );
   if( xdiff == 0 && ydiff == 0 )
@@ -914,11 +934,17 @@ int mergeCandidates( Cur cur, int last )
   const int2 lt = int2( cur.cu.x, cur.cu.y );
   const int2 rt = int2( cur.cu.x + cur.cu.w - 1, cur.cu.y );
   const int2 lb = int2( cur.cu.x, cur.cu.y + cur.cu.h - 1 );
+  // the five spatial neighbours' words, read at once (fetchNeighbour)
+  const NeighbourWords wB1 = fetchNeighbour( rt.x, rt.y - 1 );
+  const NeighbourWords wA1 = fetchNeighbour( lb.x - 1, lb.y );
+  const NeighbourWords wB0 = fetchNeighbour( rt.x + 1, rt.y - 1 );
+  const NeighbourWords wA0 = fetchNeighbour( lb.x - 1, lb.y + 1 );
+  const NeighbourWords wB2 = fetchNeighbour( lt.x - 1, lt.y - 1 );
 
   // B1: above
   Motion     above, left;
   int        cuAbove;
-  const bool availB1 = neighbourAt( cur, rt.x, rt.y - 1, cuAbove, above ) && isDiffMer( lt.x, lt.y, rt.x, rt.y - 1 );
+  const bool availB1 = neighbourAt( cur, rt.x, rt.y - 1, wB1, cuAbove, above ) && isDiffMer( lt.x, lt.y, rt.x, rt.y - 1 );
   if( availB1 )
   {
     setCand( cnt, spatialCand( above, interB ) );
@@ -929,7 +955,7 @@ int mergeCandidates( Cur cur, int last )
 
   // A1: left
   int        cuLeft;
-  const bool availA1 = neighbourAt( cur, lb.x - 1, lb.y, cuLeft, left ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y );
+  const bool availA1 = neighbourAt( cur, lb.x - 1, lb.y, wA1, cuLeft, left ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y );
   if( availA1 )
   {
     if( !availB1 || sliceIdxAt( cur, rt.x, rt.y - 1 ) != sliceIdxAt( cur, lb.x - 1, lb.y ) || !sameMotion( above, left ) )
@@ -946,7 +972,7 @@ int mergeCandidates( Cur cur, int last )
   // B0: above right
   Motion     aboveRight;
   int        cuAboveRight;
-  const bool availB0      = neighbourAt( cur, rt.x + 1, rt.y - 1, cuAboveRight, aboveRight ) && isDiffMer( lt.x, lt.y, rt.x + 1, rt.y - 1 );
+  const bool availB0      = neighbourAt( cur, rt.x + 1, rt.y - 1, wB0, cuAboveRight, aboveRight ) && isDiffMer( lt.x, lt.y, rt.x + 1, rt.y - 1 );
   if( availB0 )
   {
     if( !availB1 || sliceIdxAt( cur, rt.x, rt.y - 1 ) != sliceIdxAt( cur, rt.x + 1, rt.y - 1 ) || !sameMotion( above, aboveRight ) )
@@ -961,7 +987,7 @@ int mergeCandidates( Cur cur, int last )
   // A0: below left
   Motion     belowLeft;
   int        cuBelowLeft;
-  const bool availA0     = neighbourAt( cur, lb.x - 1, lb.y + 1, cuBelowLeft, belowLeft ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y + 1 );
+  const bool availA0     = neighbourAt( cur, lb.x - 1, lb.y + 1, wA0, cuBelowLeft, belowLeft ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y + 1 );
   if( availA0 )
   {
     if( !availA1 || sliceIdxAt( cur, lb.x - 1, lb.y + 1 ) != sliceIdxAt( cur, lb.x - 1, lb.y ) || !sameMotion( belowLeft, left ) )
@@ -978,7 +1004,7 @@ int mergeCandidates( Cur cur, int last )
   {
     Motion     aboveLeft;
     int        cuAboveLeft;
-    const bool availB2     = neighbourAt( cur, lt.x - 1, lt.y - 1, cuAboveLeft, aboveLeft ) && isDiffMer( lt.x, lt.y, lt.x - 1, lt.y - 1 );
+    const bool availB2     = neighbourAt( cur, lt.x - 1, lt.y - 1, wB2, cuAboveLeft, aboveLeft ) && isDiffMer( lt.x, lt.y, lt.x - 1, lt.y - 1 );
     if( availB2 )
     {
       const uint sliceB2 = sliceIdxAt( cur, lt.x - 1, lt.y - 1 );
