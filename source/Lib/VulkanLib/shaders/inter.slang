@@ -1036,6 +1036,24 @@ void bdofStore( int tid, int list, int w, int h, int pred[PER_THREAD], int slot,
   }
 }
 
+// Adds a sample's terms to the five sums (s_bsum's order), from its gradients in the two lists (g0, g1) and its
+// predictions (p0, p1).
+void bdofAddTerms( inout int sums[5], int2 g0, int2 g1, int p0, int p1 )
+{
+  const int gx = ( g0.x + g1.x ) >> 1;
+  const int gy = ( g0.y + g1.y ) >> 1;
+  const int di = ( p1 >> 4 ) - ( p0 >> 4 );
+  // (with the gradients' signs as -1, 0 or 1, each term is a product: |gx| = sgn(gx) gx, and the terms that a sign
+  // negates, zeroes or keeps)
+  const int sx = clamp( gx, -1, 1 );
+  const int sy = clamp( gy, -1, 1 );
+  sums[0] += sx * gx;
+  sums[1] += sy * gy;
+  sums[2] += sx * di;
+  sums[3] += sy * di;
+  sums[4] += sy * gx;
+}
+
 // Adds part q (q = 0 .. 3, nine samples) of the sums over the 6 x 6 window of the tile's 4x4 block sb into s_bsum,
 // which starts zeroed.
 void bdofAddSums( int sb, int q, int w, int h )
@@ -1043,27 +1061,18 @@ void bdofAddSums( int sb, int q, int w, int h )
   const int nsx   = w >> 2;
   const int sx    = sb % nsx;
   const int sy    = sb / nsx;
-  int       absGX = 0, absGY = 0, dIX = 0, dIY = 0, signGX = 0;
+  int       sums[5] = { 0, 0, 0, 0, 0 };
   for( int p = q * 9; p < q * 9 + 9; p++ )
   {
-    const int  cx = clamp( 4 * sx - 1 + p % 6, 0, w - 1 );
-    const int  cy = clamp( 4 * sy - 1 + p / 6, 0, h - 1 );
-    const int2 g0 = bdofGrad( 0, cx, cy );
-    const int2 g1 = bdofGrad( 1, cx, cy );
-    const int  gx = ( g0.x + g1.x ) >> 1;
-    const int  gy = ( g0.y + g1.y ) >> 1;
-    const int  di = ( bdofP( 1, cx, cy ) >> 4 ) - ( bdofP( 0, cx, cy ) >> 4 );
-    absGX  += abs( gx );
-    absGY  += abs( gy );
-    dIX    += gx < 0 ? -di : ( gx == 0 ? 0 : di );
-    dIY    += gy < 0 ? -di : ( gy == 0 ? 0 : di );
-    signGX += gy < 0 ? -gx : ( gy == 0 ? 0 : gx );
+    const int cx = clamp( 4 * sx - 1 + p % 6, 0, w - 1 );
+    const int cy = clamp( 4 * sy - 1 + p / 6, 0, h - 1 );
+    bdofAddTerms( sums, bdofGrad( 0, cx, cy ), bdofGrad( 1, cx, cy ), bdofP( 0, cx, cy ), bdofP( 1, cx, cy ) );
   }
-  InterlockedAdd( s_bsum[sb * 5], absGX );
-  InterlockedAdd( s_bsum[sb * 5 + 1], absGY );
-  InterlockedAdd( s_bsum[sb * 5 + 2], dIX );
-  InterlockedAdd( s_bsum[sb * 5 + 3], dIY );
-  InterlockedAdd( s_bsum[sb * 5 + 4], signGX );
+  [unroll]
+  for( int k = 0; k < 5; k++ )
+  {
+    InterlockedAdd( s_bsum[sb * 5 + k], sums[k] );
+  }
 }
 
 // The motion offset (vx, vy) of the tile's 4x4 block sb, from its sums in s_bsum.
@@ -1543,6 +1552,82 @@ void tile16BdofStore( int tid, int j, int i0, int4 predY[2], int16_t border[3] )
   }
 }
 
+// tile16's BDOF sums (bdofAddSums' sums over each 4x4 block's 6 x 6 window), a row at a time: thread (j, bx) adds up
+// the five sums over row j's samples in block column bx's window (columns 4 bx - 1 .. 4 bx + 4, clamped into the
+// tile: an edge column counts twice), then adds them to the sums of the block rows whose windows hold row j (rows
+// 4 by - 1 .. 4 by + 4, clamped: rows 0 and 15 count twice). So a sample's gradients are worked out once per window
+// row rather than once per window that holds it. The thread's own samples (j, 4 bx .. 4 bx + 3), whose predictions
+// it holds, come from its registers; their lists' gradient differences, which tile16BdofSample needs, it keeps in dg,
+// packed in pairs.
+void tile16BdofSums( int j, int bx, int4 predY[2], out uint dg[4] )
+{
+  const int x0      = 4 * bx;
+  int       sums[5] = { 0, 0, 0, 0, 0 };
+  // The own samples at 14 bits, as s_bdof holds them, and the row's samples left and right of them
+  int own[2][4], left[2], right[2];
+  [unroll]
+  for( int s = 0; s < 2; s++ )
+  {
+    [unroll]
+    for( int o = 0; o < 4; o++ )
+    {
+      own[s][o] = int( int16_t( predY[s][o] ) );
+    }
+    left[s]  = bdofP( s, x0 - 1, j );
+    right[s] = bdofP( s, x0 + 4, j );
+  }
+  [unroll]
+  for( int o = 0; o < 4; o++ )
+  {
+    int2 g[2];
+    [unroll]
+    for( int s = 0; s < 2; s++ )
+    {
+      const int l = o == 0 ? left[s] : own[s][o - 1];
+      const int r = o == 3 ? right[s] : own[s][o + 1];
+      g[s]        = int2( ( r >> 6 ) - ( l >> 6 ), ( bdofP( s, x0 + o, j + 1 ) >> 6 ) - ( bdofP( s, x0 + o, j - 1 ) >> 6 ) );
+    }
+    bdofAddTerms( sums, g[0], g[1], own[0][o], own[1][o] );
+    dg[o] = uint( ( g[0].x - g[1].x ) & 0xffff ) | ( uint( g[0].y - g[1].y ) << 16 );
+  }
+  // The window's first and last columns, x0 - 1 and x0 + 4 clamped into the tile
+  [unroll]
+  for( int e = 0; e < 2; e++ )
+  {
+    const int x = e == 0 ? max( x0 - 1, 0 ) : min( x0 + 4, 15 );
+    bdofAddTerms( sums, bdofGrad( 0, x, j ), bdofGrad( 1, x, j ), bdofP( 0, x, j ), bdofP( 1, x, j ) );
+  }
+  // Into the block row that holds row j (twice for the tile's first and last rows), and the neighbouring block row
+  // whose window reaches row j
+  const int by     = j >> 2;
+  const int weight = j == 0 || j == 15 ? 2 : 1;
+  const int other  = ( j & 3 ) == 3 && j < 15 ? by + 1 : ( ( j & 3 ) == 0 && j > 0 ? by - 1 : -1 );
+  [unroll]
+  for( int k = 0; k < 5; k++ )
+  {
+    InterlockedAdd( s_bsum[( by * 4 + bx ) * 5 + k], weight * sums[k] );
+  }
+  if( other >= 0 )
+  {
+    [unroll]
+    for( int k = 0; k < 5; k++ )
+    {
+      InterlockedAdd( s_bsum[( other * 4 + bx ) * 5 + k], sums[k] );
+    }
+  }
+}
+
+// bdofSample for the thread's own sample o (j, 4 bx + o), from its predictions and the gradient differences that
+// tile16BdofSums kept (dg)
+int tile16BdofSample( int4 predY[2], uint dg, int o, int2 v )
+{
+  const int shiftNum = 15 - pc.bitDepth;
+  const int offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
+  const int maxVal   = ( 1 << pc.bitDepth ) - 1;
+  const int b        = v.x * lo16( dg ) + v.y * hi16( dg );
+  return clip3( 0, maxVal, int( int16_t( ( int( int16_t( predY[0][o] ) ) + int( int16_t( predY[1][o] ) ) + b + offset ) >> shiftNum ) ) );
+}
+
 // DMVR's best cost (the centre's reduced by a quarter), from the SADs in s_sad: BDOF applies only from 2 w h on.
 int dmvrMinCost( int centre )
 {
@@ -1869,9 +1954,10 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     tile16ShiftChroma( tid, dIC );
   }
 #if BDOF
+  uint dg[4];   // (the own samples' gradient differences, for tile16BdofSample)
   if( bdof )
   {
-    bdofAddSums( tid >> 2, tid & 3, 16, 16 );
+    tile16BdofSums( j, tid & 3, predY, dg );
   }
 #endif
   int16_t cxC[2][4], cyC[2][4];
@@ -1922,7 +2008,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
-      vy[o] = bdofSample( i0 + o, j, v );
+      vy[o] = tile16BdofSample( predY, dg[o], o, v );
     }
   }
 #endif
