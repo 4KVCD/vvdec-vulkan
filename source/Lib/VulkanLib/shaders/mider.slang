@@ -2740,6 +2740,50 @@ int2 tileColumnSpan( int tc )
   return span;
 }
 
+// The most 8x8 blocks of a CTU each thread copies: a CTU of 128 x 128 has 256, 8 for each of the 32 threads
+static const int kColPerThread = 8;
+
+// Copies the colocated motion of the CTU's 8x8 blocks (their top-left 4x4 block's motion) into pc.colMotion. Each
+// thread reads all its blocks' motion before it writes any: the compiler cannot move a read of pc.motion past a write
+// to pc.colMotion (they might overlap), so reading and writing word by word would wait for memory 40 times.
+void copyColMotion( int ctu )
+{
+  const int across8  = 1 << ( pc.log2Ctu - 3 );
+  const int num8x8   = across8 * across8;
+  const int ctuSize4 = 1 << ( pc.log2Ctu - 2 );
+  uint4     head[kColPerThread];   // words 0-3 of each block's motion
+  uint      tail[kColPerThread];   // word 4
+  [unroll]
+  for( int j = 0; j < kColPerThread; j++ )
+  {
+    const int e = g_lane + 32 * j;
+    head[j]     = uint4( 0, 0, 0, 0 );
+    tail[j]     = 0;
+    if( e < num8x8 )
+    {
+      const int x4  = ( e & ( across8 - 1 ) ) * 2;
+      const int y4  = ( e >> ( pc.log2Ctu - 3 ) ) * 2;
+      uint*     src = (uint*) ( pc.motion + ( ctu * ctuSize4 * ctuSize4 + y4 * ctuSize4 + x4 ) * 5 );
+      head[j]       = uint4( src[0], src[1], src[2], src[3] );
+      tail[j]       = src[4];
+    }
+  }
+  [unroll]
+  for( int j = 0; j < kColPerThread; j++ )
+  {
+    const int e = g_lane + 32 * j;
+    if( e < num8x8 )
+    {
+      uint* dst = (uint*) ( pc.colMotion + ( ctu * num8x8 + e ) * 5 );
+      dst[0]    = head[j].x;
+      dst[1]    = head[j].y;
+      dst[2]    = head[j].z;
+      dst[3]    = head[j].w;
+      dst[4]    = tail[j];
+    }
+  }
+}
+
 [shader( "compute" )]
 [numthreads( 32, 1, 1 )]
 void main( uint3 local : SV_GroupThreadID )
@@ -2830,20 +2874,7 @@ void main( uint3 local : SV_GroupThreadID )
     // and in this pass rather than one of its own: the front end's first part waits for every pass in it.
     if( pc.colOn != 0 )
     {
-      const int across8  = 1 << ( pc.log2Ctu - 3 );
-      const int num8x8   = across8 * across8;
-      const int ctuSize4 = 1 << ( pc.log2Ctu - 2 );
-      for( int e = g_lane; e < num8x8; e += 32 )
-      {
-        const int x4  = ( e & ( across8 - 1 ) ) * 2;
-        const int y4  = ( e >> ( pc.log2Ctu - 3 ) ) * 2;
-        int*      src = pc.motion + ( ctu * ctuSize4 * ctuSize4 + y4 * ctuSize4 + x4 ) * 5;
-        int*      dst = pc.colMotion + ( ctu * num8x8 + e ) * 5;
-        for( int k = 0; k < 5; k++ )
-        {
-          dst[k] = src[k];
-        }
-      }
+      copyColMotion( ctu );
     }
   }
 }
