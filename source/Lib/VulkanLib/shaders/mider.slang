@@ -2328,6 +2328,52 @@ void spanMotion( Cur cur, Motion m, int kind )
   }
 }
 
+// Whether the CTU's luma CUs (records first .. first + count - 1, cached by cacheCtuCus) are all intra; all threads
+// call it.
+bool ctuAllIntra( int first, int count )
+{
+  bool inter = false;
+  for( int i = first + g_lane; i < first + count; i += 32 )
+  {
+    const Cu c = loadCu( i );
+    inter      = inter || ( ( c.flags & kChroma ) == 0 && c.predMode != MODE_INTRA );
+  }
+  return !WaveActiveAnyTrue( inter );
+}
+
+// The motion of a CTU whose luma CUs are all intra, as storeCuMotion and spanMotion write an intra CU's, by all the
+// threads at once: the CUs' records, and every 4x4 block of the CTU in the picture (its luma CUs cover them all).
+void storeNoMotion( int ctu, int first, int count )
+{
+  for( int i = first + g_lane; i < first + count; i += 32 )
+  {
+    if( ( loadCu( i ).flags & kChroma ) == 0 )
+    {
+      storeCuMotion( i, noCuMotion() );
+    }
+  }
+  const Motion m      = noMotion();
+  const int    packed = int( ( uint( m.refIdx[0] ) & 0xff ) | ( ( uint( m.refIdx[1] ) & 0xff ) << 8 ) | ( uint( kNotInter ) << 16 ) );
+  const int    log2C4 = pc.log2Ctu - 2;
+  const int    x0     = ( ctu % pc.widthInCtus ) << pc.log2Ctu;
+  const int    y0     = ( ctu / pc.widthInCtus ) << pc.log2Ctu;
+  int*         base   = pc.motion + ( ctu << ( 2 * log2C4 ) ) * 5;
+  for( int e = g_lane; e < 1 << ( 2 * log2C4 ); e += 32 )
+  {
+    const int x = x0 + ( ( e & ( ( 1 << log2C4 ) - 1 ) ) << 2 );
+    const int y = y0 + ( ( e >> log2C4 ) << 2 );
+    if( x < pc.width && y < pc.height )
+    {
+      int* mi = base + e * 5;
+      mi[0]   = m.mv[0].x;
+      mi[1]   = m.mv[0].y;
+      mi[2]   = m.mv[1].x;
+      mi[3]   = m.mv[1].y;
+      mi[4]   = packed;
+    }
+  }
+}
+
 // MergeCtx::setMergeInfo's restriction (restrictBiPredMergeCandsOne): no bi-prediction for 8x4 and 4x8
 void restrictBi( Cur cur, inout Motion m )
 {
@@ -2691,9 +2737,16 @@ void main( uint3 local : SV_GroupThreadID )
   const bool waitAbove = row > 0 && ctuTile( row * pc.widthInCtus + span.x ) == ctuTile( ( row - 1 ) * pc.widthInCtus + span.x );
   for( int col = span.x; col < span.y; col++ )
   {
+    const int ctu   = row * pc.widthInCtus + col;
+    const int first = int( pc.ctus[ctu * 4] );
+    const int count = int( pc.ctus[ctu * 4 + 1] & 0xffff );
+    cacheCtuCus( first, count );
+    // A CTU whose luma CUs are all intra (an intra slice's, unless IBC) reads no neighbour's motion: it does not wait
+    // for the segment above, and its CUs' motion, none, is written by all the threads at once rather than CU by CU.
+    const bool allIntra = ctuAllIntra( first, count );
     // Wait until the segment above, in the same tile, is past the CTU above-right (or done, at the tile's right
     // edge). With WPP the CTU above-right is out of the CUs' reach (cuAt): past the CTU above is enough.
-    if( waitAbove )
+    if( waitAbove && !allIntra )
     {
       if( g_lane == 0 )
       {
@@ -2704,40 +2757,43 @@ void main( uint3 local : SV_GroupThreadID )
       }
       AllMemoryBarrierWithGroupSync();
     }
-    const int ctu = row * pc.widthInCtus + col;
     if( ctuTileColStart( ctu ) )
     {
       s_lutSize[0] = 0;
       s_lutSize[1] = 0;
     }
-    Cur cur;
-    cur.ctu      = ctu;
-    cur.slice    = sliceOfCtu( ctu );
-    cur.sliceIdx = independentIdx( cur.slice );
-    cur.tile     = ctuTile( ctu );
-    cur.rect     = ctuRect( ctu );
-    const int first = int( pc.ctus[ctu * 4] );
-    const int count = int( pc.ctus[ctu * 4 + 1] & 0xffff );
-    cacheCtuCus( first, count );
-    setNeighbourCtus( cur, col, row );
-    for( int i = first; i < first + count; i++ )
+    if( allIntra )
     {
-      cur.cu = loadCu( i );
-      if( ( cur.cu.flags & kChroma ) != 0 )
+      storeNoMotion( ctu, first, count );
+    }
+    else
+    {
+      Cur cur;
+      cur.ctu      = ctu;
+      cur.slice    = sliceOfCtu( ctu );
+      cur.sliceIdx = independentIdx( cur.slice );
+      cur.tile     = ctuTile( ctu );
+      cur.rect     = ctuRect( ctu );
+      setNeighbourCtus( cur, col, row );
+      for( int i = first; i < first + count; i++ )
       {
-        continue;
+        cur.cu = loadCu( i );
+        if( ( cur.cu.flags & kChroma ) != 0 )
+        {
+          continue;
+        }
+        if( cur.cu.predMode == MODE_INTRA )
+        {
+          storeCuMotion( i, noCuMotion() );
+          spanMotion( cur, noMotion(), kNotInter );
+        }
+        else
+        {
+          deriveCu( cur );
+        }
+        // (each thread's writes of the CU's blocks become visible to all before the next CU looks them up)
+        workgroupBarrierAll();
       }
-      if( cur.cu.predMode == MODE_INTRA )
-      {
-        storeCuMotion( i, noCuMotion() );
-        spanMotion( cur, noMotion(), kNotInter );
-      }
-      else
-      {
-        deriveCu( cur );
-      }
-      // (each thread's writes of the CU's blocks become visible to all before the next CU looks them up)
-      workgroupBarrierAll();
     }
     AllMemoryBarrierWithGroupSync();   // (makes the CTU's motion visible to the rows below)
     if( g_lane == 0 )
