@@ -64,6 +64,7 @@ struct Params
   int      numVbHor;
   int      vbVer0, vbVer1, vbVer2;
   int      vbHor0, vbHor1, vbHor2;
+  int      aligned;   // CHROMA: nonzero when both planes' rows start 8-byte aligned (a block's rows read and written whole)
 };
 
 [[vk::push_constant]] Params pc;
@@ -784,7 +785,20 @@ void ccAlf( int bx, int by, int filter, int component, inout int out[16] )
 void filterPlane( int16_t* src, int16_t* dst, int bx, int by, int aps, int alt, int cc, int component )
 {
   int out[16];
-  if( alt == 255 )
+  if( alt == 255 && pc.aligned != 0 )
+  {
+    // (the block's rows read whole, 8 bytes each: most chroma CTUs have no ALF, and their blocks are only copied)
+    [unroll]
+    for( int j = 0; j < 4; j++ )
+    {
+      const uint2 v  = *(uint2*)at( src, uint( ( by + j ) * pc.srcStride + bx ) );
+      out[4 * j]     = int( v.x & 0xffffu );
+      out[4 * j + 1] = int( v.x >> 16 );
+      out[4 * j + 2] = int( v.y & 0xffffu );
+      out[4 * j + 3] = int( v.y >> 16 );
+    }
+  }
+  else if( alt == 255 )
   {
     for( int i = 0; i < 16; i++ )
     {
@@ -799,9 +813,21 @@ void filterPlane( int16_t* src, int16_t* dst, int bx, int by, int aps, int alt, 
   {
     ccAlf( bx, by, cc, component, out );
   }
-  for( int i = 0; i < 16; i++ )
+  if( pc.aligned != 0 )
   {
-    storePel( dst, pc.dstStride, bx + ( i & 3 ), by + ( i >> 2 ), out[i] );
+    [unroll]
+    for( int j = 0; j < 4; j++ )
+    {
+      *(uint2*)at( dst, uint( ( by + j ) * pc.dstStride + bx ) ) =
+        uint2( ( uint( out[4 * j] ) & 0xffffu ) | uint( out[4 * j + 1] ) << 16, ( uint( out[4 * j + 2] ) & 0xffffu ) | uint( out[4 * j + 3] ) << 16 );
+    }
+  }
+  else
+  {
+    for( int i = 0; i < 16; i++ )
+    {
+      storePel( dst, pc.dstStride, bx + ( i & 3 ), by + ( i >> 2 ), out[i] );
+    }
   }
 }
 

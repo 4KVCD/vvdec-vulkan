@@ -23,22 +23,23 @@ T* uniPtr<T>( T* p )
   return (T*)WaveReadLaneFirst( (uint64_t)p );
 }
 
-// Sample access in a plane of 16-bit samples: (0, 0) is at p, and rows are stride samples apart.
+// Sample access in a plane of 16-bit samples: (0, 0) is at p, and rows are stride samples apart; (x, y) lies in the
+// plane (at()'s offsets are unsigned).
 int loadPel( int16_t* p, int stride, int x, int y )
 {
-  return int( p[y * stride + x] );
+  return int( *at( p, uint( y * stride + x ) ) );
 }
 
 void storePel( int16_t* p, int stride, int x, int y, int v )
 {
-  p[y * stride + x] = int16_t( v );
+  *at( p, uint( y * stride + x ) ) = int16_t( v );
 }
 
 // Reads the sample at (x, y) with the coordinates clamped into the picture,
 // which returns what vvdec's border extension of the picture holds there.
 int loadClamped( int16_t* p, int stride, int x, int y, int w, int h )
 {
-  return int( p[clamp( y, 0, h - 1 ) * stride + clamp( x, 0, w - 1 )] );
+  return int( *at( p, uint( clamp( y, 0, h - 1 ) * stride + clamp( x, 0, w - 1 ) ) ) );
 }
 
 // Synchronizes the workgroup's threads and makes their writes to global and shared memory visible to each other.

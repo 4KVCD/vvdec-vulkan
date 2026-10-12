@@ -330,6 +330,7 @@ struct AlfPush
   VkDeviceAddress src0, dst0, src1, dst1, srcLuma, ctus, coeff, clip, ccCoeff;
   int32_t         srcStride, dstStride, lumaStride, width, height, lumaWidth, lumaHeight, ctuLog2, widthInCtus, bitDepth, scaleX, scaleY;
   int32_t         numVbVer, numVbHor, vbVer[3], vbHor[3];
+  int32_t         aligned;
 };
 
 // The push constants of sao.slang
@@ -643,6 +644,15 @@ void GpuRecon::recordAlf( const CodingStructure& cs, const Planes& src, const Pl
     push.scaleY    = getComponentScaleY( COMPONENT_Cb, pcv.chrFormat );
     push.width     = pcv.lumaWidth >> push.scaleX;
     push.height    = pcv.lumaHeight >> push.scaleY;
+    // the chroma blocks' rows read and written 8 bytes at a time where all the planes' rows start 8-byte aligned
+    push.aligned = 1;
+    for( const Planes* p: { &src, &dst } )
+    {
+      for( const ComponentID comp: { COMPONENT_Cb, COMPONENT_Cr } )
+      {
+        push.aligned &= p->addr[comp] % 8 == 0 && p->stride[comp] % 4 == 0 ? 1 : 0;
+      }
+    }
     dispatch( bounds ? kShader_alf_chroma_bounds : kShader_alf_chroma, push, uint32_t( ( ( push.width + 3 ) / 4 + 7 ) / 8 ),
               uint32_t( ( ( push.height + 3 ) / 4 + 7 ) / 8 ) );
     mark( "alf chroma" );
