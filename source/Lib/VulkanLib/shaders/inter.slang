@@ -2238,52 +2238,54 @@ groupshared int  s_sbWrap[2][16];
 groupshared int2 s_cbMv[2][16];
 groupshared int  s_cbWrap[2][16];
 
-// A list's luma prediction of the thread's four samples (row v of its 4x4 subblock), at 14 bits for a bi-prediction or
-// PROF (hi), else final, from the subblock's 9 x 9 window at s_pool[at], rows stride apart (its (r, c) is the reference
-// sample (r - 2, c - 2) from the subblock's integer position): the 6-tap filter vvdec uses for 4x4 blocks (kLuma4x4's
-// first and last taps are zero). The 2-D filter is separable: the six rows the samples need across, then down.
-int4 affineLumaFilter( int at, int stride, int v, int xFrac, int yFrac, bool hi )
+// A list's luma prediction of the thread's four samples (row v of its 4x4 subblock sb), at 14 bits for a bi-prediction
+// or PROF (hi), else final, from the subblock's 9 x 9 window at s_pool[at], rows stride apart (its (r, c) is the
+// reference sample (r - 2, c - 2) from the subblock's integer position): the 6-tap filter vvdec uses for 4x4 blocks
+// (kLuma4x4's first and last taps are zero). The 2-D filter is separable: the subblock's four threads filter the
+// window's nine rows across together (thread v the rows v, v + 4 and, the first, 8) into s_ext (nine rows of four a
+// subblock), and then each filters its row's four samples down from the six rows they need. (Each thread filtering its
+// six rows itself filtered most rows four times.) All the threads call it, as it waits at barriers; a thread past the
+// tile's subblocks takes the last one's (sb, the same values).
+int4 affineLumaFilter( int at, int stride, int sb, int v, int xFrac, int yFrac, bool hi )
 {
-  const int headRoom = max( 2, 14 - pc.bitDepth );
-  const int maxVal   = ( 1 << pc.bitDepth ) - 1;
-  int4      pred;
-  if( xFrac == 0 && yFrac == 0 )
+  const int  headRoom = max( 2, 14 - pc.bitDepth );
+  const int  maxVal   = ( 1 << pc.bitDepth ) - 1;
+  const bool twoD     = xFrac != 0 && yFrac != 0;
+  if( twoD )
   {
-    [unroll]
-    for( int o = 0; o < 4; o++ )
-    {
-      const int s0 = int( s_pool[at + ( v + 2 ) * stride + o + 2] );
-      pred[o]      = hi ? s0 * ( 1 << headRoom ) - IF_INTERNAL_OFFS : s0;
-    }
-  }
-  else if( xFrac != 0 && yFrac != 0 )
-  {
-    // Across: the window's rows v .. v + 5 (the filter's rows 1 .. 6), each over columns o + 0 .. o + 5
     const int shift1  = 6 - headRoom;
     const int offset1 = -IF_INTERNAL_OFFS * ( 1 << shift1 );
-    int4      across[6];
     [unroll]
-    for( int r = 0; r < 6; r++ )
+    for( int k = 0; k < 3; k++ )
     {
-      int row[9];
-      [unroll]
-      for( int c = 0; c < 9; c++ )
+      const int r = v + 4 * k;
+      if( r < 9 )
       {
-        row[c] = int( s_pool[at + ( v + r ) * stride + c] );
-      }
-      [unroll]
-      for( int o = 0; o < 4; o++ )
-      {
-        int hs = 0;
+        int row[9];
         [unroll]
-        for( int c = 1; c < 7; c++ )
+        for( int c = 0; c < 9; c++ )
         {
-          hs += kLuma4x4[xFrac * 8 + c] * row[o + c - 1];
+          row[c] = int( s_pool[at + r * stride + c] );
         }
-        across[r][o] = ( hs + offset1 ) >> shift1;
+        [unroll]
+        for( int o = 0; o < 4; o++ )
+        {
+          int hs = 0;
+          [unroll]
+          for( int c = 1; c < 7; c++ )
+          {
+            hs += kLuma4x4[xFrac * 8 + c] * row[o + c - 1];
+          }
+          s_ext[sb * 36 + r * 4 + o] = int16_t( ( hs + offset1 ) >> shift1 );
+        }
       }
     }
-    // Down
+  }
+  GroupMemoryBarrierWithGroupSync();
+  int4 pred;
+  if( twoD )
+  {
+    // Down: the window's rows v .. v + 5 (the filter's rows 1 .. 6)
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
@@ -2291,9 +2293,18 @@ int4 affineLumaFilter( int at, int stride, int v, int xFrac, int yFrac, bool hi 
       [unroll]
       for( int r = 1; r < 7; r++ )
       {
-        sum += kLuma4x4[yFrac * 8 + r] * across[r - 1][o];
+        sum += kLuma4x4[yFrac * 8 + r] * int( s_ext[sb * 36 + ( v + r - 1 ) * 4 + o] );
       }
       pred[o] = hi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
+    }
+  }
+  else if( xFrac == 0 && yFrac == 0 )
+  {
+    [unroll]
+    for( int o = 0; o < 4; o++ )
+    {
+      const int s0 = int( s_pool[at + ( v + 2 ) * stride + o + 2] );
+      pred[o]      = hi ? s0 * ( 1 << headRoom ) - IF_INTERNAL_OFFS : s0;
     }
   }
   else
@@ -2314,6 +2325,7 @@ int4 affineLumaFilter( int at, int stride, int v, int xFrac, int yFrac, bool hi 
       pred[o]     = hi ? r : clip3( 0, maxVal, r );
     }
   }
+  GroupMemoryBarrierWithGroupSync();   // (s_ext is read: PROF writes it next)
   return pred;
 }
 
@@ -2444,12 +2456,14 @@ void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, in
     }
   }
   GroupMemoryBarrierWithGroupSync();
-  const int2 mv    = s_sbMv[list][sb];
+  const int  sbf   = min( sb, nsb - 1 );   // (a thread past the subblocks filters the last one's window again)
+  const int2 mv    = s_sbMv[list][sbf];
   const int  xFrac = mv.x & 15;
   const int  yFrac = mv.y & 15;
-  if( mine )
+  pred             = affineLumaFilter( sbf * 81, 9, sbf, v, xFrac, yFrac, bi || prof );
+  if( !mine )
   {
-    pred = affineLumaFilter( at, 9, v, xFrac, yFrac, bi || prof );
+    pred = int4( 0, 0, 0, 0 );
   }
   if( prof )
   {
@@ -2783,7 +2797,7 @@ bool affineBoxTile( int tid, uint job[24], int x, int y, int w, int h, int flags
       const int2 mv   = s_sbMv[list][sbc];
       // (the subblock's window: from 2 samples before its integer position)
       const int  at   = ( 4 * ( sbc / nsx ) + ( mv.y >> 4 ) - 2 - yBox[s].y0 ) * AB_S + 4 * ( sbc % nsx ) + ( mv.x >> 4 ) - 2 - yBox[s].x0 + yLead[s];
-      int4       p    = affineLumaFilter( at, AB_S, v, mv.x & 15, mv.y & 15, hi || prof );
+      int4       p    = affineLumaFilter( at, AB_S, sbc, v, mv.x & 15, mv.y & 15, hi || prof );
       if( prof )
       {
         affineProf( job, list, sbc, v, mine, at, AB_S, mv.x & 15, mv.y & 15, hi, p );
