@@ -189,41 +189,72 @@ uint ctuTile( int ctu ) { return pc.ctus[ctu * 4 + 2] >> 16; }
 bool ctuTileColStart( int ctu ) { return ( pc.ctus[ctu * 4 + 2] & 1 ) != 0; }
 int  ctuOf( int x, int y ) { return ( y >> pc.log2Ctu ) * pc.widthInCtus + ( x >> pc.log2Ctu ); }
 
-// A slice record (GpuFrontEnd.h's SliceRecord)
-struct Slice
+// A slice record (GpuFrontEnd.h's SliceRecord, 64 words), read through word( k ): Slice reads it from memory;
+// CurSlice is the current CTU's, which every CU reads again and again, from shared memory (loadCurSlice); ColSlice is
+// one of the colocated picture's, from shared memory when it is the one there (loadColSlices), else from memory.
+interface ISlice
+{
+  uint word( int k );
+};
+
+static const int kSliceWords = 64;
+
+struct Slice : ISlice
 {
   uint* r;
+  uint  word( int k ) { return r[k]; }
 };
+
+groupshared uint s_curSlice[kSliceWords];
+static uint      g_curSliceIdx = 0xffffffffu;   // the slice whose record s_curSlice holds (its index in pc.slices)
+
+struct CurSlice : ISlice
+{
+  uint word( int k ) { return s_curSlice[k]; }
+};
+
+groupshared uint s_colSlice[kSliceWords];
+static uint      g_colSliceIdx = 0xffffffffu;   // the colocated picture's slice whose record s_colSlice holds
+
+struct ColSlice : ISlice
+{
+  uint* r;        // the record in memory
+  bool  cached;   // s_colSlice holds it
+  uint  word( int k ) { return cached ? s_colSlice[k] : r[k]; }
+};
+
+// The colocated picture's slices of the current CTU and of the one right of it (loadColSlices)
+static uint g_colCtuSlice[2];
 
 Slice sliceOfCtu( int ctu )
 {
   Slice s;
-  s.r = pc.slices + pc.widthInCtus * pc.heightInCtus + ctuSliceIdx( ctu ) * 64;
+  s.r = pc.slices + pc.widthInCtus * pc.heightInCtus + ctuSliceIdx( ctu ) * kSliceWords;
   return s;
 }
 
-int   slicePoc( Slice s ) { return int( s.r[0] ); }
-int   numRefIdx( Slice s, int list ) { return int( ( s.r[1] >> ( 8 * list ) ) & 0xff ); }
-bool  isInterB( Slice s ) { return ( s.r[1] & ( 1u << 16 ) ) != 0; }
-bool  checkLDC( Slice s ) { return ( s.r[1] & ( 1u << 17 ) ) != 0; }
-bool  colFromL0( Slice s ) { return ( s.r[1] & ( 1u << 18 ) ) != 0; }
-bool  tmvp( Slice s ) { return ( s.r[1] & ( 1u << 19 ) ) != 0; }
-bool  mmvdFullPel( Slice s ) { return ( s.r[1] & ( 1u << 20 ) ) != 0; }
-bool  hasColPic( Slice s ) { return ( s.r[1] & ( 1u << 21 ) ) != 0; }
-bool  sliceIrap( Slice s ) { return ( s.r[1] & ( 1u << 22 ) ) != 0; }
-int   colRefIdx( Slice s ) { return int( ( s.r[1] >> 24 ) & 15 ); }
-int   maxIbcCand( Slice s ) { return int( s.r[2] & 0xff ); }
-int   maxGeoCand( Slice s ) { return int( ( s.r[2] >> 8 ) & 0xff ); }
-int   maxAffineCand( Slice s ) { return int( ( s.r[2] >> 16 ) & 0xff ); }
-uint  independentIdx( Slice s ) { return s.r[3]; }
-bool  usedAsLongTerm( Slice s, int list, int refIdx ) { return ( ( s.r[4] >> ( 16 * list + refIdx ) ) & 1 ) != 0; }
-bool  rplLongTerm( Slice s, int list, int refIdx ) { return ( ( s.r[5] >> ( 16 * list + refIdx ) ) & 1 ) != 0; }
-int   refPoc( Slice s, int list, int refIdx ) { return int( s.r[16 + 16 * list + refIdx] ); }
+int   slicePoc<S : ISlice>( S s ) { return int( s.word( 0 ) ); }
+int   numRefIdx<S : ISlice>( S s, int list ) { return int( ( s.word( 1 ) >> ( 8 * list ) ) & 0xff ); }
+bool  isInterB<S : ISlice>( S s ) { return ( s.word( 1 ) & ( 1u << 16 ) ) != 0; }
+bool  checkLDC<S : ISlice>( S s ) { return ( s.word( 1 ) & ( 1u << 17 ) ) != 0; }
+bool  colFromL0<S : ISlice>( S s ) { return ( s.word( 1 ) & ( 1u << 18 ) ) != 0; }
+bool  tmvp<S : ISlice>( S s ) { return ( s.word( 1 ) & ( 1u << 19 ) ) != 0; }
+bool  mmvdFullPel<S : ISlice>( S s ) { return ( s.word( 1 ) & ( 1u << 20 ) ) != 0; }
+bool  hasColPic<S : ISlice>( S s ) { return ( s.word( 1 ) & ( 1u << 21 ) ) != 0; }
+bool  sliceIrap<S : ISlice>( S s ) { return ( s.word( 1 ) & ( 1u << 22 ) ) != 0; }
+int   colRefIdx<S : ISlice>( S s ) { return int( ( s.word( 1 ) >> 24 ) & 15 ); }
+int   maxIbcCand<S : ISlice>( S s ) { return int( s.word( 2 ) & 0xff ); }
+int   maxGeoCand<S : ISlice>( S s ) { return int( ( s.word( 2 ) >> 8 ) & 0xff ); }
+int   maxAffineCand<S : ISlice>( S s ) { return int( ( s.word( 2 ) >> 16 ) & 0xff ); }
+uint  independentIdx<S : ISlice>( S s ) { return s.word( 3 ); }
+bool  usedAsLongTerm<S : ISlice>( S s, int list, int refIdx ) { return ( ( s.word( 4 ) >> ( 16 * list + refIdx ) ) & 1 ) != 0; }
+bool  rplLongTerm<S : ISlice>( S s, int list, int refIdx ) { return ( ( s.word( 5 ) >> ( 16 * list + refIdx ) ) & 1 ) != 0; }
+int   refPoc<S : ISlice>( S s, int list, int refIdx ) { return int( s.word( 16 + 16 * list + refIdx ) ); }
 // The colocated picture's motion (ColocatedMotionInfo, 5 words, num8x8 entries per CTU) and slice table
-int*  colMotion( Slice s ) { return (int*) ( uint64_t( s.r[6] ) | ( uint64_t( s.r[7] ) << 32 ) ); }
-uint* colSlices( Slice s ) { return (uint*) ( uint64_t( s.r[8] ) | ( uint64_t( s.r[9] ) << 32 ) ); }
+int*  colMotion<S : ISlice>( S s ) { return (int*) ( uint64_t( s.word( 6 ) ) | ( uint64_t( s.word( 7 ) ) << 32 ) ); }
+uint* colSlices<S : ISlice>( S s ) { return (uint*) ( uint64_t( s.word( 8 ) ) | ( uint64_t( s.word( 9 ) ) << 32 ) ); }
 // The POC of the colocated picture itself (slice.getRefPic( colList, colRefIdx )), from the reference lists
-int   colPicPoc( Slice s ) { return refPoc( s, isInterB( s ) ? ( colFromL0( s ) ? 0 : 1 ) : 0, colRefIdx( s ) ); }
+int   colPicPoc<S : ISlice>( S s ) { return refPoc( s, isInterB( s ) ? ( colFromL0( s ) ? 0 : 1 ) : 0, colRefIdx( s ) ); }
 
 // --------------------------------------------------------------------------------------------------------------------
 // Motion
@@ -484,9 +515,9 @@ CuMotion loadCuMotion( int cuIdx )
 
 struct Cur
 {
-  Cu    cu;
-  int   ctu;
-  Slice slice;
+  Cu       cu;
+  int      ctu;
+  CurSlice slice;
   uint  sliceIdx;   // the independent slice's index
   uint  tile;
   int4  rect;       // the subpicture if treated as a picture, else the picture (left, top, right, bottom)
@@ -650,7 +681,7 @@ void addToLut( int lut, Motion mi )
 // --------------------------------------------------------------------------------------------------------------------
 
 // The colocated picture's motion at (x, y): its MotionInfo, and the slice of its CTU
-Motion colMotionAt( Cur cur, int x, int y, out Slice colSlice )
+Motion colMotionAt( Cur cur, int x, int y, out ColSlice colSlice )
 {
   const int ctuCol = ctuOf( x, y );
   const int mask8  = ( 1 << ( pc.log2Ctu - 3 ) ) - 1;
@@ -662,8 +693,11 @@ Motion colMotionAt( Cur cur, int x, int y, out Slice colSlice )
   const uint refs  = uint( mi[4] );
   m.refIdx[0]      = int( int8_t( refs & 0xff ) );
   m.refIdx[1]      = int( int8_t( ( refs >> 8 ) & 0xff ) );
-  uint* colTable   = colSlices( cur.slice );
-  colSlice.r       = colTable + pc.widthInCtus * pc.heightInCtus + colTable[ctuCol] * 64;
+  // (the colocated slices of the CTU and the one right of it are at hand: loadColSlices)
+  uint*      colTable = colSlices( cur.slice );
+  const uint colIdx   = ctuCol == cur.ctu ? g_colCtuSlice[0] : ctuCol == cur.ctu + 1 ? g_colCtuSlice[1] : colTable[ctuCol];
+  colSlice.r          = colTable + pc.widthInCtus * pc.heightInCtus + colIdx * kSliceWords;
+  colSlice.cached     = colIdx == g_colSliceIdx;
   return m;
 }
 
@@ -680,7 +714,7 @@ bool colocatedMvp( Cur cur, int list, int x, int y, int refIdx, bool sbFlag, out
     return false;   // outside the subpicture treated as a picture
   }
   int    colList = checkLDC( cur.slice ) ? list : ( colFromL0( cur.slice ) ? 1 : 0 );
-  Slice  colSlice;
+  ColSlice colSlice;
   Motion mi = colMotionAt( cur, x, y, colSlice );
   if( mi.refIdx[0] < 0 && mi.refIdx[1] < 0 )
   {
@@ -1714,7 +1748,7 @@ bool subPuMvpCand( Cur cur, int count, bool spread )
   center            = clipColPos( cur, center ) & ~7;
 
   bool  found = false;
-  Slice colSlice;
+  ColSlice colSlice;
   if( interDir( colMotionAt( cur, center.x, center.y, colSlice ) ) != 0 )
   {
     s_affDir[count] = 0;
@@ -2789,6 +2823,40 @@ int2 tileColumnSpan( int tc )
   return span;
 }
 
+// Puts the record of the CTU's slice in shared memory (s_curSlice), unless it is there already; all threads call it.
+// After the CTU before has finished with the record (the CTU's end has barriers).
+void loadCurSlice( int ctu )
+{
+  const uint idx = ctuSliceIdx( ctu );
+  if( idx != g_curSliceIdx )
+  {
+    uint* r                 = pc.slices + pc.widthInCtus * pc.heightInCtus + idx * kSliceWords;
+    s_curSlice[g_lane]      = r[g_lane];
+    s_curSlice[g_lane + 32] = r[g_lane + 32];
+    g_curSliceIdx           = idx;
+    g_colSliceIdx           = 0xffffffffu;   // (s_colSlice holds a slice of the old slice's colocated picture)
+    GroupMemoryBarrierWithGroupSync();
+  }
+}
+
+// For a CTU whose slice uses TMVP and has a colocated picture (after loadCurSlice): g_colCtuSlice gets the colocated
+// picture's slices of the CTU and of the one right of it (the temporal candidates of the CTU's CUs lie in those two),
+// and s_colSlice the record of the first, unless it holds it already; all threads call it.
+void loadColSlices( int ctu, int col )
+{
+  uint* colTable   = colSlices( CurSlice() );
+  g_colCtuSlice[0] = colTable[ctu];
+  g_colCtuSlice[1] = col + 1 < pc.widthInCtus ? colTable[ctu + 1] : g_colCtuSlice[0];
+  if( g_colCtuSlice[0] != g_colSliceIdx )
+  {
+    uint* r                 = colTable + pc.widthInCtus * pc.heightInCtus + g_colCtuSlice[0] * kSliceWords;
+    s_colSlice[g_lane]      = r[g_lane];
+    s_colSlice[g_lane + 32] = r[g_lane + 32];
+    g_colSliceIdx           = g_colCtuSlice[0];
+    GroupMemoryBarrierWithGroupSync();
+  }
+}
+
 // The most 8x8 blocks of a CTU each thread copies: a CTU of 128 x 128 has 256, 8 for each of the 32 threads
 static const int kColPerThread = 8;
 
@@ -2888,9 +2956,15 @@ void main( uint3 local : SV_GroupThreadID )
     else
     {
       Cur cur;
-      cur.ctu      = ctu;
-      cur.slice    = sliceOfCtu( ctu );
+      cur.ctu = ctu;
+      loadCurSlice( ctu );
       cur.sliceIdx = independentIdx( cur.slice );
+      // (only with TMVP: the colocated picture has the picture's size then, and the CUs read it only then; without,
+      // hasColPic may name a reference picture of another size, whose slice table has other CTUs)
+      if( tmvp( cur.slice ) && hasColPic( cur.slice ) )
+      {
+        loadColSlices( ctu, col );
+      }
       cur.tile     = ctuTile( ctu );
       cur.rect     = ctuRect( ctu );
       setNeighbourCtus( cur, col, row );
