@@ -118,8 +118,10 @@ public:
   static constexpr int32_t kStepBins = 1 << 12;
   void recordStep( VkCommandBuffer cmd, int32_t binBudget = kStepBins ) const;
   // Records into cmd the compaction's first pass, which does its work once every CTU is parsed: each CTU's record
-  // (its first CU and TU in raster order) and the totals
-  void recordCompaction( VkCommandBuffer cmd ) const;
+  // (its first CU and TU in raster order) and the totals. serial: the step's number (ParseService's, from 1): the
+  // totals go to the half of the totals of its parity, marked with it, so that the totals of a step stay as they are
+  // while the next step runs.
+  void recordCompaction( VkCommandBuffer cmd, uint32_t serial = 0 ) const;
 
   // Where the parse is, after a submission of its steps and compaction
   enum class Progress
@@ -129,7 +131,8 @@ public:
     Overflow,   // all parsed, but with more records than the room: restart() and parse again
     Failed,     // a substream given up on (a broken bitstream), or none advanced for kParseMaxStalls submissions
   };
-  Progress progress();
+  // serial: the step whose totals to read (its compaction's serial); 0: the only ones (a step at a time)
+  Progress progress( uint32_t serial = 0 );
   // After Overflow: the records staged in staged and the levels written into levels (the slot's buffers taken back
   // first: takeStaged, takeLevels), and every substream back at its start
   void   restart( StagedRecords staged, Buffer levels );
@@ -165,11 +168,12 @@ public:
   const uint32_t*   ctuRecords() const { return reinterpret_cast<const uint32_t*>( m_ctus.mapped ); }   // CtuRecord a CTU
   const uint32_t*   ctuOut() const { return reinterpret_cast<const uint32_t*>( m_ctuOut.mapped ); }     // kParseCtuOutWords a CTU
   // the numbers of CUs and TUs (the CTUs' counts), then the parse's counters: the staged CU and TU records, the job
-  // lists' room (5 words)
-  const uint32_t*   totals() const { return reinterpret_cast<const uint32_t*>( m_totals.mapped ); }
+  // lists' room (5 words); those of the step progress() read last
+  const uint32_t*   totals() const;
 
-  Picture* picture = nullptr;   // the picture parsed (ParseService)
-  bool     failed  = false;     // its parse gave up (GpuRecon's check, VVDEC_GPU_PARSE=1)
+  Picture* picture  = nullptr;   // the picture parsed (ParseService)
+  bool     failed   = false;     // its parse gave up (GpuRecon's check, VVDEC_GPU_PARSE=1)
+  uint64_t lastStep = 0;         // the parse timeline's value of the last step that steps it (ParseService)
 
 private:
   // Takes the staged records' buffers, and the room they give
@@ -199,6 +203,7 @@ private:
   uint64_t        m_lastProgress = 0;   // the substreams' next CTUs added up, after the submission before
   uint32_t        m_stalls       = 0;   // submissions in a row without progress
   bool            m_fresh        = false;   // the counters to clear (recordClear)
+  uint32_t        m_half         = 0;   // the half of m_totals that progress() read last
 };
 
 // What the GPU's parse left of a picture once it is done (ParseService): its CU, TU and CTU records in raster order
@@ -271,12 +276,28 @@ private:
     void   raise( const Counts& counts );   // each to the larger of the two
   };
   Counts         startRoom( const Picture& pic ) const;    // the room its parse starts with
-  // The finished pictures' records copied (a submission on the copies' queue), then all the pictures' steps (one on
-  // the parse queue), both waited for: the copied pictures are handed over as soon as the copy is done
-  void           submit();
-  void           finishPictures();                         // the pictures done to be copied, the others kept or restarted
-  uint64_t       submitCopies();                           // the copy's submission; returns its timeline value
-  void           submitSteps();                            // the steps' submission
+  // A step of the pictures in parse in flight: its commands, its fence, the parse timeline's value once it is done,
+  // its number (its compaction marks the totals with it) and the pictures it steps. One or two are kept in the parse
+  // queue (stepsAhead): with two, the queue has the next step while the thread takes the results of the one before.
+  struct StepFrame
+  {
+    VkCommandPool           pool   = VK_NULL_HANDLE;
+    VkCommandBuffer         cmd    = VK_NULL_HANDLE;
+    VkFence                 fence  = VK_NULL_HANDLE;
+    uint64_t                value  = 0;
+    uint32_t                serial = 0;
+    std::vector<ParseSlot*> slots;
+  };
+  // One round: the steps kept in the parse queue, the parsed pictures' records copied, the oldest step's results
+  // taken (finishPictures), the copied pictures handed over, the slots whose parse is over freed or restarted
+  void           step();
+  size_t         stepsAhead() const;                       // the steps to keep in the parse queue: 1 or 2
+  void           submitSteps();                            // a step of the pictures in parse into a free frame
+  void           finishPictures( const StepFrame& frame ); // after the step: the pictures done to be copied, others kept
+  void           submitCopies();                           // the copy's submission (after the steps that step its slots)
+  void           endSlots();                               // the slots no step in flight steps: restarted or freed
+  void           handOverCopied();                         // the copied pictures handed over (their copy done)
+  void           waitAll();                                // the steps and the copy in flight done (stopping)
   void           handOver( Picture* pic, ParsedPicture* parsed );   // (parsed null: the parse gave up)
 
   Context*                m_ctx;
@@ -291,8 +312,12 @@ private:
   std::vector<std::unique_ptr<ParseSlot>>      m_slots;           // all of them (the thread's)
   std::vector<ParseSlot*> m_free;                                 // reusable (the thread's)
   std::vector<ParseSlot*> m_parsing;                              // the pictures being parsed (the thread's)
-  // the pictures parsed, whose records the next submit copies from their slots into their results (the thread's)
-  std::vector<std::pair<ParseSlot*, ParsedPicture*>> m_copying;
+  // the pictures parsed, whose records the next round copies from their slots into their results; then the copy in
+  // flight, its pictures handed over once it is done (the thread's)
+  std::vector<std::pair<ParseSlot*, ParsedPicture*>> m_copying, m_copied;
+  // the slots whose parse is over (Overflow, Failed) while a step in flight still steps them: restarted or freed once
+  // that step is done (the thread's)
+  std::vector<ParseSlot*> m_restarting, m_freeing;
   std::vector<std::unique_ptr<ParsedPicture>>        m_results;   // all of them (the thread's)
   std::vector<ParsedPicture*>                        m_freeResults;   // reusable (the thread's)
   // GPU memory for the records and levels, staged and in the results; a tick for each picture started. A chunk with
@@ -303,13 +328,16 @@ private:
   // the most records and levels a picture had so far (startRoom): of the intra pictures, of the others, of the others
   // in each temporal layer
   Counts                  m_mostIntra, m_mostInter, m_mostLayer[MAX_TLAYER];
-  VkCommandPool           m_pool  = VK_NULL_HANDLE;   // the steps' submission
-  VkCommandBuffer         m_cmd   = VK_NULL_HANDLE;
-  VkFence                 m_fence = VK_NULL_HANDLE;
-  uint64_t                m_stepsValue = 0;   // the parse timeline's value of the steps submitted last
+  StepFrame               m_frames[2];
+  size_t                  m_firstFrame = 0;   // the oldest step in flight
+  size_t                  m_inFlight   = 0;   // the steps in flight (0 to 2: stepsAhead)
+  uint32_t                m_serial     = 0;   // the last step's number
+  uint64_t                m_doneValue  = 0;   // the parse timeline's value of the last step taken
   VkCommandPool           m_copyPool  = VK_NULL_HANDLE;   // the copy's submission
   VkCommandBuffer         m_copyCmd   = VK_NULL_HANDLE;
   VkFence                 m_copyFence = VK_NULL_HANDLE;
+  uint64_t                m_copyValue = 0;   // the parse copies' timeline value of the copy in flight
+  uint64_t                m_copyAfter = 0;   // the parse timeline's value the copy in flight waits for
   VkDeviceAddress         m_prof  = 0;   // VVDEC_GPU_PROFILE with the shader clock: the parse's cycle counts
   Buffer                  m_profBuf;
   ParseStats              m_stats;

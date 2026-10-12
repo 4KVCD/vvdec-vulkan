@@ -156,8 +156,9 @@ struct ParseCompactPush
 {
   VkDeviceAddress cusIn, tusIn, cuMeta, tuMeta, ctuOut, ctuInfo, sync, counters, cus, tus, ctus, ctusOut, totals;
   int32_t         numCtus, numCus, numTus, pass;
+  uint32_t        serial;
 };
-static_assert( sizeof( ParseCompactPush ) == 120, "ParseCompactPush: the layout of parsecompact.slang's Params" );
+static_assert( sizeof( ParseCompactPush ) == 128, "ParseCompactPush: the layout of parsecompact.slang's Params" );
 
 // Makes buf hold at least size bytes of kind, in steps of 64 KB.
 static void ensureBuffer( Context* ctx, Buffer& buf, size_t size, MemKind kind )
@@ -267,7 +268,7 @@ bool ParseSlot::prepare( const CodingStructure& cs, StagedRecords staged, Buffer
   ensureBuffer( m_ctx, m_ctuOut, m_numCtus * kParseCtuOutWords * sizeof( uint32_t ), MemKind::HostCached );
   ensureBuffer( m_ctx, m_counters, kParseCounters * sizeof( uint32_t ), MemKind::Device );   // (an atomic a CU: fast in GPU memory)
   ensureBuffer( m_ctx, m_ctus, m_numCtus * sizeof( CtuRecord ), MemKind::HostCached );
-  ensureBuffer( m_ctx, m_totals, kParseTotals * sizeof( uint32_t ), MemKind::HostCached );
+  ensureBuffer( m_ctx, m_totals, 2 * kParseTotals * sizeof( uint32_t ), MemKind::HostCached );   // (two halves: recordCompaction)
   setStaged( staged );
   clear();
   return true;
@@ -368,7 +369,7 @@ void ParseSlot::recordStep( VkCommandBuffer cmd, int32_t binBudget ) const
   dispatch( m_ctx, cmd, shader, push, m_in.numStreams );   // a workgroup per substream
 }
 
-void ParseSlot::recordCompaction( VkCommandBuffer cmd ) const
+void ParseSlot::recordCompaction( VkCommandBuffer cmd, uint32_t serial ) const
 {
   ParseCompactPush push{};
   push.ctuOut   = m_ctuOut.addr;
@@ -376,13 +377,19 @@ void ParseSlot::recordCompaction( VkCommandBuffer cmd ) const
   push.sync     = m_sync.addr;
   push.counters = m_counters.addr;
   push.ctus     = m_ctus.addr;
-  push.totals   = m_totals.addr;
+  push.totals   = m_totals.addr + VkDeviceAddress( serial & 1u ) * kParseTotals * sizeof( uint32_t );
   push.numCtus  = int32_t( m_numCtus );
   push.pass     = 0;
+  push.serial   = serial;
   dispatch( m_ctx, cmd, kShader_parsecompact, push, 1 );
 }
 
-ParseSlot::Progress ParseSlot::progress()
+const uint32_t* ParseSlot::totals() const
+{
+  return reinterpret_cast<const uint32_t*>( m_totals.mapped ) + m_half * kParseTotals;
+}
+
+ParseSlot::Progress ParseSlot::progress( uint32_t serial )
 {
   // the substreams parsed, and how far they all are
   const uint32_t* state    = reinterpret_cast<const uint32_t*>( m_state.mapped );
@@ -398,6 +405,13 @@ ParseSlot::Progress ParseSlot::progress()
     m_stalls       = progress == m_lastProgress ? m_stalls + 1 : 0;
     m_lastProgress = progress;
     return m_stalls >= kParseMaxStalls ? Progress::Failed : Progress::Parsing;
+  }
+  // (the state is read as it is now: a step after the one asked about may have parsed the last CTUs, and then the
+  // totals of the step asked about are not the picture's: the next step's are)
+  m_half = serial & 1u;
+  if( serial != 0 && totals()[15] != serial )
+  {
+    return Progress::Parsing;
   }
   if( errors() != 0 )
   {
@@ -585,9 +599,12 @@ ParseService::ParseService( Context* ctx, std::function<void()> wakeUp )
   : m_ctx( ctx ), m_wakeUp( std::move( wakeUp ) ), m_records( ctx, kIdlePictures )
 {
   CHECK( !ctx->parseQueue(), "Vulkan: the GPU parse ahead of the reconstruction needs an async compute queue" );
-  m_pool = m_ctx->createCommandPool( m_ctx->asyncFamily() );
-  m_ctx->allocateCommandBuffers( m_pool, 1, &m_cmd );
-  m_fence     = m_ctx->createFence();
+  for( StepFrame& frame: m_frames )
+  {
+    frame.pool = m_ctx->createCommandPool( m_ctx->asyncFamily() );
+    m_ctx->allocateCommandBuffers( frame.pool, 1, &frame.cmd );
+    frame.fence = m_ctx->createFence();
+  }
   m_copyPool  = m_ctx->createCommandPool( m_ctx->asyncFamily() );
   m_ctx->allocateCommandBuffers( m_copyPool, 1, &m_copyCmd );
   m_copyFence = m_ctx->createFence();
@@ -616,8 +633,11 @@ ParseService::~ParseService()
   }
   m_slots.clear();
   m_ctx->free( m_profBuf );
-  m_ctx->destroyFence( m_fence );
-  m_ctx->destroyCommandPool( m_pool );
+  for( StepFrame& frame: m_frames )
+  {
+    m_ctx->destroyFence( frame.fence );
+    m_ctx->destroyCommandPool( frame.pool );
+  }
   m_ctx->destroyFence( m_copyFence );
   m_ctx->destroyCommandPool( m_copyPool );
 }
@@ -676,10 +696,13 @@ void ParseService::run()
         // (the results handed over or being copied, which their pictures have not given back: kMaxAhead)
         const auto held = [&]() { return m_results.size() - m_freeResults.size() - m_released.size(); };
         m_wake.wait( lock, [&]() {
-          return m_stop || !m_parsing.empty() || !m_copying.empty() || ( !m_waiting.empty() && m_parsing.size() + held() < kMaxAhead );
+          return m_stop || !m_parsing.empty() || !m_copying.empty() || m_inFlight > 0 || !m_restarting.empty() || !m_freeing.empty()
+                 || ( !m_waiting.empty() && m_parsing.size() + held() < kMaxAhead );
         } );
         if( m_stop )
         {
+          lock.unlock();
+          waitAll();   // (before the slots and frames go)
           return;
         }
         std::sort( m_waiting.begin(), m_waiting.end(),
@@ -700,22 +723,22 @@ void ParseService::run()
         starting.assign( m_waiting.begin(), m_waiting.begin() + count );
         m_waiting.erase( m_waiting.begin(), m_waiting.begin() + count );
         // then the intra pictures that parse in long chains, ahead of their turn (kSerialStreams)
-        size_t serial = 0;
+        size_t serialIntra = 0;
         for( const ParseSlot* slot: m_parsing )
         {
-          serial += serialIntraPicture( *slot->picture ) ? 1 : 0;
+          serialIntra += serialIntraPicture( *slot->picture ) ? 1 : 0;
         }
         for( const Picture* pic: starting )
         {
-          serial += serialIntraPicture( *pic ) ? 1 : 0;
+          serialIntra += serialIntraPicture( *pic ) ? 1 : 0;
         }
-        for( auto it = m_waiting.begin(); it != m_waiting.end() && serial < kSerialIntraInParse; )
+        for( auto it = m_waiting.begin(); it != m_waiting.end() && serialIntra < kSerialIntraInParse; )
         {
           if( serialIntraPicture( **it ) )
           {
             starting.push_back( *it );
             it = m_waiting.erase( it );
-            serial++;
+            serialIntra++;
           }
           else
           {
@@ -727,11 +750,7 @@ void ParseService::run()
       {
         startPicture( pic );
       }
-      if( !m_parsing.empty() || !m_copying.empty() )
-      {
-        submit();
-        finishPictures();
-      }
+      step();
     }
   }
   catch( ... )
@@ -744,12 +763,23 @@ void ParseService::run()
       slot->picture->gpuParsed.unlock_nothrow();
     }
     m_parsing.clear();
-    for( const auto& copy: m_copying )
+    for( ParseSlot* slot: m_restarting )
     {
-      copy.first->picture->gpuParseResult = nullptr;
-      copy.first->picture->gpuParsed.unlock_nothrow();
+      slot->picture->gpuParseResult = nullptr;
+      slot->picture->gpuParsed.unlock_nothrow();
+    }
+    m_restarting.clear();
+    m_freeing.clear();   // (their pictures were handed over)
+    for( const auto* copies: { &m_copying, &m_copied } )
+    {
+      for( const auto& copy: *copies )
+      {
+        copy.first->picture->gpuParseResult = nullptr;
+        copy.first->picture->gpuParsed.unlock_nothrow();
+      }
     }
     m_copying.clear();
+    m_copied.clear();
     m_broken = true;
     for( Picture* pic: m_waiting )
     {
@@ -932,50 +962,98 @@ static void waitFor( Context* ctx, VkFence fence )
   }
 }
 
-void ParseService::submit()
+// Two steps in the parse queue while a picture whose parse is one or two long chains is in parse (kSerialStreams): the
+// next step then runs while the thread takes the results of the one before (the thread's turn takes ~0.9 ms, a step
+// ~1.8 ms), and such a picture's parse, its steps one after another, takes that much less (15 W: Conan 1080p +7.2%,
+// Top Gun faster 1080p +2.5%, both without WPP). Else one: the pictures of WPP parse their rows side by side, and a
+// second step only weighed on the reconstruction (Top Gun slower 1080p -0.4% to -1.7%; Beekeeper slower 4K even).
+size_t ParseService::stepsAhead() const
 {
-  const bool     copies    = !m_copying.empty();
-  const bool     steps     = !m_parsing.empty();
-  const uint64_t copyValue = copies ? submitCopies() : 0;
-  if( steps )
+  for( const ParseSlot* slot: m_parsing )
+  {
+    if( slot->input().numStreams <= kSerialStreams )
+    {
+      return 2;
+    }
+  }
+  return 1;
+}
+
+void ParseService::step()
+{
+  // the steps in the parse queue, as long as pictures are in parse (stepsAhead)
+  const size_t ahead = stepsAhead();
+  while( m_inFlight < ahead && !m_parsing.empty() )
   {
     submitSteps();
   }
-  if( copies )
+  // the pictures parsed: their records copied, after the steps that step their slots (the oldest one, at most: the
+  // pictures were found parsed when the step before it was taken, and the steps since leave them out); handed over at
+  // once when those steps are done
+  if( !m_copying.empty() && m_copied.empty() )
   {
-    // the pictures copied: to their reconstruction (whose front end waits for copyValue), their slots free for the
-    // next pictures (the steps running meanwhile do not use them)
-    waitFor( m_ctx, m_copyFence );
-    for( const auto& copy: m_copying )
+    submitCopies();
+  }
+  if( !m_copied.empty() && m_copyAfter <= m_doneValue )
+  {
+    handOverCopied();
+  }
+  // the oldest step's results
+  if( m_inFlight > 0 )
+  {
+    StepFrame& frame = m_frames[m_firstFrame];
+    // (a copy in flight waits for this step on the GPU: waiting for the copy waits for both, with one wake-up)
+    if( !m_copied.empty() )
     {
-      copy.second->m_parseValue = copyValue;
-      giveSlot( copy.first );
-      handOver( copy.second->picture, copy.second );
+      waitFor( m_ctx, m_copyFence );
     }
-    m_copying.clear();
+    waitFor( m_ctx, frame.fence );
+    m_doneValue  = frame.value;
+    m_firstFrame = 1 - m_firstFrame;
+    m_inFlight--;
+    {
+      std::lock_guard<std::mutex> lock( m_mutex );
+      m_stats.submissions++;
+      m_stats.parsingSum += int64_t( frame.slots.size() );
+    }
+    finishPictures( frame );
   }
-  if( steps )
+  // the copy that waited for that step
+  if( !m_copied.empty() )
   {
-    waitFor( m_ctx, m_fence );
-    std::lock_guard<std::mutex> lock( m_mutex );
-    m_stats.submissions++;
-    m_stats.parsingSum += int64_t( m_parsing.size() );
+    handOverCopied();
   }
+  endSlots();
+}
+
+// The pictures copied: to their reconstruction (whose front end waits for m_copyValue), their slots free (the copy
+// waited for the steps that stepped them, which are done: it is done soon)
+void ParseService::handOverCopied()
+{
+  waitFor( m_ctx, m_copyFence );
+  for( const auto& copy: m_copied )
+  {
+    copy.second->m_parseValue = m_copyValue;
+    giveSlot( copy.first );
+    handOver( copy.second->picture, copy.second );
+  }
+  m_copied.clear();
 }
 
 void ParseService::submitSteps()
 {
-  const Api& vk = m_ctx->api();
-  vk.vkResetCommandPool( m_ctx->device(), m_pool, 0 );
+  StepFrame& frame = m_frames[( m_firstFrame + m_inFlight ) % 2];
+  const Api& vk    = m_ctx->api();
+  vk.vkResetCommandPool( m_ctx->device(), frame.pool, 0 );
   VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vk.vkBeginCommandBuffer( m_cmd, &begin );
+  vk.vkBeginCommandBuffer( frame.cmd, &begin );
   // the counters of the pictures starting cleared; what the submission before wrote visible
   for( ParseSlot* slot: m_parsing )
   {
-    slot->recordClear( m_cmd );
+    slot->recordClear( frame.cmd );
   }
-  startBarrier( m_ctx, m_cmd );
+  startBarrier( m_ctx, frame.cmd );
   // the pictures' dispatches side by side, a barrier after each round; then their compaction's first passes
   size_t streams  = 0;
   bool   allLarge = true;
@@ -989,21 +1067,29 @@ void ParseService::submitSteps()
   {
     for( const ParseSlot* slot: m_parsing )
     {
-      slot->recordStep( m_cmd, budget );
+      slot->recordStep( frame.cmd, budget );
     }
-    computeBarrier( m_ctx, m_cmd );
+    computeBarrier( m_ctx, frame.cmd );
   }
+  m_serial     = m_serial == UINT32_MAX ? 1 : m_serial + 1;   // (0 is no step's)
+  frame.serial = m_serial;
   for( const ParseSlot* slot: m_parsing )
   {
-    slot->recordCompaction( m_cmd );
+    slot->recordCompaction( frame.cmd, frame.serial );
   }
-  hostReadBarrier( m_ctx, m_cmd );
-  vk.vkEndCommandBuffer( m_cmd );
-  vk.vkResetFences( m_ctx->device(), 1, &m_fence );
-  m_stepsValue = m_ctx->submitParse( m_cmd, m_fence );
+  hostReadBarrier( m_ctx, frame.cmd );
+  vk.vkEndCommandBuffer( frame.cmd );
+  vk.vkResetFences( m_ctx->device(), 1, &frame.fence );
+  frame.value = m_ctx->submitParse( frame.cmd, frame.fence );
+  frame.slots = m_parsing;
+  for( ParseSlot* slot: m_parsing )
+  {
+    slot->lastStep = frame.value;
+  }
+  m_inFlight++;
 }
 
-uint64_t ParseService::submitCopies()
+void ParseService::submitCopies()
 {
   const Api& vk = m_ctx->api();
   vk.vkResetCommandPool( m_ctx->device(), m_copyPool, 0 );
@@ -1011,46 +1097,43 @@ uint64_t ParseService::submitCopies()
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vk.vkBeginCommandBuffer( m_copyCmd, &begin );
   startBarrier( m_ctx, m_copyCmd );   // (what the parse wrote, visible)
+  uint64_t after = 0;
   for( const auto& copy: m_copying )
   {
     copy.first->recordScatter( m_copyCmd, copy.second->cus(), copy.second->tus(), copy.second->ctus() );
     copy.first->recordLevelsCopy( m_copyCmd, copy.second->m_levels );
+    after = std::max( after, copy.first->lastStep );
   }
   vk.vkEndCommandBuffer( m_copyCmd );
   vk.vkResetFences( m_ctx->device(), 1, &m_copyFence );
-  return m_ctx->submitParseCopy( m_copyCmd, m_copyFence, m_stepsValue );   // (after the steps that parsed them)
+  m_copyValue = m_ctx->submitParseCopy( m_copyCmd, m_copyFence, after );   // (after the steps that stepped them)
+  m_copyAfter = after;
+  m_copied.swap( m_copying );
 }
 
-void ParseService::finishPictures()
+void ParseService::finishPictures( const StepFrame& frame )
 {
-  for( size_t i = 0; i < m_parsing.size(); )
+  for( ParseSlot* slot: frame.slots )
   {
-    ParseSlot*                slot     = m_parsing[i];
-    const ParseSlot::Progress progress = slot->progress();
+    const auto at = std::find( m_parsing.begin(), m_parsing.end(), slot );
+    if( at == m_parsing.end() )
+    {
+      continue;   // (its parse ended at the step before)
+    }
+    const ParseSlot::Progress progress = slot->progress( frame.serial );
     if( progress == ParseSlot::Progress::Parsing )
     {
-      i++;
       continue;
     }
+    m_parsing.erase( at );
     if( progress == ParseSlot::Progress::Overflow )
     {
-      // more records or levels than the room: parsed again with room for them (a quarter more than counted)
-      StagedRecords staged = slot->takeStaged();
-      Buffer        levels = slot->takeLevels();
-      const size_t  cus    = std::max( slot->cusCounted() * 5 / 4 + 64, staged.cus.size / sizeof( CuRecord ) );
-      const size_t  tus    = std::max( slot->tusCounted() * 5 / 4 + 64, staged.tus.size / sizeof( TuRecord ) );
-      const size_t  room   = std::max( slot->levelsCounted() * 5 / 4 + 4096, levels.size / sizeof( int16_t ) );
-      for( Buffer* buf: { &staged.cus, &staged.tus, &staged.cuMeta, &staged.tuMeta, &levels } )
-      {
-        m_records.give( *buf );
-      }
-      slot->restart( takeStaged( cus, tus ), m_records.take( room * sizeof( int16_t ) ) );
+      // parsed again with room for its records once no step in flight steps it (endSlots)
+      m_restarting.push_back( slot );
       std::lock_guard<std::mutex> lock( m_mutex );
       m_stats.restarts++;
-      i++;
       continue;
     }
-    m_parsing.erase( m_parsing.begin() + i );
     const bool failed = progress != ParseSlot::Progress::Done;
     if( !failed )
     {
@@ -1079,11 +1162,11 @@ void ParseService::finishPictures()
     }
     if( failed )
     {
-      giveSlot( slot );
       handOver( slot->picture, nullptr );
+      m_freeing.push_back( slot );   // (free once no step in flight steps it: endSlots)
       continue;
     }
-    // parsed: its records copied into a result of their size (the next submit), then handed over
+    // parsed: its records copied into a result of their size (the next round), then handed over
     ParsedPicture* result = takeParsed();
     result->picture       = slot->picture;
     result->m_numCus      = slot->numCus();
@@ -1101,6 +1184,55 @@ void ParseService::finishPictures()
     result->m_numLevels = slot->numLevels();
     result->m_levels    = m_records.take( std::max<size_t>( result->m_numLevels, 1 ) * sizeof( int16_t ) );
     m_copying.emplace_back( slot, result );
+  }
+}
+
+void ParseService::endSlots()
+{
+  for( size_t i = 0; i < m_restarting.size(); )
+  {
+    ParseSlot* slot = m_restarting[i];
+    if( slot->lastStep > m_doneValue )
+    {
+      i++;
+      continue;
+    }
+    // more records or levels than the room: parsed again with room for them (a quarter more than counted)
+    StagedRecords staged = slot->takeStaged();
+    Buffer        levels = slot->takeLevels();
+    const size_t  cus    = std::max( slot->cusCounted() * 5 / 4 + 64, staged.cus.size / sizeof( CuRecord ) );
+    const size_t  tus    = std::max( slot->tusCounted() * 5 / 4 + 64, staged.tus.size / sizeof( TuRecord ) );
+    const size_t  room   = std::max( slot->levelsCounted() * 5 / 4 + 4096, levels.size / sizeof( int16_t ) );
+    for( Buffer* buf: { &staged.cus, &staged.tus, &staged.cuMeta, &staged.tuMeta, &levels } )
+    {
+      m_records.give( *buf );
+    }
+    slot->restart( takeStaged( cus, tus ), m_records.take( room * sizeof( int16_t ) ) );
+    m_parsing.push_back( slot );
+    m_restarting.erase( m_restarting.begin() + i );
+  }
+  for( size_t i = 0; i < m_freeing.size(); )
+  {
+    if( m_freeing[i]->lastStep > m_doneValue )
+    {
+      i++;
+      continue;
+    }
+    giveSlot( m_freeing[i] );
+    m_freeing.erase( m_freeing.begin() + i );
+  }
+}
+
+void ParseService::waitAll()
+{
+  for( ; m_inFlight > 0; m_inFlight-- )
+  {
+    waitFor( m_ctx, m_frames[m_firstFrame].fence );
+    m_firstFrame = 1 - m_firstFrame;
+  }
+  if( !m_copied.empty() )
+  {
+    waitFor( m_ctx, m_copyFence );
   }
 }
 
