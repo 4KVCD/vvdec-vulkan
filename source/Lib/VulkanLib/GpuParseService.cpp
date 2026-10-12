@@ -68,11 +68,15 @@ static constexpr size_t   kParseStateDone    = 1;         // kStDone: the substr
 // up the pictures' front ends on the async compute queues (VideoQ 1080p, 2^16 bins: a picture's GPU work took 16 ms
 // from its submission instead of 7, 115 fps; 2^13: 7.8 ms, 149 fps; 2^14 as fast, 4K 46 -> 54 fps; 2^12: slower
 // again, from the many submissions). With few substreams in parse (kFewStreams at most: pictures without WPP or
-// tiles parse as one substream each), the steps take kParseBinBudgetFew: a 4K all-intra picture has ~1.5M bins, and
-// short steps left the GPU idle between the submissions (isp_ai_4k: 2^14 21.4 fps, 2^16 25.1).
+// tiles parse as one substream each), all of them large (a substream of kLargeStreamBytes or more each: ~15 bins a
+// byte, so more than two steps of 2^16 bins), the steps take kParseBinBudgetFew: a 4K all-intra picture has ~1.5M
+// bins, and short steps left the GPU idle between the submissions (isp_ai_4k: 2^14 21.4 fps, 2^16 25.1). Beside a
+// small picture they don't: it would wait for the long step's end to be handed over, and the pictures after it to
+// start (VVenC random access without WPP: fg_videoq 1080p, 2^16 109.0 fps, 2^14 207.4; VideoQ 1080p 240.5 / 326.7).
 static constexpr int32_t  kParseBinBudget    = ParseSlot::kStepBins;
 static constexpr int32_t  kParseBinBudgetFew = 1 << 16;
 static constexpr size_t   kFewStreams        = 32;
+static constexpr uint32_t kLargeStreamBytes  = 8192;
 static constexpr uint32_t kParseMaxStalls    = 4;         // submissions in a row without progress before giving up
 static constexpr uint32_t kParseLocalBits    = 12;        // a meta word: the CTU above the record's place in the CTU
 static constexpr size_t   kParseCounters     = 8;         // the staged CUs and TUs, the room of the 5 job lists, the levels
@@ -92,6 +96,17 @@ static constexpr uint32_t kStepsPerSubmission = 1;
 static constexpr size_t   kMinParsing         = 8;
 static constexpr size_t   kMaxParsing         = 16;
 static constexpr size_t   kStreamsInParse     = 180;
+
+// The bytes of a picture's largest substream (its parse's longest)
+static uint32_t largestStreamBytes( const ParseInput& in )
+{
+  uint32_t most = 0;
+  for( uint32_t s = 0; s < in.numStreams; s++ )
+  {
+    most = std::max( most, in.streams[size_t( s ) * kParseStreamWords + 1] );
+  }
+  return most;
+}
 
 // The substreams of a picture's slices (each slice's entry points + 1), the workgroups of its parse steps
 static size_t substreamsOf( const Picture* pic )
@@ -907,12 +922,14 @@ void ParseService::submitSteps()
   }
   startBarrier( m_ctx, m_cmd );
   // the pictures' dispatches side by side, a barrier after each round; then their compaction's first passes
-  size_t streams = 0;
+  size_t streams  = 0;
+  bool   allLarge = true;
   for( const ParseSlot* slot: m_parsing )
   {
     streams += slot->input().numStreams;
+    allLarge = allLarge && largestStreamBytes( slot->input() ) >= kLargeStreamBytes;
   }
-  const int32_t budget = streams <= kFewStreams ? kParseBinBudgetFew : kParseBinBudget;
+  const int32_t budget = streams <= kFewStreams && allLarge ? kParseBinBudgetFew : kParseBinBudget;
   for( uint32_t step = 0; step < kStepsPerSubmission; step++ )
   {
     for( const ParseSlot* slot: m_parsing )
