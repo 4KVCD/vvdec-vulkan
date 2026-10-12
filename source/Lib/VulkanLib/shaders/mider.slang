@@ -502,42 +502,35 @@ int4 ctuRect( int ctu )
   return int4( 0, 0, pc.width - 1, pc.height - 1 );
 }
 
-// CodingStructure::getCURestricted on luma: the CU at (x, y) if cur may use it, else -1
-int cuAt( Cur cur, int x, int y )
-{
-  if( x < 0 || y < 0 || x >= pc.width || y >= pc.height )
-  {
-    return -1;
-  }
-  const int  ydiff   = ( y >> pc.log2Ctu ) - ( cur.cu.y >> pc.log2Ctu );
-  const int  xdiff   = ( x >> pc.log2Ctu ) - ( cur.cu.x >> pc.log2Ctu );
-  const bool sameCtu = ydiff == 0 && xdiff == 0;
-  if( !sameCtu && ( ydiff > 0 || xdiff > 1 - pc.wpp || ( ydiff == 0 && xdiff > 0 ) ) )
-  {
-    return -1;
-  }
-  const int idx = int( pc.cuMap[( y >> 2 ) * pc.widthIn4 + ( x >> 2 )] );
-  if( sameCtu )
-  {
-    return idx > cur.cu.index ? -1 : idx;
-  }
-  const int ctu = ctuOf( x, y );
-  if( independentIdx( sliceOfCtu( ctu ) ) == cur.sliceIdx && ctuTile( ctu ) == cur.tile )
-  {
-    return idx;
-  }
-  return -1;
-}
-
 // The CTUs left (0), above-left (1), above (2) and above-right (3) of the CU's CTU: g_nbAvail tells whether
 // getCURestricted lets the CU use each (same slice and tile; above-right not with WPP), and g_nbSlice holds their
 // independent slices. setNeighbourCtus sets both once per CTU.
 static uint g_nbAvail;
 static uint g_nbSlice[4];
 
+// Which of those four CTUs is the one xdiff, ydiff CTUs from the CU's, or -1 for another
 int nbCtu( int xdiff, int ydiff )
 {
-  return ydiff == 0 ? ( xdiff == -1 ? 0 : -1 ) : ydiff == -1 ? ( xdiff + 2 ) : -1;
+  return ydiff == 0 ? ( xdiff == -1 ? 0 : -1 ) : ydiff == -1 && abs( xdiff ) <= 1 ? ( xdiff + 2 ) : -1;
+}
+
+// CodingStructure::getCURestricted on luma for (x, y) next to the CU (in its CTU or one of the four around it): the
+// CU there if cur may use it, else -1
+int cuAt( Cur cur, int x, int y )
+{
+  if( x < 0 || y < 0 || x >= pc.width || y >= pc.height )
+  {
+    return -1;
+  }
+  const int ydiff = ( y >> pc.log2Ctu ) - ( cur.cu.y >> pc.log2Ctu );
+  const int xdiff = ( x >> pc.log2Ctu ) - ( cur.cu.x >> pc.log2Ctu );
+  const int idx   = int( pc.cuMap[( y >> 2 ) * pc.widthIn4 + ( x >> 2 )] );
+  if( ydiff == 0 && xdiff == 0 )
+  {
+    return idx > cur.cu.index ? -1 : idx;
+  }
+  const int k = nbCtu( xdiff, ydiff );
+  return k >= 0 && ( g_nbAvail & ( 1u << k ) ) != 0 ? idx : -1;
 }
 
 void setNeighbourCtus( Cur cur, int col, int row )
@@ -577,11 +570,6 @@ uint sliceIdxOfCu( int cuIdx )
 {
   Cu cu = loadCu( cuIdx );
   return independentIdx( sliceOfCtu( ctuOf( cu.x, cu.y ) ) );
-}
-
-bool isInterCu( int cuIdx )
-{
-  return cuIdx >= 0 && loadCu( cuIdx ).predMode == MODE_INTER;
 }
 
 // PU::isDiffMER
@@ -784,25 +772,34 @@ void setCand( int i, Motion m )
   s_candType[i]   = m.mrgType;
 }
 
-// A neighbour's motion at (x, y) if it is an inter CU (CU::isInter), with what
-// its CU keeps: BCW and AMVR's half-sample flag.
-bool neighbourMotion( int cuIdx, int x, int y, out Motion m )
+// --------------------------------------------------------------------------------------------------------------------
+// The blocks next to the CU
+// --------------------------------------------------------------------------------------------------------------------
+
+// The 4x4 blocks next to the CU that the merge, AMVP and affine lists look at, by vvdec's names
+static const int kA0            = 0;   // below the bottom-left one's left neighbour
+static const int kA1            = 1;   // left of the bottom-left sample
+static const int kB0            = 2;   // above-right
+static const int kB1            = 3;   // above the top-right sample
+static const int kB2            = 4;   // above-left
+static const int kB3            = 5;   // above the top-left sample
+static const int kA2            = 6;   // left of the top-left sample
+static const int kNumNeighbours = 7;
+
+int2 neighbourPos( Cu cu, int k )
 {
-  m = noMotion();
-  if( !isInterCu( cuIdx ) )
-  {
-    return false;
-  }
-  CuMotion c = loadCuMotion( cuIdx );
-  m          = motionAt( x, y );
-  m.hpel     = c.hpel;
-  m.bcw      = c.bcw;
-  return true;
+  const int right  = cu.x + cu.w - 1;
+  const int bottom = cu.y + cu.h - 1;
+  return k == kA0   ? int2( cu.x - 1, bottom + 1 )
+         : k == kA1 ? int2( cu.x - 1, bottom )
+         : k == kB0 ? int2( right + 1, cu.y - 1 )
+         : k == kB1 ? int2( right, cu.y - 1 )
+         : k == kB2 ? int2( cu.x - 1, cu.y - 1 )
+         : k == kB3 ? int2( cu.x, cu.y - 1 )
+                    : int2( cu.x - 1, cu.y );
 }
 
-// The words neighbourAt reads for a spatial neighbour at (x, y): the CU map's and the 4x4 block's motion. mergeCandidates
-// reads them for all five of its neighbours before it looks at any, so that the CU waits for memory once rather than
-// five times in a row. A place outside the picture reads the nearest block's words, which neighbourAt does not use.
+// What the lists read of a block next to the CU: the CU map's word there and the block's motion (motionAt's words)
 struct NeighbourWords
 {
   int  idx;
@@ -810,6 +807,7 @@ struct NeighbourWords
   uint w;
 };
 
+// A place outside the picture reads the nearest block's words, which neighbourCu then does not let anyone use.
 NeighbourWords fetchNeighbour( int x, int y )
 {
   const int      cx = clamp( x, 0, pc.width - 1 ), cy = clamp( y, 0, pc.height - 1 );
@@ -821,50 +819,112 @@ NeighbourWords fetchNeighbour( int x, int y )
   return n;
 }
 
-// cuAt and neighbourMotion for a spatial neighbour at (x, y) next to the CU (in the CU's CTU or one of the four
-// around it), from its words (fetchNeighbour). A translational CU's BCW and half-sample flag come from its block (where
-// spanMotion put them); for other kinds, from the CU's motion record.
-bool neighbourAt( Cur cur, int x, int y, NeighbourWords n, out int cuIdx, out Motion m )
+// Thread k (below kNumNeighbours) holds the words of the CU's neighbouring block k: fetchNeighbours reads all seven
+// at once when the CU starts, so that the CU waits for memory once for all its lists' neighbours rather than once
+// for each in turn; neighbourWords( k ) hands block k's to all the threads.
+static NeighbourWords g_nbWords;
+
+void fetchNeighbours( Cu cu )
 {
-  m     = noMotion();
-  cuIdx = -1;
-  if( x < 0 || y < 0 || x >= pc.width || y >= pc.height )
+  const int2 p = neighbourPos( cu, min( g_lane, kNumNeighbours - 1 ) );
+  g_nbWords    = fetchNeighbour( p.x, p.y );
+}
+
+// Thread lane's v, which all the threads name alike: the compiler then keeps it in a scalar register
+int laneInt( int v, int lane )
+{
+  return WaveReadLaneFirst( WaveReadLaneAt( v, lane ) );
+}
+
+NeighbourWords neighbourWords( int k )
+{
+  NeighbourWords n;
+  n.idx = laneInt( g_nbWords.idx, k );
+  n.mv  = int4( laneInt( g_nbWords.mv.x, k ), laneInt( g_nbWords.mv.y, k ), laneInt( g_nbWords.mv.z, k ), laneInt( g_nbWords.mv.w, k ) );
+  n.w   = uint( laneInt( int( g_nbWords.w ), k ) );
+  return n;
+}
+
+// cuAt for a block next to the CU at p, from its words: the CU there if cur may use it, else -1
+int neighbourCu( Cur cur, int2 p, NeighbourWords n )
+{
+  if( p.x < 0 || p.y < 0 || p.x >= pc.width || p.y >= pc.height )
   {
-    return false;
+    return -1;
   }
-  const int  idx   = n.idx;
-  const int4 mv    = n.mv;
-  const uint w     = n.w;
-  const int  xdiff = ( x >> pc.log2Ctu ) - ( cur.cu.x >> pc.log2Ctu );
-  const int  ydiff = ( y >> pc.log2Ctu ) - ( cur.cu.y >> pc.log2Ctu );
+  const int xdiff = ( p.x >> pc.log2Ctu ) - ( cur.cu.x >> pc.log2Ctu );
+  const int ydiff = ( p.y >> pc.log2Ctu ) - ( cur.cu.y >> pc.log2Ctu );
   if( xdiff == 0 && ydiff == 0 )
   {
-    cuIdx = idx > cur.cu.index ? -1 : idx;
+    return n.idx > cur.cu.index ? -1 : n.idx;
+  }
+  const int k = nbCtu( xdiff, ydiff );
+  return k >= 0 && ( g_nbAvail & ( 1u << k ) ) != 0 ? n.idx : -1;
+}
+
+// The kind of motion spanMotion and the others wrote into the block's word 4
+int blockKind( NeighbourWords n )
+{
+  return int( ( n.w >> 16 ) & 0xff );
+}
+
+// Whether the block's CU is an inter CU (CU::isInter): intra CUs' blocks are kNotInter, IBC CUs' kIbc
+bool blockInter( NeighbourWords n )
+{
+  const int kind = blockKind( n );
+  return kind != kNotInter && kind != kIbc;
+}
+
+// The block's MotionInfo
+Motion blockMotion( NeighbourWords n )
+{
+  Motion m    = noMotion();
+  m.mv[0]     = n.mv.xy;
+  m.mv[1]     = n.mv.zw;
+  m.refIdx[0] = int( int8_t( n.w & 0xff ) );
+  m.refIdx[1] = int( int8_t( ( n.w >> 8 ) & 0xff ) );
+  return m;
+}
+
+// The motion of neighbouring block k if cur may use it and its CU is an inter CU; cuIdx: its CU, or -1 if cur may
+// not use it
+bool neighbourBlock( Cur cur, int k, out int cuIdx, out Motion m )
+{
+  const NeighbourWords n = neighbourWords( k );
+  cuIdx                  = neighbourCu( cur, neighbourPos( cur.cu, k ), n );
+  m                      = blockMotion( n );
+  return cuIdx >= 0 && blockInter( n );
+}
+
+// BCW of the CU of neighbouring block k (an inter CU's): a translational CU's from the block (where spanMotion put
+// it), other kinds' from the CU's motion record
+int neighbourBcw( int k, int cuIdx )
+{
+  const NeighbourWords n = neighbourWords( k );
+  return blockKind( n ) == kTranslation ? int( ( n.w >> 24 ) & 7 ) : loadCuMotion( cuIdx ).bcw;
+}
+
+// Neighbouring block k's motion if cur may use it and its CU is an inter CU, with what the CU keeps: BCW and AMVR's
+// half-sample flag (a translational CU's from the block, other kinds' from the CU's motion record)
+bool neighbourAt( Cur cur, int k, out int cuIdx, out Motion m )
+{
+  if( !neighbourBlock( cur, k, cuIdx, m ) )
+  {
+    m = noMotion();
+    return false;
+  }
+  const NeighbourWords n = neighbourWords( k );
+  if( blockKind( n ) == kTranslation )
+  {
+    m.bcw  = int( ( n.w >> 24 ) & 7 );
+    m.hpel = ( ( n.w >> 27 ) & 1 ) != 0;
   }
   else
   {
-    const int k = nbCtu( xdiff, ydiff );
-    cuIdx       = k >= 0 && ( g_nbAvail & ( 1u << k ) ) != 0 ? idx : -1;
+    const CuMotion c = loadCuMotion( cuIdx );
+    m.bcw            = c.bcw;
+    m.hpel           = c.hpel;
   }
-  if( cuIdx < 0 )
-  {
-    return false;
-  }
-  const int kind = int( ( w >> 16 ) & 0xff );
-  if( kind == kNotInter || kind == kIbc )
-  {
-    return false;   // (CU::isInter)
-  }
-  if( kind != kTranslation )
-  {
-    return neighbourMotion( cuIdx, x, y, m );
-  }
-  m.mv[0]     = mv.xy;
-  m.mv[1]     = mv.zw;
-  m.refIdx[0] = int( int8_t( w & 0xff ) );
-  m.refIdx[1] = int( int8_t( ( w >> 8 ) & 0xff ) );
-  m.bcw       = int( ( w >> 24 ) & 7 );
-  m.hpel      = ( ( w >> 27 ) & 1 ) != 0;
   return true;
 }
 
@@ -934,17 +994,11 @@ int mergeCandidates( Cur cur, int last )
   const int2 lt = int2( cur.cu.x, cur.cu.y );
   const int2 rt = int2( cur.cu.x + cur.cu.w - 1, cur.cu.y );
   const int2 lb = int2( cur.cu.x, cur.cu.y + cur.cu.h - 1 );
-  // the five spatial neighbours' words, read at once (fetchNeighbour)
-  const NeighbourWords wB1 = fetchNeighbour( rt.x, rt.y - 1 );
-  const NeighbourWords wA1 = fetchNeighbour( lb.x - 1, lb.y );
-  const NeighbourWords wB0 = fetchNeighbour( rt.x + 1, rt.y - 1 );
-  const NeighbourWords wA0 = fetchNeighbour( lb.x - 1, lb.y + 1 );
-  const NeighbourWords wB2 = fetchNeighbour( lt.x - 1, lt.y - 1 );
 
   // B1: above
   Motion     above, left;
   int        cuAbove;
-  const bool availB1 = neighbourAt( cur, rt.x, rt.y - 1, wB1, cuAbove, above ) && isDiffMer( lt.x, lt.y, rt.x, rt.y - 1 );
+  const bool availB1 = neighbourAt( cur, kB1, cuAbove, above ) && isDiffMer( lt.x, lt.y, rt.x, rt.y - 1 );
   if( availB1 )
   {
     setCand( cnt, spatialCand( above, interB ) );
@@ -955,7 +1009,7 @@ int mergeCandidates( Cur cur, int last )
 
   // A1: left
   int        cuLeft;
-  const bool availA1 = neighbourAt( cur, lb.x - 1, lb.y, wA1, cuLeft, left ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y );
+  const bool availA1 = neighbourAt( cur, kA1, cuLeft, left ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y );
   if( availA1 )
   {
     if( !availB1 || sliceIdxAt( cur, rt.x, rt.y - 1 ) != sliceIdxAt( cur, lb.x - 1, lb.y ) || !sameMotion( above, left ) )
@@ -972,7 +1026,7 @@ int mergeCandidates( Cur cur, int last )
   // B0: above right
   Motion     aboveRight;
   int        cuAboveRight;
-  const bool availB0      = neighbourAt( cur, rt.x + 1, rt.y - 1, wB0, cuAboveRight, aboveRight ) && isDiffMer( lt.x, lt.y, rt.x + 1, rt.y - 1 );
+  const bool availB0      = neighbourAt( cur, kB0, cuAboveRight, aboveRight ) && isDiffMer( lt.x, lt.y, rt.x + 1, rt.y - 1 );
   if( availB0 )
   {
     if( !availB1 || sliceIdxAt( cur, rt.x, rt.y - 1 ) != sliceIdxAt( cur, rt.x + 1, rt.y - 1 ) || !sameMotion( above, aboveRight ) )
@@ -987,7 +1041,7 @@ int mergeCandidates( Cur cur, int last )
   // A0: below left
   Motion     belowLeft;
   int        cuBelowLeft;
-  const bool availA0     = neighbourAt( cur, lb.x - 1, lb.y + 1, wA0, cuBelowLeft, belowLeft ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y + 1 );
+  const bool availA0     = neighbourAt( cur, kA0, cuBelowLeft, belowLeft ) && isDiffMer( lt.x, lt.y, lb.x - 1, lb.y + 1 );
   if( availA0 )
   {
     if( !availA1 || sliceIdxAt( cur, lb.x - 1, lb.y + 1 ) != sliceIdxAt( cur, lb.x - 1, lb.y ) || !sameMotion( belowLeft, left ) )
@@ -1004,7 +1058,7 @@ int mergeCandidates( Cur cur, int last )
   {
     Motion     aboveLeft;
     int        cuAboveLeft;
-    const bool availB2     = neighbourAt( cur, lt.x - 1, lt.y - 1, wB2, cuAboveLeft, aboveLeft ) && isDiffMer( lt.x, lt.y, lt.x - 1, lt.y - 1 );
+    const bool availB2     = neighbourAt( cur, kB2, cuAboveLeft, aboveLeft ) && isDiffMer( lt.x, lt.y, lt.x - 1, lt.y - 1 );
     if( availB2 )
     {
       const uint sliceB2 = sliceIdxAt( cur, lt.x - 1, lt.y - 1 );
@@ -1245,12 +1299,13 @@ Motion mmvdMotion( Cur cur, int idx, int numCand )
 // AMVP
 // --------------------------------------------------------------------------------------------------------------------
 
-// PU::addMVPCandUnscaled: a neighbour's motion, in either list, that points to the current reference picture
-bool amvpSpatial( Cur cur, int list, int currRefPoc, int x, int y, out int2 mv )
+// PU::addMVPCandUnscaled: neighbouring block k's motion, in either list, that points to the current reference picture
+bool amvpSpatial( Cur cur, int list, int currRefPoc, int k, out int2 mv )
 {
   mv = int2( 0, 0 );
+  int    cuIdx;
   Motion n;
-  if( !neighbourMotion( cuAt( cur, x, y ), x, y, n ) )
+  if( !neighbourBlock( cur, k, cuIdx, n ) )
   {
     return false;
   }
@@ -1278,17 +1333,13 @@ int2 amvpCandidate( Cur cur, int list, int refIdx, int amvr, int mvpIdx )
   {
     return int2( 0, 0 );
   }
-  const int2 lt         = int2( cur.cu.x, cur.cu.y );
-  const int2 rt         = int2( cur.cu.x + cur.cu.w - 1, cur.cu.y );
-  const int2 lb         = int2( cur.cu.x, cur.cu.y + cur.cu.h - 1 );
   const int  currRefPoc = refPoc( cur.slice, list, refIdx );
   int2       mv;
-  if( amvpSpatial( cur, list, currRefPoc, lb.x - 1, lb.y + 1, mv ) || amvpSpatial( cur, list, currRefPoc, lb.x - 1, lb.y, mv ) )
+  if( amvpSpatial( cur, list, currRefPoc, kA0, mv ) || amvpSpatial( cur, list, currRefPoc, kA1, mv ) )
   {
     cands[num++] = mv;
   }
-  if( amvpSpatial( cur, list, currRefPoc, rt.x + 1, rt.y - 1, mv ) || amvpSpatial( cur, list, currRefPoc, rt.x, rt.y - 1, mv )
-      || amvpSpatial( cur, list, currRefPoc, lt.x - 1, lt.y - 1, mv ) )
+  if( amvpSpatial( cur, list, currRefPoc, kB0, mv ) || amvpSpatial( cur, list, currRefPoc, kB1, mv ) || amvpSpatial( cur, list, currRefPoc, kB2, mv ) )
   {
     cands[num++] = mv;
   }
@@ -1522,15 +1573,14 @@ void inheritedAffineMv( Cur cur, bool is6param, int nIdx, int list, out int2 mv[
   }
 }
 
-// An affine neighbour usable for inheritance (affine, of merge type DEFAULT_N), or -1
-int affineNeighbour( Cur cur, int x, int y )
+// The CU of neighbouring block k if it is usable for inheritance (an affine CU of merge type DEFAULT_N, whose blocks
+// are kAffineCu: an affine CU with the SbTMVP candidate has kSbtmvp blocks), or -1
+int affineNeighbour( Cur cur, int k )
 {
-  const int idx = cuAt( cur, x, y );
-  if( idx < 0 || ( loadCu( idx ).flags & kAffine ) == 0 )
-  {
-    return -1;
-  }
-  if( loadCuMotion( idx ).mrgType != MRG_TYPE_DEFAULT_N || !isDiffMer( cur.cu.x, cur.cu.y, x, y ) )
+  const int2           p   = neighbourPos( cur.cu, k );
+  const NeighbourWords n   = neighbourWords( k );
+  const int            idx = neighbourCu( cur, p, n );
+  if( idx < 0 || blockKind( n ) != kAffineCu || !isDiffMer( cur.cu.x, cur.cu.y, p.x, p.y ) )
   {
     return -1;
   }
@@ -1758,8 +1808,8 @@ void affineMergeCandidates( Cur cur, int last )
     int        pos = 0;
     const int2 lb  = int2( cur.cu.x, cur.cu.y + cur.cu.h - 1 );
     Motion     left;
-    const int  cuLeft = cuAt( cur, lb.x - 1, lb.y );
-    if( neighbourMotion( cuLeft, lb.x - 1, lb.y, left ) && isDiffMer( cur.cu.x, cur.cu.y, lb.x - 1, lb.y ) )
+    int        cuLeft;
+    if( neighbourBlock( cur, kA1, cuLeft, left ) && isDiffMer( cur.cu.x, cur.cu.y, lb.x - 1, lb.y ) )
     {
       s_affDir[pos]      = interDir( left );
       s_affMv[0][0][pos] = left.mv[0];
@@ -1786,30 +1836,27 @@ void affineMergeCandidates( Cur cur, int last )
   if( ( pc.sps & 2 ) != 0 )
   {
     // Inherited candidates: the first affine neighbour on the left (A0, A1) and the first one above (B0, B1, B2)
-    const int2 lt = int2( cur.cu.x, cur.cu.y );
-    const int2 rt = int2( cur.cu.x + cur.cu.w - 1, cur.cu.y );
-    const int2 lb = int2( cur.cu.x, cur.cu.y + cur.cu.h - 1 );
-    int        npu[2];
+    int npu[2];
     npu[0]       = -1;
     npu[1]       = -1;
     int numNeigh = 0;
-    int n        = affineNeighbour( cur, lb.x - 1, lb.y + 1 );
+    int n        = affineNeighbour( cur, kA0 );
     if( n < 0 )
     {
-      n = affineNeighbour( cur, lb.x - 1, lb.y );
+      n = affineNeighbour( cur, kA1 );
     }
     if( n >= 0 )
     {
       npu[numNeigh++] = n;
     }
-    n = affineNeighbour( cur, rt.x + 1, rt.y - 1 );
+    n = affineNeighbour( cur, kB0 );
     if( n < 0 )
     {
-      n = affineNeighbour( cur, rt.x, rt.y - 1 );
+      n = affineNeighbour( cur, kB1 );
     }
     if( n < 0 )
     {
-      n = affineNeighbour( cur, lt.x - 1, lt.y - 1 );
+      n = affineNeighbour( cur, kB2 );
     }
     if( n >= 0 )
     {
@@ -1864,38 +1911,45 @@ void affineMergeCandidates( Cur cur, int last )
       mi[i]    = noMotion();
       avail[i] = false;
     }
-    const int2 posLT[3] = { int2( lt.x - 1, lt.y - 1 ), int2( lt.x, lt.y - 1 ), int2( lt.x - 1, lt.y ) };
+    // (the corners' blocks in the order they are tried: LT B2, B3, A2; RT B1, B0; LB A1, A0)
+    const int kLT[3] = { kB2, kB3, kA2 };
     for( int i = 0; i < 3; i++ )
     {
-      const int idx = cuAt( cur, posLT[i].x, posLT[i].y );
-      if( isInterCu( idx ) && isDiffMer( cur.cu.x, cur.cu.y, posLT[i].x, posLT[i].y ) )
+      const int2 p = neighbourPos( cur.cu, kLT[i] );
+      int        idx;
+      Motion     m;
+      if( neighbourBlock( cur, kLT[i], idx, m ) && isDiffMer( cur.cu.x, cur.cu.y, p.x, p.y ) )
       {
         avail[0]    = true;
-        mi[0]       = motionAt( posLT[i].x, posLT[i].y );
-        neighBcw[0] = loadCuMotion( idx ).bcw;
+        mi[0]       = m;
+        neighBcw[0] = neighbourBcw( kLT[i], idx );
         break;
       }
     }
-    const int2 posRT[2] = { int2( rt.x, rt.y - 1 ), int2( rt.x + 1, rt.y - 1 ) };
+    const int kRT[2] = { kB1, kB0 };
     for( int i = 0; i < 2; i++ )
     {
-      const int idx = cuAt( cur, posRT[i].x, posRT[i].y );
-      if( isInterCu( idx ) && isDiffMer( cur.cu.x, cur.cu.y, posRT[i].x, posRT[i].y ) )
+      const int2 p = neighbourPos( cur.cu, kRT[i] );
+      int        idx;
+      Motion     m;
+      if( neighbourBlock( cur, kRT[i], idx, m ) && isDiffMer( cur.cu.x, cur.cu.y, p.x, p.y ) )
       {
         avail[1]    = true;
-        mi[1]       = motionAt( posRT[i].x, posRT[i].y );
-        neighBcw[1] = loadCuMotion( idx ).bcw;
+        mi[1]       = m;
+        neighBcw[1] = neighbourBcw( kRT[i], idx );
         break;
       }
     }
-    const int2 posLB[2] = { int2( lb.x - 1, lb.y ), int2( lb.x - 1, lb.y + 1 ) };
+    const int kLB[2] = { kA1, kA0 };
     for( int i = 0; i < 2; i++ )
     {
-      const int idx = cuAt( cur, posLB[i].x, posLB[i].y );
-      if( isInterCu( idx ) && isDiffMer( cur.cu.x, cur.cu.y, posLB[i].x, posLB[i].y ) )
+      const int2 p = neighbourPos( cur.cu, kLB[i] );
+      int        idx;
+      Motion     m;
+      if( neighbourBlock( cur, kLB[i], idx, m ) && isDiffMer( cur.cu.x, cur.cu.y, p.x, p.y ) )
       {
         avail[2] = true;
-        mi[2]    = motionAt( posLB[i].x, posLB[i].y );
+        mi[2]    = m;
         break;
       }
     }
@@ -2038,23 +2092,21 @@ void setAllAffineMv( Cur cur, inout CuMotion c, int2 lt, int2 rt, int2 lb, int l
   c.mv[l][2] = lb;
 }
 
-// PU::addAffineMVPCandUnscaled: an affine neighbour's model for the AMVP list
-bool affineAmvpInherited( Cur cur, int list, int refIdx, int x, int y, int amvr, bool cur6, out int2 mv[3] )
+// PU::addAffineMVPCandUnscaled: the model of neighbouring block k's CU for the AMVP list, if it is an affine CU of
+// merge type DEFAULT_N (whose blocks are kAffineCu: an affine CU with the SbTMVP candidate has kSbtmvp blocks)
+bool affineAmvpInherited( Cur cur, int list, int refIdx, int k, int amvr, bool cur6, out int2 mv[3] )
 {
-  mv[0]         = int2( 0, 0 );
-  mv[1]         = int2( 0, 0 );
-  mv[2]         = int2( 0, 0 );
-  const int idx = cuAt( cur, x, y );
-  if( !isInterCu( idx ) || ( loadCu( idx ).flags & kAffine ) == 0 )
+  mv[0]                  = int2( 0, 0 );
+  mv[1]                  = int2( 0, 0 );
+  mv[2]                  = int2( 0, 0 );
+  const NeighbourWords n = neighbourWords( k );
+  const int            idx = neighbourCu( cur, neighbourPos( cur.cu, k ), n );
+  if( idx < 0 || blockKind( n ) != kAffineCu )
   {
     return false;
   }
-  const CuMotion nm = loadCuMotion( idx );
-  if( nm.mrgType != MRG_TYPE_DEFAULT_N )
-  {
-    return false;
-  }
-  const Motion neib       = motionAt( x, y );
+  const CuMotion nm       = loadCuMotion( idx );
+  const Motion neib       = blockMotion( n );
   const int    currRefPoc = refPoc( cur.slice, list, refIdx );
   for( int s = 0; s < 2; s++ )
   {
@@ -2098,20 +2150,17 @@ void affineAmvpCandidate( Cur cur, int list, int refIdx, int amvr, int mvpIdx, b
   {
     return;
   }
-  const int2 lt = int2( cur.cu.x, cur.cu.y );
-  const int2 rt = int2( cur.cu.x + cur.cu.w - 1, cur.cu.y );
-  const int2 lb = int2( cur.cu.x, cur.cu.y + cur.cu.h - 1 );
-  int2       o[3];
+  int2 o[3];
   // Inherited candidates: from the left (below-left, left) and from above (above-right, above, above-left)
-  if( affineAmvpInherited( cur, list, refIdx, lb.x - 1, lb.y + 1, amvr, cur6, o ) || affineAmvpInherited( cur, list, refIdx, lb.x - 1, lb.y, amvr, cur6, o ) )
+  if( affineAmvpInherited( cur, list, refIdx, kA0, amvr, cur6, o ) || affineAmvpInherited( cur, list, refIdx, kA1, amvr, cur6, o ) )
   {
     lts[num] = o[0];
     rts[num] = o[1];
     lbs[num] = o[2];
     num++;
   }
-  if( affineAmvpInherited( cur, list, refIdx, rt.x + 1, rt.y - 1, amvr, cur6, o ) || affineAmvpInherited( cur, list, refIdx, rt.x, rt.y - 1, amvr, cur6, o )
-      || affineAmvpInherited( cur, list, refIdx, lt.x - 1, lt.y - 1, amvr, cur6, o ) )
+  if( affineAmvpInherited( cur, list, refIdx, kB0, amvr, cur6, o ) || affineAmvpInherited( cur, list, refIdx, kB1, amvr, cur6, o )
+      || affineAmvpInherited( cur, list, refIdx, kB2, amvr, cur6, o ) )
   {
     lts[num] = o[0];
     rts[num] = o[1];
@@ -2128,18 +2177,17 @@ void affineAmvpCandidate( Cur cur, int list, int refIdx, int amvr, int mvpIdx, b
     v[1] = int2( 0, 0 );
     v[2] = int2( 0, 0 );
     int2 mv;
-    if( amvpSpatial( cur, list, currRefPoc, lt.x - 1, lt.y - 1, mv ) || amvpSpatial( cur, list, currRefPoc, lt.x, lt.y - 1, mv )
-        || amvpSpatial( cur, list, currRefPoc, lt.x - 1, lt.y, mv ) )
+    if( amvpSpatial( cur, list, currRefPoc, kB2, mv ) || amvpSpatial( cur, list, currRefPoc, kB3, mv ) || amvpSpatial( cur, list, currRefPoc, kA2, mv ) )
     {
       v[0] = mv;
       pattern |= 1;
     }
-    if( amvpSpatial( cur, list, currRefPoc, rt.x, rt.y - 1, mv ) || amvpSpatial( cur, list, currRefPoc, rt.x + 1, rt.y - 1, mv ) )
+    if( amvpSpatial( cur, list, currRefPoc, kB1, mv ) || amvpSpatial( cur, list, currRefPoc, kB0, mv ) )
     {
       v[1] = mv;
       pattern |= 2;
     }
-    if( amvpSpatial( cur, list, currRefPoc, lb.x - 1, lb.y, mv ) || amvpSpatial( cur, list, currRefPoc, lb.x - 1, lb.y + 1, mv ) )
+    if( amvpSpatial( cur, list, currRefPoc, kA1, mv ) || amvpSpatial( cur, list, currRefPoc, kA0, mv ) )
     {
       v[2] = mv;
       pattern |= 4;
@@ -2414,8 +2462,9 @@ void restrictBi( Cur cur, inout Motion m )
 // DecCu::xDeriveCUMV: derives the CU's motion and writes it to the CU's motion record and its 4x4 blocks
 void deriveCu( Cur cur )
 {
-  Cu       cu = cur.cu;
-  CuMotion c  = noCuMotion();
+  Cu cu = cur.cu;
+  fetchNeighbours( cu );   // (for the lists below)
+  CuMotion c = noCuMotion();
   c.affine6   = affine6Of( cu );
   c.hpel      = imvOf( cu ) == 3;   // the parse's imv, unless the derivation sets it
   c.bcw       = bcwIdxOf( cu );
