@@ -68,11 +68,17 @@ namespace gpu
 // The planes' records: host planes (HostPlane) and their stand-ins (StandIn)
 // ====================================================================================================================
 
-static void* createHostPlane( void* opaque, vvdecComponentType, uint32_t size, uint32_t, void** allocator )
+// The component type that PlanePool gives createHostPlane for the colocated motion of a picture whose work goes to the
+// GPU. Only the GPU front end writes that motion (mider.slang, and DMVR's refinements in inter.slang) and reads it (TMVP
+// in the next pictures), so it goes to GPU memory the CPU can map (MemKind::Upload): in host memory each of the GPU's
+// scattered writes and reads of it was snooped (Beekeeper slower 4K +1.8% at 15 W).
+static constexpr vvdecComponentType kColMotion = vvdecComponentType( VVDEC_MAX_NUM_COMPONENT );
+
+static void* createHostPlane( void* opaque, vvdecComponentType comp, uint32_t size, uint32_t, void** allocator )
 {
   Context*   context = static_cast<Context*>( opaque );
   HostPlane* plane   = new HostPlane;
-  plane->host        = context->alloc( size, MemKind::HostCached );
+  plane->host        = context->alloc( size, comp == kColMotion ? MemKind::Upload : MemKind::HostCached );
   plane->bytes       = size;
   if( !plane->host.mapped )
   {
@@ -323,21 +329,21 @@ static bool sameLayout( const PelStorage& a, const PelStorage& b )
 void PlanePool::acquireColMotion( Picture& pic )
 {
   std::lock_guard<std::mutex> lock( m_mutex );
-  acquireColMotionLocked( pic );
+  acquireColMotionLocked( pic, true );
 }
 
 void PlanePool::acquire( Picture& pic )
 {
   std::unique_lock<std::mutex> lock( m_mutex );
   waitDownloadLocked( lock, pic );   // (one running for it: its planes are the CPU's to write now)
-  acquireColMotionLocked( pic );
+  acquireColMotionLocked( pic, false );
   acquirePlanesLocked( pic );
   pic.gpuNeedsDownload = false;
 }
 
-void PlanePool::acquireColMotionLocked( Picture& pic )
+void PlanePool::acquireColMotionLocked( Picture& pic, bool gpuOnly )
 {
-  // the colocated motion, of its size from the pool, else new
+  // the colocated motion, of its size and memory from the pool, else new
   if( !pic.cs || pic.cs->m_colMiMap || !pic.cs->colMiAllocator )
   {
     return;
@@ -346,7 +352,7 @@ void PlanePool::acquireColMotionLocked( Picture& pic )
   ColMotion      c{};
   for( auto it = m_freeColMotion.begin(); it != m_freeColMotion.end(); ++it )
   {
-    if( it->bytes == bytes )
+    if( it->bytes == bytes && it->gpuOnly == gpuOnly )
     {
       c = *it;
       m_freeColMotion.erase( it );
@@ -356,7 +362,7 @@ void PlanePool::acquireColMotionLocked( Picture& pic )
   if( !c.allocation )
   {
     c.bytes = bytes;
-    c.map   = m_planes->create( m_planes->opaque, VVDEC_CT_Y, bytes, MEMORY_ALIGN_DEF_SIZE, &c.allocation );
+    c.map   = m_planes->create( m_planes->opaque, gpuOnly ? kColMotion : VVDEC_CT_Y, bytes, MEMORY_ALIGN_DEF_SIZE, &c.allocation );
     CHECK( !c.map, "no memory for the colocated motion" );
   }
   pic.cs->attachColMotion( static_cast<ColocatedMotionInfo*>( c.map ), c.allocation );
@@ -402,12 +408,15 @@ void PlanePool::release( Picture& pic )
   std::unique_lock<std::mutex> lock( m_mutex );
   waitDownloadLocked( lock, pic );   // (one started ahead that its output did not need after all)
   pic.gpuNeedsDownload = false;
-  // the colocated motion back to the pool (a picture the CPU parsed has it from its set-up: from the same allocator)
+  // the colocated motion back to the pool (a picture the CPU parsed has it from its set-up: from the same allocator),
+  // with the memory it is in (one meant for the GPU's memory is in host memory when the BAR was full: the CPU's too)
   if( pic.cs && pic.cs->m_colMiAllocation && pic.cs->colMiAllocator == m_planes )
   {
-    const uint32_t bytes = uint32_t( sizeof( ColocatedMotionInfo ) * pic.cs->m_colMiMapSize );
-    void*          map   = pic.cs->m_colMiMap;
-    m_freeColMotion.push_back( ColMotion{ pic.cs->detachColMotion(), map, bytes } );
+    const uint32_t bytes      = uint32_t( sizeof( ColocatedMotionInfo ) * pic.cs->m_colMiMapSize );
+    void*          map        = pic.cs->m_colMiMap;
+    void*          allocation = pic.cs->detachColMotion();
+    const bool     gpuOnly    = static_cast<HostPlane*>( allocation )->host.kind != MemKind::HostCached;
+    m_freeColMotion.push_back( ColMotion{ allocation, map, bytes, gpuOnly } );
   }
   // its twins back to the GPU's pool (from its planes or their stand-ins), then its planes to this one
   releaseTwins( pic );

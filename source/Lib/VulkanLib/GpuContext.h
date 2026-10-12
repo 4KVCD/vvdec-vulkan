@@ -101,7 +101,8 @@ enum class MemKind
 {
   Device,       // GPU memory that the CPU cannot see
   HostCached,   // CPU memory that the CPU reads and writes at full speed; the GPU reaches it over the bus
-  Upload,       // memory the CPU writes once, in order, and the GPU reads (GPU memory when the BAR allows it)
+  Upload,       // GPU memory the CPU can map when the BAR allows it, else host memory: for what the CPU writes once, in
+                // order, and the GPU reads, and for what the GPU alone uses but the CPU must reach (colocated motion)
 };
 
 struct Buffer

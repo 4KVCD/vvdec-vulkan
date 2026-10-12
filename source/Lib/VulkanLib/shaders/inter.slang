@@ -51,7 +51,7 @@ struct Params
   int16_t*   dst0;
   int16_t*   dst1;
   int16_t*   dst2;
-  int*       dmvr;        // DMVR's refinements (vvdec's DMVR MV cache, as vvdec's Mv: hor, ver)
+  int*       dmvr;        // DMVR's refinements (vvdec's DMVR MV cache, as vvdec's Mv: hor, ver); null: none wanted
   int*       colMotion;   // the picture's colocated motion: vvdec's ColocatedMotionInfo, 5 ints
   int16_t*   lmcsFwd;     // LMCS: the forward luma mapping, one entry per luma value
   int16_t*   defer0;      // LMCS, CIIP: the predictions kept aside, laid out like the planes
@@ -2037,7 +2037,7 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
 #endif
     // Threads 0 .. 15 write the refined motion where TMVP reads it (the 8x8 grid) into the colocated motion, which
     // mider.slang (GPU front end) or DecCu's storeDmvrMotion (CPU front end) stored before, one int each; threads
-    // 16 and 17 write vvdec's DMVR MV cache.
+    // 16 and 17 write vvdec's DMVR MV cache (when it is wanted).
     if( tid < 16 )
     {
       const int x2 = ( ( x - 1 ) & ~7 ) + 8 + 8 * ( ( tid >> 2 ) & 1 );
@@ -2050,7 +2050,7 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
         pc.colMotion[( ctu * pc.num8x8 + ( ( x2 >> 3 ) & mask ) + ( ( ( y2 >> 3 ) & mask ) << ( pc.ctuLog2 - 3 ) ) ) * 5 + ( tid & 3 )] = ( tid & 1 ) == 0 ? m.x : m.y;
       }
     }
-    else if( tid < 18 )
+    else if( tid < 18 && pc.dmvr != nullptr )
     {
       pc.dmvr[int( job[8] ) * 2 + tid - 16] = tid == 16 ? delta.x : delta.y;
     }
@@ -3294,10 +3294,13 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       }
       s_minCost = minCost;
 #endif
-      const int  index8      = int( job[8] );
-      pc.dmvr[index8 * 2]     = delta.x;
-      pc.dmvr[index8 * 2 + 1] = delta.y;
-      s_delta                = delta;
+      const int index8 = int( job[8] );
+      if( pc.dmvr != nullptr )
+      {
+        pc.dmvr[index8 * 2]     = delta.x;
+        pc.dmvr[index8 * 2 + 1] = delta.y;
+      }
+      s_delta = delta;
       // Write the refined motion where TMVP reads it (the 8x8 grid) into the
       // colocated motion, which mider.slang (GPU front end) or DecCu's
       // storeDmvrMotion (CPU front end) stored before.

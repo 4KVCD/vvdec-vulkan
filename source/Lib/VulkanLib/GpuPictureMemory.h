@@ -103,7 +103,8 @@ public:
 
   // The stand-ins' allocator, for the picture list's new pictures (PicListManager::setGpuPlanes)
   UserAllocator* standIns() { return &m_standIns; }
-  // Gives the picture colocated motion (from the pool, or new) when it has none: when its work goes to the GPU
+  // Gives the picture colocated motion (from the pool, or new) when it has none: when its work goes to the GPU, whose
+  // front end alone writes and reads it (in GPU memory the CPU can map)
   void acquireColMotion( Picture& pic );
   // Swaps planes (from the pool, or new ones) in for the picture's stand-ins, its twins going with it, for the CPU to
   // write them (a picture filled in grey, a picture the CPU parses), and gives it colocated motion (the same); nothing
@@ -146,7 +147,7 @@ private:
 
   std::unique_ptr<PelStorage> makeStorage( const Picture& pic, const UserAllocator* allocator ) const;   // of its layout
   // (with m_mutex locked)
-  void      acquireColMotionLocked( Picture& pic );
+  void      acquireColMotionLocked( Picture& pic, bool gpuOnly );   // gpuOnly: acquireColMotion's, else acquire's
   void      acquirePlanesLocked( Picture& pic );   // its planes, its twins going with it
   void      swapStandInsLocked( Picture& pic );    // its planes back to the pool, its twins going to the stand-ins
   void      startDownloadLocked( Picture& pic );
@@ -165,6 +166,7 @@ private:
     void*    allocation;
     void*    map;
     uint32_t bytes;
+    bool     gpuOnly;   // in GPU memory: for a picture whose work goes to the GPU, not one the CPU writes
   };
   std::vector<ColMotion> m_freeColMotion;
   std::vector<std::unique_ptr<Download>> m_downloads;   // (their records stay where they are while one is waited for)

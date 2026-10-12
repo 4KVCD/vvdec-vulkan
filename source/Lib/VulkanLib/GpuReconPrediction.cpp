@@ -266,7 +266,9 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   push.dst0 = planes.addr[COMPONENT_Y];
   push.dst1 = planes.addr[COMPONENT_Cb];
   push.dst2 = planes.addr[COMPONENT_Cr];
-  push.dmvr = m_dmvr.addr;
+  // DMVR's refinements for vvdec's DMVR MV cache: with the GPU front end nothing reads them (the GPU stores the refined
+  // motion for TMVP itself, below), so the shader skips those writes to host memory (none: 0)
+  push.dmvr = m_useFrontEnd ? 0 : m_dmvr.addr;
   // DMVR's refinements go into the picture's colocated motion (for TMVP), in memory from the GPU's picture
   // allocator (Picture::gpuMemory)
   CHECK_FATAL( !cs.m_colMiAllocation, "Vulkan: the colocated motion out of the GPU's reach" );
