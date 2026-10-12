@@ -19,6 +19,9 @@
 //          highest wave of the samples the job reads, where inter's samples
 //          are wave 0 (GpuJobs.h's WaveMap). One 32-thread workgroup per CTU
 //          row; the rows run as a wavefront, as vvdec's CTU tasks run them.
+//          The rectangles of the map each job reads and writes are worked out
+//          32 jobs at a time, a job a thread; then the jobs go in order, the
+//          current CTU's part of the map in shared memory.
 //
 // There are five lists: 0 the residual jobs, 1 inter's regular jobs, 2 the
 // intra jobs, 3 inter's BDOF jobs, 4 inter's affine pairs. Inter's three lists
@@ -1701,21 +1704,48 @@ void cuJobs( int index, inout Out o )
 // The waves of the intra jobs (GpuJobs.h's WaveMap, as DecCu's xGpu*Jobs use it)
 // --------------------------------------------------------------------------------------------------------------------
 
-int waveShiftX( int c ) { return 2 - ( c == 0 ? 0 : pc.csx ); }
-int waveShiftY( int c ) { return 2 - ( c == 0 ? 0 : pc.csy ); }
-int waveWidth( int c ) { return ( ( pc.width >> ( c == 0 ? 0 : pc.csx ) ) + ( 1 << waveShiftX( c ) ) - 1 ) >> waveShiftX( c ); }
-int waveHeight( int c ) { return ( ( pc.height >> ( c == 0 ? 0 : pc.csy ) ) + ( 1 << waveShiftY( c ) ) - 1 ) >> waveShiftY( c ); }
+int waveShiftXOf( int c ) { return 2 - ( c == 0 ? 0 : pc.csx ); }
+int waveShiftYOf( int c ) { return 2 - ( c == 0 ? 0 : pc.csy ); }
+int waveWidthOf( int c ) { return ( ( pc.width >> ( c == 0 ? 0 : pc.csx ) ) + ( 1 << waveShiftXOf( c ) ) - 1 ) >> waveShiftXOf( c ); }
+int waveHeightOf( int c ) { return ( ( pc.height >> ( c == 0 ? 0 : pc.csy ) ) + ( 1 << waveShiftYOf( c ) ) - 1 ) >> waveShiftYOf( c ); }
+
+// The map's layout (the names ending in 0 for luma, in 1 for chroma), its tag and its planes, which the WAVES pass
+// reads from the parameters into registers once (loadWaveLayout): in the per-job code, each read of a parameter was a
+// load from memory and a wait.
+static int   g_shX0, g_shX1, g_shY0, g_shY1, g_mapW0, g_mapW1, g_mapH0, g_mapH1, g_planeSize;
+static int   g_ctuUnits;   // the units a CTU side has
+static uint  g_waveTag;
+static uint* g_waveMap;
+void loadWaveLayout()
+{
+  g_shX0      = waveShiftXOf( 0 );
+  g_shX1      = waveShiftXOf( 1 );
+  g_shY0      = waveShiftYOf( 0 );
+  g_shY1      = waveShiftYOf( 1 );
+  g_mapW0     = waveWidthOf( 0 );
+  g_mapW1     = waveWidthOf( 1 );
+  g_mapH0     = waveHeightOf( 0 );
+  g_mapH1     = waveHeightOf( 1 );
+  g_planeSize = g_mapW0 * g_mapH0;
+  g_waveTag   = pc.waveTag;
+  g_waveMap   = pc.waveMap;
+  g_ctuUnits  = 1 << ( pc.log2Ctu - 2 );
+}
+
+int waveShiftX( int c ) { return c == 0 ? g_shX0 : g_shX1; }
+int waveShiftY( int c ) { return c == 0 ? g_shY0 : g_shY1; }
+int waveWidth( int c ) { return c == 0 ? g_mapW0 : g_mapW1; }
+int waveHeight( int c ) { return c == 0 ? g_mapH0 : g_mapH1; }
 // A wave-map entry: the wave | the tag of the picture that wrote it << 16. An entry of another picture is wave 0,
 // as the map was zeroed for each picture before (GpuRecon zeroes it only when the tags wrap around).
 int mapWave( uint v )
 {
-  return ( v >> 16 ) == pc.waveTag ? int( v & 0xffffu ) : 0;
+  return ( v >> 16 ) == g_waveTag ? int( v & 0xffffu ) : 0;
 }
 
 uint* waveRow( int c, int j )
 {
-  const int planeSize = waveWidth( 0 ) * waveHeight( 0 );
-  return pc.waveMap + c * planeSize + j * waveWidth( c );
+  return g_waveMap + c * g_planeSize + j * waveWidth( c );
 }
 
 // A rectangle of component c's map in units (WaveMap::maxIn's): its first unit (x0, y0), its width, its number of
@@ -1746,11 +1776,29 @@ MapRect noRect()
   return r;
 }
 
-// The map's entry of unit u of rectangle r (u < r.n)
+#if defined( WAVES )
+// The current CTU's units of the wave map, per component (CTU / 4 units a side, at most WAVE_U), each the wave | the
+// CTU's tag << 16: an entry of another CTU reads as wave 0, as an entry of another picture does in memory.
+#define WAVE_U 32
+groupshared uint s_ctuWaves[3 * WAVE_U * WAVE_U];
+static int  g_ctuUx, g_ctuUy;   // the current CTU's first unit (the same in all components' maps)
+static uint g_ctuTag;           // the current CTU's tag: its column + 1
+#endif
+
+// The map's entry of unit u of rectangle r (u < r.n): a unit of the current CTU from shared memory (WAVES)
 uint rectUnit( MapRect r, int u )
 {
   const int j = r.y0 + int( ( float( u ) + 0.5f ) / float( r.cols ) );   // (exactly u / cols, since u and cols are small)
-  return waveRow( r.c, j )[r.x0 + u - ( j - r.y0 ) * r.cols];
+  const int x = r.x0 + u - ( j - r.y0 ) * r.cols;
+#if defined( WAVES )
+  const int lx = x - g_ctuUx, ly = j - g_ctuUy;
+  if( uint( lx ) < uint( g_ctuUnits ) && uint( ly ) < uint( g_ctuUnits ) )
+  {
+    const uint v = s_ctuWaves[( r.c * WAVE_U + ly ) * WAVE_U + lx];
+    return ( v >> 16 ) == g_ctuTag ? ( v & 0xffffu ) | g_waveTag << 16 : 0u;
+  }
+#endif
+  return waveRow( r.c, j )[x];
 }
 
 // The highest wave of the thread's units of rectangle r past its first 32 (most rectangles have no more)
@@ -1782,39 +1830,44 @@ int gatherMax( MapRect r0, MapRect r1, MapRect r2, MapRect r3, MapRect r4, int l
   return WaveActiveMax( wave );
 }
 
-// WaveMap::set by the 32 threads of a row's workgroup, each thread taking every 32nd unit.
-void waveSetP( int c, int x, int y, int width, int height, int wave, int lane )
+// WaveMap::set for the units of rectangle w (the current CTU's job's block) by the 32 threads of a row's workgroup,
+// each thread taking every 32nd unit: in the map in memory and in the CTU's units in shared memory.
+void waveSetRect( MapRect w, int wave, int lane )
 {
-  const int x0   = x >> waveShiftX( c );
-  const int y0   = y >> waveShiftY( c );
-  const int x1   = min( ( x + width - 1 ) >> waveShiftX( c ), waveWidth( c ) - 1 );
-  const int y1   = min( ( y + height - 1 ) >> waveShiftY( c ), waveHeight( c ) - 1 );
-  const int cols = x1 - x0 + 1;
-  const int n    = cols > 0 && y1 >= y0 ? cols * ( y1 - y0 + 1 ) : 0;
-  const float rcp = 1.0f / float( max( cols, 1 ) );   // (exactly u / cols, since u and cols are small)
-  for( int u = lane; u < n; u += 32 )
+  const float rcp = 1.0f / float( max( w.cols, 1 ) );   // (exactly u / cols, since u and cols are small)
+  for( int u = lane; u < w.n; u += 32 )
   {
-    const int j                                 = y0 + int( ( float( u ) + 0.5f ) * rcp );
-    waveRow( c, j )[x0 + u - ( j - y0 ) * cols] = uint( wave ) | pc.waveTag << 16;
+    const int j          = w.y0 + int( ( float( u ) + 0.5f ) * rcp );
+    const int x          = w.x0 + u - ( j - w.y0 ) * w.cols;
+    waveRow( w.c, j )[x] = uint( wave ) | g_waveTag << 16;
+#if defined( WAVES )
+    s_ctuWaves[( w.c * WAVE_U + j - g_ctuUy ) * WAVE_U + x - g_ctuUx] = uint( wave ) | g_ctuTag << 16;
+#endif
   }
 }
 
-// Word k of the job whose 12 words threads 0 .. 11 hold in words (one each)
-uint jobWord( uint words, int k )
+// A rectangle in two words: x0 | y0 << 16, cols | n << 8 | c << 24 (a rectangle's cols are below 256 and its units
+// below 65536; when n is 0 the rest does not matter)
+uint2 packRect( MapRect r )
 {
-  return WaveReadLaneAt( words, k );
+  return uint2( uint( r.x0 ) | uint( r.y0 ) << 16, ( uint( r.cols ) & 0xffu ) | uint( r.n ) << 8 | uint( r.c ) << 24 );
 }
 
-// Sets a job's wave to one above the highest wave of the samples it reads (the row's 32 threads work together). The
-// job's words are in words (word k in thread k), read before (see WAVES); its wave goes to jobOut's word 7.
-void jobWaveP( uint* jobOut, uint words, int lane )
+MapRect unpackRect( uint2 p )
 {
-  uint job[12];
-  [unroll]
-  for( int k = 0; k < 12; k++ )
-  {
-    job[k] = k == 3 || k == 7 || k == 10 || k == 11 ? 0u : jobWord( words, k );   // (words 3, 7, 10 and 11 are not needed)
-  }
+  MapRect r;
+  r.x0   = int( p.x & 0xffffu );
+  r.y0   = int( p.x >> 16 );
+  r.cols = int( p.y & 0xffu );
+  r.n    = int( ( p.y >> 8 ) & 0xffffu );
+  r.c    = int( p.y >> 24 );
+  return r;
+}
+
+// The wave-map rectangles of an intra job (its 12 words), packed (packRect): the five it reads (IBC's block or the
+// reference lines above and left, LMCS's neighbours, CCLM's luma) and the one it writes (its own block)
+void jobRects( uint job[12], out uint2 packed[6] )
+{
   const int  x     = int( job[0] & 0xffff );
   const int  y     = int( job[0] >> 16 );
   const int  w     = int( job[1] & 0xff );
@@ -1881,12 +1934,12 @@ void jobWaveP( uint* jobOut, uint words, int lane )
     const int right = ( ( lx >> pc.log2Ctu ) + 2 ) << pc.log2Ctu;
     r4              = mapRect( 0, lx - 4, ly - 4, min( 2 * lw + 8, right - ( lx - 4 ) ), 2 * lh + 8 );
   }
-  const int wave = gatherMax( r0, r1, r2, r3, r4, lane );
-  if( lane == 0 )
-  {
-    jobOut[7] = uint( wave + 1 );
-  }
-  waveSetP( c, x, y, w, h, wave + 1, lane );
+  packed[0] = packRect( r0 );
+  packed[1] = packRect( r1 );
+  packed[2] = packRect( r2 );
+  packed[3] = packRect( r3 );
+  packed[4] = packRect( r4 );
+  packed[5] = packRect( mapRect( c, x, y, w, h ) );
 }
 
 // --------------------------------------------------------------------------------------------------------------------
@@ -1894,8 +1947,9 @@ void jobWaveP( uint* jobOut, uint words, int lane )
 // --------------------------------------------------------------------------------------------------------------------
 
 #if defined( WAVES )
-groupshared int  s_row;
-groupshared int2 s_jobRange[32];   // the intra jobs of the 32 CTUs being walked: [first, end)
+groupshared int   s_row;
+groupshared int2  s_jobRange[32];   // the intra jobs of the 32 CTUs being walked: [first, end)
+groupshared uint4 s_rects[3 * 32];  // the packed rectangles (jobRects) of the 32 jobs at hand, 3 x 4 words each
 
 // The intra jobs of CTU ctu: from the first job of its first CU up to the first job of the next CTU's first CU
 int2 intraJobRange( int ctu )
@@ -1931,6 +1985,12 @@ void main( uint3 local : SV_GroupThreadID )
   {
     return;
   }
+  loadWaveLayout();
+  // (no entry of shared memory's map belongs to a CTU yet)
+  for( int i = lane; i < 3 * WAVE_U * WAVE_U; i += 32 )
+  {
+    s_ctuWaves[i] = 0u;
+  }
   for( int col = 0; col < pc.widthInCtus; col++ )
   {
     // every 32 CTUs, each thread reads one CTU's range of jobs
@@ -1943,6 +2003,9 @@ void main( uint3 local : SV_GroupThreadID )
     const int2 range = s_jobRange[col & 31];
     if( range.x < range.y )
     {
+      g_ctuUx  = col << ( pc.log2Ctu - 2 );
+      g_ctuUy  = row << ( pc.log2Ctu - 2 );
+      g_ctuTag = uint( col + 1 );
       if( row > 0 )
       {
         if( lane == 0 )
@@ -1954,18 +2017,42 @@ void main( uint3 local : SV_GroupThreadID )
         }
         AllMemoryBarrierWithGroupSync();
       }
-      // Each job's 12 words in one read (word k by thread k), the next job's while this one runs
-      uint next = lane < 12 ? pc.intra[range.x * 12 + lane] : 0u;
-      for( int j = range.x; j < range.y; j++ )
+      for( int base = range.x; base < range.y; base += 32 )
       {
-        const uint words = next;
-        if( j + 1 < range.y )
+        // The next 32 jobs' rectangles, a job a thread
+        const int count = min( 32, range.y - base );
+        if( lane < count )
         {
-          next = lane < 12 ? pc.intra[( j + 1 ) * 12 + lane] : 0u;   // (the next job's, while this one runs)
+          uint job[12];
+          [unroll]
+          for( int k = 0; k < 3; k++ )
+          {
+            const uint4 v = *(uint4*)( pc.intra + ( base + lane ) * 12 + 4 * k );   // (a job's 48 bytes are aligned)
+            job[4 * k] = v.x; job[4 * k + 1] = v.y; job[4 * k + 2] = v.z; job[4 * k + 3] = v.w;
+          }
+          uint2 packed[6];
+          jobRects( job, packed );
+          s_rects[lane * 3]     = uint4( packed[0], packed[1] );
+          s_rects[lane * 3 + 1] = uint4( packed[2], packed[3] );
+          s_rects[lane * 3 + 2] = uint4( packed[4], packed[5] );
         }
-        jobWaveP( pc.intra + j * 12, words, lane );
-        // (the job's wave-map units are written before the next job reads them)
-        workgroupBarrierAll();
+        GroupMemoryBarrierWithGroupSync();
+        // Then in order: each job's wave, one above the highest of what it reads, into its word 7 and its units
+        for( int k = 0; k < count; k++ )
+        {
+          const uint4 a    = WaveReadLaneFirst( s_rects[k * 3] );
+          const uint4 b    = WaveReadLaneFirst( s_rects[k * 3 + 1] );
+          const uint4 d    = WaveReadLaneFirst( s_rects[k * 3 + 2] );
+          const int   wave = gatherMax( unpackRect( a.xy ), unpackRect( a.zw ), unpackRect( b.xy ), unpackRect( b.zw ), unpackRect( d.xy ), lane );
+          if( lane == 0 )
+          {
+            pc.intra[( base + k ) * 12 + 7] = uint( wave + 1 );
+          }
+          waveSetRect( unpackRect( d.zw ), wave + 1, lane );
+          // (the job's units in shared memory are written before the next job reads them; their copies in memory
+          // are waited for at the CTU's end)
+          GroupMemoryBarrierWithGroupSync();
+        }
       }
       AllMemoryBarrierWithGroupSync();   // (the CTU's waves visible to the rows below)
     }
