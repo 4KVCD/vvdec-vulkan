@@ -106,6 +106,14 @@ static constexpr size_t   kStreamsInParse     = 180;
 // fps and 221 MB of GPU memory at the peak, 48: 392.0 and 213 MB, 32: 382.6 and 205 MB, 24: 374.9; Beekeeper slower
 // 4K: 172.9 / 543, 48: 172.0 / 503, 32: 170.6 / 498).
 static constexpr size_t   kMaxAhead           = 48;
+// An intra picture of at most kSerialStreams substreams (no WPP, one tile) parses in one or two long chains (Conan
+// 1080p's: 60-260 ms, where a B picture's take ~40): started in turn, behind the ~50 pictures the CPU enqueues ahead
+// (kMaxAhead holds them back), it finished after the reconstruction had caught up with it, which waited ~100 ms each
+// time. So such a picture starts at once, ahead of the pictures enqueued before it (at most kSerialIntraInParse of them
+// in parse). The intra pictures of WPP parse their rows side by side, and started early they only held back the
+// pictures before them (Top Gun slower 1080p -1.4%).
+static constexpr size_t   kSerialStreams      = 2;
+static constexpr size_t   kSerialIntraInParse = 2;
 
 // The bytes of a picture's largest substream (its parse's longest)
 static uint32_t largestStreamBytes( const ParseInput& in )
@@ -653,6 +661,8 @@ ParseStats ParseService::stats() const
   return stats;
 }
 
+static bool serialIntraPicture( const Picture& pic );
+
 void ParseService::run()
 {
   try
@@ -689,6 +699,29 @@ void ParseService::run()
         }
         starting.assign( m_waiting.begin(), m_waiting.begin() + count );
         m_waiting.erase( m_waiting.begin(), m_waiting.begin() + count );
+        // then the intra pictures that parse in long chains, ahead of their turn (kSerialStreams)
+        size_t serial = 0;
+        for( const ParseSlot* slot: m_parsing )
+        {
+          serial += serialIntraPicture( *slot->picture ) ? 1 : 0;
+        }
+        for( const Picture* pic: starting )
+        {
+          serial += serialIntraPicture( *pic ) ? 1 : 0;
+        }
+        for( auto it = m_waiting.begin(); it != m_waiting.end() && serial < kSerialIntraInParse; )
+        {
+          if( serialIntraPicture( **it ) )
+          {
+            starting.push_back( *it );
+            it = m_waiting.erase( it );
+            serial++;
+          }
+          else
+          {
+            ++it;
+          }
+        }
       }
       for( Picture* pic: starting )
       {
@@ -795,6 +828,12 @@ void ParseService::giveSlot( ParseSlot* slot )
 static bool intraPicture( const Picture& pic )
 {
   return std::all_of( pic.slices.begin(), pic.slices.end(), []( const Slice* s ) { return s->isIntra(); } );
+}
+
+// An intra picture whose parse is one or two long chains (kSerialStreams)
+static bool serialIntraPicture( const Picture& pic )
+{
+  return substreamsOf( &pic ) <= kSerialStreams && intraPicture( pic );
 }
 
 void ParseService::Counts::raise( const Counts& counts )
