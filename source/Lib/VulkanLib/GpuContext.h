@@ -201,10 +201,10 @@ public:
   void submit( VkCommandBuffer cmd, VkFence done ) { submitFirst( cmd, done ); }
 
   // --- The film grain's queue ---
-  // The film grain on the output frames (GpuFilmGrain) needs only the frame, downloaded before: on the compute queue
-  // it waited for all the decoding queued before it (4.9 ms a frame at 1080p, 8.7 ms at 4K). It runs on a queue of its
-  // own where the async compute family has one that nothing else takes (AMD's: queue 4 of 8), else on the compute
-  // queue. Its command pools are of grainFamily(); submitGrain() submits its commands, which signal done.
+  // The film grain on the output frames (GpuFilmGrain) needs only the downloaded frame. So it runs on a queue of its
+  // own where the async compute family has one that nothing else takes (AMD's queue 4 of 8), and there it does not
+  // wait for the decoding queued on the compute queue. Without such a queue it runs on the compute queue. Its command
+  // pools are of grainFamily(); submitGrain() submits its commands, which signal done.
   uint32_t grainFamily() const { return m_grainQueue ? m_asyncFamily : m_queueFamily; }
   void     submitGrain( VkCommandBuffer cmd, VkFence done );
 

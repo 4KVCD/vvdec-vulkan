@@ -479,14 +479,15 @@ bool Context::init()
     {
       m_api.vkGetDeviceQueue( m_device, m_asyncFamily, copyIndex, &m_parseCopyQueue );
     }
-    if( split )
-    {
-      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, grainIndex, &m_grainQueue );
-    }
     else
     {
       m_parseCopyQueue = m_parseQueue;
       m_parseCopyMutex = m_parseMutex;
+    }
+    // Film grain gets a queue of its own only where the queues are split; elsewhere it uses the compute queue.
+    if( split )
+    {
+      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, grainIndex, &m_grainQueue );
     }
     VkSemaphoreTypeCreateInfo timelineType{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
     timelineType.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
