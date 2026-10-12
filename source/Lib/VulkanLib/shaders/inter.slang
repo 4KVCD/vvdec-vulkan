@@ -1134,8 +1134,9 @@ void bdofApply( int tid, int w, int h, out int result[PER_THREAD] )
 #endif
 
 // --------------------------------------------------------------------------------------------------------------------
-// tile16: a 16x16 tile whose reference samples all lie inside the picture (nearly every tile). All its global reads
-// are issued at once, in aligned loads of 16 and 8 bytes, before the first wait for memory: each list's luma window
+// tile16: a 16x16 tile whose reference samples all lie inside the picture (nearly every tile; with weighted
+// prediction too, not GPM's). All its global reads are issued at once, in loads of 16 and 8 bytes (from 4-byte
+// aligned places), before the first wait for memory: each list's luma window
 // of 23 x 23 samples around its motion (with DMVR, around the merge motion; the search and the refined prediction
 // both read inside it), the chroma windows of 11 x 11, and the residuals. DMVR and the filters then work from shared
 // memory. (Reading and waiting one sample at a time, a tile waited for memory some 50 times; the shader is
@@ -1758,6 +1759,10 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   // samples from lead before the window), in two reads a thread per list (a thread past the last chunk reads the last
   // one again, and stores nothing; with one list, the second list's reads are the first's again).
   const bool two     = lists == 2;
+  // Weighted prediction (wpSample) starts from the 14-bit predictions, for a uni-prediction too (hi). (DMVR and BDOF
+  // are off where it is on.)
+  const bool wp      = ( flags & FLAG_WP ) != 0;
+  const bool hi      = bi || wp;
   int16_t*   y1      = two ? planeY[1] : planeY[0];
   const uint yFirst0 = uint( wy[0] * pc.stride0 + wx[0] - leadY[0] );   // (the windows' first chunks)
   const uint yFirst1 = two ? uint( wy[1] * pc.stride0 + wx[1] - leadY[1] ) : yFirst0;
@@ -1953,7 +1958,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     if( s < lists )
     {
-      predY[s] = lumaPred( wyAt[s], WORK_AT + 368 * s, j, i0, rx0[s], ry0[s], mvR[s].x & 15, mvR[s].y & 15, cxY[s], cyY[s], bi );
+      predY[s] = lumaPred( wyAt[s], WORK_AT + 368 * s, j, i0, rx0[s], ry0[s], mvR[s].x & 15, mvR[s].y & 15, cxY[s], cyY[s], hi );
     }
   }
 #if BDOF
@@ -2035,7 +2040,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     if( s < lists )
     {
       predC[s] = chromaPred( WC_AT( 2 * s + cc ) + leadC[s], CH_AT + 88 * ( 2 * s + cc ), cj, ci0, crx0[s], cry0[s], mvR[s].x & 31, mvR[s].y & 31,
-                             cxC[s], cyC[s], bi );
+                             cxC[s], cyC[s], hi );
     }
   }
 
@@ -2046,7 +2051,9 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   [unroll]
   for( int o = 0; o < 4; o++ )
   {
-    vy[o] = bi ? biAverage( predY[0][o], predY[1][o], flags, bcwW1, shiftNum, offset, maxVal ) : predY[0][o];
+    vy[o] = wp   ? wpSample( job[8], job[11], 0, predY[0][o], bi ? predY[1][o] : 0, maxVal )
+            : bi ? biAverage( predY[0][o], predY[1][o], flags, bcwW1, shiftNum, offset, maxVal )
+                 : predY[0][o];
   }
 #if BDOF
   if( bdof )
@@ -2073,7 +2080,9 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   [unroll]
   for( int o = 0; o < 2; o++ )
   {
-    vc[o] = bi ? biAverage( predC[0][o], predC[1][o], flags, bcwW1, shiftNum, offset, maxVal ) : predC[0][o];
+    vc[o] = wp   ? wpSample( job[9 + cc], job[11], 1 + cc, predC[0][o], bi ? predC[1][o] : 0, maxVal )
+            : bi ? biAverage( predC[0][o], predC[1][o], flags, bcwW1, shiftNum, offset, maxVal )
+                 : predC[0][o];
   }
   if( ( flags & ( FLAG_RES_Y << ( 1 + cc ) ) ) != 0 )
   {
@@ -2698,7 +2707,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const bool dmvr  = ( flags & FLAG_DMVR ) != 0;
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
-  if( ( flags & ( FLAG_GEO | FLAG_WP ) ) == 0 && widePlanes() && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
+  if( ( flags & FLAG_GEO ) == 0 && widePlanes() && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
   {
     tile16( tid, index, job, x, y, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel );
     return;
