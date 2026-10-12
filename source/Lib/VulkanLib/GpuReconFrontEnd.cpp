@@ -749,6 +749,13 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
   push.shift = 0;
   pushConstants( push );
   dispatchGroups( 1 );
+  // With room for one block of jobs (most B-pictures), SMALL sorts them all: the other passes are not recorded.
+  if( fe.sortBlocks <= 1 )
+  {
+    computeBarrier();
+    mark( "intrasort" );
+    return;
+  }
   indirectBarrier();
   const auto pass = [&]( int p, int shift, bool perBlock ) {
     push.pass  = p;
