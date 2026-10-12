@@ -16,6 +16,7 @@ S = os.path.dirname(os.path.abspath(__file__))   # this directory: the exes unde
 PROC = S + r'\procstat\procstat.exe'
 LOGS = os.path.join(S, 'ab_logs')
 stream, frames, rounds, specs = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4:]
+EXTRA = os.environ.get('AB_EXTRA', '').split()   # more vvdecapp arguments for every run (AB_EXTRA="-fg 1": film grain)
 os.makedirs(LOGS, exist_ok=True)
 
 
@@ -60,7 +61,7 @@ for r in range(rounds):
         name, mode = program(spec), spec.partition(':')[2]
         env = environment(spec)
         gpu = '0' if mode == 'cpu' else '1'
-        cmd = [PROC, '--mark', 'VVdeC,', '--mark', 'SizeInfo', '--mark', 'frames decoded @', '--', S + rf'\vvdecapp_{name}.exe', '-b', stream, '-f', str(frames), '-t', '16', '-v', '3', '--gpu', gpu]
+        cmd = [PROC, '--mark', 'VVdeC,', '--mark', 'SizeInfo', '--mark', 'frames decoded @', '--', S + rf'\vvdecapp_{name}.exe', '-b', stream, '-f', str(frames), '-t', '16', '-v', '3', '--gpu', gpu] + EXTRA
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, errors='replace')
         out = proc.stdout + proc.stderr
         log = os.path.join(LOGS, f'{os.path.splitext(os.path.basename(stream))[0]}_{re.sub(r"[^A-Za-z0-9_.=-]", "_", spec)}_run{r + 1}.log')
