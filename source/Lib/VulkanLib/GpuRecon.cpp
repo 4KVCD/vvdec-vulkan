@@ -974,12 +974,9 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   computeToTransferBarrier();
   if( inScratch )
   {
-    // The result is in the scratch planes: they become the picture's twin, and its former twin becomes the scratch
-    // planes (they have the same sizes).
-    for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
-    {
-      std::swap( planeTwin( pic, ComponentID( comp ) ), m_scratch[comp] );
-    }
+    // The luma result is in the scratch plane: it becomes the picture's luma twin, and its former twin the scratch
+    // plane (they have the same size). (The chroma result is in the twin: recordAlf.)
+    std::swap( planeTwin( pic, COMPONENT_Y ), m_scratch[COMPONENT_Y] );
   }
   const int download = submitPicture( pic, waitFirst );
   // The scratch planes (after a swap, the picture's former twin) go back to the pool at once. The GPU runs the

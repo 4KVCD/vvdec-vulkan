@@ -14,7 +14,13 @@
 //           diamond), from the workgroup's 32x32 samples and a 3-sample
 //           margin, which the workgroup reads into shared memory once.
 // CHROMA=1: a thread filters one 4x4 block of Cb and one of Cr (5x5 diamond),
-//           then adds the cross-component filter of the co-located luma.
+//           then adds the cross-component filter of the co-located luma: in
+//           pass 0 the blocks whose CTU has ALF or CC-ALF on that component,
+//           from the picture (src) into the scratch planes (dst); in pass 1
+//           those blocks back, from the scratch planes (src) into the picture
+//           (dst). The other blocks keep their samples where they are (most of
+//           the chroma CTUs: copying them through the scratch planes took the
+//           pass's time, which reads and writes whole planes at memory's pace).
 //
 // The ctus buffer holds 8 bytes per CTU: the luma filter set (255: off), the
 // chroma APS, the Cb alternative (255: off), the Cr alternative (255: off),
@@ -65,6 +71,7 @@ struct Params
   int      vbVer0, vbVer1, vbVer2;
   int      vbHor0, vbHor1, vbHor2;
   int      aligned;   // CHROMA: nonzero when both planes' rows start 8-byte aligned (a block's rows read and written whole)
+  int      pass;      // CHROMA: 0 filters (into the scratch planes), 1 copies back (into the picture)
 };
 
 [[vk::push_constant]] Params pc;
@@ -831,6 +838,24 @@ void filterPlane( int16_t* src, int16_t* dst, int bx, int by, int aps, int alt, 
   }
 }
 
+// Copies the 4x4 block at (bx, by) from src to dst.
+void copyBlock( int16_t* src, int16_t* dst, int bx, int by )
+{
+  if( pc.aligned != 0 )
+  {
+    [unroll]
+    for( int j = 0; j < 4; j++ )
+    {
+      *(uint2*)at( dst, uint( ( by + j ) * pc.dstStride + bx ) ) = *(uint2*)at( src, uint( ( by + j ) * pc.srcStride + bx ) );
+    }
+    return;
+  }
+  for( int i = 0; i < 16; i++ )
+  {
+    storePel( dst, pc.dstStride, bx + ( i & 3 ), by + ( i >> 2 ), loadPel( src, pc.srcStride, bx + ( i & 3 ), by + ( i >> 2 ) ) );
+  }
+}
+
 [shader( "compute" )]
 [numthreads( 8, 8, 1 )]
 void main( uint3 id : SV_DispatchThreadID )
@@ -841,13 +866,35 @@ void main( uint3 id : SV_DispatchThreadID )
   {
     return;
   }
-  const int ctu = ( ( by << pc.scaleY ) >> pc.ctuLog2 ) * pc.widthInCtus + ( ( bx << pc.scaleX ) >> pc.ctuLog2 );
+  const int ctu   = ( ( by << pc.scaleY ) >> pc.ctuLog2 ) * pc.widthInCtus + ( ( bx << pc.scaleX ) >> pc.ctuLog2 );
+  const int cbAlt = int( pc.ctus[ctu * 8 + CTU_CB_ALT] ), cbCc = int( pc.ctus[ctu * 8 + CTU_CC_CB] );
+  const int crAlt = int( pc.ctus[ctu * 8 + CTU_CR_ALT] ), crCc = int( pc.ctus[ctu * 8 + CTU_CC_CR] );
+  const bool cb   = cbAlt != 255 || cbCc != 255;   // (whether the CTU's Cb is filtered)
+  const bool cr   = crAlt != 255 || crCc != 255;
+  if( pc.pass == 1 )
+  {
+    if( cb )
+    {
+      copyBlock( pc.src0, pc.dst0, bx, by );
+    }
+    if( cr )
+    {
+      copyBlock( pc.src1, pc.dst1, bx, by );
+    }
+    return;
+  }
   const int aps = int( pc.ctus[ctu * 8 + CTU_CHROMA_APS] );
 #if BOUNDS
   s_region = regionOf( bx << pc.scaleX, by << pc.scaleY );
 #endif
-  filterPlane( pc.src0, pc.dst0, bx, by, aps, int( pc.ctus[ctu * 8 + CTU_CB_ALT] ), int( pc.ctus[ctu * 8 + CTU_CC_CB] ), 0 );
-  filterPlane( pc.src1, pc.dst1, bx, by, aps, int( pc.ctus[ctu * 8 + CTU_CR_ALT] ), int( pc.ctus[ctu * 8 + CTU_CC_CR] ), 1 );
+  if( cb )
+  {
+    filterPlane( pc.src0, pc.dst0, bx, by, aps, cbAlt, cbCc, 0 );
+  }
+  if( cr )
+  {
+    filterPlane( pc.src1, pc.dst1, bx, by, aps, crAlt, crCc, 1 );
+  }
 }
 
 #endif

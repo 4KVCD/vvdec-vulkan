@@ -321,8 +321,9 @@ private:
   // The first part: the picture's planes uploaded (when the CPU made the residuals), the front end (without the
   // async queue), the residuals and inter prediction.
   void recordFirstPart( const CodingStructure& cs, const PictureJobs& jobs, const PelStorage& pic, const Planes& planes, bool frontEndAsync );
-  // The in-loop filters, from planes (the picture's twin) on: deblocking and SAO in place, then ALF from the twin
-  // into the scratch planes. Returns whether the result ended in the scratch planes.
+  // The in-loop filters, from planes (the picture's twin) on: deblocking and SAO in place, then ALF from the twin:
+  // luma into the scratch planes, chroma only where ALF or CC-ALF applies (through the scratch planes, back into the
+  // twin). Returns whether the luma result ended in the scratch planes.
   bool recordInLoopFilters( const CodingStructure& cs, const PictureJobs& jobs, const PelStorage& pic, const Planes& planes, bool alf );
 
   // --- The GPU front end (GpuReconFrontEnd.cpp) ---

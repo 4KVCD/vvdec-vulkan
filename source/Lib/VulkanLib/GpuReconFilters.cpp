@@ -330,7 +330,7 @@ struct AlfPush
   VkDeviceAddress src0, dst0, src1, dst1, srcLuma, ctus, coeff, clip, ccCoeff;
   int32_t         srcStride, dstStride, lumaStride, width, height, lumaWidth, lumaHeight, ctuLog2, widthInCtus, bitDepth, scaleX, scaleY;
   int32_t         numVbVer, numVbHor, vbVer[3], vbHor[3];
-  int32_t         aligned;
+  int32_t         aligned, pass;
 };
 
 // The push constants of sao.slang
@@ -653,8 +653,17 @@ void GpuRecon::recordAlf( const CodingStructure& cs, const Planes& src, const Pl
         push.aligned &= p->addr[comp] % 8 == 0 && p->stride[comp] % 4 == 0 ? 1 : 0;
       }
     }
-    dispatch( bounds ? kShader_alf_chroma_bounds : kShader_alf_chroma, push, uint32_t( ( ( push.width + 3 ) / 4 + 7 ) / 8 ),
-              uint32_t( ( ( push.height + 3 ) / 4 + 7 ) / 8 ) );
+    // pass 0: the blocks of the CTUs with ALF or CC-ALF on a chroma component, filtered into the scratch planes; pass 1:
+    // those blocks back into the twin, where the others stay (the caller swaps only the luma planes)
+    const uint32_t groupsX = uint32_t( ( ( push.width + 3 ) / 4 + 7 ) / 8 ), groupsY = uint32_t( ( ( push.height + 3 ) / 4 + 7 ) / 8 );
+    push.pass = 0;
+    dispatch( bounds ? kShader_alf_chroma_bounds : kShader_alf_chroma, push, groupsX, groupsY );
+    computeBarrier();
+    push.pass = 1;
+    std::swap( push.src0, push.dst0 );
+    std::swap( push.src1, push.dst1 );
+    std::swap( push.srcStride, push.dstStride );
+    dispatch( kShader_alf_chroma, push, groupsX, groupsY );
     mark( "alf chroma" );
   }
 }
