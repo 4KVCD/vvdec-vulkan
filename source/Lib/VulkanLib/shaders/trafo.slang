@@ -22,6 +22,14 @@
 // handles its own samples (with BDPCM, its own rows or columns). With LFNST,
 // the top-left coefficients first go through the LFNST matrix
 // (TrQuant::xInvLfnst).
+//
+// A block with only its DC coefficient and DCT-II both ways has one residual
+// value, which the threads write 4 samples a store (as they write the zeros of
+// blocks without residual). Blocks at least 4 x 4 with rows 8-byte aligned go
+// in groups of 4 samples: a thread runs the vertical transform for 4 rows of
+// a column, then the horizontal one for 4 samples of a row, which it writes
+// with one store, the matrix's entries in its registers. Other blocks take a
+// thread per sample.
 
 #include "common.slang"
 
@@ -57,10 +65,12 @@ struct Params
 #define COEFF_MIN ( -32768 )   // maxLog2TrDynamicRange 15
 #define COEFF_MAX 32767
 
-// A block has at most 32 x 32 levels (64-point transforms keep only the first 32 coefficients).
-groupshared int s_coef[32 * 32];   // [row][column]
-groupshared int s_mid[64 * 32];    // the vertical transform's output, [row][column]
-groupshared int s_lfnst[16];       // LFNST's input
+// A block has at most 32 x 32 levels (64-point transforms keep only the first 32 coefficients). The coefficients and
+// the vertical transform's output are 16-bit (dequantization, LFNST and the vertical transform clip them to 16 bits):
+// read back as 16-bit values, they take the GPU's fast 24-bit multiply-add instead of a 32-bit multiply.
+groupshared int16_t s_coef[32 * 32];   // [row][column]
+groupshared int16_t s_mid[64 * 32];    // the vertical transform's output, [row][column]
+groupshared int     s_lfnst[16];       // LFNST's input
 
 // LFNST's input order: the top-left 4x4 coefficients in diagonal scan order, as positions x + 4 y
 static const int kLfnstScan[16] = { 0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15 };
@@ -119,6 +129,81 @@ int jointResidual( int ict, int v )
   return abs( ict ) == 2 ? ( ict > 0 ? v : -v ) : ( ( ict > 0 ? v : -v ) >> 1 );
 }
 
+// The signed 16-bit halves of a 32-bit word
+int lo16( uint v )
+{
+  return int( v << 16 ) >> 16;
+}
+
+int hi16( uint v )
+{
+  return int( v ) >> 16;
+}
+
+// Four 16-bit samples as two words, the first in the low half of the first word
+uint2 packSamples( int4 v )
+{
+  return uint2( uint( v.x & 0xffff ) | uint( v.y ) << 16, uint( v.z & 0xffff ) | uint( v.w ) << 16 );
+}
+
+// Writes v into every sample of the block (2^log2W x 2^log2H at p, rows stride apart). wide: the block's rows start
+// 8-byte aligned and are 4 samples wide at least, so that a thread writes 4 samples a store.
+void fillBlock( int16_t* p, int stride, int log2W, int log2H, bool wide, int tid, int v )
+{
+  if( wide )
+  {
+    const uint pair  = ( uint( v ) & 0xffffu ) * 0x10001u;
+    const int  log2G = log2W - 2;   // the 4-sample groups of a row
+    for( int s = tid; s < ( 1 << ( log2G + log2H ) ); s += THREADS )
+    {
+      *(uint2*)at( p, uint( ( s >> log2G ) * stride + ( s & ( ( 1 << log2G ) - 1 ) ) * 4 ) ) = uint2( pair, pair );
+    }
+  }
+  else
+  {
+    for( int s = tid; s < ( 1 << ( log2W + log2H ) ); s += THREADS )
+    {
+      *at( p, uint( ( s >> log2W ) * stride + ( s & ( ( 1 << log2W ) - 1 ) ) ) ) = int16_t( v );
+    }
+  }
+}
+
+// Writes 4 residual samples r at (x, y) of the block with one store; with joint Cb-Cr, the other component's too.
+void storeGroup( int16_t* block, int16_t* other, int stride, int x, int y, int4 r, int ict )
+{
+  *(uint2*)at( block, uint( y * stride + x ) ) = packSamples( r );
+  if( ict != 0 )
+  {
+    *(uint2*)at( other, uint( y * stride + x ) ) =
+      packSamples( int4( jointResidual( ict, r.x ), jointResidual( ict, r.y ), jointResidual( ict, r.z ), jointResidual( ict, r.w ) ) );
+  }
+}
+
+// The horizontal transform of a block whose vertical transform's output has NX columns (4 or 8), for 4-sample
+// groups of its rows: the thread's group g in rows y0, y0 + rowStep, ... Each thread keeps its group's NX x 4
+// matrix entries in registers and writes its 4 samples with one store (with joint Cb-Cr, the other component's too).
+void horizontalRows<let NX : int>( int16_t* mHor, int16_t* block, int16_t* other, int stride, int width, int height, int g, int y0,
+                                   int rowStep, int shift2, int ict )
+{
+  int4 m[NX];
+  [ForceUnroll]
+  for( int k = 0; k < NX; k++ )
+  {
+    const uint2 w = *(uint2*)at( mHor, uint( k * width + 4 * g ) );
+    m[k]          = int4( lo16( w.x ), hi16( w.x ), lo16( w.y ), hi16( w.y ) );
+  }
+  for( int y = y0; y < height; y += rowStep )
+  {
+    int4 sum = int4( 1 << ( shift2 - 1 ) );
+    [ForceUnroll]
+    for( int k = 0; k < NX; k++ )
+    {
+      sum += int( s_mid[y * 32 + k] ) * m[k];
+    }
+    storeGroup( block, other, stride, 4 * g, y, clamp( sum >> shift2, int4( COEFF_MIN ), int4( COEFF_MAX ) ), ict );
+  }
+}
+
 [shader( "compute" )]
 [numthreads( THREADS, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
@@ -155,13 +240,13 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   int16_t*  levels       = rowWidth != 0 ? pc.parsedLevels + job[8] : levelsOf( comp ) + y0 * stride + x0;
   const int levelStride  = rowWidth != 0 ? rowWidth : stride;
   int16_t*  other        = planeOf( comp == 1 ? 2 : 1 ) + y0 * stride + x0;   // joint Cb-Cr's other component
+  // rows that start 8-byte aligned, 4 samples wide at least: the threads write 4 samples a store
+  const bool wide        = width >= 4 && ( stride & 3 ) == 0 && ( uint( uint64_t( block ) ) & 7u ) == 0
+                    && ( ict == 0 || ( uint( uint64_t( other ) ) & 7u ) == 0 );
 
   if( ( flags & FLAG_ZERO ) != 0 )
   {
-    for( int s = tid; s < width * height; s += THREADS )
-    {
-      block[( s >> log2W ) * stride + ( s & ( width - 1 ) )] = int16_t( 0 );
-    }
+    fillBlock( block, stride, log2W, log2H, wide, tid, 0 );
     return;
   }
 
@@ -259,6 +344,30 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   }
 
   const uint lfnst = job[6];
+  if( lfnst == 0 && nx == 1 && ny == 1 && typeHor == 0 && typeVer == 0 )
+  {
+    // Only the DC coefficient, DCT-II both ways: DCT-II's first basis function is 64 at every point, so the residual
+    // is one value, the DC coefficient through both transforms' rounding and clipping.
+    const int dc  = dequant( int( levels[0] ), coefScale( sl, scale, width, 0, 0 ), rightShift, inputMaximum );
+    const int mid = clip3( COEFF_MIN, COEFF_MAX, ( dc * 64 + 64 ) >> 7 );
+    const int r   = clip3( COEFF_MIN, COEFF_MAX, ( mid * 64 + ( 1 << ( shift2 - 1 ) ) ) >> shift2 );
+    fillBlock( block, stride, log2W, log2H, wide, tid, r );
+    if( ict != 0 )
+    {
+      fillBlock( other, stride, log2W, log2H, wide, tid, jointResidual( ict, r ) );
+    }
+    return;
+  }
+
+  // Blocks 4 high too go in groups of 4 samples (rows in the vertical transform, columns in the horizontal one):
+  // the columns that hold levels rounded up to a power of 2 (4 at least), the rows to a multiple of 4, the added ones
+  // zero.
+  const bool groups = wide && height >= 4;
+  if( groups )
+  {
+    nx = nx <= 4 ? 4 : ( nx <= 8 ? 8 : ( nx <= 16 ? 16 : 32 ) );
+    ny = ( ny + 3 ) & ~3;
+  }
   if( lfnst != 0 )
   {
     // xInvLfnst: the set's matrix times the top-left 4x4 coefficients (only 8
@@ -281,7 +390,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     for( int s = tid; s < nx * ny; s += THREADS )
     {
       const int k = s / nx;
-      s_coef[k * 32 + s - k * nx] = 0;
+      s_coef[k * 32 + s - k * nx] = int16_t( 0 );
     }
     GroupMemoryBarrierWithGroupSync();
     if( tid < ( block8 ? 48 : 16 ) )
@@ -308,20 +417,77 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         x = transpose ? 4 + ( ( tid - 32 ) >> 2 ) : ( tid - 32 ) & 3;
         y = transpose ? ( tid - 32 ) & 3 : 4 + ( ( tid - 32 ) >> 2 );
       }
-      s_coef[y * 32 + x] = clip3( COEFF_MIN, COEFF_MAX, ( sum + 64 ) >> 7 );
+      s_coef[y * 32 + x] = int16_t( clip3( COEFF_MIN, COEFF_MAX, ( sum + 64 ) >> 7 ) );
     }
   }
   else
   {
     for( int s = tid; s < nx * ny; s += THREADS )
     {
-      const int k = s / nx;
-      const int x = s - k * nx;
-      s_coef[k * 32 + x] = dequant( int( levels[k * levelStride + x] ), coefScale( sl, scale, width, x, k ), rightShift, inputMaximum );
+      const int k     = s / nx;
+      const int x     = s - k * nx;
+      const int level = x <= lastX && k <= lastY ? int( levels[k * levelStride + x] ) : 0;
+      s_coef[k * 32 + x] = int16_t( dequant( level, coefScale( sl, scale, width, x, k ), rightShift, inputMaximum ) );
     }
   }
   GroupMemoryBarrierWithGroupSync();
 
+  if( groups )
+  {
+    // The vertical transform: a thread per column and 4 rows
+    const int log2Nx = firstbithigh( uint( nx ) );
+    for( int i = tid; i < ( height >> 2 ) << log2Nx; i += THREADS )
+    {
+      const int x   = i & ( nx - 1 );
+      const int y   = ( i >> log2Nx ) * 4;
+      int4      sum = int4( 64 );
+      for( int k = 0; k < ny; k += 4 )
+      {
+        [ForceUnroll]
+        for( int j = 0; j < 4; j++ )
+        {
+          const uint2 w = *(uint2*)at( mVer, uint( ( k + j ) * height + y ) );
+          sum += int( s_coef[( k + j ) * 32 + x] ) * int4( lo16( w.x ), hi16( w.x ), lo16( w.y ), hi16( w.y ) );
+        }
+      }
+      const int4 mid            = clamp( sum >> 7, int4( COEFF_MIN ), int4( COEFF_MAX ) );
+      s_mid[y * 32 + x]         = int16_t( mid.x );
+      s_mid[( y + 1 ) * 32 + x] = int16_t( mid.y );
+      s_mid[( y + 2 ) * 32 + x] = int16_t( mid.z );
+      s_mid[( y + 3 ) * 32 + x] = int16_t( mid.w );
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // The horizontal transform: a thread per 4-sample group of a row
+    const int log2G   = log2W - 2;
+    const int g       = tid & ( ( 1 << log2G ) - 1 );
+    const int y0      = tid >> log2G;
+    const int rowStep = THREADS >> log2G;
+    if( nx == 4 )
+    {
+      horizontalRows<4>( mHor, block, other, stride, width, height, g, y0, rowStep, shift2, ict );
+    }
+    else if( nx == 8 )
+    {
+      horizontalRows<8>( mHor, block, other, stride, width, height, g, y0, rowStep, shift2, ict );
+    }
+    else
+    {
+      for( int y = y0; y < height; y += rowStep )
+      {
+        int4 sum = int4( 1 << ( shift2 - 1 ) );
+        for( int k = 0; k < nx; k++ )
+        {
+          const uint2 w = *(uint2*)at( mHor, uint( k * width + 4 * g ) );
+          sum += int( s_mid[y * 32 + k] ) * int4( lo16( w.x ), hi16( w.x ), lo16( w.y ), hi16( w.y ) );
+        }
+        storeGroup( block, other, stride, 4 * g, y, clamp( sum >> shift2, int4( COEFF_MIN ), int4( COEFF_MAX ) ), ict );
+      }
+    }
+    return;
+  }
+
+  // Other blocks (2 wide or high, or rows not 8-byte aligned): a thread per sample
   for( int s = tid; s < nx * height; s += THREADS )
   {
     const int y   = s / nx;
@@ -329,9 +495,9 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     int       sum = 0;
     for( int k = 0; k < ny; k++ )
     {
-      sum += s_coef[k * 32 + x] * int( mVer[k * height + y] );
+      sum += int( s_coef[k * 32 + x] ) * int( mVer[k * height + y] );
     }
-    s_mid[y * 32 + x] = clip3( COEFF_MIN, COEFF_MAX, ( sum + 64 ) >> 7 );
+    s_mid[y * 32 + x] = int16_t( clip3( COEFF_MIN, COEFF_MAX, ( sum + 64 ) >> 7 ) );
   }
   GroupMemoryBarrierWithGroupSync();
 
@@ -342,7 +508,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     int       sum = 0;
     for( int k = 0; k < nx; k++ )
     {
-      sum += s_mid[y * 32 + k] * int( mHor[k * width + x] );
+      sum += int( s_mid[y * 32 + k] ) * int( mHor[k * width + x] );
     }
     const int r = clip3( COEFF_MIN, COEFF_MAX, ( sum + ( 1 << ( shift2 - 1 ) ) ) >> shift2 );
     block[y * stride + x] = int16_t( r );
