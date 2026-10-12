@@ -1136,6 +1136,24 @@ void Context::free( Buffer& buf )
   buf = Buffer();
 }
 
+void Context::freeAfterQueued( Buffer& buf )
+{
+  if( !buf.valid() )
+  {
+    return;
+  }
+  {
+    // (under the queue's lock nothing is queued meanwhile: the wait is for the work queued so far)
+    std::lock_guard<std::mutex> lock( m_queueMutex );
+    const VkResult result = m_api.vkQueueWaitIdle( m_queue );
+    if( result != VK_SUCCESS )
+    {
+      THROW_FATAL( "Vulkan: waiting for the compute queue failed (" << result << ")" );
+    }
+  }
+  free( buf );
+}
+
 VkPipeline Context::pipeline( int shaderId )
 {
   std::lock_guard<std::mutex> lock( m_pipelineMutex );

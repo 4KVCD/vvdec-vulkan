@@ -154,6 +154,10 @@ public:
   // Allocates a buffer (throws on failure) and frees one (not a range of a RangeArena's: give() takes those back).
   Buffer alloc( size_t size, MemKind kind );
   void   free( Buffer& buf );
+  // Frees a buffer once the work queued on the compute queue so far is done (it waits for that work): for a buffer that
+  // other threads' queued work may still use, such as the instances' shared planes. (Freed while queued work still
+  // uses it, its memory would go while the GPU reads it: a GPU fault.)
+  void   freeAfterQueued( Buffer& buf );
 
   // A pool for the device-local buffers that come and go with the pictures: their planes on the GPU and the scratch
   // planes of their filters. allocPooled() returns a buffer of the same size given back earlier, or a new one.

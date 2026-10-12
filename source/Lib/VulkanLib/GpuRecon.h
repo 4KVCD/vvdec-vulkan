@@ -103,7 +103,9 @@ struct JobsPush;   // (GpuReconFrontEnd.cpp)
 //   barrier over the work submitted before it. So an instance needs them only from the start of a picture's recording
 //   until its rest is submitted (GpuRecon::SharedTurn): the next picture's work, submitted later, runs after the work
 //   that used them. Two instances recording at the same time is rare (Beekeeper slower 4K: 5 pictures of 600 began
-//   while another was recorded, a recording taking ~1.6 ms), while each instance's own planes held 19 MB at 4K.
+//   while another was recorded, a recording taking ~1.6 ms), while each instance's own planes held 19 MB at 4K. That
+//   order covers using them, not freeing them: planes grown for a larger picture (RPR) are freed only once the work
+//   queued before is done (Context::freeAfterQueued), as other instances' pictures may still be using them.
 struct SharedReconBuffers
 {
   explicit SharedReconBuffers( Context* context ) : ctx( context ), frontEnd( context, kIdlePictures ) {}

@@ -793,7 +793,8 @@ void GpuRecon::bindDeferPlanes( const PelStorage& pic )
   }
   if( m_defer.size < size )
   {
-    m_ctx->free( m_defer );
+    // (the planes may be the instances' shared ones, which another instance's picture queued before may still use)
+    m_ctx->freeAfterQueued( m_defer );
     m_defer = m_ctx->alloc( size, MemKind::Device );
   }
   for( size_t comp = 0; comp < pic.bufs.size(); comp++ )
