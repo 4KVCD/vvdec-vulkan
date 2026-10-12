@@ -168,8 +168,40 @@ bool addCu()
   return true;
 }
 
+// Whether the map's entries inside the CU's block of channel type ch are ever looked up. The later CUs look up the
+// entries just left of and just above their blocks (cuAt's callers: the neighbours of contexts, of the QP prediction,
+// of the intra modes and of the partitioner), which are on the right column or the bottom row of the CUs there. Only
+// the CUs of a separate chroma tree look inside a luma CU: at the centre or the top-left of their own blocks
+// (coLocatedLumaCu, checkCclmAllowed, the QP of codingUnitAtPart).
+bool cuInsideLookedUp( Cu cu, int ch )
+{
+  return ch == 0 && ( g_dualTree || cu.treeType != TREE_D );
+}
+
+// Enters the map entry info for the units of the block of w4 x h4 units at index at: all of them, or only those of its
+// right column and bottom row (edgesOnly), the ones the later CUs look up. For a 128x128 CU that is 63 entries
+// instead of 1024.
+void setBlockEntries( int at, int w4, int h4, uint2 info, bool edgesOnly )
+{
+  if( edgesOnly )
+  {
+    // units 0 .. w4 - 1: the bottom row; then the right column above it
+    for( int u = g_lane; u < w4 + h4 - 1; u += 32 )
+    {
+      const bool bottom = u < w4;
+      mapSet( at + ( bottom ? h4 - 1 : u - w4 ) * kMapRow + ( bottom ? u : w4 - 1 ), info );
+    }
+    return;
+  }
+  const int lw4 = firstbithigh( uint( w4 ) );
+  for( int u = g_lane; u < w4 * h4; u += 32 )
+  {
+    mapSet( at + ( u >> lw4 ) * kMapRow + ( u & ( w4 - 1 ) ), info );
+  }
+}
+
 // Enters the finished CU into the CTU's maps: into the luma tree's map over its luma block, and into the chroma tree's
-// map over its chroma block
+// map over its chroma block (only where the later CUs look: cuInsideLookedUp)
 void writeCuInfo()
 {
   const Cu   cu   = g_cu;
@@ -194,12 +226,8 @@ void writeCuInfo()
     const uint2 info = uint2( base | uint( log2i( ch == 0 ? cu.lw : cu.cw ) ) << 26 | uint( log2i( ch == 0 ? cu.lh : cu.chh ) ) << 29, y );
     const int  w4  = max( bw >> 2, 1 );
     const int  h4  = max( bh >> 2, 1 );
-    const int  lw4 = firstbithigh( uint( w4 ) );
     const int  at  = ch * kMapChannel + ( ( by - y0 ) >> 2 ) * kMapRow + ( ( bx - x0 ) >> 2 );
-    for( int u = g_lane; u < w4 * h4; u += 32 )
-    {
-      mapSet( at + ( u >> lw4 ) * kMapRow + ( u & ( w4 - 1 ) ), info );
-    }
+    setBlockEntries( at, w4, h4, info, !cuInsideLookedUp( cu, ch ) );
   }
   GroupMemoryBarrierWithGroupSync();
 }
