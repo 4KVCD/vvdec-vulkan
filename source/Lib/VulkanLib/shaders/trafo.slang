@@ -252,57 +252,57 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 
   if( ( flags & FLAG_TS ) != 0 )
   {
-    // Transform skip: the dequantized levels are the residual. BDPCM first
-    // accumulates the levels along its direction (invResDPCM), one thread per
-    // row or column.
-    if( ( flags & FLAG_BDPCM_HOR ) != 0 )
+    // Transform skip: the dequantized levels are the residual. BDPCM first accumulates the levels along its direction
+    // (invResDPCM). The block's levels go into shared memory (a transform-skip block is 32 x 32 at most), dequantized
+    // there, or, with BDPCM, accumulated and dequantized there by a thread per row or column; then the residual goes
+    // out 4 samples a store where the block allows.
+    const bool bdpcm = ( flags & ( FLAG_BDPCM_HOR | FLAG_BDPCM_VER ) ) != 0;
+    for( int s = tid; s < width * height; s += THREADS )
     {
-      for( int y = tid; y < height; y += THREADS )
+      const int x     = s & ( width - 1 );
+      const int y     = s >> log2W;
+      const int level = x <= lastX && y <= lastY ? int( *at( levels, uint( y * levelStride + x ) ) ) : 0;
+      s_coef[y * 32 + x] = int16_t( bdpcm ? level : dequant( level, scale, rightShift, inputMaximum ) );
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if( bdpcm )
+    {
+      const bool hor = ( flags & FLAG_BDPCM_HOR ) != 0;
+      for( int line = tid; line < ( hor ? height : width ); line += THREADS )
       {
         int sum = 0;
-        for( int x = 0; x < width; x++ )
+        for( int k = 0; k < ( hor ? width : height ); k++ )
         {
-          const int level = int( levels[y * levelStride + x] );
-          sum             = x == 0 ? level : clip3( COEFF_MIN, COEFF_MAX, sum + level );
-          const int r     = dequant( sum, scale, rightShift, inputMaximum );
-          block[y * stride + x] = int16_t( r );
-          if( ict != 0 )
-          {
-            other[y * stride + x] = int16_t( jointResidual( ict, int( int16_t( r ) ) ) );
-          }
+          const int i     = hor ? line * 32 + k : k * 32 + line;
+          const int level = int( s_coef[i] );
+          sum             = k == 0 ? level : clip3( COEFF_MIN, COEFF_MAX, sum + level );
+          s_coef[i]       = int16_t( dequant( sum, scale, rightShift, inputMaximum ) );
         }
       }
+      GroupMemoryBarrierWithGroupSync();
     }
-    else if( ( flags & FLAG_BDPCM_VER ) != 0 )
+    if( wide )
     {
-      for( int x = tid; x < width; x += THREADS )
+      const int log2G = log2W - 2;   // the 4-sample groups of a row
+      for( int s = tid; s < height << log2G; s += THREADS )
       {
-        int sum = 0;
-        for( int y = 0; y < height; y++ )
-        {
-          const int level = int( levels[y * levelStride + x] );
-          sum             = y == 0 ? level : clip3( COEFF_MIN, COEFF_MAX, sum + level );
-          const int r     = dequant( sum, scale, rightShift, inputMaximum );
-          block[y * stride + x] = int16_t( r );
-          if( ict != 0 )
-          {
-            other[y * stride + x] = int16_t( jointResidual( ict, int( int16_t( r ) ) ) );
-          }
-        }
+        const int y = s >> log2G;
+        const int x = ( s & ( ( 1 << log2G ) - 1 ) ) * 4;
+        const int i = y * 32 + x;
+        storeGroup( block, other, stride, x, y, int4( int( s_coef[i] ), int( s_coef[i + 1] ), int( s_coef[i + 2] ), int( s_coef[i + 3] ) ), ict );
       }
     }
     else
     {
       for( int s = tid; s < width * height; s += THREADS )
       {
-        const int x     = s & ( width - 1 );
-        const int y     = s >> log2W;
-        const int level = x <= lastX && y <= lastY ? int( levels[y * levelStride + x] ) : 0;
-        const int r     = dequant( level, scale, rightShift, inputMaximum );
-        block[y * stride + x] = int16_t( r );
+        const int x = s & ( width - 1 );
+        const int y = s >> log2W;
+        const int r = int( s_coef[y * 32 + x] );
+        *at( block, uint( y * stride + x ) ) = int16_t( r );
         if( ict != 0 )
         {
-          other[y * stride + x] = int16_t( jointResidual( ict, int( int16_t( r ) ) ) );
+          *at( other, uint( y * stride + x ) ) = int16_t( jointResidual( ict, r ) );
         }
       }
     }
