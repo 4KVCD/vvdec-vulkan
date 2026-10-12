@@ -67,8 +67,12 @@ static constexpr size_t   kParseStateDone    = 1;         // kStDone: the substr
 // The bins per substream and dispatch (a CU counts as 32): a few ms alone. Longer submissions on the parse queue hold
 // up the pictures' front ends on the async compute queues (VideoQ 1080p, 2^16 bins: a picture's GPU work took 16 ms
 // from its submission instead of 7, 115 fps; 2^13: 7.8 ms, 149 fps; 2^14 as fast, 4K 46 -> 54 fps; 2^12: slower
-// again, from the many submissions).
-static constexpr int32_t  kParseBinBudget    = 1 << 14;
+// again, from the many submissions). With few substreams in parse (kFewStreams at most: pictures without WPP or
+// tiles parse as one substream each), the steps take kParseBinBudgetFew: a 4K all-intra picture has ~1.5M bins, and
+// short steps left the GPU idle between the submissions (isp_ai_4k: 2^14 21.4 fps, 2^16 25.1).
+static constexpr int32_t  kParseBinBudget    = ParseSlot::kStepBins;
+static constexpr int32_t  kParseBinBudgetFew = 1 << 16;
+static constexpr size_t   kFewStreams        = 32;
 static constexpr uint32_t kParseMaxStalls    = 4;         // submissions in a row without progress before giving up
 static constexpr uint32_t kParseLocalBits    = 12;        // a meta word: the CTU above the record's place in the CTU
 static constexpr size_t   kParseCounters     = 8;         // the staged CUs and TUs, the room of the 5 job lists, the levels
@@ -293,7 +297,7 @@ void ParseSlot::recordClear( VkCommandBuffer cmd )
   }
 }
 
-void ParseSlot::recordStep( VkCommandBuffer cmd ) const
+void ParseSlot::recordStep( VkCommandBuffer cmd, int32_t binBudget ) const
 {
   ParsePush push{};
   push.bits       = m_bits.addr;
@@ -314,7 +318,7 @@ void ParseSlot::recordStep( VkCommandBuffer cmd ) const
   push.levelCap   = int32_t( std::min<size_t>( m_levelCap, INT32_MAX ) );
   push.prof       = m_prof;
   push.state      = m_state.addr;
-  push.binBudget  = kParseBinBudget;
+  push.binBudget  = binBudget;
   push.cuMeta     = m_cuMeta.addr;
   push.tuMeta     = m_tuMeta.addr;
   push.counters   = m_counters.addr;
@@ -903,11 +907,17 @@ void ParseService::submitSteps()
   }
   startBarrier( m_ctx, m_cmd );
   // the pictures' dispatches side by side, a barrier after each round; then their compaction's first passes
+  size_t streams = 0;
+  for( const ParseSlot* slot: m_parsing )
+  {
+    streams += slot->input().numStreams;
+  }
+  const int32_t budget = streams <= kFewStreams ? kParseBinBudgetFew : kParseBinBudget;
   for( uint32_t step = 0; step < kStepsPerSubmission; step++ )
   {
     for( const ParseSlot* slot: m_parsing )
     {
-      slot->recordStep( m_cmd );
+      slot->recordStep( m_cmd, budget );
     }
     computeBarrier( m_ctx, m_cmd );
   }
