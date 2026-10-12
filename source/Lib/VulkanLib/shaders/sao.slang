@@ -14,10 +14,13 @@
 // just before it (isProcessDisabled).
 //
 // The filter compares with the deblocked samples, while the CTUs around may already be filtered. So two passes run,
-// a workgroup per list entry each (entry x + 32768 y, in rows of 32768 workgroups): pass 0 saves the deblocked samples around the CTU (the row above it and the row
-// below it, each from the column left of it to the column right of it, then the column left of it and the column
-// right of it) into the entry's ring; pass 1 reads the CTU and its ring into shared memory, applies SAO there and
-// writes the CTU back.
+// a workgroup per list entry each (entry x + 32768 y, in rows of 32768 workgroups): pass 0 saves the deblocked samples
+// around the CTU (the row above it and the row below it, each from the column left of it to the column right of it,
+// then the column left of it and the column right of it) into the entry's ring; pass 1 filters the CTU in bands of
+// BAND rows: it reads a band and the rows above and below it into shared memory (from the plane, the ring, or for the
+// row above, the previous band's last row as it was before being filtered, kept aside), applies SAO there and writes
+// the band back. (Bands keep the shared memory small, so that several workgroups fit a compute unit, also beside the
+// parse's: the whole CTU took 35.8 KB, one workgroup a compute unit.)
 
 #include "common.slang"
 
@@ -85,10 +88,13 @@ bool readable( int lx, int ly, int w, int h, int avail )
 }
 
 #define MAX_CTU 128
-// Pass 1: the CTU's samples, rows -1 .. h and columns -4 .. w + 3, in groups of 4 samples (two to a word); of the
-// first and last groups of rows 0 .. h - 1, only the samples of columns -1 and w are set
+#define BAND 32
+// Pass 1: a band of the CTU's samples, its rows y0 - 1 .. y0 + BAND and columns -4 .. w + 3, in groups of 4 samples
+// (two to a word); of the first and last groups of each row, only the samples of columns -1 and w are set
 #define TILE_GROUPS ( MAX_CTU / 4 + 2 )
-groupshared uint2 s_tile[( MAX_CTU + 2 ) * TILE_GROUPS];
+groupshared uint2 s_tile[( BAND + 2 ) * TILE_GROUPS];
+// the band's last row as deblocked (its groups 1 .. groups): the next band's row above
+groupshared uint2 s_carry[TILE_GROUPS];
 
 // A list entry's plane and CTU: the plane, its stride and size, the CTU's place and size in it (cut at the plane's
 // edges), the plane's subsampling shifts and component
@@ -164,7 +170,7 @@ struct Row
   }
 };
 
-// Row y (-1 .. h) of the tile around the CTU's group g (whose first sample is column 4 g)
+// Row y (-1 .. BAND, from the band's first row) of the tile around the CTU's group g (whose first sample is column 4 g)
 Row tileRow( int y, int g )
 {
   const int at = ( y + 1 ) * TILE_GROUPS + g + 1;
@@ -180,6 +186,123 @@ int offsetOf( uint4 prm, int i )
 {
   const uint w = i < 2 ? prm.z : prm.w;
   return int( w << uint( 16 - ( i & 1 ) * 16 ) ) >> 16;
+}
+
+// Pass 1: the band's rows y0 - 1 .. y0 + bh into the tile, whole groups each so that no two threads write the same
+// group: rows 0 .. h - 1 from the plane (their columns -1 and w from the ring), the band's row above from the ring
+// (the CTU's first band) or as the band before left it in s_carry, the row below from the ring (the CTU's last band)
+// or the plane (not filtered yet)
+void loadBand( Ctu c, int16_t* ring, int y0, int bh, int groups, bool aligned, int tid )
+{
+  for( int s = tid; s < ( bh + 2 ) * groups; s += 256 )
+  {
+    const int r = s / groups;   // tile row r: the band's row r - 1
+    const int g = s - r * groups;
+    const int y = y0 + r - 1;
+    uint2     v;
+    if( r == 0 && y0 > 0 )
+    {
+      v = s_carry[g + 1];
+    }
+    else if( y < 0 || y >= c.h )
+    {
+      // the ring's row above or below: its samples 4 g + 1 .. 4 g + 4 (its sample 0 is column -1)
+      const int at = y < 0 ? 0 : c.w + 2;
+      v            = packGroup( int( ring[at + 4 * g + 1] ), int( ring[at + 4 * g + 2] ), int( ring[at + 4 * g + 3] ), int( ring[at + 4 * g + 4] ) );
+    }
+    else
+    {
+      int16_t* p = c.plane + ( c.y0 + y ) * c.stride + c.x0 + 4 * g;
+      v          = aligned ? *(uint2*)p : packGroup( int( p[0] ), int( p[1] ), int( p[2] ), int( p[3] ) );
+    }
+    s_tile[r * TILE_GROUPS + g + 1] = v;
+  }
+  for( int r = tid; r < bh + 2; r += 256 )
+  {
+    // the columns left and right (sample 3 of the first group, sample 0 of the last): the ring's corners in its rows
+    // above and below, its columns in the CTU's rows
+    const int y = y0 + r - 1;
+    int       left, right;
+    if( y < 0 || y >= c.h )
+    {
+      const int at = y < 0 ? 0 : c.w + 2;
+      left         = int( ring[at] );
+      right        = int( ring[at + c.w + 1] );
+    }
+    else
+    {
+      left  = int( ring[2 * ( c.w + 2 ) + y] );
+      right = int( ring[2 * ( c.w + 2 ) + c.h + y] );
+    }
+    s_tile[r * TILE_GROUPS]              = packGroup( 0, 0, 0, left );
+    s_tile[r * TILE_GROUPS + groups + 1] = packGroup( right, 0, 0, 0 );
+  }
+}
+
+// Pass 1: SAO on the band's rows y0 .. y0 + bh - 1 of the CTU (in the tile), a group of 4 samples of a row at a time,
+// written to the plane
+void filterBand( Ctu c, uint4 prm, int type, int y0, int bh, int groups, bool aligned, int tid )
+{
+  const int maxV  = ( 1 << pc.bitDepth ) - 1;
+  const int avail = int( prm.y << 16 ) >> 16;
+  const int dx    = type == 1 ? 0 : ( type == 3 ? -1 : 1 );
+  const int dy    = type == 0 ? 0 : 1;
+  for( int s = tid; s < bh * groups; s += 256 )
+  {
+    const int r = s / groups;   // the band's row
+    const int g = s - r * groups;
+    const int y = y0 + r;       // the CTU's row
+    const Row r0 = tileRow( r, g );
+    int       out[4];
+    if( type == 4 )
+    {
+      // band offset: the four bands from the band position get the offsets
+      const int bandPos = int( prm.x ) >> 16;
+      [unroll]
+      for( int k = 0; k < 4; k++ )
+      {
+        const int v    = r0.at( 4 + k );
+        const int band = ( ( v >> ( pc.bitDepth - 5 ) ) - bandPos ) & 31;
+        out[k]         = band < 4 ? clip3( 0, maxV, v + offsetOf( prm, band ) ) : v;
+      }
+    }
+    else
+    {
+      // edge offset: each sample compared with (x - dx, y - dy) and (x + dx, y + dy), when both lie in CTUs the
+      // filter may read and the comparison crosses no virtual boundary (the rows above and below read only for the
+      // vertical and diagonal classes)
+      const Row  ra     = dy != 0 ? tileRow( r - 1, g ) : r0;
+      const Row  rb     = dy != 0 ? tileRow( r + 1, g ) : r0;
+      const bool inside = g > 0 && 4 * g + 4 < c.w && y > 0 && y + 1 < c.h;
+      const bool rowOff = dy != 0 && onBoundary( c.y0 + y, pc.numVbHor, pc.vbHor0, pc.vbHor1, pc.vbHor2, c.sy );
+      [unroll]
+      for( int k = 0; k < 4; k++ )
+      {
+        const int  j        = 4 + k;
+        const int  v        = r0.at( j );
+        const int  va       = type == 0 ? r0.at( j - 1 ) : ( type == 1 ? ra.at( j ) : ( type == 2 ? ra.at( j - 1 ) : ra.at( j + 1 ) ) );
+        const int  vb       = type == 0 ? r0.at( j + 1 ) : ( type == 1 ? rb.at( j ) : ( type == 2 ? rb.at( j + 1 ) : rb.at( j - 1 ) ) );
+        const int  lx       = 4 * g + k;
+        const bool disabled = rowOff || ( dx != 0 && onBoundary( c.x0 + lx, pc.numVbVer, pc.vbVer0, pc.vbVer1, pc.vbVer2, c.sx ) );
+        const bool may      = !disabled && ( inside || ( readable( lx - dx, y - dy, c.w, c.h, avail ) && readable( lx + dx, y + dy, c.w, c.h, avail ) ) );
+        const int  edge     = sgn( v - va ) + sgn( v - vb );
+        out[k]              = may && edge != 0 ? clip3( 0, maxV, v + offsetOf( prm, edge < 0 ? edge + 2 : edge + 1 ) ) : v;
+      }
+    }
+    int16_t* p = c.plane + ( c.y0 + y ) * c.stride + c.x0 + 4 * g;
+    if( aligned )
+    {
+      *(uint2*)p = packGroup( out[0], out[1], out[2], out[3] );
+    }
+    else
+    {
+      [unroll]
+      for( int k = 0; k < 4; k++ )
+      {
+        p[k] = int16_t( out[k] );
+      }
+    }
+  }
 }
 
 [shader( "compute" )]
@@ -206,98 +329,24 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     return;
   }
 
-  // The CTU's samples into the tile, then its ring: whole groups each, so that no two threads write the same group
-  const int  groups  = c.w >> 2;   // (the CTUs' widths, cut at the picture's edge too, are multiples of 4 in every plane)
-  const bool aligned = ( ( pc.aligned >> c.comp ) & 1 ) != 0;
-  for( int s = tid; s < c.h * groups; s += 256 )
+  const int   groups  = c.w >> 2;   // (the CTUs' widths, cut at the picture's edge too, are multiples of 4 in every plane)
+  const bool  aligned = ( ( pc.aligned >> c.comp ) & 1 ) != 0;
+  const uint4 prm     = *(uint4*)( pc.ctus + ( c.index * 3 + c.comp ) * 8 );
+  const int   type    = int( prm.x << 16 ) >> 16;
+  for( int y0 = 0; y0 < c.h; y0 += BAND )
   {
-    const int y = s / groups;
-    const int g = s - y * groups;
-    int16_t*  p = c.plane + ( c.y0 + y ) * c.stride + c.x0 + 4 * g;
-    s_tile[( y + 1 ) * TILE_GROUPS + g + 1] = aligned ? *(uint2*)p : packGroup( int( p[0] ), int( p[1] ), int( p[2] ), int( p[3] ) );
-  }
-  for( int s = tid; s < 2 * ( groups + 2 ); s += 256 )
-  {
-    // the rows above and below: the tile's group g (columns 4 g - 4 .. 4 g - 1) holds ring samples 4 g - 3 .. 4 g
-    const int below = s >= groups + 2 ? 1 : 0;
-    const int g     = s - below * ( groups + 2 );
-    const int at    = below * ( c.w + 2 );
-    int       v[4];
-    [unroll]
-    for( int k = 0; k < 4; k++ )
+    const int bh = min( BAND, c.h - y0 );
+    loadBand( c, ring, y0, bh, groups, aligned, tid );
+    GroupMemoryBarrierWithGroupSync();
+    filterBand( c, prm, type, y0, bh, groups, aligned, tid );
+    // (the band's last row kept as deblocked; then every thread done with the tile before the next band fills it)
+    if( y0 + bh < c.h )
     {
-      const int i = 4 * g - 3 + k;
-      v[k]        = i >= 0 && i < c.w + 2 ? int( ring[at + i] ) : 0;
-    }
-    s_tile[( below != 0 ? c.h + 1 : 0 ) * TILE_GROUPS + g] = packGroup( v[0], v[1], v[2], v[3] );
-  }
-  for( int y = tid; y < c.h; y += 256 )
-  {
-    // the columns left and right: sample 3 of the first group, sample 0 of the last
-    s_tile[( y + 1 ) * TILE_GROUPS]              = packGroup( 0, 0, 0, int( ring[2 * ( c.w + 2 ) + y] ) );
-    s_tile[( y + 1 ) * TILE_GROUPS + groups + 1] = packGroup( int( ring[2 * ( c.w + 2 ) + c.h + y] ), 0, 0, 0 );
-  }
-  GroupMemoryBarrierWithGroupSync();
-
-  // SAO, a group of 4 samples of a row at a time
-  const uint4 prm   = *(uint4*)( pc.ctus + ( c.index * 3 + c.comp ) * 8 );
-  const int   type  = int( prm.x << 16 ) >> 16;
-  const int   maxV  = ( 1 << pc.bitDepth ) - 1;
-  const int   avail = int( prm.y << 16 ) >> 16;
-  const int   dx    = type == 1 ? 0 : ( type == 3 ? -1 : 1 );
-  const int   dy    = type == 0 ? 0 : 1;
-  for( int s = tid; s < c.h * groups; s += 256 )
-  {
-    const int y  = s / groups;
-    const int g  = s - y * groups;
-    const Row rm = tileRow( y - 1, g );
-    const Row r0 = tileRow( y, g );
-    const Row rp = tileRow( y + 1, g );
-    int       out[4];
-    if( type == 4 )
-    {
-      // band offset: the four bands from the band position get the offsets
-      const int bandPos = int( prm.x ) >> 16;
-      [unroll]
-      for( int k = 0; k < 4; k++ )
+      for( int g = tid; g < groups; g += 256 )
       {
-        const int v    = r0.at( 4 + k );
-        const int band = ( ( v >> ( pc.bitDepth - 5 ) ) - bandPos ) & 31;
-        out[k]         = band < 4 ? clip3( 0, maxV, v + offsetOf( prm, band ) ) : v;
+        s_carry[g + 1] = s_tile[bh * TILE_GROUPS + g + 1];
       }
     }
-    else
-    {
-      // edge offset: each sample compared with (x - dx, y - dy) and (x + dx, y + dy), when both lie in CTUs the
-      // filter may read and the comparison crosses no virtual boundary
-      const bool inside = g > 0 && 4 * g + 4 < c.w && y > 0 && y + 1 < c.h;
-      const bool rowOff = dy != 0 && onBoundary( c.y0 + y, pc.numVbHor, pc.vbHor0, pc.vbHor1, pc.vbHor2, c.sy );
-      [unroll]
-      for( int k = 0; k < 4; k++ )
-      {
-        const int  j        = 4 + k;
-        const int  v        = r0.at( j );
-        const int  va       = type == 0 ? r0.at( j - 1 ) : ( type == 1 ? rm.at( j ) : ( type == 2 ? rm.at( j - 1 ) : rm.at( j + 1 ) ) );
-        const int  vb       = type == 0 ? r0.at( j + 1 ) : ( type == 1 ? rp.at( j ) : ( type == 2 ? rp.at( j + 1 ) : rp.at( j - 1 ) ) );
-        const int  lx       = 4 * g + k;
-        const bool disabled = rowOff || ( dx != 0 && onBoundary( c.x0 + lx, pc.numVbVer, pc.vbVer0, pc.vbVer1, pc.vbVer2, c.sx ) );
-        const bool may      = !disabled && ( inside || ( readable( lx - dx, y - dy, c.w, c.h, avail ) && readable( lx + dx, y + dy, c.w, c.h, avail ) ) );
-        const int  edge     = sgn( v - va ) + sgn( v - vb );
-        out[k]              = may && edge != 0 ? clip3( 0, maxV, v + offsetOf( prm, edge < 0 ? edge + 2 : edge + 1 ) ) : v;
-      }
-    }
-    int16_t* p = c.plane + ( c.y0 + y ) * c.stride + c.x0 + 4 * g;
-    if( aligned )
-    {
-      *(uint2*)p = packGroup( out[0], out[1], out[2], out[3] );
-    }
-    else
-    {
-      [unroll]
-      for( int k = 0; k < 4; k++ )
-      {
-        p[k] = int16_t( out[k] );
-      }
-    }
+    GroupMemoryBarrierWithGroupSync();
   }
 }
