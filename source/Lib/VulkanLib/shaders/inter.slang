@@ -92,6 +92,23 @@ struct Params
 
 [[vk::push_constant]] Params pc;
 
+// The picture's layout values. The variants built with WIDE=1 take the pictures of push.wide (GpuReconPrediction.cpp:
+// 4:2:0 planes whose rows start 16-byte aligned with margins of 16 samples or more, no wraparound, no subpictures
+// treated as pictures, no scaled references), for which these are constants: the compiler drops the paths those
+// pictures never take (inter's code 56 -> 47 KB, BDOF's 65 -> 56 KB, affine's 45 -> 25 KB, with fewer scalar
+// registers spilled; Beekeeper slower 4K +2.9%, Top Gun slower 1080p +1.0%).
+#ifndef WIDE
+#define WIDE 0
+#endif
+int  chromaScaleX() { return WIDE ? 1 : pc.scaleX; }
+int  chromaScaleY() { return WIDE ? 1 : pc.scaleY; }
+int  numComponents() { return WIDE ? 3 : pc.numComp; }
+bool widePlanes() { return WIDE != 0 || pc.wide != 0; }
+bool wrapSps() { return WIDE == 0 && pc.wrapSps != 0; }
+bool wrapPps() { return WIDE == 0 && pc.wrapPps != 0; }
+bool subpicsOn() { return WIDE == 0 && pc.subpicOn != 0; }
+bool refScaled( int slot ) { return WIDE == 0 && pc.refs[slot].scaled != 0; }
+
 // The pass's jobs start at the first job that the front end wrote, or at the buffer's start.
 uint* jobBase() { return pc.jobs + ( pc.count >= 0 ? 0u : pc.countAt[1] ) * 12; }
 
@@ -408,8 +425,8 @@ int rprCoeff( int comp, int filter, int phase, bool hpel, int k )
 // the 14-bit intermediate, else the final value.
 int rprSample( RefPlanes r, int16_t* p, int comp, int bx, int by, int col, int row, int2 mv, bool bi, bool hpel, int filterIndex )
 {
-  const int sx     = comp == 0 ? 0 : pc.scaleX;
-  const int sy     = comp == 0 ? 0 : pc.scaleY;
+  const int sx     = comp == 0 ? 0 : chromaScaleX();
+  const int sy     = comp == 0 ? 0 : chromaScaleY();
   const int refW   = int( r.size & 0xffffu ) >> sx;
   const int refH   = int( r.size >> 16 ) >> sy;
   const int stride = comp == 0 ? int( r.strides & 0xffffu ) : int( r.strides >> 16 );
@@ -550,7 +567,7 @@ static int4 g_bounds;
 void setBounds( int cuX, int cuY )
 {
   g_bounds = int4( 0, 0, pc.picWidth - 1, pc.picHeight - 1 );
-  if( pc.subpicOn != 0 )
+  if( subpicsOn() )
   {
     uint16_t* r = pc.subpics + ( ( cuY >> pc.ctuLog2 ) * pc.widthInCtus + ( cuX >> pc.ctuLog2 ) ) * 4;
     g_bounds    = int4( int( r[0] ), int( r[1] ), int( r[2] ), int( r[3] ) );
@@ -560,8 +577,8 @@ void setBounds( int cuX, int cuY )
 // g_bounds in component comp's samples
 int4 boundsOf( int comp )
 {
-  const int sx = comp == 0 ? 0 : pc.scaleX;
-  const int sy = comp == 0 ? 0 : pc.scaleY;
+  const int sx = comp == 0 ? 0 : chromaScaleX();
+  const int sy = comp == 0 ? 0 : chromaScaleY();
   return int4( g_bounds.x >> sx, g_bounds.y >> sy, ( ( g_bounds.z + 1 ) >> sx ) - 1, ( ( g_bounds.w + 1 ) >> sy ) - 1 );
 }
 
@@ -573,8 +590,8 @@ int refAt( int16_t* p, int comp, int x, int y, bool wrap )
   const int4 b = boundsOf( comp );
   if( wrap )
   {
-    const int w      = comp == 0 ? pc.picWidth : pc.picWidth >> pc.scaleX;
-    const int offset = comp == 0 ? pc.wrapOffset : pc.wrapOffset >> pc.scaleX;
+    const int w      = comp == 0 ? pc.picWidth : pc.picWidth >> chromaScaleX();
+    const int offset = comp == 0 ? pc.wrapOffset : pc.wrapOffset >> chromaScaleX();
     x = x < 0 ? ( -x - 1 < offset ? x + offset : 0 ) : ( x >= w ? ( x - w < offset ? x - offset : w - 1 ) : x );
   }
   return int( p[clamp( y, b.y, b.w ) * ( comp == 0 ? pc.stride0 : pc.stride12 ) + clamp( x, b.x, b.z )] );
@@ -620,7 +637,7 @@ int2 wrapClipMv( int2 mv, int x, int y, int w, out bool shifted )
 // wraparound, wrapClipMv instead.
 int2 clipMv( int2 mv, int x, int y, int w )
 {
-  if( pc.wrapSps != 0 )
+  if( wrapSps() )
   {
     bool shifted;
     return wrapClipMv( mv, x, y, w, shifted );
@@ -655,8 +672,8 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
   // The motion in the component's samples (1/16 luma sample is 1 / ( 16 <<
   // scale ) of a chroma sample), and the chroma filter's phase in 32nds
   // (InterpolationFilter's frac << ( 1 - scale )).
-  const int sx       = comp == 0 ? 0 : pc.scaleX;
-  const int sy       = comp == 0 ? 0 : pc.scaleY;
+  const int sx       = comp == 0 ? 0 : chromaScaleX();
+  const int sy       = comp == 0 ? 0 : chromaScaleY();
   const int xFrac    = mv.x & ( ( 16 << sx ) - 1 );
   const int yFrac    = mv.y & ( ( 16 << sy ) - 1 );
   const int xPhase   = comp == 0 ? xFrac : xFrac << ( 1 - sx );
@@ -1881,7 +1898,7 @@ int roundAffine( int v, int shift )
 int2 affineClip( int2 mv, int x, int y, int w, int cuX, int cuY, out bool wrap )
 {
   wrap = false;
-  if( pc.wrapPps != 0 )
+  if( wrapPps() )
   {
     bool shifted;
     const int2 clipped = wrapClipMv( mv, x, y, w, shifted );
@@ -1963,7 +1980,7 @@ void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, in
   const int  oy     = ( y - cuY ) >> 2;
   const int  sx     = ox + sb % nsx;      // the thread's subblock in the CU
   const int  sy     = oy + sb / nsx;
-  if( pc.refs[slot].scaled != 0 )
+  if( refScaled( slot ) )
   {
     // A scaled reference (RPR): each 4x4 block by xPredInterBlkRPR with
     // filter index 2, without PROF.
@@ -1989,7 +2006,7 @@ void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, in
   if( mine )
   {
     const int2 mv   = s_sbMv[list][sb];
-    const bool wrap = s_sbWrap[list][sb] != 0;
+    const bool wrap = wrapPps() && s_sbWrap[list][sb] != 0;   // (wrapPps(): constant in the WIDE variants)
     const int  bx   = cuX + 4 * sx + ( mv.x >> 4 ) - 2;
     const int  by   = cuY + 4 * sy + ( mv.y >> 4 ) - 2;
     for( int r = v; r < 9; r += 4 )
@@ -2150,15 +2167,15 @@ void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, in
 // four (4:2:0).
 int2 affineChromaMv( uint job[24], int list, int csx, int csy, int cw, int ch, bool spread, int cuX, int cuY, out bool wrap )
 {
-  const int lx = cuX + ( ( 4 * csx ) << pc.scaleX );   // the subblock's luma position
-  const int ly = cuY + ( ( 4 * csy ) << pc.scaleY );
-  if( pc.scaleX == 0 )
+  const int lx = cuX + ( ( 4 * csx ) << chromaScaleX() );   // the subblock's luma position
+  const int ly = cuY + ( ( 4 * csy ) << chromaScaleY() );
+  if( chromaScaleX() == 0 )
   {
     return affineClip( affineMv( job, list, csx, csy, cw, ch, spread ), lx, ly, 4, cuX, cuY, wrap );
   }
-  const int  sy  = csy << pc.scaleY;
-  const int2 sum = affineMv( job, list, 2 * csx, sy, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, sy + pc.scaleY, cw, ch, spread );
-  return affineClip( int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) ), lx, ly, 4 << pc.scaleX, cuX, cuY, wrap );
+  const int  sy  = csy << chromaScaleY();
+  const int2 sum = affineMv( job, list, 2 * csx, sy, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, sy + chromaScaleY(), cw, ch, spread );
+  return affineClip( int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) ), lx, ly, 4 << chromaScaleX(), cuX, cuY, wrap );
 }
 
 // A list's chroma prediction of the tile for component comp: the thread's samples t = tid + THREADS k, at 14 bits
@@ -2167,43 +2184,43 @@ void affineChroma( int tid, uint job[24], int list, int comp, int x, int y, int 
                    bool bi, out int pred[PER_THREAD] )
 {
   const int slot = int( ( job[7] >> ( 8 * list ) ) & 255 );
-  if( pc.refs[slot].scaled != 0 )
+  if( refScaled( slot ) )
   {
     // A scaled reference (RPR): each chroma 4x4 block by xPredInterBlkRPR with
     // filter index 2, its motion clipped as the luma's is.
     const RefPlanes r     = pc.refs[slot];
-    const int       tw    = w >> pc.scaleX;
+    const int       tw    = w >> chromaScaleX();
     const int       log2T = firstbithigh( uint( tw ) );
     for( int k = 0; k < PER_THREAD; k++ )
     {
       const int t = tid + THREADS * k;
       pred[k]     = 0;
-      if( t < tw * ( h >> pc.scaleY ) )
+      if( t < tw * ( h >> chromaScaleY() ) )
       {
         const int i   = t & ( tw - 1 );
         const int j   = t >> log2T;
-        const int csx = ( ( ( x - cuX ) >> pc.scaleX ) >> 2 ) + ( i >> 2 );
-        const int csy = ( ( ( y - cuY ) >> pc.scaleY ) >> 2 ) + ( j >> 2 );
+        const int csx = ( ( ( x - cuX ) >> chromaScaleX() ) >> 2 ) + ( i >> 2 );
+        const int csy = ( ( ( y - cuY ) >> chromaScaleY() ) >> 2 ) + ( j >> 2 );
         int2      mv;
-        if( pc.scaleX == 0 )
+        if( chromaScaleX() == 0 )
         {
           mv = affineMv( job, list, csx, csy, cw, ch, spread );
         }
         else
         {
-          const int  ly  = csy << pc.scaleY;
-          const int2 sum = affineMv( job, list, 2 * csx, ly, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, ly + pc.scaleY, cw, ch, spread );
+          const int  ly  = csy << chromaScaleY();
+          const int2 sum = affineMv( job, list, 2 * csx, ly, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, ly + chromaScaleY(), cw, ch, spread );
           mv             = int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) );
         }
         mv      = affineClipScaled( mv, cuX, cuY );
-        pred[k] = rprSample( r, comp == 1 ? r.cb : r.cr, comp, ( cuX >> pc.scaleX ) + 4 * csx, ( cuY >> pc.scaleY ) + 4 * csy, i & 3, j & 3, mv, bi, false, 2 );
+        pred[k] = rprSample( r, comp == 1 ? r.cb : r.cr, comp, ( cuX >> chromaScaleX() ) + 4 * csx, ( cuY >> chromaScaleY() ) + 4 * csy, i & 3, j & 3, mv, bi, false, 2 );
       }
     }
     return;
   }
   int16_t*  ref      = refPlane( slot, comp );
-  const int sx       = pc.scaleX;
-  const int sy       = pc.scaleY;
+  const int sx       = chromaScaleX();
+  const int sy       = chromaScaleY();
   const int tw       = w >> sx;   // the tile's chroma size
   const int th       = h >> sy;
   const int ncx      = tw >> 2;   // the tile's chroma subblocks across
@@ -2223,7 +2240,7 @@ void affineChroma( int tid, uint job[24], int list, int comp, int x, int y, int 
     const int  csx  = ocx + cb % ncx;
     const int  csy  = ocy + cb / ncx;
     const int2 mv   = s_cbMv[list][cb];
-    const bool wrap = s_cbWrap[list][cb] != 0;
+    const bool wrap = wrapPps() && s_cbWrap[list][cb] != 0;   // (wrapPps(): constant in the WIDE variants)
     s_pool[s]       = int16_t( refAt( ref, comp, ( cuX >> sx ) + 4 * csx + ( mv.x >> ( 4 + sx ) ) - 1 + c, ( cuY >> sy ) + 4 * csy + ( mv.y >> ( 4 + sy ) ) - 1 + r, wrap ) );
   }
   GroupMemoryBarrierWithGroupSync();
@@ -2318,7 +2335,7 @@ void affineMain( int tid, int index )
     {
       const bool spread = ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
       const int  nsx    = w >> 2;
-      const int  ncx    = ( w >> pc.scaleX ) >> 2;
+      const int  ncx    = ( w >> chromaScaleX() ) >> 2;
       bool       wrap;
       if( e < 16 && e < nsx * ( h >> 2 ) )
       {
@@ -2327,11 +2344,11 @@ void affineMain( int tid, int index )
         s_sbMv[list][e]    = affineClip( affineMv( job, list, sx, sy, cw, ch, spread ), cuX + 4 * sx, cuY + 4 * sy, 4, cuX, cuY, wrap );
         s_sbWrap[list][e]  = wrap ? 1 : 0;
       }
-      else if( e >= 16 && pc.numComp > 1 && e - 16 < ncx * ( ( h >> pc.scaleY ) >> 2 ) )
+      else if( e >= 16 && numComponents() > 1 && e - 16 < ncx * ( ( h >> chromaScaleY() ) >> 2 ) )
       {
         const int c        = e - 16;
-        const int csx      = ( ( ( x - cuX ) >> pc.scaleX ) >> 2 ) + c % ncx;
-        const int csy      = ( ( ( y - cuY ) >> pc.scaleY ) >> 2 ) + c / ncx;
+        const int csx      = ( ( ( x - cuX ) >> chromaScaleX() ) >> 2 ) + c % ncx;
+        const int csy      = ( ( ( y - cuY ) >> chromaScaleY() ) >> 2 ) + c / ncx;
         s_cbMv[list][c]    = affineChromaMv( job, list, csx, csy, cw, ch, spread, cuX, cuY, wrap );
         s_cbWrap[list][c]  = wrap ? 1 : 0;
       }
@@ -2390,10 +2407,10 @@ void affineMain( int tid, int index )
   }
   int pred0[PER_THREAD], pred1[PER_THREAD];
   // The chroma, one component at a time (reusing luma's prediction arrays).
-  const int tw    = w >> pc.scaleX;   // the tile's chroma size
-  const int th    = h >> pc.scaleY;
+  const int tw    = w >> chromaScaleX();   // the tile's chroma size
+  const int th    = h >> chromaScaleY();
   const int log2C = log2Int( tw );
-  for( int comp = 1; comp < pc.numComp; comp++ )
+  for( int comp = 1; comp < numComponents(); comp++ )
   {
     for( int list = 0; list < 2; list++ )
     {
@@ -2419,7 +2436,7 @@ void affineMain( int tid, int index )
       const int t = tid + THREADS * k;
       if( t < tw * th )
       {
-        const int at = ( ( y >> pc.scaleY ) + ( t >> log2C ) ) * pc.stride12 + ( x >> pc.scaleX ) + ( t & ( tw - 1 ) );
+        const int at = ( ( y >> chromaScaleY() ) + ( t >> log2C ) ) * pc.stride12 + ( x >> chromaScaleX() ) + ( t & ( tw - 1 ) );
         int       v  = ( flags & FLAG_WP ) != 0 ? wpSample( job[8 + comp], job[11], comp, pred0[k], pred1[k], maxVal )
                        : ( bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k] );
         if( ( flags & ( FLAG_RES_Y << comp ) ) != 0 )
@@ -2467,7 +2484,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const bool dmvr  = ( flags & FLAG_DMVR ) != 0;
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
-  if( ( flags & ( FLAG_GEO | FLAG_WP ) ) == 0 && pc.wide != 0 && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
+  if( ( flags & ( FLAG_GEO | FLAG_WP ) ) == 0 && widePlanes() && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
   {
     tile16( tid, index, job, x, y, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel );
     return;
@@ -2480,7 +2497,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     // The bilinear predictions of the subblock's (w + 4) x (h + 4) samples
     // from the merge motion minus 2 samples (with the PPS's wraparound, from
     // the wraparound copy).
-    const bool wrapB  = pc.wrapPps != 0;
+    const bool wrapB  = wrapPps();
     const int2 start0 = clipMv( mv0, cuX, cuY, cuW ) - int2( 32, 32 );
     const int2 start1 = clipMv( mv1, cuX, cuY, cuW ) - int2( 32, 32 );
     const int  bw     = w + 4;
@@ -2600,11 +2617,11 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const bool bdof = false;
 #endif
   [loop]
-  for( int comp = 0; comp < pc.numComp; comp++ )
+  for( int comp = 0; comp < numComponents(); comp++ )
   {
     // The component's subsampling, and the motion's fraction bits in its samples
-    const int sx     = comp == 0 ? 0 : pc.scaleX;
-    const int sy     = comp == 0 ? 0 : pc.scaleY;
+    const int sx     = comp == 0 ? 0 : chromaScaleX();
+    const int sy     = comp == 0 ? 0 : chromaScaleY();
     const int bx     = x >> sx, by = y >> sy, bw = w >> sx, bh = h >> sy;
     const int shiftX = 4 + sx;
     const int shiftY = 4 + sy;
@@ -2633,14 +2650,14 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         // prefetched window of the merge motion (xPrefetchPad: with the PPS's
         // wraparound, from the copy unless wrapClipMv moves the window's motion).
         clipped = clipMv( mv, x, y, w );
-        wrap    = pc.wrapPps != 0;
+        wrap    = wrapPps();
         const int2 deltaInt = int2( ( mv.x >> shiftX ) - ( merge.x >> shiftX ), ( mv.y >> shiftY ) - ( merge.y >> shiftY ) );
         if( deltaInt.x != 0 || deltaInt.y != 0 )
         {
           const int  half   = comp == 0 ? 3 : 1;
           const int2 before = merge - int2( half << shiftX, half << shiftY );
           int2       start;
-          if( pc.wrapPps != 0 )
+          if( wrapPps() )
           {
             bool shifted;
             start = wrapClipMv( before, x, y, w, shifted );
@@ -2660,14 +2677,14 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         // xPredInterUni: the motion is clipped at the CU (or SbTMVP's joined
         // sub-PUs), and read from the wraparound copy with the SPS's wraparound.
         clipped = clipMv( mv, cuX, cuY, cuW );
-        wrap    = pc.wrapSps != 0;
+        wrap    = wrapSps();
       }
       // One call per filter length keeps the shader's code small (it ran slower
       // when it outgrew the instruction cache).
       // (weighted prediction starts from the 14-bit predictions, for a uni-prediction too)
       const bool hi = bi || ( flags & FLAG_WP ) != 0;
       int        pred[PER_THREAD];
-      if( pc.refs[slot].scaled != 0 )
+      if( refScaled( slot ) )
       {
         // A scaled reference (RPR): the motion is not clipped (xPredInterUni),
         // and the samples are predicted one by one (no DMVR, no BDOF),

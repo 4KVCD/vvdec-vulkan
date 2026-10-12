@@ -1177,12 +1177,13 @@ VkPipeline Context::pipeline( int shaderId )
   info.stage.module = module;
   info.stage.pName  = "main";
   info.layout       = m_layout;
-  // waves of 32 threads, but for inter's three variants (VideoQ 4K on a Radeon 780M: intra 1.50 -> 1.31 ms, ALF luma
+  // waves of 32 threads, but for inter's variants (VideoQ 4K on a Radeon 780M: intra 1.50 -> 1.31 ms, ALF luma
   // 1.54 -> 1.36, the residuals 0.33 -> 0.28, but inter 4.4 -> 5.2 ms; Beekeeper 4K slower preset: BDOF's tiles 1.31
   // -> 1.23 ms in waves of 64), where the driver's choice, waves of 64, is better
   VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
   size.requiredSubgroupSize = 32;
-  const bool inter          = shaderId == kShader_inter || shaderId == kShader_inter_bdof || shaderId == kShader_inter_affine;
+  const bool inter = shaderId == kShader_inter || shaderId == kShader_inter_bdof || shaderId == kShader_inter_affine || shaderId == kShader_inter_wide
+                     || shaderId == kShader_inter_bdof_wide || shaderId == kShader_inter_affine_wide;
   if( m_wave32 && !inter )
   {
     info.stage.pNext = &size;

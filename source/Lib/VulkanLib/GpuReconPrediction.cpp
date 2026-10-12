@@ -339,13 +339,16 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
     }
   }
 
-  // Each set of tiles has its own shader variant: the regular tiles, BDOF's, and the affine pairs. The sets cover
-  // different tiles, so their dispatches need no barriers between them.
+  // Each set of tiles has its own shader variant: the regular tiles, BDOF's, and the affine pairs, each also built for
+  // the pictures of push.wide (WIDE=1: their layout values are constants, see inter.slang). The sets cover different
+  // tiles, so their dispatches need no barriers between them.
+  static const int kInterShaders[2][3] = { { kShader_inter, kShader_inter_bdof, kShader_inter_affine },
+                                           { kShader_inter_wide, kShader_inter_bdof_wide, kShader_inter_affine_wide } };
+  const int* shaders = kInterShaders[push.wide ? 1 : 0];
   if( m_useFrontEnd )
   {
     // each set from its first job, with its count on the GPU
-    static const int shaders[3] = { kShader_inter, kShader_inter_bdof, kShader_inter_affine };
-    push.count                  = -1;
+    push.count = -1;
     for( int set = 0; set < 3; set++ )
     {
       const FrontPass pass = FrontPass( kPassInter + set );
@@ -360,7 +363,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   // one workgroup per tile (an affine pair counts as one)
   if( counts.regular > 0 )
   {
-    bind( kShader_inter );
+    bind( shaders[0] );
     pushConstants( push );
     dispatchJobs( counts.regular );
   }
@@ -368,7 +371,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   {
     push.jobs  = buf.addr + counts.regular * sizeof( InterJob );
     push.count = int32_t( counts.bdof );
-    bind( kShader_inter_bdof );
+    bind( shaders[1] );
     pushConstants( push );
     dispatchJobs( counts.bdof );
   }
@@ -376,7 +379,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   {
     push.jobs  = buf.addr + ( counts.regular + counts.bdof ) * sizeof( InterJob );
     push.count = int32_t( counts.affine / 2 );
-    bind( kShader_inter_affine );
+    bind( shaders[2] );
     pushConstants( push );
     dispatchJobs( counts.affine / 2 );
   }
