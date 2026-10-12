@@ -277,12 +277,16 @@ def build_jobs():
             refs = read_opl(os.path.join(REFS, t + '.opl'))
             fg = 1 if '-fg' in extra else 0
             jobs.append(Job(f'{t}/{mode}', bit, mode, tool_frames if tool_frames and tool_frames < len(refs) else None, refs, film_grain=fg))
-        # the slower-preset cuts whole in every tier; the long streams' first frames in the wide tier, all in the full one
+        # the slower-preset cuts whole in every tier; the long streams' first frames in the wide tier, and in the full one
+        # all their references but the last 8: upstream's vvdecapp made them stopping after that many frames, which flushes
+        # the pictures decoded so far, so its last frames are other pictures than a decode that goes on outputs (Beekeeper
+        # slower 4K, -f 600: frame 598 differs); vvdecbatch goes on (and the whole Beekeeper, 4305 frames, outlasts the
+        # timeout beside 7 other decodes)
         for s in ('bee_slower_cut', 'tg_slower_cut'):
             jobs.append(Job(f'{s}/{mode}', QA_REF_STREAMS[s][0], mode, None, read_opl(os.path.join(REFS, s + '.opl'))))
         if tier != 'smoke':
             for s in ('beekeeper_slower_4K', 'topgun_slower_1080p'):
-                frames = (240 if '4K' in s else 600) if tier == 'wide' else None
+                frames = (240 if '4K' in s else 600) if tier == 'wide' else QA_REF_STREAMS[s][1] - 8
                 jobs.append(Job(f'{s}/{mode}', QA_REF_STREAMS[s][0], mode, frames, read_opl(os.path.join(REFS, s + '.opl'))))
         if tier == 'wide':
             jobs.append(Job(f'vq1080/{mode}', QA_REF_STREAMS['videoq_1080p'][0], mode, 600, read_opl(os.path.join(REFS, 'videoq_1080p.opl'))))
@@ -368,17 +372,27 @@ class Worker:
             except queue.Empty:
                 if time.time() - self.job.start > self.job.timeout:
                     self.proc.kill()
-                    return 'TIMEOUT'
+                    return self.keep('TIMEOUT')
                 return None
             if line is None:
-                return f'WORKER DIED (rc {self.proc.wait()})'
+                return self.keep(f'WORKER DIED (rc {self.proc.wait()})')
             m = re.match(r'job \d+ end (.*)', line)
             if m:
-                return self.job.check_frames(self.got, m.group(1))
+                self.got.append(line)
+                return self.keep(self.job.check_frames(self.got[:-1], m.group(1)))
             if line.startswith('job '):
                 self.got.append(line)
             elif line.strip():
                 self.got.append(line)   # (the library's error messages count for the check's lines too)
+
+    def keep(self, result):
+        """Returns result; when the job did not pass, first writes its lines to fastcheck_logs/<job>_batch.log: the
+        decode alone afterwards writes a log of its own, and a failure that comes only beside other decodes may not
+        come again."""
+        if result != 'PASS':
+            with open(os.path.join(LOGS, self.job.jid.replace('/', '_') + '_batch.log'), 'w') as f:
+                f.write('\n'.join(self.got + [result]) + '\n')
+        return result
 
     def close(self):
         try:

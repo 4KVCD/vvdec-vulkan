@@ -91,6 +91,22 @@ void logErrors( void*, int level, const char* fmt, va_list args )
   }
 }
 
+// The decoder's last error with its details (an exception's message, which says where it came from), on one line
+std::string lastError( vvdecDecoder* dec )
+{
+  std::string error   = vvdec_get_last_error( dec );
+  const char* details = vvdec_get_last_additional_error( dec );
+  if( details && *details )
+  {
+    error += std::string( ": " ) + details;
+  }
+  for( char& c: error )
+  {
+    c = c == '\n' || c == '\r' ? ' ' : c;   // (the job's end line must stay one line)
+  }
+  return error;
+}
+
 // Prints an output frame's per-plane MD5 and gives it back to the decoder. Returns false for a field picture.
 bool handleFrame( vvdecDecoder* dec, vvdecFrame* frame, int index, unsigned& frames )
 {
@@ -177,7 +193,7 @@ void decodeJob( int index, const Job& job )
     // as vvdecapp: a broken input unit is only a warning; the end of the input still comes with a frame
     if( ret != VVDEC_OK && ret != VVDEC_TRY_AGAIN && ret != VVDEC_EOF && ret != VVDEC_ERR_DEC_INPUT )
     {
-      error = vvdec_get_last_error( dec );
+      error = lastError( dec );
       break;
     }
     if( frame && frame->ctsValid )
@@ -198,7 +214,7 @@ void decodeJob( int index, const Job& job )
     const int   ret   = vvdec_flush( dec, &frame );
     if( ret != VVDEC_OK && ret != VVDEC_EOF )
     {
-      error = vvdec_get_last_error( dec );
+      error = lastError( dec );
       break;
     }
     // as vvdecapp: a frame can come with the end; the flush is over when none comes
