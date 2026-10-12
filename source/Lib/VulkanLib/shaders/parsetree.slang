@@ -177,7 +177,7 @@ static const int kMaxLevels = 24;   // the deepest stack of levels (deeper gives
 
 // Per level below the current one (as Level below): the split that made it (CTU_LEVEL at level 0, whose one part is
 // the CTU), the index of its current part, its number of parts, the CUs above and left of its current part
-// (setNeighborCu), its quantization group flags, and the area it splits
+// (setNeighborCu), its quantization group flags; and per level including the current one, the area it splits
 groupshared int s_lvSplit[kMaxLevels];
 groupshared int s_lvIdx[kMaxLevels];
 groupshared int s_lvNum[kMaxLevels];
@@ -219,23 +219,28 @@ struct Level
   int   idx;     // the current part
   int   num;     // the parts
   int   qg;      // qgEnable | qgChromaEnable << 1
-  int4  area;    // the area split (luma samples: x, y, w, h)
+  int4  part;    // the current part's area (luma samples: x, y, w, h); the area split is in s_lvArea[g_p.top]
   uint2 above;   // the CUs above and left of the current part (setNeighborCu)
   uint2 left;
 };
 
 static Level g_lv;
 
-// Keeps the current level in shared memory as level l
+// Keeps the current level in shared memory as level l (its area split is there already)
 void saveLevel( int l )
 {
   s_lvSplit[l] = g_lv.split;
   s_lvIdx[l]   = g_lv.idx;
   s_lvNum[l]   = g_lv.num;
   s_lvQg[l]    = g_lv.qg;
-  s_lvArea[l]  = g_lv.area;
   s_lvAbove[l] = g_lv.above;
   s_lvLeft[l]  = g_lv.left;
+}
+
+// The area level l splits
+int4 levelArea( int l )
+{
+  return int4( uni( s_lvArea[l].x ), uni( s_lvArea[l].y ), uni( s_lvArea[l].z ), uni( s_lvArea[l].w ) );
 }
 
 // Makes level l, kept in shared memory, the current level again
@@ -245,7 +250,7 @@ void loadLevel( int l )
   g_lv.idx   = uni( s_lvIdx[l] );
   g_lv.num   = uni( s_lvNum[l] );
   g_lv.qg    = uni( s_lvQg[l] );
-  g_lv.area  = int4( uni( s_lvArea[l].x ), uni( s_lvArea[l].y ), uni( s_lvArea[l].z ), uni( s_lvArea[l].w ) );
+  g_lv.part  = partArea( g_lv.split, g_lv.idx, levelArea( l ) );
   g_lv.above = uni( s_lvAbove[l] );
   g_lv.left  = uni( s_lvLeft[l] );
 }
@@ -281,7 +286,7 @@ int4 partArea( int split, int idx, int4 a )
 // The area of the current part (Partitioner::currArea), in luma samples
 int4 currArea()
 {
-  return partArea( g_lv.split, g_lv.idx, g_lv.area );
+  return g_lv.part;
 }
 
 // Whether the current part may start a quantization group for the delta QP (Partitioner::currQgEnable) and for the
@@ -339,7 +344,8 @@ void initCtu( int chType )
   g_lv.idx                = 0;
   g_lv.num                = 1;
   g_lv.qg                 = 3;
-  g_lv.area               = int4( g_ctuX << g_log2Ctu, g_ctuY << g_log2Ctu, g_ctuSize, g_ctuSize );
+  g_lv.part               = int4( g_ctuX << g_log2Ctu, g_ctuY << g_log2Ctu, g_ctuSize, g_ctuSize );
+  s_lvArea[0]             = g_lv.part;
   setNeighborCu();
   // The partition limits, picked as vvdec does with GDR_ADJ: the luma (or single tree) limits of intra or inter
   // slices, or the dual tree chroma's
@@ -373,7 +379,8 @@ void splitCurrArea( int split )
   g_lv.split                = split;
   g_lv.idx                  = 0;
   g_lv.num                  = split == CU_QUAD_SPLIT ? 4 : ( split == CU_TRIH_SPLIT || split == CU_TRIV_SPLIT ? 3 : 2 );
-  g_lv.area                 = area;
+  g_lv.part                 = partArea( split, 0, area );
+  s_lvArea[l]               = area;
   if( split == CU_QUAD_SPLIT )
   {
     g_p.currMtDepth = 0;
@@ -409,6 +416,7 @@ bool nextPart()
   g_lv.idx      = idx;
   if( idx < g_lv.num )
   {
+    g_lv.part = partArea( g_lv.split, idx, levelArea( g_p.top ) );
     setNeighborCu();
     const int split = g_lv.split;
     if( split == CU_TRIH_SPLIT || split == CU_TRIV_SPLIT )
