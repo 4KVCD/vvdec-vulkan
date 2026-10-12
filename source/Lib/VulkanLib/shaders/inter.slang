@@ -157,8 +157,8 @@ int geoWeight( uint params, int lx, int ly )
   const int mirror = int( ( params >> 8 ) & 255 );
   const int ox     = int( ( params >> 16 ) & 255 );
   const int oy     = int( params >> 24 );
-  const int at     = mirror == 2 ? ( 111 - oy - ly ) * 112 + ox + lx : ( oy + ly ) * 112 + ( mirror == 1 ? 111 - ox - lx : ox + lx );
-  return int( pc.geo[mask * 112 * 112 + at] );
+  const int place  = mirror == 2 ? ( 111 - oy - ly ) * 112 + ox + lx : ( oy + ly ) * 112 + ( mirror == 1 ? 111 - ox - lx : ox + lx );
+  return int( *at( pc.geo, uint( mask * 112 * 112 + place ) ) );
 }
 
 // Blends the partitions' 14-bit predictions.
@@ -1135,7 +1135,7 @@ void bdofApply( int tid, int w, int h, out int result[PER_THREAD] )
 
 // --------------------------------------------------------------------------------------------------------------------
 // tile16: a 16x16 tile whose reference samples all lie inside the picture (nearly every tile; with weighted
-// prediction too, not GPM's). All its global reads are issued at once, in loads of 16 and 8 bytes (from 4-byte
+// prediction or GPM's blend too). All its global reads are issued at once, in loads of 16 and 8 bytes (from 4-byte
 // aligned places), before the first wait for memory: each list's luma window
 // of 23 x 23 samples around its motion (with DMVR, around the merge motion; the search and the refined prediction
 // both read inside it), the chroma windows of 11 x 11, and the residuals. DMVR and the filters then work from shared
@@ -1723,7 +1723,8 @@ bool tile16Inside( int x, int y, int flags, int2 mv0, int2 mv1 )
   return inside;
 }
 
-void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, int2 mv1, int ref0, int ref1, bool bi, bool dmvr, bool hpel )
+void tile16( int tid, int index, uint* job, int x, int y, int cuX, int cuY, int flags, int2 mv0, int2 mv1, int ref0, int ref1, bool bi, bool dmvr,
+             bool hpel )
 {
   const int bcwW1 = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW's L1 weight
   const int maxVal   = ( 1 << pc.bitDepth ) - 1;
@@ -1763,6 +1764,9 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   // are off where it is on.)
   const bool wp      = ( flags & FLAG_WP ) != 0;
   const bool hi      = bi || wp;
+  // GPM: the two lists' predictions are the partitions', blended with the weights of the CU's mask (a GPM tile has
+  // both lists, so its predictions are kept at 14 bits)
+  const bool geo     = ( flags & FLAG_GEO ) != 0;
   int16_t*   y1      = two ? planeY[1] : planeY[0];
   const uint yFirst0 = uint( wy[0] * pc.stride0 + wx[0] - leadY[0] );   // (the windows' first chunks)
   const uint yFirst1 = two ? uint( wy[1] * pc.stride0 + wx[1] - leadY[1] ) : yFirst0;
@@ -2033,6 +2037,23 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     }
   }
   GroupMemoryBarrierWithGroupSync();
+  // GPM: the weights of the thread's luma samples and of its chroma samples (at the luma sample under each), read now
+  // so that the chroma filters run while they come
+  int4 geoY = int4( 0, 0, 0, 0 );
+  int2 geoC = int2( 0, 0 );
+  if( geo )
+  {
+    [unroll]
+    for( int o = 0; o < 4; o++ )
+    {
+      geoY[o] = geoWeight( job[9], x - cuX + i0 + o, y - cuY + j );
+    }
+    [unroll]
+    for( int o = 0; o < 2; o++ )
+    {
+      geoC[o] = geoWeight( job[9], ( ( x >> 1 ) + ci0 + o - ( cuX >> 1 ) ) << 1, ( ( y >> 1 ) + cj - ( cuY >> 1 ) ) << 1 );
+    }
+  }
   int2 predC[2];
   [unroll]
   for( int s = 0; s < 2; s++ )
@@ -2051,7 +2072,8 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   [unroll]
   for( int o = 0; o < 4; o++ )
   {
-    vy[o] = wp   ? wpSample( job[8], job[11], 0, predY[0][o], bi ? predY[1][o] : 0, maxVal )
+    vy[o] = geo  ? geoBlend( predY[0][o], predY[1][o], geoY[o], maxVal )
+            : wp ? wpSample( job[8], job[11], 0, predY[0][o], bi ? predY[1][o] : 0, maxVal )
             : bi ? biAverage( predY[0][o], predY[1][o], flags, bcwW1, shiftNum, offset, maxVal )
                  : predY[0][o];
   }
@@ -2080,7 +2102,8 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   [unroll]
   for( int o = 0; o < 2; o++ )
   {
-    vc[o] = wp   ? wpSample( job[9 + cc], job[11], 1 + cc, predC[0][o], bi ? predC[1][o] : 0, maxVal )
+    vc[o] = geo  ? geoBlend( predC[0][o], predC[1][o], geoC[o], maxVal )
+            : wp ? wpSample( job[9 + cc], job[11], 1 + cc, predC[0][o], bi ? predC[1][o] : 0, maxVal )
             : bi ? biAverage( predC[0][o], predC[1][o], flags, bcwW1, shiftNum, offset, maxVal )
                  : predC[0][o];
   }
@@ -2707,9 +2730,9 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const bool dmvr  = ( flags & FLAG_DMVR ) != 0;
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
-  if( ( flags & FLAG_GEO ) == 0 && widePlanes() && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
+  if( widePlanes() && w == 16 && h == 16 && tile16Inside( x, y, flags, mv0, mv1 ) )
   {
-    tile16( tid, index, job, x, y, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel );
+    tile16( tid, index, job, x, y, cuX, cuY, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel );
     return;
   }
 
