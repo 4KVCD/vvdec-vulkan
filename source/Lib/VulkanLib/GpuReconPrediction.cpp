@@ -325,11 +325,12 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
       }
     }
   }
-  // The shader's tile16 path (wide) loads the planes' rows in aligned pieces of 16 and 8 bytes, up to 7 luma (3
-  // chroma) samples before a window and 9 (5) after it. So the rows must start 16-byte aligned and the margins be
-  // wide enough (the reference pictures' planes are laid out as this one's); its chroma windows are 4:2:0's, it
-  // reads no wraparound copy, and it reads only within the picture, from references of the picture's size.
-  push.wide = pcv.chrFormat == CHROMA_420 && !push.wrapSps && !push.subpicOn && !scaled ? 1 : 0;
+  // The shader's tile paths (wide) load the planes' rows in aligned pieces of 16 and 8 bytes, up to 7 luma (3 chroma)
+  // samples before a window and 9 (5) after it. So the rows must start 16-byte aligned and the margins be wide enough
+  // (the reference pictures' planes are laid out as this one's); their chroma windows are 4:2:0's. With RPR,
+  // subpictures treated as pictures or wraparound, the shader takes them only for the jobs they suit (tileJob: no
+  // scaled reference; borderTiles: inside the bounds).
+  push.wide = pcv.chrFormat == CHROMA_420 ? 1 : 0;
   for( int comp = 0; comp < (int) cs.picture->m_bufs[PIC_RECONSTRUCTION].bufs.size(); comp++ )
   {
     const PelStorage&  pic   = cs.picture->m_bufs[PIC_RECONSTRUCTION];
@@ -342,11 +343,13 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   }
 
   // Each set of tiles has its own shader variant: the regular tiles, BDOF's, and the affine pairs, each also built for
-  // the pictures of push.wide (WIDE=1: their layout values are constants, see inter.slang). The sets cover different
-  // tiles, so their dispatches need no barriers between them.
+  // the pictures of push.wide without wraparound, subpictures treated as pictures or scaled references (WIDE=1: their
+  // layout values are constants, see inter.slang). The sets cover different tiles, so their dispatches need no
+  // barriers between them.
   static const int kInterShaders[2][3] = { { kShader_inter, kShader_inter_bdof, kShader_inter_affine },
                                            { kShader_inter_wide, kShader_inter_bdof_wide, kShader_inter_affine_wide } };
-  const int* shaders = kInterShaders[push.wide ? 1 : 0];
+  const bool constant = push.wide && !push.wrapSps && !push.subpicOn && !scaled;
+  const int* shaders  = kInterShaders[constant ? 1 : 0];
   if( m_useFrontEnd )
   {
     // each set from its first job, with its count on the GPU

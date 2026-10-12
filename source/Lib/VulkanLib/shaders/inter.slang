@@ -72,7 +72,8 @@ struct Params
   int        widthInCtus;
   int        num8x8;      // colocated-motion entries per CTU (one per 8x8 block)
   int        wide;        // nonzero when the planes' rows start 16-byte aligned with margins of 16 samples or more, so
-                          // tile may load them in 8- and 16-byte pieces (and the chroma is 4:2:0, as tile expects)
+                          // tile may load them in 8- and 16-byte pieces, and the chroma is 4:2:0, as tile expects (see
+                          // tileJob for the jobs of pictures with RPR, subpictures or wraparound)
   int        scaleX;      // chroma subsampling shifts: 1, 1 (4:2:0), 1, 0 (4:2:2), 0, 0 (4:4:4)
   int        scaleY;
   int        numComp;     // number of components: 1 (4:0:0) or 3
@@ -1706,10 +1707,13 @@ int dmvrMinCost( int centre )
 }
 #endif
 
-// Whether tile may take the tile of w x h luma samples: each list's windows must lie inside the picture.
+// Whether tile may take the tile of w x h luma samples: each list's windows must lie inside the job's bounds (the
+// picture, or its subpicture when that is treated as a picture: setBounds). (DMVR's search reads inside the windows.)
 bool tileInside( int x, int y, int w, int h, int flags, int2 mv0, int2 mv1 )
 {
-  bool inside = true;
+  const int4 b      = boundsOf( 0 );
+  const int4 c      = boundsOf( 1 );
+  bool       inside = true;
   [unroll]
   for( int list = 0; list < 2; list++ )
   {
@@ -1718,11 +1722,25 @@ bool tileInside( int x, int y, int w, int h, int flags, int2 mv0, int2 mv1 )
       const int2 m  = list == 0 ? mv0 : mv1;
       const int  wx = x + ( m.x >> 4 ) - 3, wy = y + ( m.y >> 4 ) - 3;
       const int  cx = ( x >> 1 ) + ( m.x >> 5 ) - 1, cy = ( y >> 1 ) + ( m.y >> 5 ) - 1;
-      inside        = inside && wx >= 0 && wx + w + 7 <= pc.picWidth && wy >= 0 && wy + h + 7 <= pc.picHeight && cx >= 0
-               && cx + ( w >> 1 ) + 3 <= ( pc.picWidth >> 1 ) && cy >= 0 && cy + ( h >> 1 ) + 3 <= ( pc.picHeight >> 1 );
+      inside        = inside && wx >= b.x && wx + w + 7 <= b.z + 1 && wy >= b.y && wy + h + 7 <= b.w + 1 && cx >= c.x
+               && cx + ( w >> 1 ) + 3 <= c.z + 1 && cy >= c.y && cy + ( h >> 1 ) + 3 <= c.w + 1;
     }
   }
   return inside;
+}
+
+// Whether the job may take a tile path: every job of a picture of the WIDE variants; otherwise, where the planes'
+// layout allows it (widePlanes), a job whose references are not scaled (RPR: of the picture's size, read as they are).
+bool tileJob( int flags, int ref0, int ref1 )
+{
+  return widePlanes() && !( ( flags & FLAG_L0 ) != 0 && refScaled( ref0 ) ) && !( ( flags & FLAG_L1 ) != 0 && refScaled( ref1 ) );
+}
+
+// Whether tile may take border tiles (tileNear): not where subpictures are treated as pictures or with wraparound,
+// whose reads past the bounds differ from what tileBorderRow makes of the planes' margins
+bool borderTiles()
+{
+  return !subpicsOn() && !wrapSps();
 }
 
 // Whether tile may take a 16x16 tile whose windows reach past the picture's edges (a border tile): by at most 16 luma
@@ -3063,8 +3081,9 @@ void affineMain( int tid, int index )
 
   // (weighted prediction starts from the 14-bit predictions, for a uni-prediction too)
   const bool hi = bi || ( flags & FLAG_WP ) != 0;
-  // Nearly every tile reads its windows as boxes; the others subblock by subblock (below)
-  if( widePlanes() && affineBoxTile( tid, job, x, y, w, h, flags, bi, hi ) )
+  // Nearly every tile reads its windows as boxes; the others subblock by subblock (below). (Only in the WIDE variants:
+  // the boxes read neither scaled references nor past a subpicture's or the wraparound's bounds.)
+  if( WIDE != 0 && affineBoxTile( tid, job, x, y, w, h, flags, bi, hi ) )
   {
     return;
   }
@@ -3194,15 +3213,20 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const bool dmvr  = ( flags & FLAG_DMVR ) != 0;
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
-  if( widePlanes() && w == 16 && h == 16 && tileNear( x, y, flags, mv0, mv1 ) )
+  const bool tiles = tileJob( flags, ref0, ref1 );
+  if( tiles && w == 16 && h == 16 )
   {
-    tile<1>( tid, job, x, y, 16, 16, cuX, cuY, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel, !tileInside( x, y, 16, 16, flags, mv0, mv1 ) );
-    return;
+    const bool inside = tileInside( x, y, 16, 16, flags, mv0, mv1 );
+    if( inside || ( borderTiles() && tileNear( x, y, flags, mv0, mv1 ) ) )
+    {
+      tile<1>( tid, job, x, y, 16, 16, cuX, cuY, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel, !inside );
+      return;
+    }
   }
 #if !BDOF
   // The tiles of 16x8, 8x16 and 8x8 (SbTMVP's pairs of sub-PUs and its sub-PUs, small CUs: half of the regular jobs of
   // the slower preset's streams), which have no DMVR there
-  if( widePlanes() && w >= 8 && h >= 8 && !dmvr && tileInside( x, y, w, h, flags, mv0, mv1 ) )
+  if( tiles && w >= 8 && h >= 8 && !dmvr && tileInside( x, y, w, h, flags, mv0, mv1 ) )
   {
     tile<0>( tid, job, x, y, w, h, cuX, cuY, flags, mv0, mv1, ref0, ref1, bi, false, hpel, false );
     return;
