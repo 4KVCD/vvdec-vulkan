@@ -1131,26 +1131,154 @@ void bdofApply( int tid, int w, int h, out int result[PER_THREAD] )
 // that a BDOF tile waits at no more barriers than another tile.
 // --------------------------------------------------------------------------------------------------------------------
 
-// Sample (r, c) of the window whose sample (0, 0) is at index at; clamped into the window when DMVR's refinement
-// moved the integer position (xPrefetchPad's padding).
-int winY( int at, int r, int c, bool clampIt )
+// Sample (r, c) of the window whose sample (0, 0) is at index at.
+int winY( int at, int r, int c )
 {
-  if( clampIt )
-  {
-    r = clamp( r, 0, YW - 1 );
-    c = clamp( c, 0, YW - 1 );
-  }
   return int( s_pool[at + r * YS + c] );
 }
 
-int winC( int at, int r, int c, bool clampIt )
+int winC( int at, int r, int c )
 {
-  if( clampIt )
-  {
-    r = clamp( r, 0, CWD - 1 );
-    c = clamp( c, 0, CWD - 1 );
-  }
   return int( s_pool[at + r * CS + c] );
+}
+
+// When DMVR's refinement moves a list's integer position (by dI, the refined motion's minus the merge motion's), the
+// filters read the samples at the moved position clamped into the window, as xPrefetchPad's padding is. In those few
+// tiles the windows are rewritten in place to hold just those samples, window(r, c) = window(clamp(r + dI.y),
+// clamp(c + dI.x)) (a list that did not move is copied as it is), so that the filters read every window alike: with
+// no clamping, a read takes no arithmetic of its own. Each thread reads its share of the samples (one sample place
+// for both lists, packed in pairs), and writes them after a barrier.
+void tile16ShiftLuma( int tid, int2 dI[2] )
+{
+  uint pairs[( YW * YW + THREADS - 1 ) / THREADS];
+  [unroll]
+  for( int k = 0; k < ( YW * YW + THREADS - 1 ) / THREADS; k++ )
+  {
+    const int i = min( tid + THREADS * k, YW * YW - 1 );
+    const int r = i / YW, c = i - r * YW;
+    pairs[k]    = 0;
+    [unroll]
+    for( int s = 0; s < 2; s++ )
+    {
+      const int v = winY( WY_AT( s ), clamp( r + dI[s].y, 0, YW - 1 ), clamp( c + dI[s].x, 0, YW - 1 ) );
+      pairs[k] |= uint( v & 0xffff ) << ( 16 * s );
+    }
+  }
+  GroupMemoryBarrierWithGroupSync();
+  [unroll]
+  for( int k = 0; k < ( YW * YW + THREADS - 1 ) / THREADS; k++ )
+  {
+    const int i = tid + THREADS * k;
+    if( i < YW * YW )
+    {
+      const int r = i / YW, c = i - r * YW;
+      s_pool[WY_AT( 0 ) + r * YS + c] = int16_t( pairs[k] );
+      s_pool[WY_AT( 1 ) + r * YS + c] = int16_t( pairs[k] >> 16 );
+    }
+  }
+  GroupMemoryBarrierWithGroupSync();
+}
+
+// The same for the chroma windows: each list's Cb and Cr windows move by the list's dI (in chroma samples).
+void tile16ShiftChroma( int tid, int2 dI[2] )
+{
+  uint pairs[2][2];   // [k][list]: Cb's and Cr's samples
+  [unroll]
+  for( int k = 0; k < 2; k++ )
+  {
+    const int i = min( tid + THREADS * k, CWD * CWD - 1 );
+    const int r = i / CWD, c = i - r * CWD;
+    [unroll]
+    for( int s = 0; s < 2; s++ )
+    {
+      const int rr = clamp( r + dI[s].y, 0, CWD - 1 ), cc = clamp( c + dI[s].x, 0, CWD - 1 );
+      pairs[k][s]  = uint( winC( WC_AT( 2 * s ), rr, cc ) & 0xffff ) | ( uint( winC( WC_AT( 2 * s + 1 ), rr, cc ) ) << 16 );
+    }
+  }
+  GroupMemoryBarrierWithGroupSync();
+  [unroll]
+  for( int k = 0; k < 2; k++ )
+  {
+    const int i = tid + THREADS * k;
+    if( i < CWD * CWD )
+    {
+      const int r = i / CWD, c = i - r * CWD;
+      [unroll]
+      for( int s = 0; s < 2; s++ )
+      {
+        s_pool[WC_AT( 2 * s ) + r * CS + c]     = int16_t( pairs[k][s] );
+        s_pool[WC_AT( 2 * s + 1 ) + r * CS + c] = int16_t( pairs[k][s] >> 16 );
+      }
+    }
+  }
+  GroupMemoryBarrierWithGroupSync();
+}
+
+// tile16's horizontal pass of a list's 2-D luma filter (whose taps start at the window's first row and column): the
+// window's 23 rows at at, 16 samples each, in groups of 4 (a thread's group in rows 0 .. 15, and one in rows 16 .. 22
+// for the first 28 threads), into tmp (rows of 16). A thread works out its reads' place once: each read is that plus a
+// constant.
+void tile16LumaH( int tid, int at, int tmp, int16_t cx[8], int shift1, int offset1 )
+{
+  const int gi = ( tid & 3 ) << 2;
+  [unroll]
+  for( int k = 0; k < 2; k++ )
+  {
+    const int r = ( tid >> 2 ) + 16 * k;
+    if( r < YW )
+    {
+      int w[11];
+      [unroll]
+      for( int e = 0; e < 11; e++ )
+      {
+        w[e] = winY( at, r, gi + e );
+      }
+      [unroll]
+      for( int o = 0; o < 4; o++ )
+      {
+        int sum = 0;
+        [unroll]
+        for( int t = 0; t < 8; t++ )
+        {
+          sum += int( cx[t] ) * w[o + t];
+        }
+        s_pool[tmp + r * 16 + gi + o] = int16_t( ( sum + offset1 ) >> shift1 );
+      }
+    }
+  }
+}
+
+// tile16's horizontal passes of a list's 2-D chroma filters: the 11 rows of the Cb window at at and those of the Cr
+// window just past it (as one window of 22 rows), 8 samples each, in pairs (a thread's pair in rows 0 .. 15, and one
+// in rows 16 .. 21 for the first 24 threads), into tmp (Cb's rows of 8, then Cr's).
+void tile16ChromaH( int tid, int at, int tmp, int16_t cx[4], int shift1, int offset1 )
+{
+  const int gi = ( tid & 3 ) << 1;
+  [unroll]
+  for( int k = 0; k < 2; k++ )
+  {
+    const int r = ( tid >> 2 ) + 16 * k;
+    if( r < 2 * CWD )
+    {
+      int w[5];
+      [unroll]
+      for( int e = 0; e < 5; e++ )
+      {
+        w[e] = winC( at, r, gi + e );
+      }
+      [unroll]
+      for( int o = 0; o < 2; o++ )
+      {
+        int sum = 0;
+        [unroll]
+        for( int t = 0; t < 4; t++ )
+        {
+          sum += int( cx[t] ) * w[o + t];
+        }
+        s_pool[tmp + r * 8 + gi + o] = int16_t( ( sum + offset1 ) >> shift1 );
+      }
+    }
+  }
 }
 
 // One SAD row of DMVR's search, from the bilinear predictions at b0 and b1 (rows of 20 samples).
@@ -1167,7 +1295,7 @@ int sadRowAt( int b0, int b1, int j, int hor, int ver )
 
 // The 4 luma predictions (j, i0 .. i0 + 3) of a list from its window (whose sample (0, 0) is at index at), with
 // predictBlock's arithmetic; tmp holds the horizontal pass of a 2-D filter.
-int4 lumaPred( int at, int tmp, int j, int i0, int rx0, int ry0, bool clampIt, int xFrac, int yFrac, int16_t cx[8], int16_t cy[8], bool bi )
+int4 lumaPred( int at, int tmp, int j, int i0, int rx0, int ry0, int xFrac, int yFrac, int16_t cx[8], int16_t cy[8], bool bi )
 {
   const int headRoom = max( 2, 14 - pc.bitDepth );
   const int maxVal   = ( 1 << pc.bitDepth ) - 1;
@@ -1195,7 +1323,7 @@ int4 lumaPred( int at, int tmp, int j, int i0, int rx0, int ry0, bool clampIt, i
     [unroll]
     for( int e = 0; e < 11; e++ )
     {
-      w[e] = winY( at, ry0 + j, rx0 + i0 + e, clampIt );
+      w[e] = winY( at, ry0 + j, rx0 + i0 + e );
     }
     [unroll]
     for( int o = 0; o < 4; o++ )
@@ -1220,7 +1348,7 @@ int4 lumaPred( int at, int tmp, int j, int i0, int rx0, int ry0, bool clampIt, i
       [unroll]
       for( int t = 0; t < 8; t++ )
       {
-        sum += int( cy[t] ) * winY( at, ry0 + j + t, rx0 + i0 + o, clampIt );
+        sum += int( cy[t] ) * winY( at, ry0 + j + t, rx0 + i0 + o );
       }
       const int v = ( sum + offset ) >> shiftV;
       out[o]      = bi ? v : clip3( 0, maxVal, v );
@@ -1230,7 +1358,7 @@ int4 lumaPred( int at, int tmp, int j, int i0, int rx0, int ry0, bool clampIt, i
   [unroll]
   for( int o = 0; o < 4; o++ )
   {
-    const int v = winY( at, ry0 + j, rx0 + i0 + o, clampIt );
+    const int v = winY( at, ry0 + j, rx0 + i0 + o );
     out[o]      = bi ? v * ( 1 << headRoom ) - IF_INTERNAL_OFFS : v;
   }
   return out;
@@ -1238,7 +1366,7 @@ int4 lumaPred( int at, int tmp, int j, int i0, int rx0, int ry0, bool clampIt, i
 
 // The 2 chroma predictions (j, i0) and (j, i0 + 1) of a list from its window, as lumaPred does with 4 taps; tmp
 // holds the horizontal pass, in rows of 8.
-int2 chromaPred( int at, int tmp, int j, int i0, int rx0, int ry0, bool clampIt, int xFrac, int yFrac, int16_t cx[4], int16_t cy[4], bool bi )
+int2 chromaPred( int at, int tmp, int j, int i0, int rx0, int ry0, int xFrac, int yFrac, int16_t cx[4], int16_t cy[4], bool bi )
 {
   const int headRoom = max( 2, 14 - pc.bitDepth );
   const int maxVal   = ( 1 << pc.bitDepth ) - 1;
@@ -1266,7 +1394,7 @@ int2 chromaPred( int at, int tmp, int j, int i0, int rx0, int ry0, bool clampIt,
     [unroll]
     for( int e = 0; e < 5; e++ )
     {
-      w[e] = winC( at, ry0 + j, rx0 + i0 + e, clampIt );
+      w[e] = winC( at, ry0 + j, rx0 + i0 + e );
     }
     [unroll]
     for( int o = 0; o < 2; o++ )
@@ -1291,7 +1419,7 @@ int2 chromaPred( int at, int tmp, int j, int i0, int rx0, int ry0, bool clampIt,
       [unroll]
       for( int t = 0; t < 4; t++ )
       {
-        sum += int( cy[t] ) * winC( at, ry0 + j + t, rx0 + i0 + o, clampIt );
+        sum += int( cy[t] ) * winC( at, ry0 + j + t, rx0 + i0 + o );
       }
       const int v = ( sum + offset ) >> shiftV;
       out[o]      = bi ? v : clip3( 0, maxVal, v );
@@ -1301,7 +1429,7 @@ int2 chromaPred( int at, int tmp, int j, int i0, int rx0, int ry0, bool clampIt,
   [unroll]
   for( int o = 0; o < 2; o++ )
   {
-    const int v = winC( at, ry0 + j, rx0 + i0 + o, clampIt );
+    const int v = winC( at, ry0 + j, rx0 + i0 + o );
     out[o]      = bi ? v * ( 1 << headRoom ) - IF_INTERNAL_OFFS : v;
   }
   return out;
@@ -1369,27 +1497,23 @@ int bilinearW( int p, int xFrac, int yFrac, int shift )
 
 #if BDOF
 // tile16's BDOF border: the thread's share of the border around both lists' predictions (2 x 68 samples, the k-th at
-// ring place tid + THREADS k), from the lists' windows (the window's sample (3, 3) lies at the merge motion's integer
-// position), clamped into the window when DMVR's refinement moved the integer position, as the prefetch's padding is.
-// Read while the luma windows are there; tile16BdofStore stores it with the predictions once they are gone.
+// ring place tid + THREADS k), from the lists' windows (the window's sample (3, 3) lies at the refined motion's integer
+// position: where DMVR moved it, tile16ShiftLuma moved the window). Read while the luma windows are there;
+// tile16BdofStore stores it with the predictions once they are gone.
 static const int kTileRing = 2 * ( 16 + 2 ) + 2 * 16;
-void tile16BdofBorder( int tid, int2 mvs[2], int2 mvR[2], bool clampY[2], out int16_t border[3] )
+void tile16BdofBorder( int tid, int2 mvR[2], out int16_t border[3] )
 {
   [unroll]
   for( int k = 0; k < 3; k++ )
   {
     const int r = min( tid + THREADS * k, 2 * kTileRing - 1 );
     // (the list is picked with selects: an array indexed per lane would go to scratch memory)
-    const int  s       = r >= kTileRing ? 1 : 0;
-    const int2 m       = s == 0 ? mvR[0] : mvR[1];
-    const int2 merge   = s == 0 ? mvs[0] : mvs[1];
-    const bool clampIt = s == 0 ? clampY[0] : clampY[1];
-    const int2 b       = bdofBorderAt( r - kTileRing * s, 16, 16 );
-    const int  xOff    = ( m.x & 15 ) < 8 ? 1 : 0;
-    const int  yOff    = ( m.y & 15 ) < 8 ? 1 : 0;
-    const int  c       = 3 + ( m.x >> 4 ) - ( merge.x >> 4 ) + b.x + 1 - xOff;
-    const int  row     = 3 + ( m.y >> 4 ) - ( merge.y >> 4 ) + b.y + 1 - yOff;
-    border[k]          = bdofBorderValue( winY( s == 0 ? WY_AT( 0 ) : WY_AT( 1 ), row, c, clampIt ) );
+    const int  s    = r >= kTileRing ? 1 : 0;
+    const int2 m    = s == 0 ? mvR[0] : mvR[1];
+    const int2 b    = bdofBorderAt( r - kTileRing * s, 16, 16 );
+    const int  xOff = ( m.x & 15 ) < 8 ? 1 : 0;
+    const int  yOff = ( m.y & 15 ) < 8 ? 1 : 0;
+    border[k]       = bdofBorderValue( winY( s == 0 ? WY_AT( 0 ) : WY_AT( 1 ), 3 + b.y + 1 - yOff, 3 + b.x + 1 - xOff ) );
   }
 }
 
@@ -1645,52 +1769,38 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   const bool bdof = ( flags & FLAG_BDOF ) != 0 && dmvrCost >= 2 * 16 * 16;
 #endif
 
-  // Luma: the horizontal passes of the 2-D filters, 23 rows of 16 samples in groups of 4.
-  int16_t cxY[2][8], cyY[2][8];
-  int     rx0[2], ry0[2];
-  bool    clampY[2];
+  // Luma: where DMVR moved a list's integer position, the windows are rewritten to the moved position first
+  // (tile16ShiftLuma); then the horizontal passes of the 2-D filters, 23 rows of 16 samples in groups of 4.
+  int2 dIY[2];
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    const int2 mv    = mvR[s];
-    const int  xFrac = mv.x & 15, yFrac = mv.y & 15;
-    const int2 dI    = int2( ( mv.x >> 4 ) - ( mvs[s].x >> 4 ), ( mv.y >> 4 ) - ( mvs[s].y >> 4 ) );
+    dIY[s] = int2( ( mvR[s].x >> 4 ) - ( mvs[s].x >> 4 ), ( mvR[s].y >> 4 ) - ( mvs[s].y >> 4 ) );
+  }
+  if( WaveReadLaneFirst( ( dIY[0].x | dIY[0].y | dIY[1].x | dIY[1].y ) != 0 ? 1 : 0 ) != 0 )
+  {
+    tile16ShiftLuma( tid, dIY );
+  }
+  int16_t cxY[2][8], cyY[2][8];
+  int     rx0[2], ry0[2];
+  [unroll]
+  for( int s = 0; s < 2; s++ )
+  {
+    const int xFrac = mvR[s].x & 15, yFrac = mvR[s].y & 15;
     [unroll]
     for( int k = 0; k < 8; k++ )
     {
       cxY[s][k] = int16_t( coeff( 0, xFrac, hpel, k ) );
       cyY[s][k] = int16_t( coeff( 0, yFrac, hpel, k ) );
     }
-    rx0[s]    = 3 + dI.x - ( xFrac != 0 ? 3 : 0 );
-    ry0[s]    = 3 + dI.y - ( yFrac != 0 ? 3 : 0 );
-    clampY[s] = dI.x != 0 || dI.y != 0;
+    // (a filter's taps start at the window's first column or row; unfiltered, the samples start at the motion's integer
+    // position, the window's sample 3)
+    rx0[s] = xFrac != 0 ? 0 : 3;
+    ry0[s] = yFrac != 0 ? 0 : 3;
     if( s < lists && xFrac != 0 && yFrac != 0 )
     {
-      const int shift1  = 6 - headRoom;
-      const int offset1 = -IF_INTERNAL_OFFS * ( 1 << shift1 );
-      const int at      = WY_AT( s );
-      for( int g = tid; g < 92; g += THREADS )
-      {
-        const int r  = g >> 2;
-        const int gi = ( g & 3 ) << 2;
-        int       w[11];
-        [unroll]
-        for( int e = 0; e < 11; e++ )
-        {
-          w[e] = winY( at, ry0[s] + r, rx0[s] + gi + e, clampY[s] );
-        }
-        [unroll]
-        for( int o = 0; o < 4; o++ )
-        {
-          int sum = 0;
-          [unroll]
-          for( int k = 0; k < 8; k++ )
-          {
-            sum += int( cxY[s][k] ) * w[o + k];
-          }
-          s_pool[WORK_AT + 368 * s + r * 16 + gi + o] = int16_t( ( sum + offset1 ) >> shift1 );
-        }
-      }
+      const int shift1 = 6 - headRoom;
+      tile16LumaH( tid, WY_AT( s ), WORK_AT + 368 * s, cxY[s], shift1, -IF_INTERNAL_OFFS * ( 1 << shift1 ) );
     }
   }
   GroupMemoryBarrierWithGroupSync();
@@ -1700,7 +1810,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     if( s < lists )
     {
-      predY[s] = lumaPred( WY_AT( s ), WORK_AT + 368 * s, j, i0, rx0[s], ry0[s], clampY[s], mvR[s].x & 15, mvR[s].y & 15, cxY[s], cyY[s], bi );
+      predY[s] = lumaPred( WY_AT( s ), WORK_AT + 368 * s, j, i0, rx0[s], ry0[s], mvR[s].x & 15, mvR[s].y & 15, cxY[s], cyY[s], bi );
     }
   }
 #if BDOF
@@ -1710,7 +1820,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   int16_t border[3];
   if( bdof )
   {
-    tile16BdofBorder( tid, mvs, mvR, clampY, border );
+    tile16BdofBorder( tid, mvR, border );
   }
 #endif
   GroupMemoryBarrierWithGroupSync();   // the luma windows are read; the chroma windows replace them
@@ -1747,6 +1857,17 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
     }
   }
   GroupMemoryBarrierWithGroupSync();
+  // Where DMVR moved a list's integer position in chroma samples, the chroma windows too are rewritten to it.
+  int2 dIC[2];
+  [unroll]
+  for( int s = 0; s < 2; s++ )
+  {
+    dIC[s] = int2( ( mvR[s].x >> 5 ) - ( mvs[s].x >> 5 ), ( mvR[s].y >> 5 ) - ( mvs[s].y >> 5 ) );
+  }
+  if( WaveReadLaneFirst( ( dIC[0].x | dIC[0].y | dIC[1].x | dIC[1].y ) != 0 ? 1 : 0 ) != 0 )
+  {
+    tile16ShiftChroma( tid, dIC );
+  }
 #if BDOF
   if( bdof )
   {
@@ -1755,51 +1876,22 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
 #endif
   int16_t cxC[2][4], cyC[2][4];
   int     crx0[2], cry0[2];
-  bool    clampC[2];
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    const int2 mv    = mvR[s];
-    const int  xFrac = mv.x & 31, yFrac = mv.y & 31;
-    const int2 dI    = int2( ( mv.x >> 5 ) - ( mvs[s].x >> 5 ), ( mv.y >> 5 ) - ( mvs[s].y >> 5 ) );
+    const int xFrac = mvR[s].x & 31, yFrac = mvR[s].y & 31;
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
       cxC[s][k] = int16_t( kChroma[xFrac * 4 + k] );
       cyC[s][k] = int16_t( kChroma[yFrac * 4 + k] );
     }
-    crx0[s]   = 1 + dI.x - ( xFrac != 0 ? 1 : 0 );
-    cry0[s]   = 1 + dI.y - ( yFrac != 0 ? 1 : 0 );
-    clampC[s] = dI.x != 0 || dI.y != 0;
+    crx0[s] = xFrac != 0 ? 0 : 1;
+    cry0[s] = yFrac != 0 ? 0 : 1;
     if( s < lists && xFrac != 0 && yFrac != 0 )
     {
-      const int shift1  = 6 - headRoom;
-      const int offset1 = -IF_INTERNAL_OFFS * ( 1 << shift1 );
-      for( int g = tid; g < 88; g += THREADS )
-      {
-        const int comp = g >= 44 ? 1 : 0;
-        const int gg   = g - 44 * comp;
-        const int r    = gg >> 2;
-        const int gi   = ( gg & 3 ) << 1;
-        const int at   = WC_AT( 2 * s + comp );
-        int       w[5];
-        [unroll]
-        for( int e = 0; e < 5; e++ )
-        {
-          w[e] = winC( at, cry0[s] + r, crx0[s] + gi + e, clampC[s] );
-        }
-        [unroll]
-        for( int o = 0; o < 2; o++ )
-        {
-          int sum = 0;
-          [unroll]
-          for( int k = 0; k < 4; k++ )
-          {
-            sum += int( cxC[s][k] ) * w[o + k];
-          }
-          s_pool[CH_AT + 88 * ( 2 * s + comp ) + r * 8 + gi + o] = int16_t( ( sum + offset1 ) >> shift1 );
-        }
-      }
+      const int shift1 = 6 - headRoom;
+      tile16ChromaH( tid, WC_AT( 2 * s ), CH_AT + 88 * 2 * s, cxC[s], shift1, -IF_INTERNAL_OFFS * ( 1 << shift1 ) );
     }
   }
   GroupMemoryBarrierWithGroupSync();
@@ -1809,8 +1901,8 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     if( s < lists )
     {
-      predC[s] = chromaPred( WC_AT( 2 * s + cc ), CH_AT + 88 * ( 2 * s + cc ), cj, ci0, crx0[s], cry0[s], clampC[s], mvR[s].x & 31,
-                             mvR[s].y & 31, cxC[s], cyC[s], bi );
+      predC[s] = chromaPred( WC_AT( 2 * s + cc ), CH_AT + 88 * ( 2 * s + cc ), cj, ci0, crx0[s], cry0[s], mvR[s].x & 31, mvR[s].y & 31,
+                             cxC[s], cyC[s], bi );
     }
   }
 
