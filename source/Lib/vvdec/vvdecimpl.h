@@ -44,6 +44,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "vvdec/vvdec.h"
 #include "DecoderLib/DecLib.h"             // internal decoder
+#include <deque>
 #if VVDEC_VULKAN
 #include "VulkanLib/GpuContext.h"
 #include "VulkanLib/GpuFilmGrain.h"
@@ -227,9 +228,17 @@ private:
   void xAddGrain                   ( vvdecFrame *frame );
 #if VVDEC_VULKAN
   // the grain on the GPU: the frame's planes the picture's (cropped by
-  // confLeft, confTop), or (copied) the GPU's copy in the frame's storage
-  void xAddGrainGpu                ( vvdecFrame *frame, Picture* pcPic, int confLeft, int confTop, bool copied );
+  // confLeft, confTop), or (copied) the GPU's copy in the frame's storage;
+  // returns the grain's ticket (gpu::GpuFilmGrain::apply)
+  int64_t xAddGrainGpu             ( vvdecFrame *frame, Picture* pcPic, int confLeft, int confTop, bool copied );
 #endif
+  // Whether the frame with the sequence number seq may go out: the GPU adds
+  // no grain to it, or that grain is done -- waited for with wait, and when
+  // m_grainFramesAhead frames' grain is under way -- and then the picture it
+  // read is released. xGrainDoneAll waits for every frame's grain.
+  bool xGrainDone                  ( uint64_t seq, bool wait );
+  void xGrainReap                  ();   // (the pictures of the frames whose grain is done, released)
+  void xGrainDoneAll               ();
 
   static int xRetrieveNalStartCode ( unsigned char *pB, int iZerosInStartcode );
   static int xConvertPayloadToRBSP ( const uint8_t* payload, size_t payloadLen, InputBitstream* bitstream, bool isVclNalUnit );
@@ -279,6 +288,18 @@ private:
   std::unique_ptr<gpu::GpuFilmGrain>       m_gpuFilmGrain;   // made when the GPU first adds grain
   int                                      m_grainFramesGpu                = 0;   // with the GPU: the frames given grain there
   int                                      m_grainFramesCpu                = 0;   // and on the CPU
+  // The frames whose grain the GPU adds while the decoder goes on: a frame's sequence number, its grain's ticket, and
+  // the picture the grain reads (released once the grain is done; null where the frame holds the picture). A frame
+  // goes out once its grain is done, or once m_grainFramesAhead frames' grain is under way (xGrainDone): three up
+  // to 1920 x 1088 (two: 1080p -18%), two past it (each frame holds its storage: 4K, three, 79 MB more for no gain).
+  struct GrainInFlight
+  {
+    uint64_t seq;
+    int64_t  ticket;
+    Picture* pic;
+  };
+  std::deque<GrainInFlight>                m_grainInFlight;
+  size_t                                   m_grainFramesAhead = gpu::GpuFilmGrain::kSlots - 1;
 #endif
 };
 

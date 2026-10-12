@@ -308,6 +308,7 @@ bool Context::init()
   }
   const uint32_t parseIndex  = split ? 0u : uint32_t( m_asyncCount );
   const uint32_t copyIndex   = split ? 2u : uint32_t( m_asyncCount + 1 );
+  const uint32_t grainIndex  = 4u;   // (with split: one of the even queues the parse leaves, the film grain's)
   const uint32_t asyncQueues = split ? uint32_t( 2 * kMaxAsync ) : uint32_t( m_asyncCount + ( ownParseQueue ? 1 : 0 ) + ( ownCopyQueue ? 1 : 0 ) );
   VkDeviceQueueCreateInfo queueInfos[3] = { { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO }, { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO },
                                             { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO } };
@@ -474,6 +475,10 @@ bool Context::init()
     if( ownCopyQueue )
     {
       m_api.vkGetDeviceQueue( m_device, m_asyncFamily, copyIndex, &m_parseCopyQueue );
+    }
+    if( split )
+    {
+      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, grainIndex, &m_grainQueue );
     }
     else
     {
@@ -1415,6 +1420,24 @@ void Context::submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore se
     {
       THROW_FATAL( "Vulkan: vkQueueSubmit (copies) failed (" << result << ")" );
     }
+  }
+}
+
+void Context::submitGrain( VkCommandBuffer cmd, VkFence done )
+{
+  if( !m_grainQueue )
+  {
+    submit( cmd, done );
+    return;
+  }
+  VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+  info.commandBufferCount = 1;
+  info.pCommandBuffers    = &cmd;
+  std::lock_guard<std::mutex> lock( m_grainMutex );
+  const VkResult              result = m_api.vkQueueSubmit( m_grainQueue, 1, &info, done );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkQueueSubmit (film grain) failed (" << result << ")" );
   }
 }
 

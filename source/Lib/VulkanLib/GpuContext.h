@@ -196,8 +196,16 @@ public:
   // rest's semaphore and signals transferDone.
   void submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore semaphore, VkCommandBuffer transfer, VkFence transferDone,
                    VkSemaphore waitFront = VK_NULL_HANDLE );
-  // Other work on the compute queue (film grain on the output frames), which signals done.
+  // Other work on the compute queue, which signals done.
   void submit( VkCommandBuffer cmd, VkFence done ) { submitFirst( cmd, done ); }
+
+  // --- The film grain's queue ---
+  // The film grain on the output frames (GpuFilmGrain) needs only the frame, downloaded before: on the compute queue
+  // it waited for all the decoding queued before it (4.9 ms a frame at 1080p, 8.7 ms at 4K). It runs on a queue of its
+  // own where the async compute family has one that nothing else takes (AMD's: queue 4 of 8), else on the compute
+  // queue. Its command pools are of grainFamily(); submitGrain() submits its commands, which signal done.
+  uint32_t grainFamily() const { return m_grainQueue ? m_asyncFamily : m_queueFamily; }
+  void     submitGrain( VkCommandBuffer cmd, VkFence done );
 
   // --- The copy queue ---
   // A queue for copies only (the GPU's copy engine), when the device has one. Its copies run alongside the compute
@@ -276,6 +284,10 @@ private:
   std::mutex                       m_queueMutex;
   VkSemaphore                      m_timeline      = VK_NULL_HANDLE;   // signalled by the pictures' first parts
   uint64_t                         m_timelineValue = 0;                // the last value signalled (guarded by m_queueMutex)
+
+  // the film grain's queue (one of the async family's), when it has its own, and its lock
+  VkQueue                          m_grainQueue = VK_NULL_HANDLE;
+  std::mutex                       m_grainMutex;
 
   // the copy queue
   VkQueue                          m_transferQueue      = VK_NULL_HANDLE;

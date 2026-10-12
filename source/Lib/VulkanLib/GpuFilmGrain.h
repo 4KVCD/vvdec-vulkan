@@ -57,10 +57,13 @@ namespace gpu
 
 // Adds film grain to output frames on the GPU (filmgrain.slang), bit-exact with vvdec's FilmGrain on the CPU
 // (VVDecImpl::xAddGrain). The frames are in host memory the GPU can reach: the pictures' planes, or the output's
-// copies of them.
+// copies of them. The grain of a frame is under way while the decoder goes on (up to kSlots frames at a time); each
+// frame has a ticket to wait for (VVDecImpl hands a frame out once its grain is done).
 class GpuFilmGrain
 {
 public:
+  static constexpr int kSlots = 4;   // the frames whose grain may be under way at a time
+
   explicit GpuFilmGrain( Context* ctx );
   ~GpuFilmGrain();
   GpuFilmGrain( const GpuFilmGrain& )            = delete;
@@ -74,20 +77,36 @@ public:
     int             readWidth = 0;   // source: the samples a row has from x = 0 on (can be wider than the frame: the picture's)
   };
 
-  // Where the next frame's block seeds go (FilmGrain::prepareBlockSeeds): room for count seeds.
+  // Where the next frame's block seeds go (FilmGrain::prepareBlockSeeds): room for count seeds, in the next frame's
+  // slot (once the frame that had it before is done).
   uint32_t* seeds( size_t count );
   // Adds the grain to a frame of lumaWidth x lumaHeight luma samples, reading src (16 bits per sample) and writing
   // dst (dstBytes per sample; dst may be src). The planes' subsampling, the bit depth and the grain models come from
-  // grain; the block seeds must already be written (seeds()). Returns when the GPU is done.
-  void apply( const FilmGrain& grain, int numPlanes, const Plane src[3], const Plane dst[3], int dstBytes, int lumaWidth, int lumaHeight );
+  // grain; the block seeds must already be written (seeds()). Returns at once, with the frame's ticket: src and dst
+  // must stay as they are until the ticket is done.
+  int64_t apply( const FilmGrain& grain, int numPlanes, const Plane src[3], const Plane dst[3], int dstBytes, int lumaWidth, int lumaHeight );
+  // Whether the grain of the frame with the ticket is done; wait() returns once it is.
+  bool done( int64_t ticket );
+  void wait( int64_t ticket );
 
 private:
-  Context*        m_ctx;
-  Buffer          m_tables;   // the grain patterns, then per component the scale table (sLUT), then the pattern tables (pLUT)
-  Buffer          m_seeds;
-  VkCommandPool   m_pool  = VK_NULL_HANDLE;
-  VkCommandBuffer m_cmd   = VK_NULL_HANDLE;
-  VkFence         m_fence = VK_NULL_HANDLE;
+  // The work of a frame: its tables (the grain patterns, then per component the scale table (sLUT), then the
+  // pattern tables (pLUT)), its block seeds, its commands; and the ticket of its frame while the GPU may be at it.
+  struct Slot
+  {
+    Buffer          tables;
+    Buffer          seeds;
+    VkCommandPool   pool   = VK_NULL_HANDLE;
+    VkCommandBuffer cmd    = VK_NULL_HANDLE;
+    VkFence         fence  = VK_NULL_HANDLE;
+    int64_t         ticket = -1;   // the frame under way (-1: none)
+  };
+
+  void finish( Slot& slot );   // waits until the slot's frame is done, and frees the slot
+
+  Context* m_ctx;
+  Slot     m_slots[kSlots];
+  int64_t  m_nextTicket = 0;   // the next frame's (its slot: the ticket modulo kSlots)
 };
 
 }   // namespace gpu

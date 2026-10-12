@@ -241,6 +241,7 @@ int VVDecImpl::reset()
     }
   };
 
+  xGrainDoneAll();   // (the GPU's grain done before the frames and pictures go)
   for( auto& entry: m_rcFrameList )
   {
     vvdec_frame_reset( &std::get<vvdecFrame>( entry ) );
@@ -480,6 +481,10 @@ int VVDecImpl::decode( vvdecAccessUnit& rcAccessUnit, vvdecFrame** ppcFrame )
         }
         *ppcFrame = nullptr;
       }
+      else if( !xGrainDone( std::get<vvdecFrame>( *m_pcFrameNext ).sequenceNumber, false ) )
+      {
+        *ppcFrame = nullptr;   // (the GPU's grain of the next frame under way: it goes out at a later call)
+      }
       else
       {
         *ppcFrame = &std::get<vvdecFrame>( *m_pcFrameNext );
@@ -578,6 +583,7 @@ int VVDecImpl::flush( vvdecFrame** ppframe )
       }
       else
       {
+         xGrainDone( std::get<vvdecFrame>( *m_pcFrameNext ).sequenceNumber, true );
          *ppframe = &std::get<vvdecFrame>( *m_pcFrameNext );
          m_uiSeqNumOutput = ( *ppframe )->sequenceNumber;
          ++m_pcFrameNext;
@@ -972,7 +978,7 @@ void VVDecImpl::xAddGrain( vvdecFrame* frame )
 }
 
 #if VVDEC_VULKAN
-void VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft, int confTop, bool copied )
+int64_t VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft, int confTop, bool copied )
 {
   if( !m_gpuFilmGrain )
   {
@@ -1017,14 +1023,72 @@ void VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft, i
       dst[c].stride = stride[c] * int( sizeof( Pel ) );
     }
   }
-  m_gpuFilmGrain->apply( *m_filmGrainSynth, int( frame->numPlanes ), src, dst, int( frame->planes[0].bytesPerSample ), width, height );
+  const int64_t ticket = m_gpuFilmGrain->apply( *m_filmGrainSynth, int( frame->numPlanes ), src, dst, int( frame->planes[0].bytesPerSample ), width, height );
 
   if( m_filmGrainCharacteristicsState != FgcPersist )   // Not persistent
   {
     m_filmGrainCharacteristicsState = FgcNone;
   }
+  return ticket;
 }
 #endif
+
+void VVDecImpl::xGrainReap()
+{
+#if VVDEC_VULKAN
+  // the frames whose grain is done: the pictures it read back to the decoder at once (held until their frames go
+  // out, they ran the decoder short of pictures)
+  for( auto it = m_grainInFlight.begin(); it != m_grainInFlight.end(); )
+  {
+    if( !m_gpuFilmGrain->done( it->ticket ) )
+    {
+      ++it;
+      continue;
+    }
+    if( it->pic )
+    {
+      m_cDecLib->releasePicture( it->pic );
+    }
+    it = m_grainInFlight.erase( it );
+  }
+#endif
+}
+
+bool VVDecImpl::xGrainDone( uint64_t seq, bool wait )
+{
+#if VVDEC_VULKAN
+  xGrainReap();
+  for( auto it = m_grainInFlight.begin(); it != m_grainInFlight.end(); ++it )
+  {
+    if( it->seq != seq )
+    {
+      continue;
+    }
+    if( !wait && m_grainInFlight.size() < m_grainFramesAhead )
+    {
+      return false;
+    }
+    m_gpuFilmGrain->wait( it->ticket );
+    if( it->pic )
+    {
+      m_cDecLib->releasePicture( it->pic );
+    }
+    m_grainInFlight.erase( it );
+    return true;
+  }
+#endif
+  return true;
+}
+
+void VVDecImpl::xGrainDoneAll()
+{
+#if VVDEC_VULKAN
+  while( !m_grainInFlight.empty() )
+  {
+    xGrainDone( m_grainInFlight.front().seq, true );
+  }
+#endif
+}
 
 int VVDecImpl::xAddPicture( Picture* pcPic )
 {
@@ -1285,6 +1349,7 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
   }
 
   // Grain synthesis
+  bool grainReadsPicture = false;   // (the GPU's grain, under way, reads the picture: released once it is done)
   if( m_enableFilmGrain && m_filmGrainCharacteristicsState != FgcNone )
   {
 #if VVDEC_VULKAN
@@ -1294,7 +1359,10 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
     }
     if( gpuGrain )
     {
-      xAddGrainGpu( &cFrame, pcPic, confLeft, confTop, bCreateStorage );
+      const int64_t ticket = xAddGrainGpu( &cFrame, pcPic, confLeft, confTop, bCreateStorage );
+      grainReadsPicture    = bCreateStorage;
+      m_grainFramesAhead   = size_t( cFrame.width ) * cFrame.height > 1920 * 1088 ? 2 : 3;
+      m_grainInFlight.push_back( { cFrame.sequenceNumber, ticket, bCreateStorage ? pcPic : nullptr } );
     }
     else
 #endif
@@ -1324,7 +1392,7 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
 
   m_uiSeqNumber++;
 
-  if( bCreateStorage )
+  if( bCreateStorage && !grainReadsPicture )
   {
     // release library picture storage, because picture has been copied into new storage class
     m_cDecLib->releasePicture( pcPic );

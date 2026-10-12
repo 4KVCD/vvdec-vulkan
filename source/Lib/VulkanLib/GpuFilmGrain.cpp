@@ -72,34 +72,86 @@ static_assert( sizeof( FilmGrainPush ) == 88, "FilmGrainPush: the layout of film
 
 GpuFilmGrain::GpuFilmGrain( Context* ctx ) : m_ctx( ctx )
 {
-  m_pool = m_ctx->createCommandPool( m_ctx->queueFamily() );
-  m_ctx->allocateCommandBuffers( m_pool, 1, &m_cmd );
-  m_fence  = m_ctx->createFence();
-  m_tables = m_ctx->alloc( kTableBytes, MemKind::Upload );
+  for( Slot& slot: m_slots )
+  {
+    slot.pool = m_ctx->createCommandPool( m_ctx->grainFamily() );
+    m_ctx->allocateCommandBuffers( slot.pool, 1, &slot.cmd );
+    slot.fence  = m_ctx->createFence();
+    slot.tables = m_ctx->alloc( kTableBytes, MemKind::Upload );
+  }
 }
 
 GpuFilmGrain::~GpuFilmGrain()
 {
-  m_ctx->destroyFence( m_fence );
-  m_ctx->destroyCommandPool( m_pool );
-  m_ctx->free( m_tables );
-  m_ctx->free( m_seeds );
+  for( Slot& slot: m_slots )
+  {
+    finish( slot );   // (the frames' grain done before the commands, tables and seeds go)
+    m_ctx->destroyFence( slot.fence );
+    m_ctx->destroyCommandPool( slot.pool );
+    m_ctx->free( slot.tables );
+    m_ctx->free( slot.seeds );
+  }
+}
+
+void GpuFilmGrain::finish( Slot& slot )
+{
+  if( slot.ticket < 0 )
+  {
+    return;
+  }
+  if( m_ctx->api().vkWaitForFences( m_ctx->device(), 1, &slot.fence, VK_TRUE, UINT64_MAX ) != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: the film grain's work failed" );
+  }
+  slot.ticket = -1;
+}
+
+bool GpuFilmGrain::done( int64_t ticket )
+{
+  Slot& slot = m_slots[ticket % kSlots];
+  if( slot.ticket != ticket )
+  {
+    return true;   // (its slot was freed: done)
+  }
+  const VkResult status = m_ctx->api().vkGetFenceStatus( m_ctx->device(), slot.fence );
+  if( status == VK_NOT_READY )
+  {
+    return false;
+  }
+  if( status != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: the film grain's work failed" );
+  }
+  slot.ticket = -1;
+  return true;
+}
+
+void GpuFilmGrain::wait( int64_t ticket )
+{
+  Slot& slot = m_slots[ticket % kSlots];
+  if( slot.ticket == ticket )
+  {
+    finish( slot );
+  }
 }
 
 uint32_t* GpuFilmGrain::seeds( size_t count )
 {
+  Slot& slot = m_slots[m_nextTicket % kSlots];
+  finish( slot );   // (the frame that had the slot before)
   const size_t size = count * sizeof( uint32_t );
-  if( m_seeds.size < size )
+  if( slot.seeds.size < size )
   {
-    m_ctx->free( m_seeds );
-    m_seeds = m_ctx->alloc( ( size + 4095 ) & ~size_t( 4095 ), MemKind::Upload );
+    m_ctx->free( slot.seeds );
+    slot.seeds = m_ctx->alloc( ( size + 4095 ) & ~size_t( 4095 ), MemKind::Upload );
   }
-  return reinterpret_cast<uint32_t*>( m_seeds.mapped );
+  return reinterpret_cast<uint32_t*>( slot.seeds.mapped );
 }
 
-void GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane src[3], const Plane dst[3], int dstBytes, int lumaWidth, int lumaHeight )
+int64_t GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane src[3], const Plane dst[3], int dstBytes, int lumaWidth, int lumaHeight )
 {
   const Api&           vk   = m_ctx->api();
+  Slot&                slot = m_slots[m_nextTicket % kSlots];   // (seeds() freed it)
   const FilmGrainImpl& impl = grain.impl();
   // FilmGrainImpl::add_grain_block's checks, where a component has grain
   bool anyPresent = false;
@@ -114,27 +166,27 @@ void GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane src
     CHECK( impl.scaleShift() + impl.bitShift() < 8 || impl.scaleShift() + impl.bitShift() > 13, "wrong scale_shift" );
   }
 
-  // the tables as the synthesis has them now (the GPU's work before is done)
-  memcpy( m_tables.mapped, impl.patterns(), kPatternBytes );
+  // the tables as the synthesis has them now
+  memcpy( slot.tables.mapped, impl.patterns(), kPatternBytes );
   for( int c = 0; c < 3; c++ )
   {
-    memcpy( m_tables.mapped + kPatternBytes + c * 256, impl.scaleLut( c ), 256 );
-    memcpy( m_tables.mapped + kPatternBytes + 768 + c * 256, impl.patternLut( c ), 256 );
+    memcpy( slot.tables.mapped + kPatternBytes + c * 256, impl.scaleLut( c ), 256 );
+    memcpy( slot.tables.mapped + kPatternBytes + 768 + c * 256, impl.patternLut( c ), 256 );
   }
 
-  vk.vkResetCommandPool( m_ctx->device(), m_pool, 0 );
+  vk.vkResetCommandPool( m_ctx->device(), slot.pool, 0 );
   VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vk.vkBeginCommandBuffer( m_cmd, &begin );
-  vk.vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_filmgrain ) );
+  vk.vkBeginCommandBuffer( slot.cmd, &begin );
+  vk.vkCmdBindPipeline( slot.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_filmgrain ) );
   for( int c = 0; c < numPlanes; c++ )
   {
     FilmGrainPush push{};
     push.src        = src[c].addr;
     push.dst        = dst[c].addr;
-    push.pattern    = m_tables.addr;
-    push.luts       = m_tables.addr + kPatternBytes;
-    push.seeds      = m_seeds.addr;
+    push.pattern    = slot.tables.addr;
+    push.luts       = slot.tables.addr + kPatternBytes;
+    push.seeds      = slot.seeds.addr;
     push.srcStride  = src[c].stride;
     push.dstStride  = dst[c].stride;
     push.subx       = c ? impl.subX() : 1;
@@ -147,23 +199,21 @@ void GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane src
     push.scaleShift = impl.scaleShift();
     push.dstBytes   = dstBytes;
     push.present    = grain.componentPresent( c ) ? 1 : 0;
-    vk.vkCmdPushConstants( m_cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+    vk.vkCmdPushConstants( slot.cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
     // a workgroup 1024 samples of a row
-    vk.vkCmdDispatch( m_cmd, uint32_t( ( push.width + 1023 ) / 1024 ), uint32_t( lumaHeight / push.suby ), 1 );
+    vk.vkCmdDispatch( slot.cmd, uint32_t( ( push.width + 1023 ) / 1024 ), uint32_t( lumaHeight / push.suby ), 1 );
   }
   // the host reads the frame after the fence
   VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
   barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
   barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  vk.vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
-  vk.vkEndCommandBuffer( m_cmd );
+  vk.vkCmdPipelineBarrier( slot.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+  vk.vkEndCommandBuffer( slot.cmd );
 
-  vk.vkResetFences( m_ctx->device(), 1, &m_fence );
-  m_ctx->submit( m_cmd, m_fence );
-  if( vk.vkWaitForFences( m_ctx->device(), 1, &m_fence, VK_TRUE, UINT64_MAX ) != VK_SUCCESS )
-  {
-    THROW_FATAL( "Vulkan: the film grain's work failed" );
-  }
+  vk.vkResetFences( m_ctx->device(), 1, &slot.fence );
+  m_ctx->submitGrain( slot.cmd, slot.fence );
+  slot.ticket = m_nextTicket++;
+  return slot.ticket;
 }
 
 }   // namespace gpu
