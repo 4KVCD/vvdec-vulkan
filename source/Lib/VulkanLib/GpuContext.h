@@ -127,7 +127,7 @@ struct Options
   std::string device;                  // VVDEC_GPU_DEVICE: the index of the Vulkan device (empty: the first discrete GPU,
                                        // else the first integrated one)
   bool        profile       = false;   // VVDEC_GPU_PROFILE=1: the GPU time of each pass, each shader's registers
-  std::string isaDir;                  // VVDEC_GPU_ISA: with profile on AMD, where each shader's machine code is written
+  std::string isaDir;                  // VVDEC_GPU_ISA: on AMD, the directory where each shader's machine code is written
   std::string pipelineCache;           // VVDEC_GPU_CACHE: the file of the compiled pipelines' binaries (Context's
                                        // PipelineBinaries; empty: in the user's cache directory, "0": none)
   bool        async         = true;    // VVDEC_GPU_ASYNC=0: the front end on the compute queue, not an async queue
@@ -348,7 +348,7 @@ private:
   std::mutex                       m_timeMutex;
   std::atomic<int64_t>             m_memoryNow[2]  = { { 0 }, { 0 } };
   std::atomic<int64_t>             m_memoryPeak[2] = { { 0 }, { 0 } };
-  PFN_vkGetShaderInfoAMD           m_getShaderInfo = nullptr;   // VK_AMD_shader_info, when profiling on AMD
+  PFN_vkGetShaderInfoAMD           m_getShaderInfo = nullptr;   // VK_AMD_shader_info, on AMD when profiling or writing machine code
 
   static std::mutex s_mutex;
   static Context*   s_context;

@@ -350,8 +350,11 @@ bool Context::init()
   enable.features.shaderInt64 = VK_TRUE;
 
   // VVDEC_GPU_PROFILE=1: the GPU time of the passes, and with
-  // VK_AMD_shader_info the registers and memory each shader takes
+  // VK_AMD_shader_info the registers and memory each shader takes.
+  // VVDEC_GPU_ISA=<directory> needs VK_AMD_shader_info too, for the
+  // shaders' machine code.
   m_profiling = m_options.profile;
+  const bool wantShaderInfo = m_profiling || !m_options.isaDir.empty();
   const char* shaderInfo = "VK_AMD_shader_info";
   const char* shaderClock = "VK_KHR_shader_clock";
   // and for the parse shader, OpSubgroupReadInvocationKHR (GpuContext.h's subgroupBallot)
@@ -371,7 +374,7 @@ bool Context::init()
     m_api.vkEnumerateDeviceExtensionProperties( m_physical, nullptr, &extensionCount, extensions.data() );
     for( const VkExtensionProperties& extension: extensions )
     {
-      hasShaderInfo |= m_profiling && strcmp( extension.extensionName, shaderInfo ) == 0;
+      hasShaderInfo |= wantShaderInfo && strcmp( extension.extensionName, shaderInfo ) == 0;
       hasShaderClock |= m_profiling && strcmp( extension.extensionName, shaderClock ) == 0;
       hasSubgroupBallot |= strcmp( extension.extensionName, subgroupBallot ) == 0;
       hasMaintenance5 |= strcmp( extension.extensionName, maintenance5 ) == 0;
@@ -1227,6 +1230,10 @@ VkPipeline Context::pipeline( int shaderId )
           {
             fwrite( text.data(), 1, textSize, file );
             fclose( file );
+          }
+          else
+          {
+            msg( WARNING, "Vulkan: cannot write %s (does the directory exist?)\n", path.c_str() );
           }
         }
       }
