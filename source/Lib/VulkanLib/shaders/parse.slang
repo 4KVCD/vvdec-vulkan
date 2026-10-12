@@ -605,23 +605,25 @@ uint decodeBinBody( int ctxId )
   const uint q     = ( s0 + s1 ) >> 8;
   uint       bin   = q >> 7;
   const uint lps   = ( ( ( ( q ^ ( bin != 0 ? 0xffu : 0u ) ) >> 2 ) * ( g_range >> 5 ) ) >> 1 ) + 4;
-  uint       range = g_range - lps;
+  const uint range = g_range - lps;
   const uint sr    = range << 7;
-  if( g_value >= sr )
+  if( g_value < sr )
+  {
+    // The most probable symbol: renormalized by a bit when range is below 256 (it is 128 to 510). (A shift of 0 or 1
+    // rather than an if: the compiler's code for an if here took a detour through vector registers.)
+    const uint numBits = ( range >> 8 ) ^ 1u;
+    g_value <<= numBits;
+    g_range = range << numBits;
+    g_bitsNeeded += int( numBits );
+  }
+  else
   {
     const uint numBits = 8u - uint( firstbithigh( lps ) );   // (= m_RenormTable_32[lps >> 3], as lps is 4 to 255)
     g_value            = ( g_value - sr ) << numBits;
-    range              = lps << numBits;
+    g_range            = lps << numBits;
     bin ^= 1u;
     g_bitsNeeded += int( numBits );
   }
-  else if( range < 256 )
-  {
-    g_value <<= 1;
-    range <<= 1;
-    g_bitsNeeded++;
-  }
-  g_range = range;
   if( g_bitsNeeded >= 0 )
   {
     g_value += readByte() << uint( g_bitsNeeded );
