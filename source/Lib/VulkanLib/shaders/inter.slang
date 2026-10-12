@@ -1725,14 +1725,103 @@ bool tileInside( int x, int y, int w, int h, int flags, int2 mv0, int2 mv1 )
   return inside;
 }
 
+// Whether tile may take a 16x16 tile whose windows reach past the picture's edges (a border tile): by at most 16 luma
+// (8 chroma) samples past each edge, so that the reads past an edge stay in the planes' margins, and no motion needs
+// clipping (with DMVR's refinement of up to 2 samples too).
+bool tileNear( int x, int y, int flags, int2 mv0, int2 mv1 )
+{
+  bool near = true;
+  [unroll]
+  for( int list = 0; list < 2; list++ )
+  {
+    if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) != 0 )
+    {
+      const int2 m  = list == 0 ? mv0 : mv1;
+      const int  wx = x + ( m.x >> 4 ) - 3, wy = y + ( m.y >> 4 ) - 3;
+      const int  cx = ( x >> 1 ) + ( m.x >> 5 ) - 1, cy = ( y >> 1 ) + ( m.y >> 5 ) - 1;
+      near          = near && wx >= -16 && wx + YW <= pc.picWidth + 16 && wy >= -16 && wy + YW <= pc.picHeight + 16 && cx >= -8
+             && cx + CWD <= ( pc.picWidth >> 1 ) + 8 && cy >= -8 && cy + CWD <= ( pc.picHeight >> 1 ) + 8;
+    }
+  }
+  return near;
+}
+
+// A border tile's window row of n samples at s_pool[at], its first at the picture's column x0: the reads took the
+// samples beside the picture from its planes' margins, which hold no border extension on the GPU; the row's samples
+// left of column 0 get column 0's, those right of the last column the last column's, as vvdec's border extension of the
+// reference picture holds them. (tileNear leaves both columns in the row.)
+void tileBorderRow( int at, int x0, int n, int width )
+{
+  const int first = -x0;              // the row's sample at column 0
+  const int last  = width - 1 - x0;   // at the picture's last column
+  if( first > 0 )
+  {
+    const int16_t v = s_pool[at + first];
+    for( int c = 0; c < first; c++ )
+    {
+      s_pool[at + c] = v;
+    }
+  }
+  if( last < n - 1 )
+  {
+    const int16_t v = s_pool[at + last];
+    for( int c = last + 1; c < n; c++ )
+    {
+      s_pool[at + c] = v;
+    }
+  }
+}
+
+// tileBorderRow for each row of a border tile's luma windows (at: the lists' windows, x0: their first columns), a
+// thread per row: threads 0 .. 22 the first list's, 32 .. 54 the second's
+void tileBorderLuma( int tid, int at[2], int x0[2], bool two )
+{
+  const int s = tid >> 5;
+  const int r = tid & 31;
+  if( r < YW && ( s == 0 || two ) )
+  {
+    tileBorderRow( at[s] + r * YS, x0[s], YW, pc.picWidth );
+  }
+}
+
+// The same for the chroma windows (at: [2 * list + component - 1]): threads 16 b .. 16 b + 10 the rows of window b
+void tileBorderChroma( int tid, int at[4], int x0[2], bool two )
+{
+  const int b = tid >> 4;
+  const int r = tid & 15;
+  if( r < CWD && ( b < 2 || two ) )
+  {
+    tileBorderRow( at[b] + r * CS, x0[b >> 1], CWD, pc.picWidth >> 1 );
+  }
+}
+
+// The residuals that the picture holds where the thread's predictions go (atY: luma, atC: chroma), when the block has
+// any. Both chroma planes are read at the thread's place when either has a residual (the other is another thread's: no
+// more memory traffic; and the branch is the same for all the threads), and the thread's picked after: a plane picked
+// before reading would have its pointer read per thread, one more round trip.
+void tileResiduals( int flags, uint atY, uint atC, inout uint2 resY, inout uint resCb, inout uint resCr )
+{
+  if( ( flags & FLAG_RES_Y ) != 0 )
+  {
+    resY = *(uint2*)at( pc.dst0, atY );
+  }
+  if( ( flags & ( ( FLAG_RES_Y << 1 ) | ( FLAG_RES_Y << 2 ) ) ) != 0 )
+  {
+    resCb = *(uint*)at( pc.dst1, atC );
+    resCr = *(uint*)at( pc.dst2, atC );
+  }
+}
+
 // FULL: a 16x16 tile, else one of w x h (16x8, 8x16 or 8x8) without DMVR or BDOF. (Two functions: in each, the size's
 // values are constants or nearly so.)
+// border (FULL only): the windows reach past the picture's edges (tileNear).
 void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int cuX, int cuY, int flags, int2 mv0, int2 mv1, int ref0, int ref1,
-                           bool bi, bool dmvr, bool hpel )
+                           bool bi, bool dmvr, bool hpel, bool border )
 {
   const int  tw     = FULL != 0 ? 16 : w;
   const int  th     = FULL != 0 ? 16 : h;
   const bool dmvrOn = FULL != 0 && dmvr;
+  const bool edges  = FULL != 0 && border;
   // The windows' rows: of nch chunks of 8 luma samples (of 4 chroma samples) each, from lead samples before the window;
   // th + 7 luma rows, th / 2 + 3 chroma rows. A 16x16 tile's luma chunks take two reads a thread per list (69 > 64).
   const int  nch    = tw == 16 ? 3 : 2;
@@ -1776,11 +1865,21 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   int wyAt[2] = { WY_AT( 0 ) + leadY[0], WY_AT( 1 ) + leadY[1] };
   int wcAt[4] = { WC_AT( 0 ) + leadC[0], WC_AT( 1 ) + leadC[0], WC_AT( 2 ) + leadC[1], WC_AT( 3 ) + leadC[1] };
 
-  // All of the tile's reads, none of them in a branch, so that they wait for memory together: after a branch the
-  // compiler makes the next read wait for all those before it. Each read takes one plane, the same in all the threads,
-  // so that its address is a scalar base and an offset (at()). Luma windows: rows of nch x 16 bytes per list (a 16x16
-  // tile's: 23 rows of 24 samples from lead before the window, in two reads a thread per list; a thread past the last
-  // chunk reads the last one again, and stores nothing; with one list, the second list's reads are the first's again).
+  // The thread's places: its luma samples (j, i0 .. i0 + 3) and its chroma samples (cj, ci0 .. ci0 + 1) of component cc
+  const int  j     = FULL != 0 ? jAll : min( jAll, th - 1 );
+  const int  i0    = ( tid & ( ( 1 << lg ) - 1 ) ) << 2;
+  const int  cc    = tid >> 5;
+  const int  cj    = FULL != 0 ? cjAll : min( cjAll, ( th >> 1 ) - 1 );
+  const int  ci0   = ( tid & ( ( 1 << lg ) - 1 ) ) << 1;
+  const uint atY   = uint( ( y + j ) * pc.stride0 + x + i0 );
+  const uint atC   = uint( ( ( y >> 1 ) + cj ) * pc.stride12 + ( x >> 1 ) + ci0 );
+
+  // All of the tile's reads, issued before the first wait for memory, in no branch but the residuals' after the windows'
+  // and the border tiles' (one of two whole sets of reads): after a branch the compiler makes the next read wait for all
+  // those before it. Each read takes one plane, the same in all the threads, so that its address is a scalar base and an
+  // offset (at()). Luma windows: rows of nch x 16 bytes per list (a 16x16 tile's: 23 rows of 24 samples from lead before
+  // the window, in two reads a thread per list; a thread past the last chunk reads the last one again, and stores
+  // nothing; with one list, the second list's reads are the first's again).
   const bool two     = lists == 2;
   // Weighted prediction (wpSample) starts from the 14-bit predictions, for a uni-prediction too (hi). (DMVR and BDOF
   // are off where it is on.)
@@ -1793,54 +1892,65 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   const uint yFirst0 = uint( wy[0] * pc.stride0 + wx[0] - leadY[0] );   // (the windows' first chunks)
   const uint yFirst1 = two ? uint( wy[1] * pc.stride0 + wx[1] - leadY[1] ) : yFirst0;
   uint4      yChunk[4];
-  [unroll]
-  for( int k = 0; k < 4; k++ )
-  {
-    if( FULL != 0 || ( k & 1 ) == 0 )
-    {
-      const int  rem = min( tid + THREADS * ( k & 1 ), yTasks - 1 );
-      const int  row = nch == 3 ? rem / 3 : rem >> 1;
-      const uint i   = ( k < 2 ? yFirst0 : yFirst1 ) + uint( row * pc.stride0 + 8 * ( rem - nch * row ) );
-      yChunk[k]      = load16( k < 2 ? planeY[0] : y1, i );
-    }
-  }
-  // Chroma windows: rows of nch x 8 bytes per component and list (a 16x16 tile's: 11 rows of 12 samples from lead before
-  // the window), a read a thread for each (Cb and Cr of the first list, then of the second).
+  uint2      cChunk[4];
   int16_t*   cb1     = two ? planeCb[1] : planeCb[0];
   int16_t*   cr1     = two ? planeCr[1] : planeCr[0];
-  const uint cFirst0 = uint( cys[0] * pc.stride12 + cxs[0] - leadC[0] );
-  const uint cFirst1 = two ? uint( cys[1] * pc.stride12 + cxs[1] - leadC[1] ) : cFirst0;
   const int  cRem    = min( tid, cTasks - 1 );
   const int  cRow    = nch == 3 ? cRem / 3 : cRem >> 1;
-  uint2      cChunk[4];
-  [unroll]
-  for( int k = 0; k < 4; k++ )
+  uint2      resY    = uint2( 0, 0 );
+  uint       resCb   = 0, resCr = 0;
+  if( edges )
   {
-    const uint i = ( k < 2 ? cFirst0 : cFirst1 ) + uint( cRow * pc.stride12 + 4 * ( cRem - nch * cRow ) );
-    cChunk[k]    = load8( k == 0 ? planeCb[0] : ( k == 1 ? planeCr[0] : ( k == 2 ? cb1 : cr1 ) ), i );
+    // A border tile: each row read is clamped into the picture (the rows past its top and bottom are its first and last
+    // rows, as vvdec's border extension holds them), and a chunk wholly left or right of the picture is read from the
+    // row's start instead (tileBorderLuma sets its samples); a chunk across an edge reaches 7 samples past it at most,
+    // into the margin. (Chroma alike, with chunks of 4 samples.) The reads index from the margin's sample 16 left of the
+    // plane's first sample: at() takes no negative index (as an offset of 2 GB, a chunk left of the first row faulted).
+    [unroll]
+    for( int k = 0; k < 4; k++ )
+    {
+      const int s   = k < 2 || !two ? 0 : 1;
+      const int rem = min( tid + THREADS * ( k & 1 ), yTasks - 1 );
+      const int row = rem / 3;
+      const int col = wx[s] - leadY[s] + 8 * ( rem - 3 * row );
+      const int c0  = col + 8 <= 0 || col >= pc.picWidth ? 0 : col;
+      yChunk[k]     = load16( planeY[s] - 16, uint( clamp( wy[s] + row, 0, pc.picHeight - 1 ) * pc.stride0 + c0 + 16 ) );
+    }
+    [unroll]
+    for( int k = 0; k < 4; k++ )
+    {
+      const int s   = k < 2 || !two ? 0 : 1;
+      const int col = cxs[s] - leadC[s] + 4 * ( cRem - 3 * cRow );
+      const int c0  = col + 4 <= 0 || col >= ( pc.picWidth >> 1 ) ? 0 : col;
+      cChunk[k]     = load8( ( ( k & 1 ) == 0 ? planeCb[s] : planeCr[s] ) - 16,
+                             uint( clamp( cys[s] + cRow, 0, ( pc.picHeight >> 1 ) - 1 ) * pc.stride12 + c0 + 16 ) );
+    }
+    tileResiduals( flags, atY, atC, resY, resCb, resCr );
   }
-  // The residuals that the picture holds where the thread's predictions go, when the block has any: luma (j, i0 ..
-  // i0 + 3) and chroma (cj, ci0 .. ci0 + 1) of component cc. Both chroma planes are read at the thread's place when
-  // either has a residual (the other is another thread's: no more memory traffic; and the branch is the same for all
-  // the threads), and the thread's picked after: a plane picked before reading would have its pointer read per
-  // thread, one more round trip.
-  const int  j     = FULL != 0 ? jAll : min( jAll, th - 1 );
-  const int  i0    = ( tid & ( ( 1 << lg ) - 1 ) ) << 2;
-  const int  cc    = tid >> 5;
-  const int  cj    = FULL != 0 ? cjAll : min( cjAll, ( th >> 1 ) - 1 );
-  const int  ci0   = ( tid & ( ( 1 << lg ) - 1 ) ) << 1;
-  const uint atY   = uint( ( y + j ) * pc.stride0 + x + i0 );
-  const uint atC   = uint( ( ( y >> 1 ) + cj ) * pc.stride12 + ( x >> 1 ) + ci0 );
-  uint2      resY  = uint2( 0, 0 );
-  uint       resCb = 0, resCr = 0;
-  if( ( flags & FLAG_RES_Y ) != 0 )
+  else
   {
-    resY = *(uint2*)at( pc.dst0, atY );
-  }
-  if( ( flags & ( ( FLAG_RES_Y << 1 ) | ( FLAG_RES_Y << 2 ) ) ) != 0 )
-  {
-    resCb = *(uint*)at( pc.dst1, atC );
-    resCr = *(uint*)at( pc.dst2, atC );
+    [unroll]
+    for( int k = 0; k < 4; k++ )
+    {
+      if( FULL != 0 || ( k & 1 ) == 0 )
+      {
+        const int  rem = min( tid + THREADS * ( k & 1 ), yTasks - 1 );
+        const int  row = nch == 3 ? rem / 3 : rem >> 1;
+        const uint i   = ( k < 2 ? yFirst0 : yFirst1 ) + uint( row * pc.stride0 + 8 * ( rem - nch * row ) );
+        yChunk[k]      = load16( k < 2 ? planeY[0] : y1, i );
+      }
+    }
+    // Chroma windows: rows of nch x 8 bytes per component and list (a 16x16 tile's: 11 rows of 12 samples from lead
+    // before the window), a read a thread for each (Cb and Cr of the first list, then of the second).
+    const uint cFirst0 = uint( cys[0] * pc.stride12 + cxs[0] - leadC[0] );
+    const uint cFirst1 = two ? uint( cys[1] * pc.stride12 + cxs[1] - leadC[1] ) : cFirst0;
+    [unroll]
+    for( int k = 0; k < 4; k++ )
+    {
+      const uint i = ( k < 2 ? cFirst0 : cFirst1 ) + uint( cRow * pc.stride12 + 4 * ( cRem - nch * cRow ) );
+      cChunk[k]    = load8( k == 0 ? planeCb[0] : ( k == 1 ? planeCr[0] : ( k == 2 ? cb1 : cr1 ) ), i );
+    }
+    tileResiduals( flags, atY, atC, resY, resCb, resCr );
   }
   const uint resC = cc == 0 ? resCb : resCr;
 
@@ -1863,6 +1973,11 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   int dmvrCost = 2 * 16 * 16;   // (without DMVR, BDOF applies wherever the tile's flag says)
 #endif
   GroupMemoryBarrierWithGroupSync();
+  if( edges )
+  {
+    tileBorderLuma( tid, wyAt, wx, two );
+    GroupMemoryBarrierWithGroupSync();
+  }
 
   // DMVR, as xProcessDMVR: the centre's SAD first. When it is small enough (83% of VideoQ's subblocks) there is no
   // refinement, and neither the other 24 SADs nor most bilinear predictions are needed.
@@ -2024,6 +2139,11 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
     }
   }
   GroupMemoryBarrierWithGroupSync();
+  if( edges )
+  {
+    tileBorderChroma( tid, wcAt, cxs, two );
+    GroupMemoryBarrierWithGroupSync();
+  }
   // Where DMVR moved a list's integer position in chroma samples, the chroma windows too are rewritten to it.
   int2 dIC[2];
   [unroll]
@@ -3074,9 +3194,9 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const bool dmvr  = ( flags & FLAG_DMVR ) != 0;
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
-  if( widePlanes() && w == 16 && h == 16 && tileInside( x, y, 16, 16, flags, mv0, mv1 ) )
+  if( widePlanes() && w == 16 && h == 16 && tileNear( x, y, flags, mv0, mv1 ) )
   {
-    tile<1>( tid, job, x, y, 16, 16, cuX, cuY, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel );
+    tile<1>( tid, job, x, y, 16, 16, cuX, cuY, flags, mv0, mv1, ref0, ref1, bi, dmvr, hpel, !tileInside( x, y, 16, 16, flags, mv0, mv1 ) );
     return;
   }
 #if !BDOF
@@ -3084,7 +3204,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   // the slower preset's streams), which have no DMVR there
   if( widePlanes() && w >= 8 && h >= 8 && !dmvr && tileInside( x, y, w, h, flags, mv0, mv1 ) )
   {
-    tile<0>( tid, job, x, y, w, h, cuX, cuY, flags, mv0, mv1, ref0, ref1, bi, false, hpel );
+    tile<0>( tid, job, x, y, w, h, cuX, cuY, flags, mv0, mv1, ref0, ref1, bi, false, hpel, false );
     return;
   }
 #endif
