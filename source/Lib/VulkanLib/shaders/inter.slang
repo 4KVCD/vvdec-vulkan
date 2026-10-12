@@ -1461,10 +1461,10 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   const bool l0    = ( flags & FLAG_L0 ) != 0;
   int2       mvs[2]  = { l0 ? mv0 : mv1, mv1 };
   int        refs[2] = { l0 ? ref0 : ref1, bi ? ref1 : ( l0 ? ref0 : ref1 ) };
-  // The planes, read once for the workgroup (each load below picks its own).
-  int16_t*   planeY[2]  = { refPlane( refs[0], 0 ), refPlane( refs[1], 0 ) };
-  int16_t*   planeCb[2] = { refPlane( refs[0], 1 ), refPlane( refs[1], 1 ) };
-  int16_t*   planeCr[2] = { refPlane( refs[0], 2 ), refPlane( refs[1], 2 ) };
+  // The planes, read once for the workgroup (each load below picks its own), as scalar bases for at().
+  int16_t*   planeY[2]  = { uniPtr( refPlane( refs[0], 0 ) ), uniPtr( refPlane( refs[1], 0 ) ) };
+  int16_t*   planeCb[2] = { uniPtr( refPlane( refs[0], 1 ) ), uniPtr( refPlane( refs[1], 1 ) ) };
+  int16_t*   planeCr[2] = { uniPtr( refPlane( refs[0], 2 ) ), uniPtr( refPlane( refs[1], 2 ) ) };
   int        wx[2], wy[2], leadY[2], cxs[2], cys[2], leadC[2];
   [unroll]
   for( int s = 0; s < 2; s++ )
@@ -1478,36 +1478,35 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   }
 
   // All of the tile's reads, none of them in a branch, so that they wait for memory together: after a branch the
-  // compiler makes the next read wait for all those before it. Luma windows: 23 rows of 4 x 16 bytes per list (a
-  // thread past the last chunk reads the last one again, and stores nothing).
-  uint4 yChunk[3];
+  // compiler makes the next read wait for all those before it. Each read takes one plane, the same in all the threads,
+  // so that its address is a scalar base and an offset (at()). Luma windows: 23 rows of 4 x 16 bytes per list, in two
+  // reads a thread per list (a thread past the last chunk reads the last one again, and stores nothing; with one list,
+  // the second list's reads are the first's again).
+  const bool two     = lists == 2;
+  int16_t*   y1      = two ? planeY[1] : planeY[0];
+  const uint yFirst0 = uint( wy[0] * pc.stride0 + wx[0] - leadY[0] );   // (the windows' first chunks)
+  const uint yFirst1 = two ? uint( wy[1] * pc.stride0 + wx[1] - leadY[1] ) : yFirst0;
+  uint4      yChunk[4];
   [unroll]
-  for( int k = 0; k < 3; k++ )
+  for( int k = 0; k < 4; k++ )
   {
-    const int task = min( tid + THREADS * k, 92 * lists - 1 );
-    const int s    = task >= 92 ? 1 : 0;
-    const int rem  = task - 92 * s;
-    // (the slot is picked with selects: an array indexed per lane would go to scratch memory)
-    const int row0 = s == 0 ? wy[0] : wy[1];
-    const int col0 = s == 0 ? wx[0] - leadY[0] : wx[1] - leadY[1];
-    int16_t*  p    = ( s == 0 ? planeY[0] : planeY[1] ) + ( row0 + ( rem >> 2 ) ) * pc.stride0 + col0 + 8 * ( rem & 3 );
-    yChunk[k]      = *(uint4*)p;
+    const int  rem = min( tid + THREADS * ( k & 1 ), 91 );
+    const uint i   = ( k < 2 ? yFirst0 : yFirst1 ) + uint( ( rem >> 2 ) * pc.stride0 + 8 * ( rem & 3 ) );
+    yChunk[k]      = *(uint4*)at( k < 2 ? planeY[0] : y1, i );
   }
-  // Chroma windows: 11 rows of 4 x 8 bytes per component and list (the same).
-  uint2 cChunk[3];
+  // Chroma windows: 11 rows of 4 x 8 bytes per component and list, a read a thread for each (Cb and Cr of the first
+  // list, then of the second).
+  int16_t*   cb1     = two ? planeCb[1] : planeCb[0];
+  int16_t*   cr1     = two ? planeCr[1] : planeCr[0];
+  const uint cFirst0 = uint( cys[0] * pc.stride12 + cxs[0] - leadC[0] );
+  const uint cFirst1 = two ? uint( cys[1] * pc.stride12 + cxs[1] - leadC[1] ) : cFirst0;
+  uint2      cChunk[4];
   [unroll]
-  for( int k = 0; k < 3; k++ )
+  for( int k = 0; k < 4; k++ )
   {
-    const int task = min( tid + THREADS * k, 88 * lists - 1 );
-    const int s    = task >= 88 ? 1 : 0;
-    const int rem  = task - 88 * s;
-    const int comp = rem >= 44 ? 1 : 0;
-    const int rem2 = rem - 44 * comp;
-    int16_t*  base = s == 0 ? ( comp == 0 ? planeCb[0] : planeCr[0] ) : ( comp == 0 ? planeCb[1] : planeCr[1] );
-    const int row0 = s == 0 ? cys[0] : cys[1];
-    const int col0 = s == 0 ? cxs[0] - leadC[0] : cxs[1] - leadC[1];
-    int16_t*  p    = base + ( row0 + ( rem2 >> 2 ) ) * pc.stride12 + col0 + 4 * ( rem2 & 3 );
-    cChunk[k]      = *(uint2*)p;
+    const int  rem = min( tid, 43 );
+    const uint i   = ( k < 2 ? cFirst0 : cFirst1 ) + uint( ( rem >> 2 ) * pc.stride12 + 4 * ( rem & 3 ) );
+    cChunk[k]      = *(uint2*)at( k == 0 ? planeCb[0] : ( k == 1 ? planeCr[0] : ( k == 2 ? cb1 : cr1 ) ), i );
   }
   // The residuals that the picture holds where the thread's predictions go, when the block has any: luma (j, i0 ..
   // i0 + 3) and chroma (cj, ci0 .. ci0 + 1) of component cc. Both chroma planes are read at the thread's place when
@@ -1519,36 +1518,31 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   const int  cc    = tid >> 5;
   const int  cj    = ( tid & 31 ) >> 2;
   const int  ci0   = ( tid & 3 ) << 1;
-  const int  atY   = ( y + j ) * pc.stride0 + x + i0;
-  const int  atC   = ( ( y >> 1 ) + cj ) * pc.stride12 + ( x >> 1 ) + ci0;
-  int16_t*   srcY  = pc.dst0 + atY;
-  int16_t*   srcCb = pc.dst1 + atC;
-  int16_t*   srcCr = pc.dst2 + atC;
+  const uint atY   = uint( ( y + j ) * pc.stride0 + x + i0 );
+  const uint atC   = uint( ( ( y >> 1 ) + cj ) * pc.stride12 + ( x >> 1 ) + ci0 );
   uint2      resY  = uint2( 0, 0 );
   uint       resCb = 0, resCr = 0;
   if( ( flags & FLAG_RES_Y ) != 0 )
   {
-    resY = *(uint2*)srcY;
+    resY = *(uint2*)at( pc.dst0, atY );
   }
   if( ( flags & ( ( FLAG_RES_Y << 1 ) | ( FLAG_RES_Y << 2 ) ) ) != 0 )
   {
-    resCb = *(uint*)srcCb;
-    resCr = *(uint*)srcCr;
+    resCb = *(uint*)at( pc.dst1, atC );
+    resCr = *(uint*)at( pc.dst2, atC );
   }
   const uint resC = cc == 0 ? resCb : resCr;
 
   // Store the luma windows in shared memory.
   [unroll]
-  for( int k = 0; k < 3; k++ )
+  for( int k = 0; k < 4; k++ )
   {
-    const int task = tid + THREADS * k;
-    if( task < 92 * lists )
+    const int rem = tid + THREADS * ( k & 1 );
+    if( ( k < 2 || two ) && rem < 92 )
     {
-      const int s   = task >= 92 ? 1 : 0;
-      const int rem = task - 92 * s;
       // (the row from the window's first sample: the chunk's samples before it, and past the row's room, are dropped)
-      const int   at   = WY_AT( s ) + ( rem >> 2 ) * YS;
-      const int   c0   = 8 * ( rem & 3 ) - ( s == 0 ? leadY[0] : leadY[1] );
+      const int   row  = WY_AT( k >> 1 ) + ( rem >> 2 ) * YS;
+      const int   c0   = 8 * ( rem & 3 ) - ( k < 2 ? leadY[0] : leadY[1] );
       const uint4 v    = yChunk[k];
       const uint  w[4] = { v.x, v.y, v.z, v.w };
       [unroll]
@@ -1556,7 +1550,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
       {
         if( uint( c0 + m ) < uint( YS ) )
         {
-          s_pool[at + c0 + m] = int16_t( w[m >> 1] >> ( 16 * ( m & 1 ) ) );
+          s_pool[row + c0 + m] = int16_t( w[m >> 1] >> ( 16 * ( m & 1 ) ) );
         }
       }
     }
@@ -1733,18 +1727,13 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
 
   // Chroma: store the windows in shared memory, then the horizontal passes of the 2-D filters, 11 rows of 8 in pairs.
   [unroll]
-  for( int k = 0; k < 3; k++ )
+  for( int k = 0; k < 4; k++ )
   {
-    const int task = tid + THREADS * k;
-    if( task < 88 * lists )
+    if( ( k < 2 || two ) && tid < 44 )
     {
-      const int s    = task >= 88 ? 1 : 0;
-      const int rem  = task - 88 * s;
-      const int comp = rem >= 44 ? 1 : 0;
-      const int rem2 = rem - 44 * comp;
       // (the row from the window's first sample: the chunk's samples before it, and past the row's room, are dropped)
-      const int   at   = WC_AT( 2 * s + comp ) + ( rem2 >> 2 ) * CS;
-      const int   c0   = 4 * ( rem2 & 3 ) - ( s == 0 ? leadC[0] : leadC[1] );
+      const int   row  = WC_AT( k ) + ( tid >> 2 ) * CS;
+      const int   c0   = 4 * ( tid & 3 ) - ( k < 2 ? leadC[0] : leadC[1] );
       const uint2 v    = cChunk[k];
       const uint  w[2] = { v.x, v.y };
       [unroll]
@@ -1752,7 +1741,7 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
       {
         if( uint( c0 + m ) < uint( CS ) )
         {
-          s_pool[at + c0 + m] = int16_t( w[m >> 1] >> ( 16 * ( m & 1 ) ) );
+          s_pool[row + c0 + m] = int16_t( w[m >> 1] >> ( 16 * ( m & 1 ) ) );
         }
       }
     }
@@ -1853,8 +1842,8 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     vy = clamp( vy + int4( lo16( resY.x ), hi16( resY.x ), lo16( resY.y ), hi16( resY.y ) ), 0, maxVal );
   }
-  int16_t* outY = ( ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0 ) + atY;
-  *(uint2*)outY  = uint2( uint( vy.x & 0xffff ) | uint( vy.y ) << 16, uint( vy.z & 0xffff ) | uint( vy.w ) << 16 );
+  int16_t* outY = ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0;
+  *(uint2*)at( outY, atY ) = uint2( uint( vy.x & 0xffff ) | uint( vy.y ) << 16, uint( vy.z & 0xffff ) | uint( vy.w ) << 16 );
   int2 vc;
   [unroll]
   for( int o = 0; o < 2; o++ )
@@ -1865,10 +1854,10 @@ void tile16( int tid, int index, uint* job, int x, int y, int flags, int2 mv0, i
   {
     vc = clamp( vc + int2( lo16( resC ), hi16( resC ) ), 0, maxVal );
   }
-  // (each component's place first, then the thread's: see the residuals)
-  int16_t* outCb = ( ( flags & FLAG_DEFER_CB ) != 0 ? pc.defer1 : pc.dst1 ) + atC;
-  int16_t* outCr = ( ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2 ) + atC;
-  *(uint*)( cc == 0 ? outCb : outCr ) = uint( vc.x & 0xffff ) | uint( vc.y ) << 16;
+  // (each component's plane first, then the thread's: see the residuals)
+  int16_t* outCb = ( flags & FLAG_DEFER_CB ) != 0 ? pc.defer1 : pc.dst1;
+  int16_t* outCr = ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2;
+  *(uint*)at( cc == 0 ? outCb : outCr, atC ) = uint( vc.x & 0xffff ) | uint( vc.y ) << 16;
 }
 
 

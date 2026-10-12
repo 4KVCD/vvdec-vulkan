@@ -6,6 +6,23 @@ int clip3( int lo, int hi, int v )
   return min( max( v, lo ), hi );
 }
 
+// p advanced by index elements, for a pointer the same in all the threads (a push constant's, or uniPtr's) and an
+// offset below 2 GB, as every buffer of the decoder's is. So written, AMD's compiler adds the 32-bit offset to the
+// pointer in the load or store instruction itself (scalar-base addressing); p + index makes each thread work out a
+// 64-bit address instead (a sign extension, a shift and two adds with carry).
+T* at<T>( T* p, uint index )
+{
+  return (T*)( (uint8_t*)p + ( ( index * uint( sizeof( T ) ) ) & 0x7fffffffu ) );
+}
+
+// A pointer the same in all the threads, made one the compiler keeps in scalar registers: for a pointer read from
+// memory, which the compiler reads with vector loads once the shader may have written memory before (at() could not
+// use it as a scalar base then).
+T* uniPtr<T>( T* p )
+{
+  return (T*)WaveReadLaneFirst( (uint64_t)p );
+}
+
 // Sample access in a plane of 16-bit samples: (0, 0) is at p, and rows are stride samples apart.
 int loadPel( int16_t* p, int stride, int x, int y )
 {
