@@ -212,36 +212,13 @@ bool parseShadowRequested()
   return on;
 }
 
-bool buildParseInput( const CodingStructure& cs, ParseInput& in )
+// Each CTU's slice (word 2 ctu) and its tile, with bit 16 set in a tile's first column (word 2 ctu + 1)
+static void writeCtuInfo( const CodingStructure& cs, ParseInput& in )
 {
   const PreCalcValues& pcv  = *cs.pcv;
-  const SPS&           sps  = *cs.sps;
   const PPS&           pps  = *cs.pps;
   const Picture&       pic  = *cs.picture;
   const int            ctus = int( pcv.sizeInCtus );
-  const bool           wpp  = sps.getEntropyCodingSyncEnabledFlag();
-  const bool           entryPoints = sps.getEntryPointsPresentFlag();
-  const ChromaFormat   chFmt = sps.getChromaFormatIdc();
-
-  in.bits.clear();
-  in.streams.clear();
-  in.numStreams = 0;
-  in.ctuList.clear();
-  in.ctuInfo.assign( 2 * size_t( ctus ), 0u );
-  in.slices.assign( kSliceStride * pic.slices.size(), 0u );
-  in.pic.assign( kParsePicWords, 0 );
-
-  // The most CUs a CTU can have: one per 4x4 luma block, plus one per 16 chroma samples (the chroma tree's CUs).
-  // The TUs get as many slots.
-  const int ctuSize  = int( pcv.maxCUWidth );
-  const int chromaW  = chFmt == CHROMA_400 ? 0 : ctuSize >> getChannelTypeScaleX( CH_C, chFmt );
-  const int chromaH  = chFmt == CHROMA_400 ? 0 : ctuSize >> getChannelTypeScaleY( CH_C, chFmt );
-  in.cuSlots         = uint32_t( ctuSize * ctuSize / 16 + chromaW * chromaH / 16 );
-  in.tuSlots         = in.cuSlots;
-  in.wppSlots        = uint32_t( pcv.heightInCtus * pps.getNumTileColumns() );
-  in.contexts        = CTX_COUNT;
-
-  // Each CTU's tile and whether it is in its tile's first column, then each CTU's slice
   for( int ctu = 0; ctu < ctus; ctu++ )
   {
     const int x             = ctu % int( pcv.widthInCtus );
@@ -256,195 +233,211 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
       in.ctuInfo[2 * slice->getCtuAddrInSlice( int( i ) )] = uint32_t( si );
     }
   }
-  auto sameSliceTile = [&]( int a, int b ) {
+}
+
+// The slice's flags word (kSl* flags): SAO, ALF and CC-ALF per component, dependent quantization, sign hiding,
+// transform skip's residual coding, chroma QP adjustment, mvd_l1_zero, bi-directional prediction, the low-delay
+// check, and the dual tree
+static uint32_t sliceFlags( const Slice& slice, const SPS& sps, const PicHeader& ph )
+{
+  uint32_t flags = 0;
+  flags |= slice.getSaoEnabledFlag( CHANNEL_TYPE_LUMA ) ? kSlSaoLuma : 0;
+  flags |= slice.getSaoEnabledFlag( CHANNEL_TYPE_CHROMA ) ? kSlSaoChroma : 0;
+  flags |= slice.getAlfEnabledFlag( COMPONENT_Y ) ? kSlAlfY : 0;
+  flags |= slice.getAlfEnabledFlag( COMPONENT_Cb ) ? kSlAlfCb : 0;
+  flags |= slice.getAlfEnabledFlag( COMPONENT_Cr ) ? kSlAlfCr : 0;
+  flags |= slice.getCcAlfEnabledFlag( 1 ) ? kSlCcAlfCb : 0;
+  flags |= slice.getCcAlfEnabledFlag( 2 ) ? kSlCcAlfCr : 0;
+  flags |= slice.getDepQuantEnabledFlag() ? kSlDepQuant : 0;
+  flags |= slice.getSignDataHidingEnabledFlag() ? kSlSignHiding : 0;
+  flags |= slice.getTSResidualCodingDisabledFlag() ? kSlTsResOff : 0;
+  flags |= slice.getUseChromaQpAdj() ? kSlChromaQpAdj : 0;
+  flags |= ph.getMvdL1ZeroFlag() ? kSlMvdL1Zero : 0;
+  flags |= slice.getBiDirPred() ? kSlBiDirPred : 0;
+  flags |= slice.getCheckLDC() ? kSlCheckLDC : 0;
+  flags |= slice.isIntra() && sps.getUseDualITree() ? kSlDualTree : 0;
+  return flags;
+}
+
+// The slice's ALF word: its number of luma APSs, the chroma APS's number of alternative filters (byte 1), and the
+// CC-ALF APSs' numbers of filters for Cb and Cr (bytes 2 and 3)
+static uint32_t sliceAlfWord( const Slice& slice )
+{
+  uint32_t alf = uint32_t( slice.getNumAlfAps() ) & 0xff;
+  if( slice.getAlfEnabledFlag( COMPONENT_Cb ) || slice.getAlfEnabledFlag( COMPONENT_Cr ) )
+  {
+    const APS* aps = slice.getAlfAPS( slice.getAlfApsIdChroma() );
+    CHECK( aps == nullptr, "APS not initialized" );
+    alf |= ( uint32_t( aps->getAlfAPSParam().numAlternativesChroma ) & 0xff ) << 8;
+  }
+  for( int comp = 1; comp <= 2; comp++ )
+  {
+    if( slice.getCcAlfEnabledFlag( comp ) )
+    {
+      const APS* aps = slice.getAlfAPS( comp == 1 ? slice.getCcAlfCbApsId() : slice.getCcAlfCrApsId() );
+      CHECK( aps == nullptr, "APS not initialized" );
+      alf |= ( uint32_t( aps->getCcAlfAPSParam().ccAlfFilterCount[comp - 1] ) & 0xff ) << ( comp == 1 ? 16 : 24 );
+    }
+  }
+  return alf;
+}
+
+// The slice's weighted-prediction mask: bit 16 * list + refIdx is set where a reference picture (of the first 16 in
+// each list) has weights for any component
+static uint32_t sliceWpMask( const Slice& slice )
+{
+  uint32_t wp = 0;
+  for( int list = 0; list < 2; list++ )
+  {
+    for( int refIdx = 0; refIdx < slice.getNumRefIdx( RefPicList( list ) ) && refIdx < 16; refIdx++ )
+    {
+      const WPScalingParam* p = nullptr;
+      slice.getWpScaling( RefPicList( list ), refIdx, p );
+      if( p && ( p[COMPONENT_Y].bPresentFlag || p[COMPONENT_Cb].bPresentFlag || p[COMPONENT_Cr].bPresentFlag ) )
+      {
+        wp |= 1u << ( 16 * list + refIdx );
+      }
+    }
+  }
+  return wp;
+}
+
+// The slice's initial contexts (states, then rates, from word kParseSliceWords on), from the table
+// CABACReader::initCtxModels picks (cabac_init_flag swaps the P and B tables), computed with vvdec's own Ctx::init
+static void writeInitialContexts( const Slice& slice, uint32_t* w )
+{
+  SliceType initType = slice.getSliceType();
+  if( slice.getPPS()->getCabacInitPresentFlag() && slice.getCabacInitFlag() )
+  {
+    initType = initType == P_SLICE ? B_SLICE : ( initType == B_SLICE ? P_SLICE : initType );
+  }
+  Ctx ctx;
+  ctx.init( slice.getSliceQp(), int( initType ) );
+  for( int k = 0; k < CTX_COUNT; k++ )
+  {
+    w[kParseSliceWords + k]             = ctx[k].gpuState();
+    w[kParseSliceWords + CTX_COUNT + k] = ctx[k].gpuRates();
+  }
+}
+
+// The slice's parameter words (kSliceStride of them at w)
+static void writeSliceWords( const Slice& slice, const SPS& sps, uint32_t* w )
+{
+  const PicHeader& ph     = *slice.getPicHeader();
+  w[kSlType]              = uint32_t( slice.getSliceType() );
+  w[kSlQp]                = uint32_t( slice.getSliceQp() );
+  w[kSlFlags]             = sliceFlags( slice, sps, ph );
+  w[kSlNumRef]            = uint32_t( slice.getNumRefIdx( REF_PIC_LIST_0 ) ) | uint32_t( slice.getNumRefIdx( REF_PIC_LIST_1 ) ) << 8;
+  w[kSlSymRef]            = ( uint32_t( slice.getSymRefIdx( 0 ) ) & 0xff ) | ( uint32_t( slice.getSymRefIdx( 1 ) ) & 0xff ) << 8;
+  w[kSlMaxAffMerge]       = ph.getMaxNumAffineMergeCand();
+  w[kSlAlf]               = sliceAlfWord( slice );
+  w[kSlSubdiv]            = slice.getCuQpDeltaSubdiv() | slice.getCuChromaQpOffsetSubdiv() << 8;
+  w[kSlChromaQpDelta]     = uint32_t( slice.getSliceChromaQpDelta( COMPONENT_Cb ) );
+  w[kSlChromaQpDelta + 1] = uint32_t( slice.getSliceChromaQpDelta( COMPONENT_Cr ) );
+  w[kSlChromaQpDelta + 2] = uint32_t( slice.getSliceChromaQpDelta( JOINT_CbCr ) );
+  w[kSlWp]                = sliceWpMask( slice );
+  w[kSlPartLuma]          = partitionLimits( slice, sps, ph, CHANNEL_TYPE_LUMA );
+  w[kSlPartChroma]        = slice.isIntra() && sps.getUseDualITree() ? partitionLimits( slice, sps, ph, CHANNEL_TYPE_CHROMA ) : 0u;
+  writeInitialContexts( slice, w );
+}
+
+// Slice si's substreams and its CTUs in decoding order, whose data lies in in.bits from sliceOffset on (dataSize
+// bytes). A new substream begins after each CTU that ends a tile or, with WPP, a CTU row of a tile, when the slice has
+// entry points; without them the data runs on in the same substream and the shader decodes end_of_subset_one_bit
+// there. As DecSlice::parseSlice does, the flags restart the contexts and the arithmetic decoder at a tile's or a WPP
+// row's first CTU, load the contexts the row above saved and save them after a WPP row's first CTU; with WPP they also
+// make the shader wait until the CTU above is parsed.
+// (slice is not const: vvdec's substream getters are not)
+static void listSliceCtus( const CodingStructure& cs, Slice& slice, size_t si, uint32_t sliceOffset, size_t dataSize, ParseInput& in )
+{
+  const PreCalcValues& pcv         = *cs.pcv;
+  const PPS&           pps         = *cs.pps;
+  const bool           wpp         = cs.sps->getEntropyCodingSyncEnabledFlag();
+  const bool           entryPoints = cs.sps->getEntryPointsPresentFlag();
+  auto                 sameSliceTile = [&]( int a, int b ) {
     return in.ctuInfo[2 * a] == in.ctuInfo[2 * b] && ( in.ctuInfo[2 * a + 1] & 0xffff ) == ( in.ctuInfo[2 * b + 1] & 0xffff );
   };
-
-  for( size_t si = 0; si < pic.slices.size(); si++ )
+  const uint32_t numSubstreams = slice.getNumberOfSubstreamSizes() + 1;
+  uint32_t       streamOffset  = sliceOffset;
+  uint32_t       subStream     = 0;
+  auto           streamSize    = [&]( uint32_t s ) {
+    if( s + 1 < numSubstreams )
+    {
+      return slice.getSubstreamSize( s );
+    }
+    return uint32_t( sliceOffset + dataSize - streamOffset );
+  };
+  auto beginStream = [&]() {
+    const size_t at = in.streams.size();
+    in.streams.resize( at + kParseStreamWords, 0u );
+    in.streams[at + 0] = streamOffset;
+    in.streams[at + 1] = streamSize( subStream );
+    in.streams[at + 2] = uint32_t( in.ctuList.size() / 2 );
+    in.streams[at + 4] = uint32_t( si );
+    in.numStreams++;
+  };
+  auto endStream = [&]() {
+    const size_t at    = in.streams.size() - kParseStreamWords;
+    in.streams[at + 3] = uint32_t( in.ctuList.size() / 2 ) - in.streams[at + 2];
+    CHECK( in.streams[at + 0] + in.streams[at + 1] > sliceOffset + dataSize, "a substream past its slice's data" );
+  };
+  beginStream();
+  const int widthInCtus = int( pcv.widthInCtus );
+  for( uint32_t ctuIdx = 0; ctuIdx < slice.getNumCtuInSlice(); ctuIdx++ )
   {
-    Slice*                      slice = pic.slices[si];
-    const std::vector<uint8_t>& data  = slice->parseTaskParams.gpuSliceData;
-    if( data.empty() )
+    const int      ctuRs     = int( slice.getCtuAddrInSlice( int( ctuIdx ) ) );
+    const int      x         = ctuRs % widthInCtus;
+    const int      y         = ctuRs / widthInCtus;
+    const uint32_t tileCol   = pps.ctuToTileCol( x );
+    const uint32_t tileRow   = pps.ctuToTileRow( y );
+    const int      tileX0    = int( pps.getTileColumnBd( tileCol ) );
+    const int      tileY0    = int( pps.getTileRowBd( tileRow ) );
+    const int      tileW     = int( pps.getTileColumnWidth( tileCol ) );
+    const int      tileH     = int( pps.getTileRowHeight( tileRow ) );
+    const bool     aboveSame = y > 0 && sameSliceTile( ctuRs - widthInCtus, ctuRs );
+    uint32_t       flags     = 0;
+    if( x == tileX0 && y == tileY0 )
     {
-      return false;
+      flags |= ctuIdx != 0 ? kCtuRestart : 0;
     }
-    const PicHeader& ph          = *slice->getPicHeader();
-    const uint32_t   sliceOffset = uint32_t( in.bits.size() );
-    in.bits.insert( in.bits.end(), data.begin(), data.end() );
-
-    // The slice's parameter words
-    uint32_t* w      = in.slices.data() + kSliceStride * si;
-    w[kSlType]       = uint32_t( slice->getSliceType() );
-    w[kSlQp]         = uint32_t( slice->getSliceQp() );
-    uint32_t flags   = 0;
-    flags |= slice->getSaoEnabledFlag( CHANNEL_TYPE_LUMA ) ? kSlSaoLuma : 0;
-    flags |= slice->getSaoEnabledFlag( CHANNEL_TYPE_CHROMA ) ? kSlSaoChroma : 0;
-    flags |= slice->getAlfEnabledFlag( COMPONENT_Y ) ? kSlAlfY : 0;
-    flags |= slice->getAlfEnabledFlag( COMPONENT_Cb ) ? kSlAlfCb : 0;
-    flags |= slice->getAlfEnabledFlag( COMPONENT_Cr ) ? kSlAlfCr : 0;
-    flags |= slice->getCcAlfEnabledFlag( 1 ) ? kSlCcAlfCb : 0;
-    flags |= slice->getCcAlfEnabledFlag( 2 ) ? kSlCcAlfCr : 0;
-    flags |= slice->getDepQuantEnabledFlag() ? kSlDepQuant : 0;
-    flags |= slice->getSignDataHidingEnabledFlag() ? kSlSignHiding : 0;
-    flags |= slice->getTSResidualCodingDisabledFlag() ? kSlTsResOff : 0;
-    flags |= slice->getUseChromaQpAdj() ? kSlChromaQpAdj : 0;
-    flags |= ph.getMvdL1ZeroFlag() ? kSlMvdL1Zero : 0;
-    flags |= slice->getBiDirPred() ? kSlBiDirPred : 0;
-    flags |= slice->getCheckLDC() ? kSlCheckLDC : 0;
-    flags |= slice->isIntra() && sps.getUseDualITree() ? kSlDualTree : 0;
-    w[kSlFlags]       = flags;
-    w[kSlNumRef]      = uint32_t( slice->getNumRefIdx( REF_PIC_LIST_0 ) ) | uint32_t( slice->getNumRefIdx( REF_PIC_LIST_1 ) ) << 8;
-    w[kSlSymRef]      = ( uint32_t( slice->getSymRefIdx( 0 ) ) & 0xff ) | ( uint32_t( slice->getSymRefIdx( 1 ) ) & 0xff ) << 8;
-    w[kSlMaxAffMerge] = ph.getMaxNumAffineMergeCand();
-    uint32_t alf      = uint32_t( slice->getNumAlfAps() ) & 0xff;
-    if( slice->getAlfEnabledFlag( COMPONENT_Cb ) || slice->getAlfEnabledFlag( COMPONENT_Cr ) )
+    else if( x == tileX0 && wpp )
     {
-      const APS* aps = slice->getAlfAPS( slice->getAlfApsIdChroma() );
-      CHECK( aps == nullptr, "APS not initialized" );
-      alf |= ( uint32_t( aps->getAlfAPSParam().numAlternativesChroma ) & 0xff ) << 8;
+      flags |= ctuIdx != 0 ? kCtuRestart : 0;
+      flags |= aboveSame ? kCtuSyncLoad : 0;
     }
-    for( int comp = 1; comp <= 2; comp++ )
+    if( x == tileX0 && wpp )
     {
-      if( slice->getCcAlfEnabledFlag( comp ) )
-      {
-        const APS* aps = slice->getAlfAPS( comp == 1 ? slice->getCcAlfCbApsId() : slice->getCcAlfCrApsId() );
-        CHECK( aps == nullptr, "APS not initialized" );
-        alf |= ( uint32_t( aps->getCcAlfAPSParam().ccAlfFilterCount[comp - 1] ) & 0xff ) << ( comp == 1 ? 16 : 24 );
-      }
+      flags |= kCtuSyncSave;
     }
-    w[kSlAlf]               = alf;
-    w[kSlSubdiv]            = slice->getCuQpDeltaSubdiv() | slice->getCuChromaQpOffsetSubdiv() << 8;
-    w[kSlChromaQpDelta]     = uint32_t( slice->getSliceChromaQpDelta( COMPONENT_Cb ) );
-    w[kSlChromaQpDelta + 1] = uint32_t( slice->getSliceChromaQpDelta( COMPONENT_Cr ) );
-    w[kSlChromaQpDelta + 2] = uint32_t( slice->getSliceChromaQpDelta( JOINT_CbCr ) );
-    uint32_t wp             = 0;
-    for( int list = 0; list < 2; list++ )
+    if( wpp && aboveSame )
     {
-      for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ) && refIdx < 16; refIdx++ )
-      {
-        const WPScalingParam* p = nullptr;
-        slice->getWpScaling( RefPicList( list ), refIdx, p );
-        if( p && ( p[COMPONENT_Y].bPresentFlag || p[COMPONENT_Cb].bPresentFlag || p[COMPONENT_Cr].bPresentFlag ) )
-        {
-          wp |= 1u << ( 16 * list + refIdx );
-        }
-      }
+      flags |= kCtuWaitAbove;
     }
-    w[kSlWp]          = wp;
-    w[kSlPartLuma]    = partitionLimits( *slice, sps, ph, CHANNEL_TYPE_LUMA );
-    w[kSlPartChroma]  = slice->isIntra() && sps.getUseDualITree() ? partitionLimits( *slice, sps, ph, CHANNEL_TYPE_CHROMA ) : 0u;
-    // The slice's initial contexts, from the table CABACReader::initCtxModels picks (cabac_init_flag swaps the P and
-    // B tables), computed with vvdec's own Ctx::init
-    SliceType initType = slice->getSliceType();
-    if( slice->getPPS()->getCabacInitPresentFlag() && slice->getCabacInitFlag() )
+    const bool last = ctuIdx + 1 == slice.getNumCtuInSlice();
+    const bool ends = !last && x + 1 == tileX0 + tileW && ( y + 1 == tileY0 + tileH || wpp );
+    if( ends && !entryPoints )
     {
-      initType = initType == P_SLICE ? B_SLICE : ( initType == B_SLICE ? P_SLICE : initType );
+      flags |= kCtuTerminate;
     }
-    Ctx ctx;
-    ctx.init( slice->getSliceQp(), int( initType ) );
-    for( int k = 0; k < CTX_COUNT; k++ )
+    const uint32_t slot = uint32_t( y ) * uint32_t( pps.getNumTileColumns() ) + tileCol;
+    in.ctuList.push_back( uint32_t( ctuRs ) );
+    in.ctuList.push_back( flags | slot << 8 );
+    if( ends && entryPoints )
     {
-      w[kParseSliceWords + k]             = ctx[k].gpuState();
-      w[kParseSliceWords + CTX_COUNT + k] = ctx[k].gpuRates();
+      endStream();
+      streamOffset += streamSize( subStream );
+      subStream++;
+      CHECK( subStream >= numSubstreams, "more substreams than entry points" );
+      beginStream();
     }
-
-    // The slice's substreams and its CTUs in decoding order. A new substream begins after each CTU that ends a tile
-    // or, with WPP, a CTU row of a tile, when the slice has entry points; without them the data runs on in the same
-    // substream and the shader decodes end_of_subset_one_bit there. As DecSlice::parseSlice does, the flags restart
-    // the contexts and the arithmetic decoder at a tile's or a WPP row's first CTU, load the contexts the row above
-    // saved and save them after a WPP row's first CTU; with WPP they also make the shader wait until the CTU above
-    // is parsed.
-    const uint32_t numSubstreams = slice->getNumberOfSubstreamSizes() + 1;
-    uint32_t       streamOffset  = sliceOffset;
-    uint32_t       subStream     = 0;
-    auto           streamSize    = [&]( uint32_t s ) {
-      if( s + 1 < numSubstreams )
-      {
-        return slice->getSubstreamSize( s );
-      }
-      return uint32_t( sliceOffset + data.size() - streamOffset );
-    };
-    auto beginStream = [&]() {
-      const size_t at = in.streams.size();
-      in.streams.resize( at + kParseStreamWords, 0u );
-      in.streams[at + 0] = streamOffset;
-      in.streams[at + 1] = streamSize( subStream );
-      in.streams[at + 2] = uint32_t( in.ctuList.size() / 2 );
-      in.streams[at + 4] = uint32_t( si );
-      in.numStreams++;
-    };
-    auto endStream = [&]() {
-      const size_t at    = in.streams.size() - kParseStreamWords;
-      in.streams[at + 3] = uint32_t( in.ctuList.size() / 2 ) - in.streams[at + 2];
-      CHECK( in.streams[at + 0] + in.streams[at + 1] > sliceOffset + data.size(), "a substream past its slice's data" );
-    };
-    beginStream();
-    const int widthInCtus = int( pcv.widthInCtus );
-    for( uint32_t ctuIdx = 0; ctuIdx < slice->getNumCtuInSlice(); ctuIdx++ )
-    {
-      const int      ctuRs     = int( slice->getCtuAddrInSlice( int( ctuIdx ) ) );
-      const int      x         = ctuRs % widthInCtus;
-      const int      y         = ctuRs / widthInCtus;
-      const uint32_t tileCol   = pps.ctuToTileCol( x );
-      const uint32_t tileRow   = pps.ctuToTileRow( y );
-      const int      tileX0    = int( pps.getTileColumnBd( tileCol ) );
-      const int      tileY0    = int( pps.getTileRowBd( tileRow ) );
-      const int      tileW     = int( pps.getTileColumnWidth( tileCol ) );
-      const int      tileH     = int( pps.getTileRowHeight( tileRow ) );
-      const bool     aboveSame = y > 0 && sameSliceTile( ctuRs - widthInCtus, ctuRs );
-      uint32_t       flags     = 0;
-      if( x == tileX0 && y == tileY0 )
-      {
-        flags |= ctuIdx != 0 ? kCtuRestart : 0;
-      }
-      else if( x == tileX0 && wpp )
-      {
-        flags |= ctuIdx != 0 ? kCtuRestart : 0;
-        flags |= aboveSame ? kCtuSyncLoad : 0;
-      }
-      if( x == tileX0 && wpp )
-      {
-        flags |= kCtuSyncSave;
-      }
-      if( wpp && aboveSame )
-      {
-        flags |= kCtuWaitAbove;
-      }
-      const bool last = ctuIdx + 1 == slice->getNumCtuInSlice();
-      const bool ends = !last && x + 1 == tileX0 + tileW && ( y + 1 == tileY0 + tileH || wpp );
-      if( ends && !entryPoints )
-      {
-        flags |= kCtuTerminate;
-      }
-      const uint32_t slot = uint32_t( y ) * uint32_t( pps.getNumTileColumns() ) + tileCol;
-      in.ctuList.push_back( uint32_t( ctuRs ) );
-      in.ctuList.push_back( flags | slot << 8 );
-      if( ends && entryPoints )
-      {
-        endStream();
-        streamOffset += streamSize( subStream );
-        subStream++;
-        CHECK( subStream >= numSubstreams, "more substreams than entry points" );
-        beginStream();
-      }
-    }
-    endStream();
   }
+  endStream();
+}
 
-  // The picture's parameters
-  int32_t* p           = in.pic.data();
-  p[kPicWidthInCtus]   = int32_t( pcv.widthInCtus );
-  p[kPicHeightInCtus]  = int32_t( pcv.heightInCtus );
-  p[kPicLog2Ctu]       = int32_t( getLog2( pcv.maxCUWidth ) );
-  p[kPicWidth]         = int32_t( pcv.lumaWidth );
-  p[kPicHeight]        = int32_t( pcv.lumaHeight );
-  p[kPicChromaFormat]  = int32_t( chFmt );
-  p[kPicQpBdOffset]    = sps.getQpBDOffset();
-  p[kPicLog2MinCb]     = int32_t( sps.getLog2MinCodingBlockSize() );
-  p[kPicMaxTbSize]     = int32_t( sps.getMaxTbSize() );
-  p[kPicWpp]           = wpp ? 1 : 0;
-  p[kPicLog2MaxTs]     = int32_t( sps.getLog2MaxTransformSkipBlockSize() );
-  int tools            = 0;
+// The SPS's tools, as the picture's kPicTools word holds them (kTool* flags)
+static int spsTools( const SPS& sps )
+{
+  int tools = 0;
   tools |= sps.getUseSBT() ? kToolSbt : 0;
   tools |= sps.getUseAffine() ? kToolAffine : 0;
   tools |= sps.getUseAffineType() ? kToolAffineType : 0;
@@ -468,10 +461,33 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
   tools |= sps.getTransformSkipEnabledFlag() ? kToolTs : 0;
   tools |= sps.getJointCbCrEnabledFlag() ? kToolJointCbCr : 0;
   tools |= sps.getUseMTS() ? kToolMts : 0;
-  p[kPicTools]        = tools;
-  const int leftOut   = kToolSbt | kToolAffine | kToolAffineType | kToolAffineAmvr | kToolBcw | kToolCiip | kToolGeo | kToolMmvd | kToolSmvd
+  return tools;
+}
+
+// The picture's parameter words (in.pic), and whether the lite parse (no code for the tools it leaves out) will do
+static void writePictureWords( const CodingStructure& cs, ParseInput& in )
+{
+  const PreCalcValues& pcv   = *cs.pcv;
+  const SPS&           sps   = *cs.sps;
+  const PPS&           pps   = *cs.pps;
+  const ChromaFormat   chFmt = sps.getChromaFormatIdc();
+  int32_t*             p     = in.pic.data();
+  p[kPicWidthInCtus]         = int32_t( pcv.widthInCtus );
+  p[kPicHeightInCtus]        = int32_t( pcv.heightInCtus );
+  p[kPicLog2Ctu]             = int32_t( getLog2( pcv.maxCUWidth ) );
+  p[kPicWidth]               = int32_t( pcv.lumaWidth );
+  p[kPicHeight]              = int32_t( pcv.lumaHeight );
+  p[kPicChromaFormat]        = int32_t( chFmt );
+  p[kPicQpBdOffset]          = sps.getQpBDOffset();
+  p[kPicLog2MinCb]           = int32_t( sps.getLog2MinCodingBlockSize() );
+  p[kPicMaxTbSize]           = int32_t( sps.getMaxTbSize() );
+  p[kPicWpp]                 = sps.getEntropyCodingSyncEnabledFlag() ? 1 : 0;
+  p[kPicLog2MaxTs]           = int32_t( sps.getLog2MaxTransformSkipBlockSize() );
+  const int tools            = spsTools( sps );
+  p[kPicTools]               = tools;
+  const int leftOut          = kToolSbt | kToolAffine | kToolAffineType | kToolAffineAmvr | kToolBcw | kToolCiip | kToolGeo | kToolMmvd | kToolSmvd
                       | kToolIsp | kToolMrl | kToolMip | kToolLfnst | kToolMtsIntra | kToolMtsInter | kToolAct | kToolJointCbCr;
-  in.lite             = ( tools & leftOut ) == 0;
+  in.lite = ( tools & leftOut ) == 0;
   for( const Slice* slice: cs.picture->slices )
   {
     in.lite = in.lite && !slice->getDepQuantEnabledFlag();
@@ -504,6 +520,50 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
       }
     }
   }
+}
+
+bool buildParseInput( const CodingStructure& cs, ParseInput& in )
+{
+  const PreCalcValues& pcv   = *cs.pcv;
+  const SPS&           sps   = *cs.sps;
+  const PPS&           pps   = *cs.pps;
+  const Picture&       pic   = *cs.picture;
+  const int            ctus  = int( pcv.sizeInCtus );
+  const ChromaFormat   chFmt = sps.getChromaFormatIdc();
+
+  in.bits.clear();
+  in.streams.clear();
+  in.numStreams = 0;
+  in.ctuList.clear();
+  in.ctuInfo.assign( 2 * size_t( ctus ), 0u );
+  in.slices.assign( kSliceStride * pic.slices.size(), 0u );
+  in.pic.assign( kParsePicWords, 0 );
+
+  // The most CUs a CTU can have: one per 4x4 luma block, plus one per 16 chroma samples (the chroma tree's CUs).
+  // The TUs get as many slots.
+  const int ctuSize = int( pcv.maxCUWidth );
+  const int chromaW = chFmt == CHROMA_400 ? 0 : ctuSize >> getChannelTypeScaleX( CH_C, chFmt );
+  const int chromaH = chFmt == CHROMA_400 ? 0 : ctuSize >> getChannelTypeScaleY( CH_C, chFmt );
+  in.cuSlots        = uint32_t( ctuSize * ctuSize / 16 + chromaW * chromaH / 16 );
+  in.tuSlots        = in.cuSlots;
+  in.wppSlots       = uint32_t( pcv.heightInCtus * pps.getNumTileColumns() );
+  in.contexts       = CTX_COUNT;
+
+  writeCtuInfo( cs, in );
+  for( size_t si = 0; si < pic.slices.size(); si++ )
+  {
+    Slice&                      slice = *pic.slices[si];
+    const std::vector<uint8_t>& data  = slice.parseTaskParams.gpuSliceData;
+    if( data.empty() )
+    {
+      return false;
+    }
+    const uint32_t sliceOffset = uint32_t( in.bits.size() );
+    in.bits.insert( in.bits.end(), data.begin(), data.end() );
+    writeSliceWords( slice, sps, in.slices.data() + kSliceStride * si );
+    listSliceCtus( cs, slice, si, sliceOffset, data.size(), in );
+  }
+  writePictureWords( cs, in );
   return true;
 }
 
