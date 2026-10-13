@@ -1472,56 +1472,215 @@ bool spreadOverLimit( int a, int b, int c, int d, int predType )
   return bw * bh > 15 * 11;
 }
 
-void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
+// The residual of an inter CU: the GPU adds it to each component that has one (the flags returned; CIIP's and LMCS's
+// chroma add it later), and inside such a component the transform blocks without a residual are cleared by zero jobs
+// in the residual list (in blocks whose sizes are powers of two: an SBT transform unit without residual can be 3/4 of
+// the CU).
+uint residualJobs( Cu cu, int numComp, bool lmcsChroma, inout Out o )
 {
-  uint*      slice      = sliceOfCtu( cu.ctu );
-  uint*      jslice     = jobSliceOfCtu( cu.ctu );
-  const int4 y4         = cu.blk[0];
-  const int  numComp    = pc.chromaFormat == 0 ? 1 : 3;
-  uint       flags      = m.hpel ? kInterHalfPel : 0;
-  const bool lmcs       = sliceLmcs( jslice ) && ( pc.ph & kPhLmcs ) != 0;
-  const bool lmcsChroma = lmcs && ( pc.ph & kPhLmcsChroma ) != 0 && cu.rootCbf;
-  if( lmcs )
+  uint flags = 0;
+  if( !cu.rootCbf )
   {
-    flags |= kInterLumaMap;
+    return flags;
   }
-
-  // The residual: the GPU adds it to each component that has one. Inside such a component, the transform blocks
-  // without a residual are cleared by zero jobs in the residual list.
-  if( cu.rootCbf )
+  for( int c = 0; c < numComp; c++ )
   {
-    for( int c = 0; c < numComp; c++ )
+    if( ( ( cu.planeCbf >> c ) & 1 ) == 0 )
     {
-      if( ( ( cu.planeCbf >> c ) & 1 ) == 0 )
+      continue;
+    }
+    if( ( cu.flags & kCiip ) == 0 )
+    {
+      flags |= lmcsChroma && c != 0 ? kInterDeferCb << ( c - 1 ) : kInterResidualY << c;
+    }
+    for( int t = 0; t < cu.numTus; t++ )
+    {
+      const Tu   tu    = loadTu( cu.firstTu + t );
+      const int4 block = tu.blk[chOf( c )];
+      if( valid( block ) && !cbfOf( tu, c ) && !( c != 0 && tu.jointCbCr != 0 ) && ( pc.ph & kPhTrafo ) != 0 )
       {
-        continue;
-      }
-      if( ( cu.flags & kCiip ) == 0 )
-      {
-        flags |= lmcsChroma && c != 0 ? kInterDeferCb << ( c - 1 ) : kInterResidualY << c;
-      }
-      for( int t = 0; t < cu.numTus; t++ )
-      {
-        const Tu   tu    = loadTu( cu.firstTu + t );
-        const int4 block = tu.blk[chOf( c )];
-        if( valid( block ) && !cbfOf( tu, c ) && !( c != 0 && tu.jointCbCr != 0 ) && ( pc.ph & kPhTrafo ) != 0 )
+        for( int y = 0; y < block.w; y += 1 << log2Of( block.w - y ) )
         {
-          // in blocks whose sizes are powers of two (an SBT transform unit without residual can be 3/4 of the CU)
-          for( int y = 0; y < block.w; y += 1 << log2Of( block.w - y ) )
+          for( int x = 0; x < block.z; x += 1 << log2Of( block.z - x ) )
           {
-            for( int x = 0; x < block.z; x += 1 << log2Of( block.z - x ) )
-            {
-              uint w[12];
-              clearJob( w );
-              setTrafo( w, block.x + x, block.y + y, log2Of( block.z - x ), log2Of( block.w - y ), c, 0, 0, kTrafoZero, 0, 0, 0, 0, 0, 0 );
-              emitTrafo( o, w );
-            }
+            uint w[12];
+            clearJob( w );
+            setTrafo( w, block.x + x, block.y + y, log2Of( block.z - x ), log2Of( block.w - y ), c, 0, 0, kTrafoZero, 0, 0, 0, 0, 0, 0 );
+            emitTrafo( o, w );
           }
         }
       }
     }
   }
+  return flags;
+}
 
+// A GPM CU's jobs (motionCompensationGeo): each partition is a uni-prediction, and the two are blended with the mask of
+// the split's angle, in tiles of up to 16 x 16
+void geoJobs( Cu cu, Motion m, uint* jslice, uint flags, inout Out o )
+{
+  const int4 y4    = cu.blk[0];
+  const int  dir0  = m.geo[0] >> 4;
+  const int  dir1  = m.geo[1] >> 4;
+  const int  ref0  = refSlot( jslice, dir0 - 1, m.geo[0] & 15 );
+  const int  ref1  = refSlot( jslice, dir1 - 1, m.geo[1] & 15 );
+  const int  split = cu.geoSplit;
+  const int  angle = int( pc.tables[T_GEO + split] & 0xff );
+  const int  wIdx  = log2Of( y4.z ) - 3;
+  const int  hIdx  = log2Of( y4.w ) - 3;
+  const uint woff  = pc.tables[T_WOFF + ( split * 4 + hIdx ) * 4 + wIdx];
+  for( int y = y4.y; y < y4.y + y4.w; y += 16 )
+  {
+    for( int x = y4.x; x < y4.x + y4.z; x += 16 )
+    {
+      uint w[12];
+      setInter( w, x, y, min( 16, y4.z ), min( 16, y4.w ), flags | kInterL0 | kInterL1, m.mv[0][1], m.mv[1][1], y4.x, y4.y, ref0, ref1, 0 );
+      w[7] |= uint( y4.z ) << 20;
+      w[1] |= kInterGeo << 16;
+      // (as InterJob::setGeo packs them)
+      w[9] = pc.tables[T_MASK + angle] | pc.tables[T_MIRROR + angle] << 8 | uint( int( int16_t( woff & 0xffff ) ) ) << 16
+             | uint( int( int16_t( woff >> 16 ) ) ) << 24;
+      emitInter( o, w );
+    }
+  }
+}
+
+// An affine CU's jobs (xPredAffineBlk: 4x4 subblocks, each with its own motion, refined by PROF), in pairs of jobs per
+// tile of up to 16 x 16: the tile with the lists' base motion, then the CU's size, the lists' PROF and spread flags and
+// their model's steps (InterJob::setAffine). A bi-prediction from one picture with the same control points predicts
+// from list 0 alone, unless the weighted bi-prediction weighs the lists.
+void affineJobs( Cu cu, Motion m, uint* slice, uint* jslice, uint flags, inout Out o )
+{
+  const int4 y4     = cu.blk[0];
+  uint       aflags = flags;
+  int        ref0 = 0, ref1 = 0;
+  if( m.refIdx[0] >= 0 )
+  {
+    aflags |= kInterL0;
+    ref0 = refSlot( jslice, 0, m.refIdx[0] );
+  }
+  if( m.refIdx[1] >= 0 )
+  {
+    aflags |= kInterL1;
+    ref1 = refSlot( jslice, 1, m.refIdx[1] );
+  }
+  if( m.refIdx[0] >= 0 && m.refIdx[1] >= 0 && isInterB( slice ) && ( pc.ph & kPpsWpBi ) == 0
+      && refPoc( slice, 0, m.refIdx[0] ) == refPoc( slice, 1, m.refIdx[1] ) && all( m.mv[0][0] == m.mv[1][0] ) && all( m.mv[0][1] == m.mv[1][1] )
+      && ( !m.affine6 || all( m.mv[0][2] == m.mv[1][2] ) ) )
+  {
+    aflags &= ~kInterL1;
+  }
+  const bool bcw = ( aflags & kInterL0 ) != 0 && ( aflags & kInterL1 ) != 0 && m.bcw != 0;
+
+  // Per list: the model (the base motion, and the steps across and down), whether its motion spreads too far for
+  // subblocks, and whether PROF refines it
+  bool prof[2]      = { false, false };
+  bool spread[2]    = { false, false };
+  int  params[2][6] = { { 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0 } };
+  for( int list = 0; list < 2; list++ )
+  {
+    if( m.refIdx[list] < 0 )
+    {
+      continue;
+    }
+    const int2 lt    = m.mv[list][0];
+    const int2 rt    = m.mv[list][1];
+    const int2 lb    = m.mv[list][2];
+    const int  dHorX = ( rt.x - lt.x ) * ( 1 << ( 7 - log2Of( y4.z ) ) );
+    const int  dHorY = ( rt.y - lt.y ) * ( 1 << ( 7 - log2Of( y4.z ) ) );
+    const int  dVerX = m.affine6 ? ( lb.x - lt.x ) * ( 1 << ( 7 - log2Of( y4.w ) ) ) : -dHorY;
+    const int  dVerY = m.affine6 ? ( lb.y - lt.y ) * ( 1 << ( 7 - log2Of( y4.w ) ) ) : dHorX;
+    spread[list]     = spreadOverLimit( dHorX, dHorY, dVerX, dVerY, m.interDir );
+    prof[list]       = ( pc.sps & kSpsProf ) != 0 && ( pc.ph & kPhNoProf ) == 0
+                 && !( ( m.affine6 && all( lt == rt ) && all( lt == lb ) ) || ( !m.affine6 && all( lt == rt ) ) ) && !spread[list]
+                 && !refScaled( jslice, list, m.refIdx[list] );
+    params[list][0] = lt.x * ( 1 << 7 );
+    params[list][1] = lt.y * ( 1 << 7 );
+    params[list][2] = dHorX;
+    params[list][3] = dHorY;
+    params[list][4] = dVerX;
+    params[list][5] = dVerY;
+  }
+  for( int y = y4.y; y < y4.y + y4.w; y += 16 )
+  {
+    for( int x = y4.x; x < y4.x + y4.z; x += 16 )
+    {
+      uint w[12];
+      setInter( w, x, y, min( 16, y4.z ), min( 16, y4.w ), aflags | kInterAffine, int2( 0 ), int2( 0 ), y4.x, y4.y, ref0, ref1, 0 );
+      if( bcw )
+      {
+        w[1] |= kInterBcw << 16;
+        w[7] |= ( pc.tables[T_BCW1 + m.bcw] + 2 ) << 16;
+      }
+      wpJob( m.bcw, jslice, m.refIdx[0], m.refIdx[1], aflags, w );
+      uint next[12];
+      clearJob( next );
+      // InterJob::setAffine
+      w[2]    = uint( params[0][0] );
+      w[3]    = uint( params[0][1] );
+      w[4]    = uint( params[1][0] );
+      w[5]    = uint( params[1][1] );
+      next[0] = uint( y4.z ) | uint( y4.w ) << 8 | uint( prof[0] ) << 16 | uint( prof[1] ) << 17 | uint( spread[0] ) << 18 | uint( spread[1] ) << 19;
+      for( int k = 0; k < 4; k++ )
+      {
+        next[1 + k] = uint( params[0][2 + k] );
+        next[5 + k] = uint( params[1][2 + k] );
+      }
+      emitInter( o, w );
+      emitAffineNext( o, next );
+    }
+  }
+}
+
+// The chroma that an inter CU under LMCS kept aside (flags: its kInterDeferCb bits): per transform block, intra jobs
+// that add its residual to the prediction, scaled where finishLMCSAndReco scales it
+void lmcsChromaJobs( Cu cu, uint flags, inout Out o )
+{
+  for( int t = 0; t < cu.numTus; t++ )
+  {
+    const Tu tu = loadTu( cu.firstTu + t );
+    for( int c = 1; c <= 2; c++ )
+    {
+      const int4 block = tu.blk[1];
+      if( ( flags & ( kInterDeferCb << ( c - 1 ) ) ) == 0 || !valid( block ) )
+      {
+        continue;
+      }
+      const bool scaled = ( cbfOf( tu, c ) || tu.jointCbCr != 0 ) && block.z * block.w > 4;
+      for( int y = 0; y < block.w; y += 1 << log2Of( block.w - y ) )
+      {
+        for( int x = 0; x < block.z; x += 1 << log2Of( block.z - x ) )
+        {
+          const int bw = 1 << log2Of( block.z - x );
+          const int bh = 1 << log2Of( block.w - y );
+          uint      w[12];
+          setIntra( w, block.x + x, block.y + y, bw, bh, c, kIntraLmcs, 0, kIntraResidual, 0, 0 );
+          if( scaled )
+          {
+            setLmcsScale( tu.blk[0].xy, w );
+          }
+          emitIntra( o, w );
+        }
+      }
+    }
+  }
+}
+
+// An inter CU's jobs: the residual's, then the motion compensation's by the kind of motion (GPM, affine, SbTMVP's,
+// which the workgroup makes together in sbtmvpJobs, or translational), then CIIP's or LMCS's chroma
+void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
+{
+  uint*      slice      = sliceOfCtu( cu.ctu );
+  uint*      jslice     = jobSliceOfCtu( cu.ctu );
+  const int  numComp    = pc.chromaFormat == 0 ? 1 : 3;
+  const bool lmcs       = sliceLmcs( jslice ) && ( pc.ph & kPhLmcs ) != 0;
+  const bool lmcsChroma = lmcs && ( pc.ph & kPhLmcsChroma ) != 0 && cu.rootCbf;
+  uint       flags      = m.hpel ? kInterHalfPel : 0;
+  if( lmcs )
+  {
+    flags |= kInterLumaMap;
+  }
+  flags |= residualJobs( cu, numComp, lmcsChroma, o );
   // CIIP: keep all of inter's prediction aside, for the blend with planar's
   if( ( cu.flags & kCiip ) != 0 )
   {
@@ -1530,110 +1689,11 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
 
   if( ( cu.flags & kGeo ) != 0 )
   {
-    // motionCompensationGeo: each partition is a uni-prediction; the two are blended with the mask of the split's angle
-    const int  dir0  = m.geo[0] >> 4;
-    const int  dir1  = m.geo[1] >> 4;
-    const int  ref0  = refSlot( jslice, dir0 - 1, m.geo[0] & 15 );
-    const int  ref1  = refSlot( jslice, dir1 - 1, m.geo[1] & 15 );
-    const int  split = cu.geoSplit;
-    const int  angle = int( pc.tables[T_GEO + split] & 0xff );
-    const int  wIdx  = log2Of( y4.z ) - 3;
-    const int  hIdx  = log2Of( y4.w ) - 3;
-    const uint woff  = pc.tables[T_WOFF + ( split * 4 + hIdx ) * 4 + wIdx];
-    for( int y = y4.y; y < y4.y + y4.w; y += 16 )
-    {
-      for( int x = y4.x; x < y4.x + y4.z; x += 16 )
-      {
-        uint w[12];
-        setInter( w, x, y, min( 16, y4.z ), min( 16, y4.w ), flags | kInterL0 | kInterL1, m.mv[0][1], m.mv[1][1], y4.x, y4.y, ref0, ref1, 0 );
-        w[7] |= uint( y4.z ) << 20;
-        w[1] |= kInterGeo << 16;
-        // (as InterJob::setGeo packs them)
-        w[9] = pc.tables[T_MASK + angle] | pc.tables[T_MIRROR + angle] << 8 | uint( int( int16_t( woff & 0xffff ) ) ) << 16
-               | uint( int( int16_t( woff >> 16 ) ) ) << 24;
-        emitInter( o, w );
-      }
-    }
+    geoJobs( cu, m, jslice, flags, o );
   }
   else if( ( cu.flags & kAffine ) != 0 && m.mrgType != MRG_TYPE_SUBPU_ATMVP )
   {
-    // xPredAffineBlk: 4x4 subblocks, each with its own motion, refined by PROF
-    uint aflags = flags;
-    int  ref0 = 0, ref1 = 0;
-    if( m.refIdx[0] >= 0 )
-    {
-      aflags |= kInterL0;
-      ref0 = refSlot( jslice, 0, m.refIdx[0] );
-    }
-    if( m.refIdx[1] >= 0 )
-    {
-      aflags |= kInterL1;
-      ref1 = refSlot( jslice, 1, m.refIdx[1] );
-    }
-    if( m.refIdx[0] >= 0 && m.refIdx[1] >= 0 && isInterB( slice ) && ( pc.ph & kPpsWpBi ) == 0
-        && refPoc( slice, 0, m.refIdx[0] ) == refPoc( slice, 1, m.refIdx[1] ) && all( m.mv[0][0] == m.mv[1][0] ) && all( m.mv[0][1] == m.mv[1][1] )
-        && ( !m.affine6 || all( m.mv[0][2] == m.mv[1][2] ) ) )
-    {
-      aflags &= ~kInterL1;
-    }
-    const bool bcw = ( aflags & kInterL0 ) != 0 && ( aflags & kInterL1 ) != 0 && m.bcw != 0;
-
-    bool prof[2]      = { false, false };
-    bool spread[2]    = { false, false };
-    int  params[2][6] = { { 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0 } };
-    for( int list = 0; list < 2; list++ )
-    {
-      if( m.refIdx[list] < 0 )
-      {
-        continue;
-      }
-      const int2 lt    = m.mv[list][0];
-      const int2 rt    = m.mv[list][1];
-      const int2 lb    = m.mv[list][2];
-      const int  dHorX = ( rt.x - lt.x ) * ( 1 << ( 7 - log2Of( y4.z ) ) );
-      const int  dHorY = ( rt.y - lt.y ) * ( 1 << ( 7 - log2Of( y4.z ) ) );
-      const int  dVerX = m.affine6 ? ( lb.x - lt.x ) * ( 1 << ( 7 - log2Of( y4.w ) ) ) : -dHorY;
-      const int  dVerY = m.affine6 ? ( lb.y - lt.y ) * ( 1 << ( 7 - log2Of( y4.w ) ) ) : dHorX;
-      spread[list]     = spreadOverLimit( dHorX, dHorY, dVerX, dVerY, m.interDir );
-      prof[list]       = ( pc.sps & kSpsProf ) != 0 && ( pc.ph & kPhNoProf ) == 0
-                   && !( ( m.affine6 && all( lt == rt ) && all( lt == lb ) ) || ( !m.affine6 && all( lt == rt ) ) ) && !spread[list]
-                   && !refScaled( jslice, list, m.refIdx[list] );
-      params[list][0] = lt.x * ( 1 << 7 );
-      params[list][1] = lt.y * ( 1 << 7 );
-      params[list][2] = dHorX;
-      params[list][3] = dHorY;
-      params[list][4] = dVerX;
-      params[list][5] = dVerY;
-    }
-    for( int y = y4.y; y < y4.y + y4.w; y += 16 )
-    {
-      for( int x = y4.x; x < y4.x + y4.z; x += 16 )
-      {
-        uint w[12];
-        setInter( w, x, y, min( 16, y4.z ), min( 16, y4.w ), aflags | kInterAffine, int2( 0 ), int2( 0 ), y4.x, y4.y, ref0, ref1, 0 );
-        if( bcw )
-        {
-          w[1] |= kInterBcw << 16;
-          w[7] |= ( pc.tables[T_BCW1 + m.bcw] + 2 ) << 16;
-        }
-        wpJob( m.bcw, jslice, m.refIdx[0], m.refIdx[1], aflags, w );
-        uint next[12];
-        clearJob( next );
-        // InterJob::setAffine
-        w[2]    = uint( params[0][0] );
-        w[3]    = uint( params[0][1] );
-        w[4]    = uint( params[1][0] );
-        w[5]    = uint( params[1][1] );
-        next[0] = uint( y4.z ) | uint( y4.w ) << 8 | uint( prof[0] ) << 16 | uint( prof[1] ) << 17 | uint( spread[0] ) << 18 | uint( spread[1] ) << 19;
-        for( int k = 0; k < 4; k++ )
-        {
-          next[1 + k] = uint( params[0][2 + k] );
-          next[5 + k] = uint( params[1][2 + k] );
-        }
-        emitInter( o, w );
-        emitAffineNext( o, next );
-      }
-    }
+    affineJobs( cu, m, slice, jslice, flags, o );
   }
   else if( m.mrgType == MRG_TYPE_SUBPU_ATMVP )
   {
@@ -1651,37 +1711,9 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
   {
     ciipJobs( cu, o, cache, lmcsChroma );
   }
-  // The chroma kept aside: each transform block's prediction plus its residual, scaled where finishLMCSAndReco does
   else if( ( flags & ( kInterDeferCb | kInterDeferCb << 1 ) ) != 0 )
   {
-    for( int t = 0; t < cu.numTus; t++ )
-    {
-      const Tu tu = loadTu( cu.firstTu + t );
-      for( int c = 1; c <= 2; c++ )
-      {
-        const int4 block = tu.blk[1];
-        if( ( flags & ( kInterDeferCb << ( c - 1 ) ) ) == 0 || !valid( block ) )
-        {
-          continue;
-        }
-        const bool scaled = ( cbfOf( tu, c ) || tu.jointCbCr != 0 ) && block.z * block.w > 4;
-        for( int y = 0; y < block.w; y += 1 << log2Of( block.w - y ) )
-        {
-          for( int x = 0; x < block.z; x += 1 << log2Of( block.z - x ) )
-          {
-            const int bw = 1 << log2Of( block.z - x );
-            const int bh = 1 << log2Of( block.w - y );
-            uint      w[12];
-            setIntra( w, block.x + x, block.y + y, bw, bh, c, kIntraLmcs, 0, kIntraResidual, 0, 0 );
-            if( scaled )
-            {
-              setLmcsScale( tu.blk[0].xy, w );
-            }
-            emitIntra( o, w );
-          }
-        }
-      }
-    }
+    lmcsChromaJobs( cu, flags, o );
   }
 }
 
