@@ -669,7 +669,83 @@ ParseStats ParseService::stats() const
   return stats;
 }
 
-static bool serialIntraPicture( const Picture& pic );
+// Whether all the picture's slices are intra slices
+static bool intraPicture( const Picture& pic )
+{
+  return std::all_of( pic.slices.begin(), pic.slices.end(), []( const Slice* s ) { return s->isIntra(); } );
+}
+
+// An intra picture whose parse is one or two long chains (kSerialStreams)
+static bool serialIntraPicture( const Picture& pic )
+{
+  return substreamsOf( &pic ) <= kSerialStreams && intraPicture( pic );
+}
+
+size_t ParseService::heldResults() const
+{
+  return m_results.size() - m_freeResults.size() - m_released.size();
+}
+
+bool ParseService::hasWork() const
+{
+  return !m_parsing.empty() || !m_copying.empty() || m_inFlight > 0 || !m_restarting.empty() || !m_freeing.empty()
+         || ( !m_waiting.empty() && m_parsing.size() + heldResults() < kMaxAhead );
+}
+
+std::vector<Picture*> ParseService::takeStartingPictures()
+{
+  // The pictures enqueued since, oldest first, as many as may be parsed at a time: while the parse is not too far
+  // ahead (kMaxAhead), up to kMaxParsing pictures in parse (kMaxSerialIntraParsing while all are serial intra
+  // pictures), and past kMinParsing only while the substreams in parse are fewer than kStreamsInParse
+  std::sort( m_waiting.begin(), m_waiting.end(), []( const Picture* a, const Picture* b ) { return a->decodingOrderNumber < b->decodingOrderNumber; } );
+  size_t streams = 0;
+  for( const ParseSlot* slot: m_parsing )
+  {
+    streams += slot->input().numStreams;
+  }
+  const size_t ahead          = m_parsing.size() + heldResults();
+  bool         allSerialIntra = std::all_of( m_parsing.begin(), m_parsing.end(), []( const ParseSlot* slot ) { return serialIntraPicture( *slot->picture ); } );
+  size_t       count          = 0;
+  while( count < m_waiting.size() && ahead + count < kMaxAhead )
+  {
+    const size_t inParse = m_parsing.size() + count;
+    allSerialIntra       = allSerialIntra && serialIntraPicture( *m_waiting[count] );
+    const size_t cap     = allSerialIntra ? kMaxSerialIntraParsing : kMaxParsing;
+    if( inParse >= cap || ( inParse >= kMinParsing && streams >= kStreamsInParse ) )
+    {
+      break;
+    }
+    streams += substreamsOf( m_waiting[count] );
+    count++;
+  }
+  std::vector<Picture*> starting( m_waiting.begin(), m_waiting.begin() + count );
+  m_waiting.erase( m_waiting.begin(), m_waiting.begin() + count );
+
+  // Then the intra pictures that parse in long chains, ahead of their turn (kSerialIntraInParse of them in parse)
+  size_t serialIntra = 0;
+  for( const ParseSlot* slot: m_parsing )
+  {
+    serialIntra += serialIntraPicture( *slot->picture ) ? 1 : 0;
+  }
+  for( const Picture* pic: starting )
+  {
+    serialIntra += serialIntraPicture( *pic ) ? 1 : 0;
+  }
+  for( auto it = m_waiting.begin(); it != m_waiting.end() && serialIntra < kSerialIntraInParse; )
+  {
+    if( serialIntraPicture( **it ) )
+    {
+      starting.push_back( *it );
+      it = m_waiting.erase( it );
+      serialIntra++;
+    }
+    else
+    {
+      ++it;
+    }
+  }
+  return starting;
+}
 
 void ParseService::run()
 {
@@ -677,70 +753,17 @@ void ParseService::run()
   {
     while( true )
     {
-      // the pictures enqueued since, oldest first, as many as may be parsed at a time
       std::vector<Picture*> starting;
       {
         std::unique_lock<std::mutex> lock( m_mutex );
-        // (the results handed over or being copied, which their pictures have not given back: kMaxAhead)
-        const auto held = [&]() { return m_results.size() - m_freeResults.size() - m_released.size(); };
-        m_wake.wait( lock, [&]() {
-          return m_stop || !m_parsing.empty() || !m_copying.empty() || m_inFlight > 0 || !m_restarting.empty() || !m_freeing.empty()
-                 || ( !m_waiting.empty() && m_parsing.size() + held() < kMaxAhead );
-        } );
+        m_wake.wait( lock, [&]() { return m_stop || hasWork(); } );
         if( m_stop )
         {
           lock.unlock();
           waitAll();   // (before the slots and frames go)
           return;
         }
-        std::sort( m_waiting.begin(), m_waiting.end(),
-                   []( const Picture* a, const Picture* b ) { return a->decodingOrderNumber < b->decodingOrderNumber; } );
-        size_t streams = 0;
-        for( const ParseSlot* slot: m_parsing )
-        {
-          streams += slot->input().numStreams;
-        }
-        const size_t ahead          = m_parsing.size() + held();
-        bool         allSerialIntra = std::all_of( m_parsing.begin(), m_parsing.end(),
-                                                   []( const ParseSlot* slot ) { return serialIntraPicture( *slot->picture ); } );
-        size_t       count          = 0;
-        while( count < m_waiting.size() && ahead + count < kMaxAhead )
-        {
-          const size_t inParse = m_parsing.size() + count;
-          allSerialIntra       = allSerialIntra && serialIntraPicture( *m_waiting[count] );
-          const size_t cap     = allSerialIntra ? kMaxSerialIntraParsing : kMaxParsing;
-          if( inParse >= cap || ( inParse >= kMinParsing && streams >= kStreamsInParse ) )
-          {
-            break;
-          }
-          streams += substreamsOf( m_waiting[count] );
-          count++;
-        }
-        starting.assign( m_waiting.begin(), m_waiting.begin() + count );
-        m_waiting.erase( m_waiting.begin(), m_waiting.begin() + count );
-        // then the intra pictures that parse in long chains, ahead of their turn (kSerialStreams)
-        size_t serialIntra = 0;
-        for( const ParseSlot* slot: m_parsing )
-        {
-          serialIntra += serialIntraPicture( *slot->picture ) ? 1 : 0;
-        }
-        for( const Picture* pic: starting )
-        {
-          serialIntra += serialIntraPicture( *pic ) ? 1 : 0;
-        }
-        for( auto it = m_waiting.begin(); it != m_waiting.end() && serialIntra < kSerialIntraInParse; )
-        {
-          if( serialIntraPicture( **it ) )
-          {
-            starting.push_back( *it );
-            it = m_waiting.erase( it );
-            serialIntra++;
-          }
-          else
-          {
-            ++it;
-          }
-        }
+        starting = takeStartingPictures();
       }
       for( Picture* pic: starting )
       {
@@ -751,40 +774,44 @@ void ParseService::run()
   }
   catch( ... )
   {
-    // the GPU failed (or the service did): the pictures waiting for their parse fail, and so do those enqueued later
-    std::lock_guard<std::mutex> lock( m_mutex );
-    for( ParseSlot* slot: m_parsing )
-    {
-      slot->picture->gpuParseResult = nullptr;
-      slot->picture->gpuParsed.unlock_nothrow();
-    }
-    m_parsing.clear();
-    for( ParseSlot* slot: m_restarting )
-    {
-      slot->picture->gpuParseResult = nullptr;
-      slot->picture->gpuParsed.unlock_nothrow();
-    }
-    m_restarting.clear();
-    m_freeing.clear();   // (their pictures were handed over)
-    for( const auto* copies: { &m_copying, &m_copied } )
-    {
-      for( const auto& copy: *copies )
-      {
-        copy.first->picture->gpuParseResult = nullptr;
-        copy.first->picture->gpuParsed.unlock_nothrow();
-      }
-    }
-    m_copying.clear();
-    m_copied.clear();
-    m_broken = true;
-    for( Picture* pic: m_waiting )
-    {
-      pic->gpuParseResult = nullptr;
-      pic->gpuParsed.unlock_nothrow();
-    }
-    m_waiting.clear();
-    m_wakeUp();
+    failAll();
   }
+}
+
+void ParseService::failAll()
+{
+  // The pictures waiting for their parse fail, and so do those enqueued later (m_broken)
+  const auto fail = []( Picture* pic ) {
+    pic->gpuParseResult = nullptr;
+    pic->gpuParsed.unlock_nothrow();
+  };
+  std::lock_guard<std::mutex> lock( m_mutex );
+  for( const std::vector<ParseSlot*>* slots: { &m_parsing, &m_restarting } )
+  {
+    for( ParseSlot* slot: *slots )
+    {
+      fail( slot->picture );
+    }
+  }
+  m_parsing.clear();
+  m_restarting.clear();
+  m_freeing.clear();   // (their pictures were handed over)
+  for( const auto* copies: { &m_copying, &m_copied } )
+  {
+    for( const auto& copy: *copies )
+    {
+      fail( copy.first->picture );
+    }
+  }
+  m_copying.clear();
+  m_copied.clear();
+  m_broken = true;
+  for( Picture* pic: m_waiting )
+  {
+    fail( pic );
+  }
+  m_waiting.clear();
+  m_wakeUp();
 }
 
 ParseSlot* ParseService::takeSlot()
@@ -848,18 +875,6 @@ void ParseService::giveSlot( ParseSlot* slot )
 {
   giveRecords( slot );
   m_free.push_back( slot );
-}
-
-// Whether all the picture's slices are intra slices
-static bool intraPicture( const Picture& pic )
-{
-  return std::all_of( pic.slices.begin(), pic.slices.end(), []( const Slice* s ) { return s->isIntra(); } );
-}
-
-// An intra picture whose parse is one or two long chains (kSerialStreams)
-static bool serialIntraPicture( const Picture& pic )
-{
-  return substreamsOf( &pic ) <= kSerialStreams && intraPicture( pic );
 }
 
 void ParseService::Counts::raise( const Counts& counts )

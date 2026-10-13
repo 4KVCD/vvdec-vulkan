@@ -264,6 +264,12 @@ public:
 
 private:
   void           run();                                    // the thread
+  // (with m_mutex held:) whether the thread has anything to do; the parse results held (handed over or being copied,
+  // not given back yet); the waiting pictures to start now, taken from m_waiting
+  bool                  hasWork() const;
+  size_t                heldResults() const;
+  std::vector<Picture*> takeStartingPictures();
+  void           failAll();                                // after a GPU failure: every picture's parse fails
   ParseSlot*     takeSlot();                               // a slot no picture uses, or a new one
   ParsedPicture* takeParsed();                             // a parse result no picture holds, or a new one
   StagedRecords  takeStaged( size_t cus, size_t tus );     // room for a parse's staged records, from the arena
