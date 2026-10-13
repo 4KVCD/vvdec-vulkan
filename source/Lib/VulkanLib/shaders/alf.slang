@@ -369,9 +369,9 @@ void main( uint3 id : SV_DispatchThreadID )
 // picture's edges (vvdec's border extension). They are stored in groups of 4
 // samples (8 bytes): what a 4x4 block's classification and filter read of a
 // row arrives as 3 groups, and the samples are picked out of them in
-// registers. (Reading one sample at a time, a block read shared memory some
-// 600 times and waited for most reads; the groups took VideoQ 4K's ALF luma
-// from 1.55 to 1.33 ms per picture with ALF.)
+// registers. Don't read the samples one at a time: a block then reads shared
+// memory some 600 times and waits for most of the reads (the groups cut
+// VideoQ 4K's ALF luma from 1.55 to 1.33 ms per picture with ALF).
 #define TILE 32
 #define MARGIN 3                         // rows above and below
 #define GROUPS ( TILE / 4 + 2 )          // 4-sample groups per row: the tile's, plus one on each side
@@ -435,14 +435,12 @@ Row tileRow( int y, int G )
 static const int kTh[16] = { 0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4 };
 static const int kTransposeTable[8] = { 0, 1, 0, 2, 2, 3, 1, 3 };
 
-[shader( "compute" )]
-[numthreads( 8, 8, 1 )]
-void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
+// Loads the workgroup's tile (s_x0, s_y0) with its margins into s_tile, in 4-sample groups, by the workgroup's 64
+// threads; the samples past the picture's edges are the nearest ones inside. Rows start 8-byte aligned
+// (GpuRecon::recordAlf), and so do the groups.
+void loadTile( int tid )
 {
-  s_x0 = int( group.x ) * TILE;
-  s_y0 = int( group.y ) * TILE;
-  // Rows start 8-byte aligned (GpuRecon::recordAlf), and so do the groups.
-  for( int s = int( local.y * 8 + local.x ); s < TILE_H * GROUPS; s += 64 )
+  for( int s = tid; s < TILE_H * GROUPS; s += 64 )
   {
     const int r = s / GROUPS;
     const int x = s_x0 - 4 + 4 * ( s - r * GROUPS );
@@ -461,14 +459,14 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
     }
     s_tile[s] = v;
   }
-  GroupMemoryBarrierWithGroupSync();
+}
 
-  const int vbH   = 1 << pc.ctuLog2;
-  const int vbPos = vbH - 4;
-
-  // Compute the cells' Laplacians, two neighbouring cells per iteration (their
-  // samples lie in 2 groups of each tile row).
-  for( int t = int( local.y * 8 + local.x ); t < CELLS * CELLS / 2; t += 64 )
+// Computes the cells' Laplacians into s_cls (see above), two neighbouring cells per iteration (their samples lie in 2
+// groups of each tile row), by the workgroup's 64 threads. The rows next to the virtual boundary (vbPos in each CTU of
+// vbH rows) read their own row instead of the one past the boundary.
+void cellLaplacians( int tid, int vbH, int vbPos )
+{
+  for( int t = tid; t < CELLS * CELLS / 2; t += 64 )
   {
     const int cy  = t / ( CELLS / 2 );
     const int m   = t - cy * ( CELLS / 2 );   // this iteration's cells: 2 * m and 2 * m + 1 of row cy
@@ -500,33 +498,20 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
       s_cls[cy * CELLS + 2 * m + e] = uint2( uint( v ) | uint( h ) << 16, uint( d0 ) | uint( d1 ) << 16 );
     }
   }
-  GroupMemoryBarrierWithGroupSync();
+}
 
-  const int bx = int( id.x ) * 4;
-  const int by = int( id.y ) * 4;
-  if( bx >= pc.width || by >= pc.height )
-  {
-    return;
-  }
-  const int G = ( bx - s_x0 ) / 4 + 1;
+// A 4x4 block's class and transpose (AdaptiveLoopFilter::deriveClassificationBlk)
+struct AlfClass
+{
+  int classIdx;
+  int transposeIdx;
+};
 
-  // Each tile lies within one CTU (CTUs are 32 luma samples or larger).
-  const int ctu = ( by >> pc.ctuLog2 ) * pc.widthInCtus + ( bx >> pc.ctuLog2 );
-  const int set = int( pc.ctus[ctu * 8 + CTU_LUMA_SET] );
-  if( set == 255 )
-  {
-    [unroll]
-    for( int dy = 0; dy < 4; dy++ )
-    {
-      *(uint2*)( pc.dst0 + ( by + dy ) * pc.dstStride + bx ) = s_tile[( by + dy - s_y0 + MARGIN ) * GROUPS + G];
-    }
-    return;
-  }
-
+// Classifies the 4x4 block at (bx, by): sums the Laplacians over its window, the 4x4 cells from ( bx - 2, by - 2 )
+// except the rows that the virtual boundary hides, then works out its activity and directions.
+AlfClass classifyBlock( int bx, int by, int vbH, int vbPos )
+{
   const int byVb = by & ( vbH - 1 );
-
-  // Classification: sum the Laplacians over the block's window, the 4x4 cells
-  // from ( bx - 2, by - 2 ), except the rows that the virtual boundary hides.
   int sumV = 0, sumH = 0, sumD0 = 0, sumD1 = 0;
   const int rFirst = byVb == vbPos ? 1 : 0;
   const int rLast  = byVb == vbPos - 4 ? 2 : 3;
@@ -594,9 +579,18 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
   {
     classIdx += ( ( ( mainDirection & 1 ) << 1 ) + directionStrength ) * 5;
   }
-  const int transposeIdx = kTransposeTable[mainDirection * 2 + ( secondaryDirection >> 1 )];
+  AlfClass cls;
+  cls.classIdx     = classIdx;
+  cls.transposeIdx = kTransposeTable[mainDirection * 2 + ( secondaryDirection >> 1 )];
+  return cls;
+}
 
-  const int base = set * LUMA_SET_SIZE + transposeIdx * NUM_CLASSES * LUMA_COEFF + classIdx * LUMA_COEFF;
+// Filters the 4x4 block at (bx, by), the tile's group G, with the filter of its class in the CTU's filter set, one row
+// at a time: its 4 samples ( bx + i, y ) are sample j = 4 + i of each Row. Next to the virtual boundary the rows past
+// it are replaced by the nearest ones before it, and the filter's sum is scaled down.
+void filterBlock( int bx, int by, int G, int set, AlfClass cls, int vbH, int vbPos )
+{
+  const int base = set * LUMA_SET_SIZE + cls.transposeIdx * NUM_CLASSES * LUMA_COEFF + cls.classIdx * LUMA_COEFF;
   int c[12], k[12];
   for( int i = 0; i < 12; i++ )
   {
@@ -604,8 +598,6 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
     k[i] = int( pc.clip[base + i] );
   }
 
-  // Filter the block one row at a time: its 4 samples ( bx + i, y ) are sample
-  // j = 4 + i of each Row.
   const int maxVal = ( 1 << pc.bitDepth ) - 1;
   [unroll]
   for( int dy = 0; dy < 4; dy++ )
@@ -664,6 +656,45 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
     }
     *(uint2*)( pc.dst0 + y * pc.dstStride + bx ) = uint2( uint( out[0] ) | uint( out[1] ) << 16, uint( out[2] ) | uint( out[3] ) << 16 );
   }
+}
+
+// One workgroup per tile of 32 x 32 luma samples, one thread per 4x4 block: the tile and its cells' Laplacians in
+// shared memory, then each block's class and filter (or a copy, where the CTU has ALF off).
+[shader( "compute" )]
+[numthreads( 8, 8, 1 )]
+void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
+{
+  s_x0          = int( group.x ) * TILE;
+  s_y0          = int( group.y ) * TILE;
+  const int tid = int( local.y * 8 + local.x );
+  loadTile( tid );
+  GroupMemoryBarrierWithGroupSync();
+  const int vbH   = 1 << pc.ctuLog2;
+  const int vbPos = vbH - 4;
+  cellLaplacians( tid, vbH, vbPos );
+  GroupMemoryBarrierWithGroupSync();
+
+  const int bx = int( id.x ) * 4;
+  const int by = int( id.y ) * 4;
+  if( bx >= pc.width || by >= pc.height )
+  {
+    return;
+  }
+  const int G = ( bx - s_x0 ) / 4 + 1;
+  // Each tile lies within one CTU (CTUs are 32 luma samples or larger).
+  const int ctu = ( by >> pc.ctuLog2 ) * pc.widthInCtus + ( bx >> pc.ctuLog2 );
+  const int set = int( pc.ctus[ctu * 8 + CTU_LUMA_SET] );
+  if( set == 255 )
+  {
+    // (ALF off: the block's samples as they are)
+    [unroll]
+    for( int dy = 0; dy < 4; dy++ )
+    {
+      *(uint2*)( pc.dst0 + ( by + dy ) * pc.dstStride + bx ) = s_tile[( by + dy - s_y0 + MARGIN ) * GROUPS + G];
+    }
+    return;
+  }
+  filterBlock( bx, by, G, set, classifyBlock( bx, by, vbH, vbPos ), vbH, vbPos );
 }
 
 #else   // CHROMA
