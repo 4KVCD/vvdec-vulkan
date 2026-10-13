@@ -148,7 +148,7 @@ int2 ringPlace( Ctu c, int i )
 
 uint2 packGroup( int v0, int v1, int v2, int v3 )
 {
-  return uint2( ( uint( v0 ) & 0xffffu ) | uint( v1 ) << 16, ( uint( v2 ) & 0xffffu ) | uint( v3 ) << 16 );
+  return packSamples( int4( v0, v1, v2, v3 ) );
 }
 
 // Sample k (0 to 3) of a group

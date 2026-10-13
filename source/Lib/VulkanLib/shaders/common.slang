@@ -35,6 +35,35 @@ void storePel( int16_t* p, int stride, int x, int y, int v )
   *at( p, uint( y * stride + x ) ) = int16_t( v );
 }
 
+// The signed 16-bit halves of a 32-bit word
+int lo16( uint v )
+{
+  return int( v << 16 ) >> 16;
+}
+
+int hi16( uint v )
+{
+  return int( v ) >> 16;
+}
+
+// Two 16-bit samples as a word, the first in its low half
+uint packPair( int2 v )
+{
+  return uint( v.x & 0xffff ) | uint( v.y ) << 16;
+}
+
+// Four 16-bit samples as two words, the first in the low half of the first word
+uint2 packSamples( int4 v )
+{
+  return uint2( packPair( v.xy ), packPair( v.zw ) );
+}
+
+// The four signed 16-bit samples of two words (packSamples' inverse)
+int4 unpackSamples( uint2 w )
+{
+  return int4( lo16( w.x ), hi16( w.x ), lo16( w.y ), hi16( w.y ) );
+}
+
 // Reads the sample at (x, y) with the coordinates clamped into the picture,
 // which returns what vvdec's border extension of the picture holds there.
 int loadClamped( int16_t* p, int stride, int x, int y, int w, int h )

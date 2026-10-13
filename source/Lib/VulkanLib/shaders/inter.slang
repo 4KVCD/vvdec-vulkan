@@ -1629,16 +1629,6 @@ int2 chromaPred( int at, int tmp, int j, int i0, int rx0, int ry0, int xFrac, in
   return out;
 }
 
-int lo16( uint v )
-{
-  return int( v << 16 ) >> 16;
-}
-
-int hi16( uint v )
-{
-  return int( v ) >> 16;
-}
-
 // dmvrDelta from the SADs in s_sad, with the centre's cost (reduced by a quarter) passed in; each thread computes it.
 int sadOr( int i, int centre )
 {
@@ -2323,7 +2313,7 @@ void chromaTile( int tid, uint* job, int x, int y, int cuX, int cuY, int flags, 
         }
       }
       const uint2 res  = kc == 0 ? resCb : resCr;
-      const int4  resV = int4( lo16( res.x ), hi16( res.x ), lo16( res.y ), hi16( res.y ) );
+      const int4  resV = unpackSamples( res );
       int4        v;
       [unroll]
       for( int o = 0; o < 4; o++ )
@@ -2337,7 +2327,7 @@ void chromaTile( int tid, uint* job, int x, int y, int cuX, int cuY, int flags, 
         v = clamp( v + resV, 0, maxVal );
       }
       int16_t* out = ( flags & ( FLAG_DEFER_CB << kc ) ) != 0 ? ( kc == 0 ? pc.defer1 : pc.defer2 ) : ( kc == 0 ? pc.dst1 : pc.dst2 );
-      *(uint2*)at( out, atC ) = uint2( uint( v.x & 0xffff ) | uint( v.y ) << 16, uint( v.z & 0xffff ) | uint( v.w ) << 16 );
+      *(uint2*)at( out, atC ) = packSamples( v );
     }
     GroupMemoryBarrierWithGroupSync();   // (the next round's windows replace these)
   }
@@ -2843,12 +2833,12 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   }
   if( ( flags & FLAG_RES_Y ) != 0 )
   {
-    vy = clamp( vy + int4( lo16( resY.x ), hi16( resY.x ), lo16( resY.y ), hi16( resY.y ) ), 0, maxVal );
+    vy = clamp( vy + unpackSamples( resY ), 0, maxVal );
   }
   int16_t* outY = ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0;
   if( t.mineY )
   {
-    *(uint2*)at( outY, t.atY ) = uint2( uint( vy.x & 0xffff ) | uint( vy.y ) << 16, uint( vy.z & 0xffff ) | uint( vy.w ) << 16 );
+    *(uint2*)at( outY, t.atY ) = packSamples( vy );
   }
   int2 vc;
   [unroll]
@@ -2865,7 +2855,7 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   int16_t* outCr = ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2;
   if( chroma420() && t.mineC )
   {
-    *(uint*)at( t.cc == 0 ? outCb : outCr, t.atC ) = uint( vc.x & 0xffff ) | uint( vc.y ) << 16;
+    *(uint*)at( t.cc == 0 ? outCb : outCr, t.atC ) = packPair( vc );
   }
   // (4:2:2 and 4:4:4: main runs chromaTile with this)
   chroma.tw    = t.tw;
@@ -3555,10 +3545,9 @@ bool affineBoxTile( int tid, uint job[24], int x, int y, int w, int h, int flags
     }
     if( ( flags & FLAG_RES_Y ) != 0 )
     {
-      vy = clamp( vy + int4( lo16( resY.x ), hi16( resY.x ), lo16( resY.y ), hi16( resY.y ) ), 0, maxVal );
+      vy = clamp( vy + unpackSamples( resY ), 0, maxVal );
     }
-    *(uint2*)at( ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0, atY ) =
-      uint2( uint( vy.x & 0xffff ) | uint( vy.y ) << 16, uint( vy.z & 0xffff ) | uint( vy.w ) << 16 );
+    *(uint2*)at( ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0, atY ) = packSamples( vy );
   }
 
   // Chroma: the boxes into the pool (a chunk a store), then the thread's two samples of each list from its chroma
@@ -3605,7 +3594,7 @@ bool affineBoxTile( int tid, uint job[24], int x, int y, int w, int h, int flags
   {
     int16_t* outCb = ( flags & FLAG_DEFER_CB ) != 0 ? pc.defer1 : pc.dst1;
     int16_t* outCr = ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2;
-    *(uint*)at( cc == 0 ? outCb : outCr, atC ) = uint( vc.x & 0xffff ) | uint( vc.y ) << 16;
+    *(uint*)at( cc == 0 ? outCb : outCr, atC ) = packPair( vc );
   }
   return true;
 }

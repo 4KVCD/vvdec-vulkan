@@ -129,23 +129,6 @@ int jointResidual( int ict, int v )
   return abs( ict ) == 2 ? ( ict > 0 ? v : -v ) : ( ( ict > 0 ? v : -v ) >> 1 );
 }
 
-// The signed 16-bit halves of a 32-bit word
-int lo16( uint v )
-{
-  return int( v << 16 ) >> 16;
-}
-
-int hi16( uint v )
-{
-  return int( v ) >> 16;
-}
-
-// Four 16-bit samples as two words, the first in the low half of the first word
-uint2 packSamples( int4 v )
-{
-  return uint2( uint( v.x & 0xffff ) | uint( v.y ) << 16, uint( v.z & 0xffff ) | uint( v.w ) << 16 );
-}
-
 // Writes v into every sample of the block (2^log2W x 2^log2H at p, rows stride apart). wide: the block's rows start
 // 8-byte aligned and are 4 samples wide at least, so that a thread writes 4 samples a store.
 void fillBlock( int16_t* p, int stride, int log2W, int log2H, bool wide, int tid, int v )
@@ -190,7 +173,7 @@ void horizontalRows<let NX : int>( int16_t* mHor, int16_t* block, int16_t* other
   for( int k = 0; k < NX; k++ )
   {
     const uint2 w = *(uint2*)at( mHor, uint( k * width + 4 * g ) );
-    m[k]          = int4( lo16( w.x ), hi16( w.x ), lo16( w.y ), hi16( w.y ) );
+    m[k]          = unpackSamples( w );
   }
   for( int y = y0; y < height; y += rowStep )
   {
@@ -411,7 +394,7 @@ void verticalGroups( int tid, TrafoBlock t, int16_t* mVer, int nx, int ny )
       for( int j = 0; j < 4; j++ )
       {
         const uint2 w = *(uint2*)at( mVer, uint( ( k + j ) * t.height + y ) );
-        sum += int( s_coef[( k + j ) * 32 + x] ) * int4( lo16( w.x ), hi16( w.x ), lo16( w.y ), hi16( w.y ) );
+        sum += int( s_coef[( k + j ) * 32 + x] ) * unpackSamples( w );
       }
     }
     const int4 mid            = clamp( sum >> 7, int4( COEFF_MIN ), int4( COEFF_MAX ) );
@@ -445,7 +428,7 @@ void horizontalGroups( int tid, TrafoBlock t, int16_t* mHor, int nx, int shift2 
     for( int k = 0; k < nx; k++ )
     {
       const uint2 w = *(uint2*)at( mHor, uint( k * t.width + 4 * g ) );
-      sum += int( s_mid[y * 32 + k] ) * int4( lo16( w.x ), hi16( w.x ), lo16( w.y ), hi16( w.y ) );
+      sum += int( s_mid[y * 32 + k] ) * unpackSamples( w );
     }
     storeGroup( t.block, t.other, t.stride, 4 * g, y, clamp( sum >> shift2, int4( COEFF_MIN ), int4( COEFF_MAX ) ), t.ict );
   }
