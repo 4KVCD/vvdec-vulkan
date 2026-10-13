@@ -906,11 +906,9 @@ void GpuRecon::startEarlyRows( CodingStructure& cs, const PictureJobs& jobs, siz
   }
 }
 
-int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
-                            PelStorage& pic, bool waitFirst )
+void GpuRecon::takePictureSettings( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao,
+                                    const AdaptiveLoopFilter* alf, PelStorage& pic )
 {
-  // With the GPU's parse, the shared deferred-prediction planes, held until the picture's rest is submitted (the return)
-  const SharedDeferTurn deferTurn( *this, jobs.shared );
   if( m_prepared.picture != cs.picture )
   {
     prepareFilters( cs, deblock, sao, alf );
@@ -920,6 +918,56 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   m_frontEndTrafo    = jobs.frontEndTrafo;
   m_frontEndInter    = jobs.frontEndInter;
   bindDeferPlanes( pic );
+}
+
+// The GPU front end runs on the async compute queue, beside the work submitted before: its passes are latency-bound (a
+// few waves each, the motion derivation one per CTU row), and the reconstruction of the pictures before keeps the GPU
+// busy meanwhile. Part 1 of a picture the GPU parsed waits there for the picture's parsed records
+// (recordFrontEndAsync). Otherwise the first part holds the front end (and for a picture the GPU parsed, waits for its
+// records itself).
+bool GpuRecon::startFrontEnd( const CodingStructure& cs, const PictureJobs& jobs )
+{
+  const bool async = jobs.useFrontEnd && jobs.cus && m_cmdFrontEnd1 != VK_NULL_HANDLE;
+  if( async )
+  {
+    recordFrontEndAsync( cs, jobs );
+  }
+  else if( jobs.useFrontEnd && jobs.parsed && m_ctx->asyncQueue() )
+  {
+    m_firstParseWait = jobs.parsed->parseValue();
+  }
+  return async;
+}
+
+void GpuRecon::recordRest( const CodingStructure& cs, const PictureJobs& jobs, PelStorage& pic, const Planes& planes, bool alf )
+{
+  if( jobs.intra || jobs.useFrontEnd )
+  {
+    static const std::vector<std::vector<IntraJob>> noIntra;
+    recordIntra( cs, jobs.useFrontEnd ? noIntra : *jobs.intra, planes );   // in place
+    computeBarrier();
+    if( m_lmcsOn )
+    {
+      recordLmcs( cs, planes, lmcsParams() );   // in place
+      computeBarrier();
+    }
+  }
+  const bool inScratch = recordInLoopFilters( cs, jobs, pic, planes, alf );
+  computeToTransferBarrier();
+  if( inScratch )
+  {
+    // The luma result is in the scratch plane: it becomes the picture's luma twin, and its former twin the scratch
+    // plane (they have the same size). (The chroma result is in the twin: recordAlf.)
+    std::swap( planeTwin( pic, COMPONENT_Y ), m_scratch[COMPONENT_Y] );
+  }
+}
+
+int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
+                            PelStorage& pic, bool waitFirst )
+{
+  // With the GPU's parse, the shared deferred-prediction planes, held until the picture's rest is submitted (the return)
+  const SharedDeferTurn deferTurn( *this, jobs.shared );
+  takePictureSettings( cs, jobs, deblock, sao, alf, pic );
 
   // After the early rows (startEarlyRows), the command pool is already reset, the reference table written and the
   // reference pictures uploaded.
@@ -933,21 +981,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
     }
     m_earlyRowsMarks = 0;
   }
-
-  // The GPU front end on the async compute queue, beside the work submitted before: its passes are latency-bound (a
-  // few waves each, the motion derivation one per CTU row), and the reconstruction of the pictures before keeps the
-  // GPU busy meanwhile. Part 1 of a picture the GPU parsed waits there for the picture's parsed records
-  // (recordFrontEndAsync). Otherwise the first part holds the front end (and for a picture the GPU parsed, waits for
-  // its records itself).
-  const bool frontEndAsync = jobs.useFrontEnd && jobs.cus && m_cmdFrontEnd1 != VK_NULL_HANDLE;
-  if( frontEndAsync )
-  {
-    recordFrontEndAsync( cs, jobs );
-  }
-  else if( jobs.useFrontEnd && jobs.parsed && m_ctx->asyncQueue() )
-  {
-    m_firstParseWait = jobs.parsed->parseValue();
-  }
+  const bool frontEndAsync = startFrontEnd( cs, jobs );
 
   // The picture is reconstructed in the GPU's own memory, which its shaders reach faster than host memory, and
   // stays there as a reference picture.
@@ -961,27 +995,7 @@ int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool d
   recordFirstPart( cs, jobs, pic, planes, frontEndAsync );
   splitCommands();
   cs.picture->gpuFirstValue = m_firstValue;   // for the front ends of the pictures whose colocated picture this is
-
-  // The rest: intra prediction, LMCS's inverse mapping and the in-loop filters
-  if( jobs.intra || jobs.useFrontEnd )
-  {
-    static const std::vector<std::vector<IntraJob>> noIntra;
-    recordIntra( cs, jobs.useFrontEnd ? noIntra : *jobs.intra, planes );   // in place
-    computeBarrier();
-    if( m_lmcsOn )
-    {
-      recordLmcs( cs, planes, lmcsParams() );   // in place
-      computeBarrier();
-    }
-  }
-  const bool inScratch = recordInLoopFilters( cs, jobs, pic, planes, alf != nullptr );
-  computeToTransferBarrier();
-  if( inScratch )
-  {
-    // The luma result is in the scratch plane: it becomes the picture's luma twin, and its former twin the scratch
-    // plane (they have the same size). (The chroma result is in the twin: recordAlf.)
-    std::swap( planeTwin( pic, COMPONENT_Y ), m_scratch[COMPONENT_Y] );
-  }
+  recordRest( cs, jobs, pic, planes, alf != nullptr );
   const int download = submitPicture( pic, waitFirst );
   // The scratch planes (after a swap, the picture's former twin) go back to the pool at once. The GPU runs the
   // pictures' work one after the other (each part begins with a barrier over all the work before it), so the work of

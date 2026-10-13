@@ -318,9 +318,17 @@ private:
   VkDeviceAddress lmcsParams() const { return m_params.addr + m_prepared.dbSize + m_prepared.alfSize + m_prepared.saoSize; }
 
   // --- The order of a picture's work (GpuRecon.cpp) ---
+  // The picture's filter parameters (unless prepareFilters ran for it), what jobs says the GPU does, and the deferred
+  // prediction planes bound to the picture
+  void takePictureSettings( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
+                            PelStorage& pic );
+  // Starts the picture's front end on the async queue when it can run there, and returns whether it does
+  bool startFrontEnd( const CodingStructure& cs, const PictureJobs& jobs );
   // The first part: the picture's planes uploaded (when the CPU made the residuals), the front end (without the
   // async queue), the residuals and inter prediction.
   void recordFirstPart( const CodingStructure& cs, const PictureJobs& jobs, const PelStorage& pic, const Planes& planes, bool frontEndAsync );
+  // The rest: intra prediction and LMCS's inverse mapping in place, then the in-loop filters
+  void recordRest( const CodingStructure& cs, const PictureJobs& jobs, PelStorage& pic, const Planes& planes, bool alf );
   // The in-loop filters, from planes (the picture's twin) on: deblocking and SAO in place, then ALF from the twin:
   // luma into the scratch planes, chroma only where ALF or CC-ALF applies (through the scratch planes, back into the
   // twin). Returns whether the luma result ended in the scratch planes.
