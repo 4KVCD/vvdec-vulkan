@@ -192,6 +192,27 @@ int biAverage( int p0, int p1, int flags, int w1, int shiftNum, int offset, int 
 }
 
 #define IF_INTERNAL_OFFS 8192
+
+// Combines a sample's predictions from the job's lists as its flags say (p0: the first list's; p1: L1's when both are
+// used): GPM's blend, with the first partition's weight gpmWeight (out of 8); weighted prediction, with component
+// comp's parameters (the job's words wpParams and wpOffsets1, see wpSample); the average, with BCW's weights (bcwW1:
+// L1's); or the one list's prediction, which is final already. (GPM's jobs have no weighted prediction.)
+int combineLists( int flags, int comp, int p0, int p1, int gpmWeight, uint wpParams, uint wpOffsets1, int bcwW1 )
+{
+  const int  maxVal   = ( 1 << pc.bitDepth ) - 1;
+  const int  shiftNum = max( 2, 14 - pc.bitDepth ) + 1;
+  const int  offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
+  const bool bi       = ( flags & ( FLAG_L0 | FLAG_L1 ) ) == ( FLAG_L0 | FLAG_L1 );
+  if( ( flags & FLAG_GEO ) != 0 )
+  {
+    return geoBlend( p0, p1, gpmWeight, maxVal );
+  }
+  if( ( flags & FLAG_WP ) != 0 )
+  {
+    return wpSample( wpParams, wpOffsets1, comp, p0, bi ? p1 : 0, maxVal );
+  }
+  return bi ? biAverage( p0, p1, flags, bcwW1, shiftNum, offset, maxVal ) : p0;
+}
 #define THREADS 64
 #define PER_THREAD 4   // a 16x16 tile's luma samples per thread
 
@@ -2122,7 +2143,6 @@ void chromaTile( int tid, uint* job, int x, int y, int cuX, int cuY, int flags, 
   const int              bcwW1    = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW's L1 weight
   const bool             bi       = lists == 2;
   const bool             geo      = ( flags & FLAG_GEO ) != 0;
-  const bool             wp       = ( flags & FLAG_WP ) != 0;
   const int              cHeight  = pc.picHeight >> L.sy;
   // Each list's window starts a sample before its motion's integer position. With DMVR that is the refined motion's,
   // dI from the merge motion's: the window's rows are the merge motion's window's, clamped into it, and its columns
@@ -2302,20 +2322,15 @@ void chromaTile( int tid, uint* job, int x, int y, int cuX, int cuY, int flags, 
           pred[s] = chromaGroupPred( L, chromaWindowAt( L, k, s ) + lead[s], chromaPassAt( L, k, s ), j, i0, xFrac[s], yFrac[s], cx[s], cy[s], hi );
         }
       }
-      const int shiftNum = headRoom + 1;
-      const int offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
-      const uint2 res    = kc == 0 ? resCb : resCr;
-      const int4  resV   = int4( lo16( res.x ), hi16( res.x ), lo16( res.y ), hi16( res.y ) );
+      const uint2 res  = kc == 0 ? resCb : resCr;
+      const int4  resV = int4( lo16( res.x ), hi16( res.x ), lo16( res.y ), hi16( res.y ) );
       int4        v;
       [unroll]
       for( int o = 0; o < 4; o++ )
       {
         // (GPM: the weight of the CU's luma sample under the chroma sample)
-        v[o] = geo ? geoBlend( pred[0][o], pred[1][o],
-                               geoWeight( job[9], ( ( x >> L.sx ) + i0 + o - ( cuX >> L.sx ) ) << L.sx, ( ( y >> L.sy ) + j - ( cuY >> L.sy ) ) << L.sy ), maxVal )
-               : wp ? wpSample( job[9 + kc], job[11], 1 + kc, pred[0][o], bi ? pred[1][o] : 0, maxVal )
-               : bi ? biAverage( pred[0][o], pred[1][o], flags, bcwW1, shiftNum, offset, maxVal )
-                    : pred[0][o];
+        const int gpmWeight = geo ? geoWeight( job[9], ( ( x >> L.sx ) + i0 + o - ( cuX >> L.sx ) ) << L.sx, ( ( y >> L.sy ) + j - ( cuY >> L.sy ) ) << L.sy ) : 0;
+        v[o]                = combineLists( flags, 1 + kc, pred[0][o], pred[1][o], gpmWeight, job[9 + kc], job[11], bcwW1 );
       }
       if( ( flags & ( FLAG_RES_Y << ( 1 + kc ) ) ) != 0 )
       {
@@ -2328,94 +2343,124 @@ void chromaTile( int tid, uint* job, int x, int y, int cuX, int cuY, int flags, 
   }
 }
 
-// FULL: a 16x16 tile, else one of w x h (16x8, 8x16 or 8x8) without DMVR or BDOF. (Two functions: in each, the size's
-// values are constants or nearly so.)
-// border (FULL only): the windows reach past the picture's edges (tileNear). chroma: what chromaTile needs of the tile.
-void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int cuX, int cuY, int flags, int2 mv0, int2 mv1, int ref0, int ref1,
-                           bool bi, bool dmvr, bool hpel, bool border, out TileChroma chroma )
+// What tile's steps share: the tile, its lists, its windows' places in the planes and in shared memory, and the
+// thread's samples. tileSetup works it out first.
+struct TileSetup
 {
-  const int  tw     = FULL != 0 ? 16 : w;
-  const int  th     = FULL != 0 ? 16 : h;
-  const bool dmvrOn = FULL != 0 && dmvr;
-  const bool edges  = FULL != 0 && border;
-  // The windows' rows: of nch chunks of 8 luma samples (of 4 chroma samples) each, from lead samples before the window;
-  // th + 7 luma rows, th / 2 + 3 chroma rows. A 16x16 tile's luma chunks take two reads a thread per list (69 > 64).
-  const int  nch    = tw == 16 ? 3 : 2;
-  const int  rowsY  = th + 7;
-  const int  rowsC  = ( th >> 1 ) + 3;
-  const int  yTasks = nch * rowsY;
-  const int  cTasks = nch * rowsC;
-  // The thread's luma samples (j, i0 .. i0 + 3), and its chroma samples (cj, ci0 .. ci0 + 1) of component cc: 2^lg
-  // threads a row. In a tile of fewer than 16 rows, the threads past its rows (or its chroma's) work on its last row
-  // too, and store nothing.
-  const int  lg     = tw == 16 ? 2 : 1;
-  const int  jAll   = tid >> lg;
-  const int  cjAll  = ( tid & 31 ) >> lg;
-  const bool mineY  = FULL != 0 || jAll < th;
-  const bool mineC  = FULL != 0 || cjAll < ( th >> 1 );
-  const int  bcwW1 = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW's L1 weight
-  const int maxVal   = ( 1 << pc.bitDepth ) - 1;
-  const int headRoom = max( 2, 14 - pc.bitDepth );
+  int  x, y;           // the tile's first sample (luma)
+  int  tw, th;         // its size: 16x16 (FULL), else 16x8, 8x16 or 8x8
+  int  flags;          // the job's FLAG_*
+  bool edges;          // a border tile: its windows reach past the picture's edges (tileNear)
+  bool wp;             // weighted prediction (wpSample), which starts from the 14-bit predictions, for a uni-prediction too
+  bool geo;            // GPM: the two lists' predictions are the partitions', blended with the weights of the CU's mask
+  bool hi;             // the predictions are kept at 14 bits for combining (bi-prediction, weighted prediction)
+  int  lists;          // 1 or 2: slot 0 holds the first list used, slot 1 L1 when both are
+  bool two;            // lists == 2
+  int2 mvs[2];         // each slot's motion (with DMVR, the merge motion that the windows are read around)
+  int  refs[2];        // each slot's reference picture
+  // The windows' rows: of nch chunks (of 8 luma or 4 chroma samples) each, from a lead sample before the window when
+  // it starts at an odd place (the reads start 4-byte aligned); rowsY luma rows (the tile's + 7) and rowsC chroma rows
+  // (half the tile's + 3), yTasks and cTasks chunks of a window
+  int  nch, rowsY, rowsC, yTasks, cTasks;
+  int  cRem, cRow;                 // the thread's chroma chunk of a window (its row cRow; a thread past the last one
+                                   // takes the last one, cRem)
+  int  wx[2], wy[2], leadY[2];     // each slot's luma window: its first sample, and its lead
+  int  cxs[2], cys[2], leadC[2];   // and its chroma windows'
+  int  wyAt[2];                    // the luma windows' sample (0, 0) in shared memory
+  int  wcAt[4];                    // the chroma windows': [2 slot + component - 1]
+  // The thread's samples: luma (j, i0 .. i0 + 3) and chroma (cj, ci0 .. ci0 + 1) of component cc (0: Cb, 1: Cr), 2^lg
+  // threads a row. In a tile of fewer than 16 rows the threads past its rows (or its chroma's) work on its last row
+  // too, and store nothing (mineY, mineC).
+  int  lg, j, i0, cc, cj, ci0;
+  bool mineY, mineC;
+  uint atY, atC;                   // the planes' places of the thread's luma and chroma samples
+};
 
-  // The lists' slots: the first list used goes in slot 0; with both lists, L1 goes in slot 1.
-  const int  lists = bi ? 2 : 1;
-  const bool l0    = ( flags & FLAG_L0 ) != 0;
-  int2       mvs[2]  = { l0 ? mv0 : mv1, mv1 };
-  int        refs[2] = { l0 ? ref0 : ref1, bi ? ref1 : ( l0 ? ref0 : ref1 ) };
-  // The planes, read once for the workgroup (each load below picks its own), as scalar bases for at().
-  int16_t*   planeY[2]  = { uniPtr( refPlane( refs[0], 0 ) ), uniPtr( refPlane( refs[1], 0 ) ) };
-  int16_t*   planeCb[2] = { uniPtr( refPlane( refs[0], 1 ) ), uniPtr( refPlane( refs[1], 1 ) ) };
-  int16_t*   planeCr[2] = { uniPtr( refPlane( refs[0], 2 ) ), uniPtr( refPlane( refs[1], 2 ) ) };
-  int        wx[2], wy[2], leadY[2], cxs[2], cys[2], leadC[2];
+TileSetup tileSetup<let FULL : int>( int tid, int x, int y, int w, int h, int flags, int2 mv0, int2 mv1, int ref0, int ref1, bool bi,
+                                    bool border )
+{
+  TileSetup t;
+  t.x      = x;
+  t.y      = y;
+  t.tw     = FULL != 0 ? 16 : w;
+  t.th     = FULL != 0 ? 16 : h;
+  t.flags  = flags;
+  t.edges  = FULL != 0 && border;
+  t.wp     = ( flags & FLAG_WP ) != 0;
+  t.geo    = ( flags & FLAG_GEO ) != 0;   // (a GPM tile has both lists)
+  t.hi     = bi || t.wp;
+  t.lists  = bi ? 2 : 1;
+  t.two    = bi;
+  // A 16x16 tile's luma chunks take two reads a thread per list (69 > 64).
+  t.nch    = t.tw == 16 ? 3 : 2;
+  t.rowsY  = t.th + 7;
+  t.rowsC  = ( t.th >> 1 ) + 3;
+  t.yTasks = t.nch * t.rowsY;
+  t.cTasks = t.nch * t.rowsC;
+  t.cRem   = min( tid, t.cTasks - 1 );
+  t.cRow   = t.nch == 3 ? t.cRem / 3 : t.cRem >> 1;
+
+  const bool l0 = ( flags & FLAG_L0 ) != 0;
+  t.mvs[0]      = l0 ? mv0 : mv1;
+  t.mvs[1]      = mv1;
+  t.refs[0]     = l0 ? ref0 : ref1;
+  t.refs[1]     = bi ? ref1 : ( l0 ? ref0 : ref1 );
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    wx[s]    = x + ( mvs[s].x >> 4 ) - 3;
-    wy[s]    = y + ( mvs[s].y >> 4 ) - 3;
-    leadY[s] = wx[s] & 1;   // the sample before the window, when it starts at an odd place: the reads start 4-byte aligned
-    cxs[s]   = ( x >> 1 ) + ( mvs[s].x >> 5 ) - 1;
-    cys[s]   = ( y >> 1 ) + ( mvs[s].y >> 5 ) - 1;
-    leadC[s] = cxs[s] & 1;   // the same for chroma
+    t.wx[s]    = x + ( t.mvs[s].x >> 4 ) - 3;
+    t.wy[s]    = y + ( t.mvs[s].y >> 4 ) - 3;
+    t.leadY[s] = t.wx[s] & 1;
+    t.cxs[s]   = ( x >> 1 ) + ( t.mvs[s].x >> 5 ) - 1;
+    t.cys[s]   = ( y >> 1 ) + ( t.mvs[s].y >> 5 ) - 1;
+    t.leadC[s] = t.cxs[s] & 1;
+    t.wyAt[s]  = WY_AT( s ) + t.leadY[s];
   }
-  // The windows' sample (0, 0) in shared memory: lead samples into the stored rows
-  int wyAt[2] = { WY_AT( 0 ) + leadY[0], WY_AT( 1 ) + leadY[1] };
-  int wcAt[4] = { WC_AT( 0 ) + leadC[0], WC_AT( 1 ) + leadC[0], WC_AT( 2 ) + leadC[1], WC_AT( 3 ) + leadC[1] };
+  t.wcAt[0] = WC_AT( 0 ) + t.leadC[0];
+  t.wcAt[1] = WC_AT( 1 ) + t.leadC[0];
+  t.wcAt[2] = WC_AT( 2 ) + t.leadC[1];
+  t.wcAt[3] = WC_AT( 3 ) + t.leadC[1];
 
-  // The thread's places: its luma samples (j, i0 .. i0 + 3) and its chroma samples (cj, ci0 .. ci0 + 1) of component cc
-  const int  j     = FULL != 0 ? jAll : min( jAll, th - 1 );
-  const int  i0    = ( tid & ( ( 1 << lg ) - 1 ) ) << 2;
-  const int  cc    = tid >> 5;
-  const int  cj    = FULL != 0 ? cjAll : min( cjAll, ( th >> 1 ) - 1 );
-  const int  ci0   = ( tid & ( ( 1 << lg ) - 1 ) ) << 1;
-  const uint atY   = uint( ( y + j ) * pc.stride0 + x + i0 );
-  const uint atC   = uint( ( ( y >> 1 ) + cj ) * pc.stride12 + ( x >> 1 ) + ci0 );
+  t.lg            = t.tw == 16 ? 2 : 1;
+  const int jAll  = tid >> t.lg;
+  const int cjAll = ( tid & 31 ) >> t.lg;
+  t.mineY         = FULL != 0 || jAll < t.th;
+  t.mineC         = FULL != 0 || cjAll < ( t.th >> 1 );
+  t.j             = FULL != 0 ? jAll : min( jAll, t.th - 1 );
+  t.i0            = ( tid & ( ( 1 << t.lg ) - 1 ) ) << 2;
+  t.cc            = tid >> 5;
+  t.cj            = FULL != 0 ? cjAll : min( cjAll, ( t.th >> 1 ) - 1 );
+  t.ci0           = ( tid & ( ( 1 << t.lg ) - 1 ) ) << 1;
+  t.atY           = uint( ( y + t.j ) * pc.stride0 + x + t.i0 );
+  t.atC           = uint( ( ( y >> 1 ) + t.cj ) * pc.stride12 + ( x >> 1 ) + t.ci0 );
+  return t;
+}
 
-  // All of the tile's reads, issued before the first wait for memory, in no branch but the residuals' after the windows'
-  // and the border tiles' (one of two whole sets of reads): after a branch the compiler makes the next read wait for all
-  // those before it. Each read takes one plane, the same in all the threads, so that its address is a scalar base and an
-  // offset (at()). Luma windows: rows of nch x 16 bytes per list (a 16x16 tile's: 23 rows of 24 samples from lead before
-  // the window, in two reads a thread per list; a thread past the last chunk reads the last one again, and stores
-  // nothing; with one list, the second list's reads are the first's again).
-  const bool two     = lists == 2;
-  // Weighted prediction (wpSample) starts from the 14-bit predictions, for a uni-prediction too (hi). (DMVR and BDOF
-  // are off where it is on.)
-  const bool wp      = ( flags & FLAG_WP ) != 0;
-  const bool hi      = bi || wp;
-  // GPM: the two lists' predictions are the partitions', blended with the weights of the CU's mask (a GPM tile has
-  // both lists, so its predictions are kept at 14 bits)
-  const bool geo     = ( flags & FLAG_GEO ) != 0;
-  int16_t*   y1      = two ? planeY[1] : planeY[0];
-  const uint yFirst0 = uint( wy[0] * pc.stride0 + wx[0] - leadY[0] );   // (the windows' first chunks)
-  const uint yFirst1 = two ? uint( wy[1] * pc.stride0 + wx[1] - leadY[1] ) : yFirst0;
-  uint4      yChunk[4];
-  uint2      cChunk[4];
-  int16_t*   cb1     = two ? planeCb[1] : planeCb[0];
-  int16_t*   cr1     = two ? planeCr[1] : planeCr[0];
-  const int  cRem    = min( tid, cTasks - 1 );
-  const int  cRow    = nch == 3 ? cRem / 3 : cRem >> 1;
-  uint2      resY    = uint2( 0, 0 );
+// All of the tile's reads, issued before the first wait for memory, in no branch but the residuals' after the windows'
+// and the border tiles' (one of two whole sets of reads): after a branch the compiler makes the next read wait for all
+// those before it. Each read takes one plane, the same in all the threads, so that its address is a scalar base and an
+// offset (at()). Luma windows: rows of nch x 16 bytes per list (a 16x16 tile's: 23 rows of 24 samples from lead before
+// the window, in two reads a thread per list; a thread past the last chunk reads the last one again, and stores
+// nothing; with one list, the second list's reads are the first's again). Chroma windows (4:2:0's): rows of nch x 8
+// bytes per component and list (a 16x16 tile's: 11 rows of 12 samples from lead before the window), a read a thread
+// for each (Cb and Cr of the first list, then of the second). Then the residuals that the picture holds where the
+// thread's samples go (resC: its chroma component's).
+void tileIssueReads<let FULL : int>( int tid, TileSetup t, out uint4 yChunk[4], out uint2 cChunk[4], out uint2 resY, out uint resC )
+{
+  // The planes, read once for the workgroup (each load picks its own), as scalar bases for at().
+  int16_t*  planeY[2]  = { uniPtr( refPlane( t.refs[0], 0 ) ), uniPtr( refPlane( t.refs[1], 0 ) ) };
+  int16_t*  planeCb[2] = { uniPtr( refPlane( t.refs[0], 1 ) ), uniPtr( refPlane( t.refs[1], 1 ) ) };
+  int16_t*  planeCr[2] = { uniPtr( refPlane( t.refs[0], 2 ) ), uniPtr( refPlane( t.refs[1], 2 ) ) };
+  const int  cRem    = t.cRem;
+  const int  cRow    = t.cRow;
+  int16_t*   y1      = t.two ? planeY[1] : planeY[0];
+  const uint yFirst0 = uint( t.wy[0] * pc.stride0 + t.wx[0] - t.leadY[0] );   // (the windows' first chunks)
+  const uint yFirst1 = t.two ? uint( t.wy[1] * pc.stride0 + t.wx[1] - t.leadY[1] ) : yFirst0;
+  int16_t*   cb1     = t.two ? planeCb[1] : planeCb[0];
+  int16_t*   cr1     = t.two ? planeCr[1] : planeCr[0];
   uint       resCb   = 0, resCr = 0;
-  if( edges )
+  resY               = uint2( 0, 0 );
+  if( t.edges )
   {
     // A border tile: each row read is clamped into the picture (the rows past its top and bottom are its first and last
     // rows, as vvdec's border extension holds them), and a chunk wholly left or right of the picture is read from the
@@ -2425,26 +2470,26 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
-      const int s   = k < 2 || !two ? 0 : 1;
-      const int rem = min( tid + THREADS * ( k & 1 ), yTasks - 1 );
+      const int s   = k < 2 || !t.two ? 0 : 1;
+      const int rem = min( tid + THREADS * ( k & 1 ), t.yTasks - 1 );
       const int row = rem / 3;
-      const int col = wx[s] - leadY[s] + 8 * ( rem - 3 * row );
+      const int col = t.wx[s] - t.leadY[s] + 8 * ( rem - 3 * row );
       const int c0  = col + 8 <= 0 || col >= pc.picWidth ? 0 : col;
-      yChunk[k]     = load16( planeY[s] - 16, uint( clamp( wy[s] + row, 0, pc.picHeight - 1 ) * pc.stride0 + c0 + 16 ) );
+      yChunk[k]     = load16( planeY[s] - 16, uint( clamp( t.wy[s] + row, 0, pc.picHeight - 1 ) * pc.stride0 + c0 + 16 ) );
     }
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
       if( chroma420() )
       {
-        const int s   = k < 2 || !two ? 0 : 1;
-        const int col = cxs[s] - leadC[s] + 4 * ( cRem - 3 * cRow );
+        const int s   = k < 2 || !t.two ? 0 : 1;
+        const int col = t.cxs[s] - t.leadC[s] + 4 * ( cRem - 3 * cRow );
         const int c0  = col + 4 <= 0 || col >= ( pc.picWidth >> 1 ) ? 0 : col;
         cChunk[k]     = load8( ( ( k & 1 ) == 0 ? planeCb[s] : planeCr[s] ) - 16,
-                               uint( clamp( cys[s] + cRow, 0, ( pc.picHeight >> 1 ) - 1 ) * pc.stride12 + c0 + 16 ) );
+                               uint( clamp( t.cys[s] + cRow, 0, ( pc.picHeight >> 1 ) - 1 ) * pc.stride12 + c0 + 16 ) );
       }
     }
-    tileResiduals( flags, atY, atC, resY, resCb, resCr );
+    tileResiduals( t.flags, t.atY, t.atC, resY, resCb, resCr );
   }
   else
   {
@@ -2453,131 +2498,183 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
     {
       if( FULL != 0 || ( k & 1 ) == 0 )
       {
-        const int  rem = min( tid + THREADS * ( k & 1 ), yTasks - 1 );
-        const int  row = nch == 3 ? rem / 3 : rem >> 1;
-        const uint i   = ( k < 2 ? yFirst0 : yFirst1 ) + uint( row * pc.stride0 + 8 * ( rem - nch * row ) );
+        const int  rem = min( tid + THREADS * ( k & 1 ), t.yTasks - 1 );
+        const int  row = t.nch == 3 ? rem / 3 : rem >> 1;
+        const uint i   = ( k < 2 ? yFirst0 : yFirst1 ) + uint( row * pc.stride0 + 8 * ( rem - t.nch * row ) );
         yChunk[k]      = load16( k < 2 ? planeY[0] : y1, i );
       }
     }
-    // Chroma windows: rows of nch x 8 bytes per component and list (a 16x16 tile's: 11 rows of 12 samples from lead
-    // before the window), a read a thread for each (Cb and Cr of the first list, then of the second).
-    const uint cFirst0 = uint( cys[0] * pc.stride12 + cxs[0] - leadC[0] );
-    const uint cFirst1 = two ? uint( cys[1] * pc.stride12 + cxs[1] - leadC[1] ) : cFirst0;
+    const uint cFirst0 = uint( t.cys[0] * pc.stride12 + t.cxs[0] - t.leadC[0] );
+    const uint cFirst1 = t.two ? uint( t.cys[1] * pc.stride12 + t.cxs[1] - t.leadC[1] ) : cFirst0;
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
       if( chroma420() )
       {
-        const uint i = ( k < 2 ? cFirst0 : cFirst1 ) + uint( cRow * pc.stride12 + 4 * ( cRem - nch * cRow ) );
+        const uint i = ( k < 2 ? cFirst0 : cFirst1 ) + uint( cRow * pc.stride12 + 4 * ( cRem - t.nch * cRow ) );
         cChunk[k]    = load8( k == 0 ? planeCb[0] : ( k == 1 ? planeCr[0] : ( k == 2 ? cb1 : cr1 ) ), i );
       }
     }
-    tileResiduals( flags, atY, atC, resY, resCb, resCr );
+    tileResiduals( t.flags, t.atY, t.atC, resY, resCb, resCr );
   }
-  const uint resC = cc == 0 ? resCb : resCr;
+  resC = t.cc == 0 ? resCb : resCr;
+}
 
-  // Store the luma windows in shared memory, a chunk a store.
+// Stores the luma windows in shared memory, a chunk a store.
+void tileStoreLumaWindows<let FULL : int>( int tid, TileSetup t, uint4 yChunk[4] )
+{
   [unroll]
   for( int k = 0; k < 4; k++ )
   {
     const int rem = tid + THREADS * ( k & 1 );
-    if( ( FULL != 0 || ( k & 1 ) == 0 ) && ( k < 2 || two ) && rem < yTasks )
+    if( ( FULL != 0 || ( k & 1 ) == 0 ) && ( k < 2 || t.two ) && rem < t.yTasks )
     {
-      const int row = nch == 3 ? rem / 3 : rem >> 1;
-      storeEight( WY_AT( k >> 1 ) + row * YS + 8 * ( rem - nch * row ), yChunk[k] );
+      const int row = t.nch == 3 ? rem / 3 : rem >> 1;
+      storeEight( WY_AT( k >> 1 ) + row * YS + 8 * ( rem - t.nch * row ), yChunk[k] );
     }
   }
+}
+
+// Stores the chroma windows (4:2:0's) in shared memory, a chunk a store.
+void tileStoreChromaWindows( int tid, TileSetup t, uint2 cChunk[4] )
+{
+  [unroll]
+  for( int k = 0; k < 4; k++ )
+  {
+    if( chroma420() && ( k < 2 || t.two ) && tid < t.cTasks )
+    {
+      storeFour( WC_AT( k ) + t.cRow * CS + 4 * ( t.cRem - t.nch * t.cRow ), cChunk[k] );
+    }
+  }
+}
+
+// DMVR (xProcessDMVR) of a 16x16 tile, from its luma windows: the centre's SAD first. When it is small enough (83% of
+// VideoQ's subblocks) there is no refinement, and neither the other 24 SADs nor most bilinear predictions are needed.
+// Gives the refined motion (mvR, in the lists' slots) and, for BDOF, the best cost (cost). s_sad starts zeroed.
+void tileDmvr( int tid, uint* job, TileSetup t, int2 mv0, int2 mv1, out int2 mvR[2], out int cost )
+{
+  const int shift = 4 - ( 10 - pc.bitDepth );
+  // Rows 2, 4 .. 16 and columns 2 .. 17 of the bilinear predictions (the windows' samples from (3, 3)), 2 per thread
+  int part = 0;
+  [unroll]
+  for( int k = 0; k < 2; k++ )
+  {
+    const int e  = tid + THREADS * k;
+    const int rc = ( 3 + 2 * ( e >> 4 ) ) * YS + 3 + ( e & 15 );
+    part += abs( bilinearW( t.wyAt[0] + rc, t.mvs[0].x & 15, t.mvs[0].y & 15, shift )
+                 - bilinearW( t.wyAt[1] + rc, t.mvs[1].x & 15, t.mvs[1].y & 15, shift ) );
+  }
+  const int waveSum = WaveActiveSum( part );
+  if( WaveIsFirstLane() )
+  {
+    InterlockedAdd( s_sad[12], waveSum );
+  }
+  GroupMemoryBarrierWithGroupSync();
+  const int  centre = s_sad[12] - ( s_sad[12] >> 2 );
+  const bool search = centre >= 16 * 16;
+  if( search )
+  {
+    // The bilinear predictions of the 20 x 20 samples from the merge motion minus 2 samples (the windows' samples
+    // from (1, 1)), but their last row, which no SAD reads; then the other 24 SADs over every other row
+    [unroll]
+    for( int s = 0; s < 2; s++ )
+    {
+      const int at = t.wyAt[s] + YS + 1;
+      for( int o = tid; o < DMVR_ROWS * 20; o += THREADS )
+      {
+        const int v = o / 20;
+        s_pool[WORK_AT + DMVR_ROWS * 20 * s + o] = int16_t( bilinearW( at + v * YS + o - 20 * v, t.mvs[s].x & 15, t.mvs[s].y & 15, shift ) );
+      }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // (the 24 positions but the centre times 8 rows, 3 a thread)
+    [unroll]
+    for( int k = 0; k < 3; k++ )
+    {
+      const int p   = tid + THREADS * k;
+      const int row = p / 24;
+      const int pos = p - 24 * row;
+      InterlockedAdd( s_sad[pos + ( pos >= 12 ? 1 : 0 )], int( sadRow( WORK_AT, WORK_AT + DMVR_ROWS * 20, 2 * row, pos + ( pos >= 12 ? 1 : 0 ) ) ) );
+    }
+    GroupMemoryBarrierWithGroupSync();
+  }
+  // Every thread works out the refinement itself (so none waits for another), from the SADs with the centre's
+  // reduced by a quarter.
+  const int2 delta = search ? dmvrDeltaFrom( centre ) : int2( 0, 0 );
+  cost             = centre;
+#if BDOF
+  cost = search ? dmvrMinCost( centre ) : centre;
+#endif
+  // Threads 0 .. 15 write the refined motion where TMVP reads it (the 8x8 grid) into the colocated motion, which
+  // mider.slang (GPU front end) or DecCu's storeDmvrMotion (CPU front end) stored before, one int each; threads
+  // 16 and 17 write vvdec's DMVR MV cache (when it is wanted).
+  if( tid < 16 )
+  {
+    const int x2 = ( ( t.x - 1 ) & ~7 ) + 8 + 8 * ( ( tid >> 2 ) & 1 );
+    const int y2 = ( ( t.y - 1 ) & ~7 ) + 8 + 8 * ( tid >> 3 );
+    if( x2 < t.x + 16 && y2 < t.y + 16 )
+    {
+      const int  mask = ( 1 << ( pc.ctuLog2 - 3 ) ) - 1;
+      const int  ctu  = ( y2 >> pc.ctuLog2 ) * pc.widthInCtus + ( x2 >> pc.ctuLog2 );
+      const int2 m    = ( tid & 2 ) == 0 ? mv0 + delta : mv1 - delta;
+      pc.colMotion[( ctu * pc.num8x8 + ( ( x2 >> 3 ) & mask ) + ( ( ( y2 >> 3 ) & mask ) << ( pc.ctuLog2 - 3 ) ) ) * 5 + ( tid & 3 )] = ( tid & 1 ) == 0 ? m.x : m.y;
+    }
+  }
+  else if( tid < 18 && pc.dmvr != nullptr )
+  {
+    pc.dmvr[int( job[8] ) * 2 + tid - 16] = tid == 16 ? delta.x : delta.y;
+  }
+  mvR[0] = clipStorage( mv0 + delta );
+  mvR[1] = clipStorage( mv1 - delta );
+}
+
+// Whether DMVR moved either slot's integer position (in luma samples with fracBits 4, chroma's with 5), and by how much
+// (dI: the refined motion's integer position less the merge motion's), the same in all the threads
+bool integerMoved( int2 mvs[2], int2 mvR[2], int fracBits, out int2 dI[2] )
+{
+  [unroll]
+  for( int s = 0; s < 2; s++ )
+  {
+    dI[s] = int2( ( mvR[s].x >> fracBits ) - ( mvs[s].x >> fracBits ), ( mvR[s].y >> fracBits ) - ( mvs[s].y >> fracBits ) );
+  }
+  return WaveReadLaneFirst( ( dI[0].x | dI[0].y | dI[1].x | dI[1].y ) != 0 ? 1 : 0 ) != 0;
+}
+
+// FULL: a 16x16 tile, else one of w x h (16x8, 8x16 or 8x8) without DMVR or BDOF. (Two functions: in each, the size's
+// values are constants or nearly so.)
+// border (FULL only): the windows reach past the picture's edges (tileNear). chroma: what chromaTile needs of the tile.
+void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int cuX, int cuY, int flags, int2 mv0, int2 mv1, int ref0, int ref1,
+                           bool bi, bool dmvr, bool hpel, bool border, out TileChroma chroma )
+{
+  const TileSetup t        = tileSetup<FULL>( tid, x, y, w, h, flags, mv0, mv1, ref0, ref1, bi, border );
+  const int       bcwW1    = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW's L1 weight
+  const int       maxVal   = ( 1 << pc.bitDepth ) - 1;
+  const int       headRoom = max( 2, 14 - pc.bitDepth );
+
+  // All the reads, then the luma windows into shared memory (with a border tile's samples beside the picture set)
+  uint4 yChunk[4];
+  uint2 cChunk[4];
+  uint2 resY;
+  uint  resC;
+  tileIssueReads<FULL>( tid, t, yChunk, cChunk, resY, resC );
+  tileStoreLumaWindows<FULL>( tid, t, yChunk );
   if( FULL != 0 && tid < 25 )
   {
     s_sad[tid] = 0;
   }
-#if BDOF
-  int dmvrCost = 2 * 16 * 16;   // (without DMVR, BDOF applies wherever the tile's flag says)
-#endif
   GroupMemoryBarrierWithGroupSync();
-  if( edges )
+  if( t.edges )
   {
-    tileBorderLuma( tid, wyAt, wx, two );
+    tileBorderLuma( tid, t.wyAt, t.wx, t.two );
     GroupMemoryBarrierWithGroupSync();
   }
 
-  // DMVR, as xProcessDMVR: the centre's SAD first. When it is small enough (83% of VideoQ's subblocks) there is no
-  // refinement, and neither the other 24 SADs nor most bilinear predictions are needed.
-  int2 mvR[2] = { mvs[0], mvs[1] };
-  if( dmvrOn )
+  // DMVR's refined motion (without DMVR, BDOF applies wherever the tile's flag says)
+  int2 mvR[2]    = { t.mvs[0], t.mvs[1] };
+  int  dmvrCost  = 2 * 16 * 16;
+  if( FULL != 0 && dmvr )
   {
-    const int shift = 4 - ( 10 - pc.bitDepth );
-    // Rows 2, 4 .. 16 and columns 2 .. 17 of the bilinear predictions (the windows' samples from (3, 3)), 2 per thread
-    int part = 0;
-    [unroll]
-    for( int k = 0; k < 2; k++ )
-    {
-      const int e  = tid + THREADS * k;
-      const int rc = ( 3 + 2 * ( e >> 4 ) ) * YS + 3 + ( e & 15 );
-      part += abs( bilinearW( wyAt[0] + rc, mvs[0].x & 15, mvs[0].y & 15, shift )
-                   - bilinearW( wyAt[1] + rc, mvs[1].x & 15, mvs[1].y & 15, shift ) );
-    }
-    const int waveSum = WaveActiveSum( part );
-    if( WaveIsFirstLane() )
-    {
-      InterlockedAdd( s_sad[12], waveSum );
-    }
-    GroupMemoryBarrierWithGroupSync();
-    const int  centre = s_sad[12] - ( s_sad[12] >> 2 );
-    const bool search = centre >= 16 * 16;
-    if( search )
-    {
-      // The bilinear predictions of the 20 x 20 samples from the merge motion minus 2 samples (the windows' samples
-      // from (1, 1)), but their last row, which no SAD reads; then the other 24 SADs over every other row
-      [unroll]
-      for( int s = 0; s < 2; s++ )
-      {
-        const int at = wyAt[s] + YS + 1;
-        for( int o = tid; o < DMVR_ROWS * 20; o += THREADS )
-        {
-          const int v = o / 20;
-          s_pool[WORK_AT + DMVR_ROWS * 20 * s + o] = int16_t( bilinearW( at + v * YS + o - 20 * v, mvs[s].x & 15, mvs[s].y & 15, shift ) );
-        }
-      }
-      GroupMemoryBarrierWithGroupSync();
-      // (the 24 positions but the centre times 8 rows, 3 a thread)
-      [unroll]
-      for( int k = 0; k < 3; k++ )
-      {
-        const int p   = tid + THREADS * k;
-        const int row = p / 24;
-        const int pos = p - 24 * row;
-        InterlockedAdd( s_sad[pos + ( pos >= 12 ? 1 : 0 )], int( sadRow( WORK_AT, WORK_AT + DMVR_ROWS * 20, 2 * row, pos + ( pos >= 12 ? 1 : 0 ) ) ) );
-      }
-      GroupMemoryBarrierWithGroupSync();
-    }
-    // Every thread works out the refinement itself (so none waits for another), from the SADs with the centre's
-    // reduced by a quarter.
-    const int2 delta = search ? dmvrDeltaFrom( centre ) : int2( 0, 0 );
-#if BDOF
-    dmvrCost = search ? dmvrMinCost( centre ) : centre;
-#endif
-    // Threads 0 .. 15 write the refined motion where TMVP reads it (the 8x8 grid) into the colocated motion, which
-    // mider.slang (GPU front end) or DecCu's storeDmvrMotion (CPU front end) stored before, one int each; threads
-    // 16 and 17 write vvdec's DMVR MV cache (when it is wanted).
-    if( tid < 16 )
-    {
-      const int x2 = ( ( x - 1 ) & ~7 ) + 8 + 8 * ( ( tid >> 2 ) & 1 );
-      const int y2 = ( ( y - 1 ) & ~7 ) + 8 + 8 * ( tid >> 3 );
-      if( x2 < x + 16 && y2 < y + 16 )
-      {
-        const int  mask = ( 1 << ( pc.ctuLog2 - 3 ) ) - 1;
-        const int  ctu  = ( y2 >> pc.ctuLog2 ) * pc.widthInCtus + ( x2 >> pc.ctuLog2 );
-        const int2 m    = ( tid & 2 ) == 0 ? mv0 + delta : mv1 - delta;
-        pc.colMotion[( ctu * pc.num8x8 + ( ( x2 >> 3 ) & mask ) + ( ( ( y2 >> 3 ) & mask ) << ( pc.ctuLog2 - 3 ) ) ) * 5 + ( tid & 3 )] = ( tid & 1 ) == 0 ? m.x : m.y;
-      }
-    }
-    else if( tid < 18 && pc.dmvr != nullptr )
-    {
-      pc.dmvr[int( job[8] ) * 2 + tid - 16] = tid == 16 ? delta.x : delta.y;
-    }
-    mvR[0] = clipStorage( mv0 + delta );
-    mvR[1] = clipStorage( mv1 - delta );
+    tileDmvr( tid, job, t, mv0, mv1, mvR, dmvrCost );
   }
 #if BDOF
   const bool bdof = ( flags & FLAG_BDOF ) != 0 && dmvrCost >= 2 * 16 * 16;
@@ -2587,14 +2684,9 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   // (tile16ShiftLuma); then the horizontal passes of the 2-D filters (a 16x16 tile's: 23 rows of 16 samples in groups
   // of 4).
   int2 dIY[2];
-  [unroll]
-  for( int s = 0; s < 2; s++ )
+  if( integerMoved( t.mvs, mvR, 4, dIY ) )
   {
-    dIY[s] = int2( ( mvR[s].x >> 4 ) - ( mvs[s].x >> 4 ), ( mvR[s].y >> 4 ) - ( mvs[s].y >> 4 ) );
-  }
-  if( WaveReadLaneFirst( ( dIY[0].x | dIY[0].y | dIY[1].x | dIY[1].y ) != 0 ? 1 : 0 ) != 0 )
-  {
-    tile16ShiftLuma( tid, wyAt, dIY );
+    tile16ShiftLuma( tid, t.wyAt, dIY );
   }
   int16_t cxY[2][8], cyY[2][8];
   int     rx0[2], ry0[2];
@@ -2612,10 +2704,10 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
     // position, the window's sample 3)
     rx0[s] = xFrac != 0 ? 0 : 3;
     ry0[s] = yFrac != 0 ? 0 : 3;
-    if( s < lists && xFrac != 0 && yFrac != 0 )
+    if( s < t.lists && xFrac != 0 && yFrac != 0 )
     {
       const int shift1 = 6 - headRoom;
-      tileLumaH( tid, wyAt[s], WORK_AT + 368 * s, cxY[s], shift1, -IF_INTERNAL_OFFS * ( 1 << shift1 ), rowsY, lg );
+      tileLumaH( tid, t.wyAt[s], WORK_AT + 368 * s, cxY[s], shift1, -IF_INTERNAL_OFFS * ( 1 << shift1 ), t.rowsY, t.lg );
     }
   }
   GroupMemoryBarrierWithGroupSync();
@@ -2623,9 +2715,9 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    if( s < lists )
+    if( s < t.lists )
     {
-      predY[s] = lumaPred( wyAt[s], WORK_AT + 368 * s, j, i0, rx0[s], ry0[s], mvR[s].x & 15, mvR[s].y & 15, cxY[s], cyY[s], hi );
+      predY[s] = lumaPred( t.wyAt[s], WORK_AT + 368 * s, t.j, t.i0, rx0[s], ry0[s], mvR[s].x & 15, mvR[s].y & 15, cxY[s], cyY[s], t.hi );
     }
   }
 #if BDOF
@@ -2635,14 +2727,14 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   int16_t border[3];
   if( bdof )
   {
-    tile16BdofBorder( tid, wyAt, mvR, border );
+    tile16BdofBorder( tid, t.wyAt, mvR, border );
   }
 #endif
   GroupMemoryBarrierWithGroupSync();   // the luma windows are read; the chroma windows replace them
 #if BDOF
   if( bdof )
   {
-    tile16BdofStore( tid, j, i0, predY, border );
+    tile16BdofStore( tid, t.j, t.i0, predY, border );
     for( int i = tid; i < 16 * 5; i += THREADS )
     {
       s_bsum[i] = 0;
@@ -2650,41 +2742,29 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   }
 #endif
 
-  // Chroma: store the windows in shared memory (a chunk a store), then the horizontal passes of the 2-D filters (a
+  // Chroma (4:2:0's): the windows into shared memory (with a border tile's samples beside the picture set, and moved
+  // where DMVR moved a list's integer position in chroma samples), then the horizontal passes of the 2-D filters (a
   // 16x16 tile's: 11 rows of 8 in pairs).
-  [unroll]
-  for( int k = 0; k < 4; k++ )
-  {
-    if( chroma420() && ( k < 2 || two ) && tid < cTasks )
-    {
-      storeFour( WC_AT( k ) + cRow * CS + 4 * ( cRem - nch * cRow ), cChunk[k] );
-    }
-  }
+  tileStoreChromaWindows( tid, t, cChunk );
   GroupMemoryBarrierWithGroupSync();
-  if( edges )
+  if( t.edges )
   {
     if( chroma420() )
     {
-      tileBorderChroma( tid, wcAt, cxs, two );
+      tileBorderChroma( tid, t.wcAt, t.cxs, t.two );
     }
     GroupMemoryBarrierWithGroupSync();
   }
-  // Where DMVR moved a list's integer position in chroma samples, the chroma windows too are rewritten to it.
   int2 dIC[2];
-  [unroll]
-  for( int s = 0; s < 2; s++ )
+  if( chroma420() && integerMoved( t.mvs, mvR, 5, dIC ) )
   {
-    dIC[s] = int2( ( mvR[s].x >> 5 ) - ( mvs[s].x >> 5 ), ( mvR[s].y >> 5 ) - ( mvs[s].y >> 5 ) );
-  }
-  if( chroma420() && WaveReadLaneFirst( ( dIC[0].x | dIC[0].y | dIC[1].x | dIC[1].y ) != 0 ? 1 : 0 ) != 0 )
-  {
-    tile16ShiftChroma( tid, wcAt, dIC );
+    tile16ShiftChroma( tid, t.wcAt, dIC );
   }
 #if BDOF
   uint dg[4];   // (the own samples' gradient differences, for tile16BdofSample)
   if( bdof )
   {
-    tile16BdofSums( j, tid & 3, predY, dg );
+    tile16BdofSums( t.j, tid & 3, predY, dg );
   }
 #endif
   int16_t cxC[2][4], cyC[2][4];
@@ -2701,10 +2781,10 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
     }
     crx0[s] = xFrac != 0 ? 0 : 1;
     cry0[s] = yFrac != 0 ? 0 : 1;
-    if( chroma420() && s < lists && xFrac != 0 && yFrac != 0 )
+    if( chroma420() && s < t.lists && xFrac != 0 && yFrac != 0 )
     {
       const int shift1 = 6 - headRoom;
-      tileChromaH( tid, wcAt[2 * s], CH_AT + 88 * 2 * s, cxC[s], shift1, -IF_INTERNAL_OFFS * ( 1 << shift1 ), rowsC, lg );
+      tileChromaH( tid, t.wcAt[2 * s], CH_AT + 88 * 2 * s, cxC[s], shift1, -IF_INTERNAL_OFFS * ( 1 << shift1 ), t.rowsC, t.lg );
     }
   }
   GroupMemoryBarrierWithGroupSync();
@@ -2712,19 +2792,19 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   // so that the chroma filters run while they come
   int4 geoY = int4( 0, 0, 0, 0 );
   int2 geoC = int2( 0, 0 );
-  if( geo )
+  if( t.geo )
   {
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
-      geoY[o] = geoWeight( job[9], x - cuX + i0 + o, y - cuY + j );
+      geoY[o] = geoWeight( job[9], x - cuX + t.i0 + o, y - cuY + t.j );
     }
     [unroll]
     for( int o = 0; o < 2; o++ )
     {
       if( chroma420() )
       {
-        geoC[o] = geoWeight( job[9], ( ( x >> 1 ) + ci0 + o - ( cuX >> 1 ) ) << 1, ( ( y >> 1 ) + cj - ( cuY >> 1 ) ) << 1 );
+        geoC[o] = geoWeight( job[9], ( ( x >> 1 ) + t.ci0 + o - ( cuX >> 1 ) ) << 1, ( ( y >> 1 ) + t.cj - ( cuY >> 1 ) ) << 1 );
       }
     }
   }
@@ -2732,29 +2812,24 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    if( chroma420() && s < lists )
+    if( chroma420() && s < t.lists )
     {
-      predC[s] = chromaPred( WC_AT( 2 * s + cc ) + leadC[s], CH_AT + 88 * ( 2 * s + cc ), cj, ci0, crx0[s], cry0[s], mvR[s].x & 31, mvR[s].y & 31,
-                             cxC[s], cyC[s], hi );
+      predC[s] = chromaPred( WC_AT( 2 * s + t.cc ) + t.leadC[s], CH_AT + 88 * ( 2 * s + t.cc ), t.cj, t.ci0, crx0[s], cry0[s], mvR[s].x & 31,
+                             mvR[s].y & 31, cxC[s], cyC[s], t.hi );
     }
   }
 
-  // Average the predictions, add the residuals and write the results.
-  const int shiftNum = headRoom + 1;
-  const int offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
-  int4      vy;
+  // Combine the predictions, add the residuals and write the results.
+  int4 vy;
   [unroll]
   for( int o = 0; o < 4; o++ )
   {
-    vy[o] = geo  ? geoBlend( predY[0][o], predY[1][o], geoY[o], maxVal )
-            : wp ? wpSample( job[8], job[11], 0, predY[0][o], bi ? predY[1][o] : 0, maxVal )
-            : bi ? biAverage( predY[0][o], predY[1][o], flags, bcwW1, shiftNum, offset, maxVal )
-                 : predY[0][o];
+    vy[o] = combineLists( flags, 0, predY[0][o], predY[1][o], geoY[o], job[8], job[11], bcwW1 );
   }
 #if BDOF
   if( bdof )
   {
-    const int2 v = bdofOffset( ( j >> 2 ) * 4 + ( i0 >> 2 ) );
+    const int2 v = bdofOffset( ( t.j >> 2 ) * 4 + ( t.i0 >> 2 ) );
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
@@ -2771,39 +2846,36 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
     vy = clamp( vy + int4( lo16( resY.x ), hi16( resY.x ), lo16( resY.y ), hi16( resY.y ) ), 0, maxVal );
   }
   int16_t* outY = ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0;
-  if( mineY )
+  if( t.mineY )
   {
-    *(uint2*)at( outY, atY ) = uint2( uint( vy.x & 0xffff ) | uint( vy.y ) << 16, uint( vy.z & 0xffff ) | uint( vy.w ) << 16 );
+    *(uint2*)at( outY, t.atY ) = uint2( uint( vy.x & 0xffff ) | uint( vy.y ) << 16, uint( vy.z & 0xffff ) | uint( vy.w ) << 16 );
   }
   int2 vc;
   [unroll]
   for( int o = 0; o < 2; o++ )
   {
-    vc[o] = geo  ? geoBlend( predC[0][o], predC[1][o], geoC[o], maxVal )
-            : wp ? wpSample( job[9 + cc], job[11], 1 + cc, predC[0][o], bi ? predC[1][o] : 0, maxVal )
-            : bi ? biAverage( predC[0][o], predC[1][o], flags, bcwW1, shiftNum, offset, maxVal )
-                 : predC[0][o];
+    vc[o] = combineLists( flags, 1 + t.cc, predC[0][o], predC[1][o], geoC[o], job[9 + t.cc], job[11], bcwW1 );
   }
-  if( ( flags & ( FLAG_RES_Y << ( 1 + cc ) ) ) != 0 )
+  if( ( flags & ( FLAG_RES_Y << ( 1 + t.cc ) ) ) != 0 )
   {
     vc = clamp( vc + int2( lo16( resC ), hi16( resC ) ), 0, maxVal );
   }
   // (each component's plane first, then the thread's: see the residuals)
   int16_t* outCb = ( flags & FLAG_DEFER_CB ) != 0 ? pc.defer1 : pc.dst1;
   int16_t* outCr = ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2;
-  if( chroma420() && mineC )
+  if( chroma420() && t.mineC )
   {
-    *(uint*)at( cc == 0 ? outCb : outCr, atC ) = uint( vc.x & 0xffff ) | uint( vc.y ) << 16;
+    *(uint*)at( t.cc == 0 ? outCb : outCr, t.atC ) = uint( vc.x & 0xffff ) | uint( vc.y ) << 16;
   }
   // (4:2:2 and 4:4:4: main runs chromaTile with this)
-  chroma.tw      = tw;
-  chroma.th      = th;
-  chroma.mvs     = mvs;
-  chroma.mvR     = mvR;
-  chroma.refs    = refs;
-  chroma.lists   = lists;
-  chroma.hi      = hi;
-  chroma.edges   = edges;
+  chroma.tw    = t.tw;
+  chroma.th    = t.th;
+  chroma.mvs   = t.mvs;
+  chroma.mvR   = mvR;
+  chroma.refs  = t.refs;
+  chroma.lists = t.lists;
+  chroma.hi    = t.hi;
+  chroma.edges = t.edges;
 }
 
 
@@ -3468,18 +3540,14 @@ bool affineBoxTile( int tid, uint job[24], int x, int y, int w, int h, int flags
   // Average the luma predictions (with BCW's weights), apply LMCS's mapping, add the residuals and write the results:
   // only the threads of the tile's subblocks. (A thread past them has no final predictions: affineProf leaves its 14-bit
   // ones, which as LMCS's table index read far outside the table, and the GPU faulted.)
-  const int shiftNum = max( 2, 14 - pc.bitDepth ) + 1;
-  const int offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
-  const int bcwW1    = int( ( job[7] >> 16 ) & 15 ) - 2;
+  const int bcwW1 = int( ( job[7] >> 16 ) & 15 ) - 2;
   if( mine )
   {
     int4 vy;
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
-      vy[o] = ( flags & FLAG_WP ) != 0 ? wpSample( job[8], job[11], 0, predY[0][o], predY[1][o], maxVal )
-              : bi                     ? biAverage( predY[0][o], predY[1][o], flags, bcwW1, shiftNum, offset, maxVal )
-                                       : predY[0][o];
+      vy[o] = combineLists( flags, 0, predY[0][o], predY[1][o], 0, job[8], job[11], bcwW1 );
     }
     if( ( flags & FLAG_LUMA_MAP ) != 0 )
     {
@@ -3527,9 +3595,7 @@ bool affineBoxTile( int tid, uint job[24], int x, int y, int w, int h, int flags
   [unroll]
   for( int o = 0; o < 2; o++ )
   {
-    vc[o] = ( flags & FLAG_WP ) != 0 ? wpSample( job[9 + cc], job[11], 1 + cc, predC[0][o], predC[1][o], maxVal )
-            : bi                     ? biAverage( predC[0][o], predC[1][o], flags, bcwW1, shiftNum, offset, maxVal )
-                                     : predC[0][o];
+    vc[o] = combineLists( flags, 1 + cc, predC[0][o], predC[1][o], 0, job[9 + cc], job[11], bcwW1 );
   }
   if( ( flags & ( FLAG_RES_Y << ( 1 + cc ) ) ) != 0 )
   {
@@ -3630,9 +3696,7 @@ void affineMain( int tid, int index )
 
   // Average the predictions (with BCW's weights), apply LMCS's mapping, add the residuals and write the results: the
   // thread's four samples of its subblock's row (affineLuma).
-  const int shiftNum = max( 2, 14 - pc.bitDepth ) + 1;
-  const int offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
-  const int nsx      = w >> 2;
+  const int nsx = w >> 2;
   if( ( tid >> 2 ) < nsx * ( h >> 2 ) )
   {
     const int sb  = tid >> 2;
@@ -3641,8 +3705,7 @@ void affineMain( int tid, int index )
     for( int o = 0; o < 4; o++ )
     {
       const int at = row * pc.stride0 + x + 4 * ( sb % nsx ) + o;
-      int       v  = ( flags & FLAG_WP ) != 0 ? wpSample( job[8], job[11], 0, luma0[o], luma1[o], maxVal )
-                     : ( bi ? biAverage( luma0[o], luma1[o], flags, bcwW1, shiftNum, offset, maxVal ) : luma0[o] );
+      int       v  = combineLists( flags, 0, luma0[o], luma1[o], 0, job[8], job[11], bcwW1 );
       if( ( flags & FLAG_LUMA_MAP ) != 0 )
       {
         v = int( pc.lmcsFwd[v] );
@@ -3686,8 +3749,7 @@ void affineMain( int tid, int index )
       if( t < tw * th )
       {
         const int at = ( ( y >> chromaScaleY() ) + ( t >> log2C ) ) * pc.stride12 + ( x >> chromaScaleX() ) + ( t & ( tw - 1 ) );
-        int       v  = ( flags & FLAG_WP ) != 0 ? wpSample( job[8 + comp], job[11], comp, pred0[k], pred1[k], maxVal )
-                       : ( bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k] );
+        int       v  = combineLists( flags, comp, pred0[k], pred1[k], 0, job[8 + comp], job[11], bcwW1 );
         if( ( flags & ( FLAG_RES_Y << comp ) ) != 0 )
         {
           v = clip3( 0, maxVal, v + int( dst[at] ) );
@@ -4012,8 +4074,6 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     const bool map      = comp == 0 && ( flags & FLAG_LUMA_MAP ) != 0;
     const bool defer    = comp == 0 ? ( flags & FLAG_DEFER_Y ) != 0 : ( flags & ( FLAG_DEFER_CB << ( comp - 1 ) ) ) != 0;
     int16_t*   out      = defer ? ( comp == 0 ? pc.defer0 : ( comp == 1 ? pc.defer1 : pc.defer2 ) ) : dst;
-    const int  shiftNum = max( 2, 14 - pc.bitDepth ) + 1;
-    const int  offset   = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
     const int  log2W    = log2Int( bw );
     for( int k = 0; k < PER_THREAD; k++ )
     {
@@ -4024,20 +4084,9 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       }
       const int i  = t & ( bw - 1 );
       const int j  = t >> log2W;
-      int       v;
-      if( ( flags & FLAG_WP ) != 0 )
-      {
-        v = wpSample( job[8 + comp], job[11], comp, pred0[k], pred1[k], maxVal );
-      }
-      else if( ( flags & FLAG_GEO ) != 0 )
-      {
-        // (the position of the CU's luma sample under this sample)
-        v = geoBlend( pred0[k], pred1[k], geoWeight( job[9], ( bx + i - ( cuX >> sx ) ) << sx, ( by + j - ( cuY >> sy ) ) << sy ), maxVal );
-      }
-      else
-      {
-        v = bdof && comp == 0 ? bdofOut[k] : ( bi ? biAverage( pred0[k], pred1[k], flags, bcwW1, shiftNum, offset, maxVal ) : pred0[k] );
-      }
+      // (GPM: the weight of the CU's luma sample under this sample)
+      const int gpmWeight = ( flags & FLAG_GEO ) != 0 ? geoWeight( job[9], ( bx + i - ( cuX >> sx ) ) << sx, ( by + j - ( cuY >> sy ) ) << sy ) : 0;
+      int       v         = bdof && comp == 0 ? bdofOut[k] : combineLists( flags, comp, pred0[k], pred1[k], gpmWeight, job[8 + comp], job[11], bcwW1 );
       const int at = ( by + j ) * stride + bx + i;
       if( map )
       {
