@@ -108,6 +108,8 @@ struct DeblockPush
   VkDeviceAddress countAt;
 };
 static_assert( sizeof( DeblockPush ) == 120, "DeblockPush: the layout of deblock.slang's Params" );
+// deblock.slang's workgroups: a thread per edge, 64 threads each
+static constexpr int kDeblockEdgesPerGroup = 64;
 
 // the index of the lowest bit set in v (v must not be 0)
 static inline int lowestBit( uint32_t v )
@@ -237,27 +239,21 @@ void GpuRecon::uploadCpuEdges( const std::vector<EdgeLists>& edges, size_t first
   }
 }
 
-void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params, const std::vector<EdgeLists>& edges )
+// deblock.slang's push constants for the picture: the CTUs' parameters, the picture's geometry and bit depth, and LADF's
+// intervals. The planes, the direction and the edge list are set per dispatch.
+static void deblockPush( const CodingStructure& cs, VkDeviceAddress params, DeblockPush& push )
 {
   const PreCalcValues& pcv    = *cs.pcv;
+  const SPS&           sps    = *cs.sps;
   const bool           chroma = isChromaEnabled( pcv.chrFormat );
-
-  // The CPU front end's edges are uploaded (the GPU front end's are in its buffer, with their counts on the GPU).
-  size_t first[5] = { 0, 0, 0, 0, 0 };
-  if( !m_useFrontEnd )
-  {
-    uploadCpuEdges( edges, first );
-  }
-
-  DeblockPush push{};
+  push             = DeblockPush{};
   push.ctus        = params;
   push.ctuLog2     = getLog2( pcv.maxCUWidth );
   push.widthInCtus = pcv.widthInCtus;
-  push.bitDepth    = cs.sps->getBitDepth();
+  push.bitDepth    = sps.getBitDepth();
   push.scaleX      = chroma ? getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) : 0;
   push.scaleY      = chroma ? getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) : 0;
   // LADF (luma-adaptive deblocking): its intervals' QP offsets and lower bounds
-  const SPS& sps = *cs.sps;
   if( sps.getLadfEnabled() )
   {
     push.ladfNum = sps.getLadfNumIntervals();
@@ -270,51 +266,69 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
       }
     }
   }
+}
 
-  // Dispatches one edge list, one thread per edge: the GPU front end's list of pass, or the CPU front end's list l.
-  const auto dispatchList = [&]( int shader, FrontPass pass, int l ) {
-    push.edges   = m_useFrontEnd ? m_frontEnd.edges.addr : m_cpuJobs.edges.addr + first[l] * sizeof( Edge );
-    push.count   = m_useFrontEnd ? -1 : int32_t( first[l + 1] - first[l] );
-    push.countAt = frontEndCount( pass );
-    if( m_useFrontEnd )
-    {
-      bind( shader );
-      pushConstants( push );
-      dispatchIndirect( pass );
-    }
-    else if( push.count > 0 )
-    {
-      bind( shader );
-      pushConstants( push );
-      dispatchGroups( uint32_t( ( push.count + 63 ) / 64 ) );
-    }
-  };
+// Dispatches shader on one edge list, a thread per edge: with the GPU front end, its list of pass (counted on the GPU);
+// otherwise the CPU front end's list number list, as uploadCpuEdges laid the lists out (first: each list's first edge,
+// then the total).
+void GpuRecon::dispatchEdgeList( int shader, FrontPass pass, const size_t first[5], int list, DeblockPush& push )
+{
+  push.edges   = m_useFrontEnd ? m_frontEnd.edges.addr : m_cpuJobs.edges.addr + first[list] * sizeof( Edge );
+  push.count   = m_useFrontEnd ? -1 : int32_t( first[list + 1] - first[list] );
+  push.countAt = frontEndCount( pass );
+  if( m_useFrontEnd )
+  {
+    bind( shader );
+    pushConstants( push );
+    dispatchIndirect( pass );
+  }
+  else if( push.count > 0 )
+  {
+    bind( shader );
+    pushConstants( push );
+    dispatchGroups( uint32_t( ( push.count + kDeblockEdgesPerGroup - 1 ) / kDeblockEdgesPerGroup ) );
+  }
+}
+
+void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params, const std::vector<EdgeLists>& edges )
+{
+  const PreCalcValues& pcv    = *cs.pcv;
+  const bool           chroma = isChromaEnabled( pcv.chrFormat );
+  // Luma's filters load and store 4 samples at a time, from multiples of 4, so the luma rows must be 8-byte aligned.
+  // The chroma filters take both chroma planes with one stride.
+  CHECK_FATAL( planes.addr[COMPONENT_Y] % 8 != 0 || planes.stride[COMPONENT_Y] % 4 != 0, "Vulkan: the luma rows are not 8-byte aligned" );
+  CHECK( chroma && planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
+
+  // The CPU front end's edges are uploaded (the GPU front end's are in its buffer, with their counts on the GPU).
+  size_t first[5] = { 0, 0, 0, 0, 0 };
+  if( !m_useFrontEnd )
+  {
+    uploadCpuEdges( edges, first );
+  }
+  DeblockPush push;
+  deblockPush( cs, params, push );
+  // The lists: luma's vertical and horizontal edges (lists 0 and 1), then chroma's (lists 2 and 3).
   for( int dir = 0; dir < 2; dir++ )
   {
     if( dir == 1 )
     {
       computeBarrier();   // the horizontal edges are filtered after the vertical ones
     }
-    push.dir = dir;
-
-    // luma (its filters load and store 4 samples at a time, from multiples of 4: the rows must be 8-byte aligned)
-    CHECK_FATAL( planes.addr[COMPONENT_Y] % 8 != 0 || planes.stride[COMPONENT_Y] % 4 != 0, "Vulkan: the luma rows are not 8-byte aligned" );
+    push.dir    = dir;
     push.pic0   = planes.addr[COMPONENT_Y];
     push.pic1   = 0;
     push.stride = planes.stride[COMPONENT_Y];
     push.width  = pcv.lumaWidth;
     push.height = pcv.lumaHeight;
-    dispatchList( dir == 0 ? kShader_deblock_luma_ver : kShader_deblock_luma_hor, FrontPass( kPassDeblockLumaVer + dir ), dir );
-
+    dispatchEdgeList( dir == 0 ? kShader_deblock_luma_ver : kShader_deblock_luma_hor, FrontPass( kPassDeblockLumaVer + dir ), first, dir, push );
     if( chroma )
     {
-      CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
       push.pic0   = planes.addr[COMPONENT_Cb];
       push.pic1   = planes.addr[COMPONENT_Cr];
       push.stride = planes.stride[COMPONENT_Cb];
       push.width  = pcv.lumaWidth >> push.scaleX;
       push.height = pcv.lumaHeight >> push.scaleY;
-      dispatchList( kShader_deblock_chroma, FrontPass( kPassDeblockChromaVer + dir ), 2 + dir );
+      dispatchEdgeList( kShader_deblock_chroma, FrontPass( kPassDeblockChromaVer + dir ), first, 2 + dir, push );
     }
     mark( dir == 0 ? "deblock ver" : "deblock hor" );
   }

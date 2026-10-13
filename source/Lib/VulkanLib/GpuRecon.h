@@ -89,6 +89,7 @@ namespace gpu
 
 struct JobsPush;       // (GpuReconFrontEnd.cpp)
 struct DbParamsPush;   // (GpuReconFrontEnd.cpp)
+struct DeblockPush;    // (GpuReconFilters.cpp)
 struct IntraSortPush;  // (GpuReconFrontEnd.cpp)
 struct InterPush;      // (GpuReconPrediction.cpp)
 
@@ -412,6 +413,7 @@ private:
   // Deblocking, in place. edges: the CPU front end's edge lists per CTU (unused with the GPU front end).
   void recordDeblock( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params, const std::vector<EdgeLists>& edges );
   void uploadCpuEdges( const std::vector<EdgeLists>& edges, size_t first[5] );   // first: each list's first edge, then the total
+  void dispatchEdgeList( int shader, FrontPass pass, const size_t first[5], int list, DeblockPush& push );
   // SAO in place, on the CTUs whose SAO is on (sao.slang)
   void recordSao( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params );
   void recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
