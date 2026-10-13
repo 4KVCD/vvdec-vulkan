@@ -78,63 +78,71 @@ uint blockEdges( int ctu, int dir, int r, int c, out uint2 luma, out uint2 chrom
   return which;
 }
 
-[shader( "compute" )]
-[numthreads( 256, 1, 1 )]
-void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
+// SCAN: for each list in turn, turns the CTUs' counts into offsets (each thread takes a run of CTUs), each list
+// starting where the previous one ends; stores each list's first entry and count, the deblocking passes' indirect
+// arguments (one thread per edge, in workgroups of 64) and the total of all lists
+void scanEdgeLists( int tid )
 {
-  const int tid  = int( local.x );
   const int ctus = pc.widthInCtus * pc.heightInCtus;
-  if( pc.pass == 1 )
+  const int per  = ( ctus + 255 ) / 256;
+  const int c0   = min( tid * per, ctus );
+  const int c1   = min( c0 + per, ctus );
+  uint      base = 0;
+  for( int l = 0; l < 4; l++ )
   {
-    // SCAN: for each list in turn, turn the CTUs' counts into offsets (each thread takes a run of CTUs); each list
-    // starts where the previous one ends.
-    const int per = ( ctus + 255 ) / 256;
-    const int c0  = min( tid * per, ctus );
-    const int c1  = min( c0 + per, ctus );
-    uint      base = 0;
-    for( int l = 0; l < 4; l++ )
+    uint sum = 0;
+    for( int c = c0; c < c1; c++ )
     {
-      uint sum = 0;
-      for( int c = c0; c < c1; c++ )
-      {
-        sum += pc.counts[c * 4 + l];
-      }
-      uint       run;
-      const uint before = workgroupPrefixSum( sum, tid, run );
-      if( tid == 0 )
-      {
-        pc.lists[l * 2]     = base;
-        pc.lists[l * 2 + 1] = run;
-        // The deblocking pass for this list runs one thread per edge, in workgroups of 64.
-        storePassArgs( pc.args, kPassDeblockLumaVer + l, ( run + 63 ) / 64, 1, run, base );
-      }
-      uint at = base + before;
-      for( int c = c0; c < c1; c++ )
-      {
-        const uint v          = pc.counts[c * 4 + l];
-        pc.counts[c * 4 + l]  = at;
-        at += v;
-      }
-      base += run;
+      sum += pc.counts[c * 4 + l];
     }
+    uint       run;
+    const uint before = workgroupPrefixSum( sum, tid, run );
     if( tid == 0 )
     {
-      pc.lists[8] = base;
+      pc.lists[l * 2]     = base;
+      pc.lists[l * 2 + 1] = run;
+      storePassArgs( pc.args, kPassDeblockLumaVer + l, ( run + 63 ) / 64, 1, run, base );
     }
-    return;
+    uint at = base + before;
+    for( int c = c0; c < c1; c++ )
+    {
+      const uint v         = pc.counts[c * 4 + l];
+      pc.counts[c * 4 + l] = at;
+      at += v;
+    }
+    base += run;
   }
+  if( tid == 0 )
+  {
+    pc.lists[8] = base;
+  }
+}
 
-  const int  ctu  = int( group.x );
-  const int  n    = 1 << ( pc.log2Ctu - 2 );
-  const int  x0   = ( ctu % pc.widthInCtus ) << pc.log2Ctu;
-  const int  y0   = ( ctu / pc.widthInCtus ) << pc.log2Ctu;
+// Stores edge e at place at of the lists (when there is room), and moves at on
+void storeEdge( inout uint at, uint2 e )
+{
+  if( at < uint( pc.capacity ) )
+  {
+    pc.edges[at * 2]     = e.x;
+    pc.edges[at * 2 + 1] = e.y;
+  }
+  at++;
+}
+
+// COUNT (pass 0) and WRITE (pass 2) for CTU ctu, per direction: each thread takes four consecutive 4x4 blocks, in
+// raster order within the CTU, and works out their luma and chroma edges; COUNT stores the CTU's numbers of edges,
+// WRITE writes the edges at the CTU's offsets (SCAN's) plus the earlier threads'
+void ctuEdges( int tid, int ctu )
+{
+  const int   n       = 1 << ( pc.log2Ctu - 2 );
+  const int   x0      = ( ctu % pc.widthInCtus ) << pc.log2Ctu;
+  const int   y0      = ( ctu / pc.widthInCtus ) << pc.log2Ctu;
   const int   cols    = min( n, ( pc.width - x0 + 3 ) >> 2 );
   const int   rows    = min( n, ( pc.height - y0 + 3 ) >> 2 );
   const bool  off     = deblockingOff( sliceOfCtu( ctu ) );
   const float rcpCols = 1.0f / float( max( cols, 1 ) );
   for( int dir = 0; dir < 2; dir++ )
   {
-    // Each thread takes four consecutive 4x4 blocks, in raster order within the CTU.
     const int blocks = off ? 0 : rows * cols;
     uint2     e[4][2];
     uint      which[4];
@@ -147,11 +155,11 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       e[k][1]     = uint2( 0 );
       if( i < blocks )
       {
-        uint2 lumaEdge, chromaEdge;
+        uint2     lumaEdge, chromaEdge;
         const int row = int( ( float( i ) + 0.5f ) * rcpCols );   // (exactly i / cols, since i and cols are small)
         which[k]      = blockEdges( ctu, dir, row, i - row * cols, lumaEdge, chromaEdge );
-        e[k][0]  = lumaEdge;
-        e[k][1]  = chromaEdge;
+        e[k][0]       = lumaEdge;
+        e[k][1]       = chromaEdge;
         cl += which[k] & 1;
         cc += ( which[k] >> 1 ) & 1;
       }
@@ -172,24 +180,29 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       {
         if( ( which[k] & 1 ) != 0 )
         {
-          if( atL < uint( pc.capacity ) )
-          {
-            pc.edges[atL * 2]     = e[k][0].x;
-            pc.edges[atL * 2 + 1] = e[k][0].y;
-          }
-          atL++;
+          storeEdge( atL, e[k][0] );
         }
         if( ( which[k] & 2 ) != 0 )
         {
-          if( atC < uint( pc.capacity ) )
-          {
-            pc.edges[atC * 2]     = e[k][1].x;
-            pc.edges[atC * 2 + 1] = e[k][1].y;
-          }
-          atC++;
+          storeEdge( atC, e[k][1] );
         }
       }
     }
     GroupMemoryBarrierWithGroupSync();
+  }
+}
+
+[shader( "compute" )]
+[numthreads( 256, 1, 1 )]
+void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
+{
+  const int tid = int( local.x );
+  if( pc.pass == 1 )
+  {
+    scanEdgeLists( tid );
+  }
+  else
+  {
+    ctuEdges( tid, int( group.x ) );
   }
 }
