@@ -123,9 +123,51 @@ Options Options::fromEnvironment()
   return options;
 }
 
+// The device extensions the decoder uses where the device has them
+static constexpr const char* kExtShaderInfo     = "VK_AMD_shader_info";              // the shaders' registers, machine code
+static constexpr const char* kExtShaderClock    = "VK_KHR_shader_clock";             // the parse's profile
+static constexpr const char* kExtSubgroupBallot = "VK_EXT_shader_subgroup_ballot";   // the parse's OpSubgroupReadInvocationKHR
+static constexpr const char* kExtMaintenance5   = "VK_KHR_maintenance5";             // (the pipelines' binaries need it)
+static constexpr const char* kExtPipelineBinary = "VK_KHR_pipeline_binary";          // the pipelines' binaries kept in a file
+
 bool Context::init()
 {
   m_options = Options::fromEnvironment();
+  if( !loadLibrary() || !createInstance() )
+  {
+    return false;
+  }
+  VkPhysicalDeviceProperties props;
+  bool                       timelineSemaphore = false, subgroupSizeControl = false;
+  if( !chooseDevice( props ) || !checkFeatures( props, timelineSemaphore, subgroupSizeControl ) )
+  {
+    return false;
+  }
+  uint32_t count = 0;
+  m_api.vkGetPhysicalDeviceQueueFamilyProperties( m_physical, &count, nullptr );
+  std::vector<VkQueueFamilyProperties> families( count );
+  m_api.vkGetPhysicalDeviceQueueFamilyProperties( m_physical, &count, families.data() );
+  if( !chooseQueueFamilies( families, timelineSemaphore, props.deviceName ) )
+  {
+    return false;
+  }
+  const AsyncQueueLayout async = chooseAsyncQueues( families );
+  if( !createDevice( props, subgroupSizeControl, async ) )
+  {
+    return false;
+  }
+  getQueues( async );
+  m_api.vkGetPhysicalDeviceMemoryProperties( m_physical, &m_memProps );
+  if( !createPipelineLayout() )
+  {
+    return false;
+  }
+  msg( INFO, "Vulkan: %s\n", m_deviceName.c_str() );
+  return true;
+}
+
+bool Context::loadLibrary()
+{
 #ifdef _WIN32
   if( !s_library )
   {
@@ -149,11 +191,11 @@ bool Context::init()
   }
   m_api.vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr) dlsym( s_library, "vkGetInstanceProcAddr" );
 #endif
-  if( !m_api.vkGetInstanceProcAddr )
-  {
-    return false;
-  }
+  return m_api.vkGetInstanceProcAddr != nullptr;
+}
 
+bool Context::createInstance()
+{
   if( !s_instance )
   {
     auto createInstance = (PFN_vkCreateInstance) m_api.vkGetInstanceProcAddr( VK_NULL_HANDLE, "vkCreateInstance" );
@@ -182,7 +224,11 @@ bool Context::init()
 #define VVDEC_VK_LOAD_INSTANCE( name ) m_api.name = (PFN_##name) m_api.vkGetInstanceProcAddr( m_instance, #name );
   VVDEC_VK_INSTANCE_FUNCS( VVDEC_VK_LOAD_INSTANCE )
 #undef VVDEC_VK_LOAD_INSTANCE
+  return true;
+}
 
+bool Context::chooseDevice( VkPhysicalDeviceProperties& props )
+{
   uint32_t count = 0;
   m_api.vkEnumeratePhysicalDevices( m_instance, &count, nullptr );
   std::vector<VkPhysicalDevice> devices( count );
@@ -193,8 +239,8 @@ bool Context::init()
     return false;
   }
 
-  // VVDEC_GPU_DEVICE picks a device by its index; otherwise the first discrete
-  // GPU, then the first integrated one, then the first device
+  // VVDEC_GPU_DEVICE picks a device by its index; otherwise the first discrete GPU, then the first integrated one,
+  // then the first device
   int chosen = -1;
   if( !m_options.device.empty() )
   {
@@ -210,9 +256,9 @@ bool Context::init()
   {
     for( int i = 0; i < (int) devices.size() && chosen < 0; i++ )
     {
-      VkPhysicalDeviceProperties props;
-      m_api.vkGetPhysicalDeviceProperties( devices[i], &props );
-      if( props.deviceType == wanted && props.apiVersion >= VK_API_VERSION_1_2 )
+      VkPhysicalDeviceProperties p;
+      m_api.vkGetPhysicalDeviceProperties( devices[i], &p );
+      if( p.deviceType == wanted && p.apiVersion >= VK_API_VERSION_1_2 )
       {
         chosen = i;
       }
@@ -224,7 +270,6 @@ bool Context::init()
   }
   m_physical = devices[chosen];
 
-  VkPhysicalDeviceProperties props;
   m_api.vkGetPhysicalDeviceProperties( m_physical, &props );
   m_deviceName      = props.deviceName;
   m_timestampPeriod = props.limits.timestampPeriod;
@@ -233,12 +278,16 @@ bool Context::init()
     msg( WARNING, "Vulkan: %s lacks Vulkan 1.2 or 256 bytes of push constants\n", props.deviceName );
     return false;
   }
+  return true;
+}
 
+bool Context::checkFeatures( const VkPhysicalDeviceProperties& props, bool& timelineSemaphore, bool& subgroupSizeControl )
+{
   VkPhysicalDeviceVulkan12Features features12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
   VkPhysicalDeviceVulkan11Features features11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
   VkPhysicalDeviceSubgroupSizeControlFeatures sizeControl{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES };
-  features12.pNext  = &features11;
-  features11.pNext  = &sizeControl;
+  features12.pNext = &features11;
+  features11.pNext = &sizeControl;
   VkPhysicalDeviceFeatures2 features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
   features.pNext = &features12;
   m_api.vkGetPhysicalDeviceFeatures2( m_physical, &features );
@@ -248,12 +297,16 @@ bool Context::init()
     msg( WARNING, "Vulkan: %s lacks 8/16/64-bit integers or buffer device addresses\n", props.deviceName );
     return false;
   }
+  timelineSemaphore   = features12.timelineSemaphore != VK_FALSE;
+  subgroupSizeControl = sizeControl.subgroupSizeControl != VK_FALSE;
+  return true;
+}
 
+bool Context::chooseQueueFamilies( const std::vector<VkQueueFamilyProperties>& families, bool timelineSemaphore, const char* deviceName )
+{
   // a queue with compute: the first family that has it
-  m_api.vkGetPhysicalDeviceQueueFamilyProperties( m_physical, &count, nullptr );
-  std::vector<VkQueueFamilyProperties> families( count );
-  m_api.vkGetPhysicalDeviceQueueFamilyProperties( m_physical, &count, families.data() );
-  m_queueFamily = UINT32_MAX;
+  const uint32_t count = uint32_t( families.size() );
+  m_queueFamily        = UINT32_MAX;
   for( uint32_t i = 0; i < count && m_queueFamily == UINT32_MAX; i++ )
   {
     if( ( families[i].queueFlags & VK_QUEUE_COMPUTE_BIT ) && families[i].timestampValidBits )
@@ -263,12 +316,12 @@ bool Context::init()
   }
   if( m_queueFamily == UINT32_MAX )
   {
-    msg( WARNING, "Vulkan: %s has no compute queue with timestamps\n", props.deviceName );
+    msg( WARNING, "Vulkan: %s has no compute queue with timestamps\n", deviceName );
     return false;
   }
 
-  // and a family for copies only (the copy engine), the pictures' downloads
-  // there run alongside the compute queue's work
+  // and a family for copies only (the copy engine): the pictures' downloads there run alongside the compute queue's
+  // work
   for( uint32_t i = 0; i < count && m_transferFamily == UINT32_MAX; i++ )
   {
     if( ( families[i].queueFlags & VK_QUEUE_TRANSFER_BIT ) && !( families[i].queueFlags & ( VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT ) ) )
@@ -280,7 +333,7 @@ bool Context::init()
 
   // and a family for compute only (an async compute engine), with timestamps: the GPU's front end there runs
   // alongside the compute queue's work (VVDEC_GPU_ASYNC=0: not)
-  for( uint32_t i = 0; i < count && m_asyncFamily == UINT32_MAX && features12.timelineSemaphore && m_options.async; i++ )
+  for( uint32_t i = 0; i < count && m_asyncFamily == UINT32_MAX && timelineSemaphore && m_options.async; i++ )
   {
     if( i != m_queueFamily && ( families[i].queueFlags & VK_QUEUE_COMPUTE_BIT ) && !( families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT )
         && families[i].timestampValidBits )
@@ -288,51 +341,84 @@ bool Context::init()
       m_asyncFamily = i;
     }
   }
+  return true;
+}
 
-  const float    priority = 1.0f;
-  const float    asyncPriorities[2 * kMaxAsync] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
-  const uint32_t asyncFamilySize = m_asyncFamily != UINT32_MAX ? families[m_asyncFamily].queueCount : 0;
-  m_asyncCount = int( std::min<uint32_t>( asyncFamilySize, uint32_t( kMaxAsync ) ) );
+Context::AsyncQueueLayout Context::chooseAsyncQueues( const std::vector<VkQueueFamilyProperties>& families )
+{
+  AsyncQueueLayout layout;
+  layout.familySize = m_asyncFamily != UINT32_MAX ? families[m_asyncFamily].queueCount : 0;
+  m_asyncCount      = int( std::min<uint32_t>( layout.familySize, uint32_t( kMaxAsync ) ) );
   // the parse queue: one more of the family's when it has one (AMD's has 8); then the parse's copies' queue, one more
-  const bool ownParseQueue = m_asyncCount > 0 && asyncFamilySize > uint32_t( m_asyncCount );
-  const bool ownCopyQueue  = ownParseQueue && asyncFamilySize > uint32_t( m_asyncCount + 1 );
+  layout.ownParseQueue = m_asyncCount > 0 && layout.familySize > uint32_t( m_asyncCount );
+  layout.ownCopyQueue  = layout.ownParseQueue && layout.familySize > uint32_t( m_asyncCount + 1 );
   // Where the family has twice the front ends' queues (AMD's 8), the front ends take the odd queues and the parse and
   // its copies the even ones. Windows runs AMD's async family on two compute engines, each queue on the engine of its
   // index's parity, and the queues of an engine take turns at their submissions: a parse step (several ms) held up the
   // front ends that shared its engine (Top Gun slower 1080p +1.6 to +2.5%, Beekeeper 4K +1.0%).
-  const bool split = ownCopyQueue && m_asyncCount == kMaxAsync && asyncFamilySize >= uint32_t( 2 * kMaxAsync );
-  uint32_t   asyncIndex[kMaxAsync];
+  layout.split = layout.ownCopyQueue && m_asyncCount == kMaxAsync && layout.familySize >= uint32_t( 2 * kMaxAsync );
   for( int i = 0; i < m_asyncCount; i++ )
   {
-    asyncIndex[i] = split ? uint32_t( 2 * i + 1 ) : uint32_t( i );
+    layout.frontIndex[i] = layout.split ? uint32_t( 2 * i + 1 ) : uint32_t( i );
   }
-  const uint32_t parseIndex  = split ? 0u : uint32_t( m_asyncCount );
-  const uint32_t copyIndex   = split ? 2u : uint32_t( m_asyncCount + 1 );
-  const uint32_t grainIndex  = 4u;   // (with split: one of the even queues the parse leaves, the film grain's)
-  const uint32_t asyncQueues = split ? uint32_t( 2 * kMaxAsync ) : uint32_t( m_asyncCount + ( ownParseQueue ? 1 : 0 ) + ( ownCopyQueue ? 1 : 0 ) );
-  VkDeviceQueueCreateInfo queueInfos[3] = { { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO }, { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO },
-                                            { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO } };
-  uint32_t numQueueInfos = 0;
+  layout.parseIndex = layout.split ? 0u : uint32_t( m_asyncCount );
+  layout.copyIndex  = layout.split ? 2u : uint32_t( m_asyncCount + 1 );
+  layout.grainIndex = 4u;   // (with split: one of the even queues the parse leaves, the film grain's)
+  layout.queues     = layout.split ? uint32_t( 2 * kMaxAsync )
+                                   : uint32_t( m_asyncCount + ( layout.ownParseQueue ? 1 : 0 ) + ( layout.ownCopyQueue ? 1 : 0 ) );
+  return layout;
+}
+
+Context::DeviceExtensions Context::findExtensions() const
+{
+  DeviceExtensions found;
+  // VVDEC_GPU_PROFILE=1: the GPU time of the passes, and with VK_AMD_shader_info the registers and memory each shader
+  // takes; VVDEC_GPU_ISA=<directory> needs VK_AMD_shader_info too, for the shaders' machine code
+  const bool wantShaderInfo = m_options.profile || !m_options.isaDir.empty();
+  uint32_t   count          = 0;
+  m_api.vkEnumerateDeviceExtensionProperties( m_physical, nullptr, &count, nullptr );
+  std::vector<VkExtensionProperties> extensions( count );
+  m_api.vkEnumerateDeviceExtensionProperties( m_physical, nullptr, &count, extensions.data() );
+  for( const VkExtensionProperties& extension: extensions )
+  {
+    found.shaderInfo |= wantShaderInfo && strcmp( extension.extensionName, kExtShaderInfo ) == 0;
+    found.shaderClock |= m_options.profile && strcmp( extension.extensionName, kExtShaderClock ) == 0;
+    found.subgroupBallot |= strcmp( extension.extensionName, kExtSubgroupBallot ) == 0;
+    found.maintenance5 |= strcmp( extension.extensionName, kExtMaintenance5 ) == 0;
+    found.pipelineBinary |= strcmp( extension.extensionName, kExtPipelineBinary ) == 0;
+  }
+  return found;
+}
+
+bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl, const AsyncQueueLayout& async )
+{
+  // the queues: the compute queue, the copy queue, the async family's
+  const float             priority                       = 1.0f;
+  const float             asyncPriorities[2 * kMaxAsync] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+  VkDeviceQueueCreateInfo queueInfos[3]                  = { { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO },
+                                                             { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO },
+                                                             { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO } };
+  uint32_t                numQueueInfos                  = 0;
   for( const uint32_t family: { m_queueFamily, m_transferFamily, m_asyncFamily } )
   {
     if( family != UINT32_MAX )
     {
       queueInfos[numQueueInfos].queueFamilyIndex = family;
-      queueInfos[numQueueInfos].queueCount       = family == m_asyncFamily ? asyncQueues : 1;
+      queueInfos[numQueueInfos].queueCount       = family == m_asyncFamily ? async.queues : 1;
       queueInfos[numQueueInfos].pQueuePriorities = family == m_asyncFamily ? asyncPriorities : &priority;
       numQueueInfos++;
     }
   }
 
-  // waves of 32 threads where the shaders run better so (GPUs with both
-  // sizes, AMD's): the size, subgroup size control
+  // waves of 32 threads where the shaders run better so (GPUs with both sizes, AMD's): the size, subgroup size control
   VkPhysicalDeviceSubgroupSizeControlProperties sizes{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES };
   VkPhysicalDeviceProperties2                   props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
   props2.pNext = &sizes;
   m_api.vkGetPhysicalDeviceProperties2( m_physical, &props2 );
-  m_wave32 = props.apiVersion >= VK_API_VERSION_1_3 && sizeControl.subgroupSizeControl && sizes.minSubgroupSize <= 32 && sizes.maxSubgroupSize >= 32
+  m_wave32 = props.apiVersion >= VK_API_VERSION_1_3 && subgroupSizeControl && sizes.minSubgroupSize <= 32 && sizes.maxSubgroupSize >= 32
              && ( sizes.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT );
 
+  // the features the decoder needs (checkFeatures)
   VkPhysicalDeviceVulkan12Features enable12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
   VkPhysicalDeviceVulkan11Features enable11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
   VkPhysicalDeviceSubgroupSizeControlFeatures enableSize{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES };
@@ -349,71 +435,45 @@ bool Context::init()
   enable.features.shaderInt16 = VK_TRUE;
   enable.features.shaderInt64 = VK_TRUE;
 
-  // VVDEC_GPU_PROFILE=1: the GPU time of the passes, and with
-  // VK_AMD_shader_info the registers and memory each shader takes.
-  // VVDEC_GPU_ISA=<directory> needs VK_AMD_shader_info too, for the
-  // shaders' machine code.
-  m_profiling = m_options.profile;
-  const bool wantShaderInfo = m_profiling || !m_options.isaDir.empty();
-  const char* shaderInfo = "VK_AMD_shader_info";
-  const char* shaderClock = "VK_KHR_shader_clock";
-  // and for the parse shader, OpSubgroupReadInvocationKHR (GpuContext.h's subgroupBallot)
-  const char* subgroupBallot = "VK_EXT_shader_subgroup_ballot";
-  bool        hasShaderInfo = false;
-  bool        hasShaderClock = false;
-  bool        hasSubgroupBallot = false;
-  // the compiled pipelines' binaries kept in a file (PipelineBinaries), unless VVDEC_GPU_CACHE=0
-  const char* maintenance5      = "VK_KHR_maintenance5";
-  const char* pipelineBinary    = "VK_KHR_pipeline_binary";
-  bool        hasMaintenance5   = false;
-  bool        hasPipelineBinary = false;
-  {
-    uint32_t extensionCount = 0;
-    m_api.vkEnumerateDeviceExtensionProperties( m_physical, nullptr, &extensionCount, nullptr );
-    std::vector<VkExtensionProperties> extensions( extensionCount );
-    m_api.vkEnumerateDeviceExtensionProperties( m_physical, nullptr, &extensionCount, extensions.data() );
-    for( const VkExtensionProperties& extension: extensions )
-    {
-      hasShaderInfo |= wantShaderInfo && strcmp( extension.extensionName, shaderInfo ) == 0;
-      hasShaderClock |= m_profiling && strcmp( extension.extensionName, shaderClock ) == 0;
-      hasSubgroupBallot |= strcmp( extension.extensionName, subgroupBallot ) == 0;
-      hasMaintenance5 |= strcmp( extension.extensionName, maintenance5 ) == 0;
-      hasPipelineBinary |= strcmp( extension.extensionName, pipelineBinary ) == 0;
-    }
-  }
-  // and the subgroup's clock and the device's, for the parse's profile (shaders/parse.slang's PROFILE)
+  // the extensions the decoder uses where the device has them
+  m_profiling                    = m_options.profile;
+  const DeviceExtensions found   = findExtensions();
+  bool                   hasClock = found.shaderClock;
+  std::vector<const char*> deviceExtensions;
+  // the subgroup's clock and the device's, for the parse's profile (shaders/parse.slang's PROFILE)
   VkPhysicalDeviceShaderClockFeaturesKHR enableClock{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR };
-  if( hasShaderClock )
+  if( hasClock )
   {
     VkPhysicalDeviceFeatures2 features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
     features.pNext = &enableClock;
     m_api.vkGetPhysicalDeviceFeatures2( m_physical, &features );
-    hasShaderClock = enableClock.shaderSubgroupClock && enableClock.shaderDeviceClock;
+    hasClock          = enableClock.shaderSubgroupClock && enableClock.shaderDeviceClock;
     enableClock.pNext = nullptr;
   }
-  if( hasShaderClock )
+  if( hasClock )
   {
     enableClock.pNext = enable.pNext;
     enable.pNext      = &enableClock;
   }
-  m_shaderClock = hasShaderClock;
-  std::vector<const char*> deviceExtensions;
-  if( hasShaderInfo )
+  m_shaderClock = hasClock;
+  if( found.shaderInfo )
   {
-    deviceExtensions.push_back( shaderInfo );
+    deviceExtensions.push_back( kExtShaderInfo );
   }
-  if( hasShaderClock )
+  if( hasClock )
   {
-    deviceExtensions.push_back( shaderClock );
+    deviceExtensions.push_back( kExtShaderClock );
   }
-  if( hasSubgroupBallot )
+  // for the parse shader, OpSubgroupReadInvocationKHR (GpuContext.h's subgroupBallot)
+  if( found.subgroupBallot )
   {
-    deviceExtensions.push_back( subgroupBallot );
+    deviceExtensions.push_back( kExtSubgroupBallot );
   }
-  m_subgroupBallot = hasSubgroupBallot;
+  m_subgroupBallot = found.subgroupBallot;
+  // the compiled pipelines' binaries kept in a file (PipelineBinaries), unless VVDEC_GPU_CACHE=0
   VkPhysicalDeviceMaintenance5FeaturesKHR   enableMaintenance5{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR };
   VkPhysicalDevicePipelineBinaryFeaturesKHR enableBinaries{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
-  bool binaries = hasMaintenance5 && hasPipelineBinary && props.apiVersion >= VK_API_VERSION_1_3 && m_options.pipelineCache != "0";
+  bool binaries = found.maintenance5 && found.pipelineBinary && props.apiVersion >= VK_API_VERSION_1_3 && m_options.pipelineCache != "0";
   if( binaries )
   {
     enableMaintenance5.pNext = &enableBinaries;
@@ -427,14 +487,14 @@ bool Context::init()
     enableBinaries.pNext     = enable.pNext;
     enableMaintenance5.pNext = &enableBinaries;
     enable.pNext             = &enableMaintenance5;
-    deviceExtensions.push_back( maintenance5 );
-    deviceExtensions.push_back( pipelineBinary );
+    deviceExtensions.push_back( kExtMaintenance5 );
+    deviceExtensions.push_back( kExtPipelineBinary );
   }
 
   VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
-  deviceInfo.pNext                = &enable;
-  deviceInfo.queueCreateInfoCount = numQueueInfos;
-  deviceInfo.pQueueCreateInfos    = queueInfos;
+  deviceInfo.pNext                   = &enable;
+  deviceInfo.queueCreateInfoCount    = numQueueInfos;
+  deviceInfo.pQueueCreateInfos       = queueInfos;
   deviceInfo.enabledExtensionCount   = uint32_t( deviceExtensions.size() );
   deviceInfo.ppEnabledExtensionNames = deviceExtensions.empty() ? nullptr : deviceExtensions.data();
   if( m_api.vkCreateDevice( m_physical, &deviceInfo, nullptr, &m_device ) != VK_SUCCESS )
@@ -446,7 +506,7 @@ bool Context::init()
 #define VVDEC_VK_LOAD_DEVICE( name ) m_api.name = (PFN_##name) m_api.vkGetDeviceProcAddr( m_device, #name );
   VVDEC_VK_DEVICE_FUNCS( VVDEC_VK_LOAD_DEVICE )
 #undef VVDEC_VK_LOAD_DEVICE
-  if( hasShaderInfo )
+  if( found.shaderInfo )
   {
     m_getShaderInfo = (PFN_vkGetShaderInfoAMD) m_api.vkGetDeviceProcAddr( m_device, "vkGetShaderInfoAMD" );
   }
@@ -454,55 +514,62 @@ bool Context::init()
   {
     openPipelineBinaries( props );
   }
+  return true;
+}
 
+void Context::getQueues( const AsyncQueueLayout& async )
+{
   m_api.vkGetDeviceQueue( m_device, m_queueFamily, 0, &m_queue );
   if( transferQueue() )
   {
     m_api.vkGetDeviceQueue( m_device, m_transferFamily, 0, &m_transferQueue );
   }
-  if( asyncQueue() )
+  if( !asyncQueue() )
   {
-    for( int i = 0; i < m_asyncCount; i++ )
-    {
-      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, asyncIndex[i], &m_asyncQueues[i] );
-    }
-    if( ownParseQueue )
-    {
-      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, parseIndex, &m_parseQueue );
-    }
-    else
-    {
-      m_parseQueue = m_asyncQueues[m_asyncCount - 1];
-      m_parseMutex = &m_asyncMutexes[m_asyncCount - 1];
-    }
-    if( ownCopyQueue )
-    {
-      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, copyIndex, &m_parseCopyQueue );
-    }
-    else
-    {
-      m_parseCopyQueue = m_parseQueue;
-      m_parseCopyMutex = m_parseMutex;
-    }
-    // Film grain gets a queue of its own only where the queues are split; elsewhere it uses the compute queue.
-    if( split )
-    {
-      m_api.vkGetDeviceQueue( m_device, m_asyncFamily, grainIndex, &m_grainQueue );
-    }
-    VkSemaphoreTypeCreateInfo timelineType{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
-    timelineType.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-    VkSemaphoreCreateInfo timelineInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    timelineInfo.pNext = &timelineType;
-    if( m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_timeline ) != VK_SUCCESS
-        || m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_parseTimeline ) != VK_SUCCESS
-        || m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_parseCopyTimeline ) != VK_SUCCESS )
-    {
-      THROW_FATAL( "Vulkan: vkCreateSemaphore failed (the timeline semaphores)" );
-    }
+    return;
   }
-  m_api.vkGetPhysicalDeviceMemoryProperties( m_physical, &m_memProps );
+  for( int i = 0; i < m_asyncCount; i++ )
+  {
+    m_api.vkGetDeviceQueue( m_device, m_asyncFamily, async.frontIndex[i], &m_asyncQueues[i] );
+  }
+  if( async.ownParseQueue )
+  {
+    m_api.vkGetDeviceQueue( m_device, m_asyncFamily, async.parseIndex, &m_parseQueue );
+  }
+  else
+  {
+    m_parseQueue = m_asyncQueues[m_asyncCount - 1];
+    m_parseMutex = &m_asyncMutexes[m_asyncCount - 1];
+  }
+  if( async.ownCopyQueue )
+  {
+    m_api.vkGetDeviceQueue( m_device, m_asyncFamily, async.copyIndex, &m_parseCopyQueue );
+  }
+  else
+  {
+    m_parseCopyQueue = m_parseQueue;
+    m_parseCopyMutex = m_parseMutex;
+  }
+  // Film grain gets a queue of its own only where the queues are split; elsewhere it uses the compute queue.
+  if( async.split )
+  {
+    m_api.vkGetDeviceQueue( m_device, m_asyncFamily, async.grainIndex, &m_grainQueue );
+  }
+  VkSemaphoreTypeCreateInfo timelineType{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+  timelineType.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  VkSemaphoreCreateInfo timelineInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+  timelineInfo.pNext = &timelineType;
+  if( m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_timeline ) != VK_SUCCESS
+      || m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_parseTimeline ) != VK_SUCCESS
+      || m_api.vkCreateSemaphore( m_device, &timelineInfo, nullptr, &m_parseCopyTimeline ) != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkCreateSemaphore failed (the timeline semaphores)" );
+  }
+}
 
-  VkPushConstantRange range{ VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushConstantSize };
+bool Context::createPipelineLayout()
+{
+  VkPushConstantRange        range{ VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushConstantSize };
   VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
   layoutInfo.pushConstantRangeCount = 1;
   layoutInfo.pPushConstantRanges    = &range;
@@ -510,14 +577,11 @@ bool Context::init()
   {
     return false;
   }
-
   m_pipelines = new VkPipeline[kShaderCount];
   for( int i = 0; i < kShaderCount; i++ )
   {
     m_pipelines[i] = VK_NULL_HANDLE;
   }
-
-  msg( INFO, "Vulkan: %s\n", m_deviceName.c_str() );
   return true;
 }
 

@@ -307,6 +307,37 @@ private:
   std::atomic<uint32_t>            m_asyncNext{ 0 };
   uint32_t                         m_asyncFamily = UINT32_MAX;
 
+  // init's steps: the Vulkan loader (s_library); the instance (s_instance); the device (VVDEC_GPU_DEVICE's, else the
+  // first discrete GPU, then the first integrated one) and the features the decoder needs; the queue families; the
+  // async family's queues; the device with its queues and the extensions it has that the decoder uses; the layout of
+  // the pipelines
+  bool loadLibrary();
+  bool createInstance();
+  bool chooseDevice( VkPhysicalDeviceProperties& props );
+  bool checkFeatures( const VkPhysicalDeviceProperties& props, bool& timelineSemaphore, bool& subgroupSizeControl );
+  bool chooseQueueFamilies( const std::vector<VkQueueFamilyProperties>& families, bool timelineSemaphore, const char* deviceName );
+  // Which of the async family's queues the front ends, the parse, its copies and film grain take
+  struct AsyncQueueLayout
+  {
+    uint32_t familySize    = 0;       // the family's queues
+    bool     ownParseQueue = false;   // the parse has a queue of its own (else the last front end's)
+    bool     ownCopyQueue  = false;   // and its copies one more (else the parse's)
+    bool     split         = false;   // the front ends on the odd queues; the parse, its copies and film grain on even ones
+    uint32_t frontIndex[kMaxAsync] = {};
+    uint32_t parseIndex = 0, copyIndex = 0, grainIndex = 0;
+    uint32_t queues     = 0;          // the family's queues to create
+  };
+  AsyncQueueLayout chooseAsyncQueues( const std::vector<VkQueueFamilyProperties>& families );
+  // The extensions the device has, of those the decoder uses
+  struct DeviceExtensions
+  {
+    bool shaderInfo = false, shaderClock = false, subgroupBallot = false, maintenance5 = false, pipelineBinary = false;
+  };
+  DeviceExtensions findExtensions() const;
+  bool createDevice( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl, const AsyncQueueLayout& async );
+  void getQueues( const AsyncQueueLayout& async );
+  bool createPipelineLayout();
+
   // the parse queue (one of the async family's), its lock (its own, or the async queue's it shares) and timeline
   VkQueue                          m_parseQueue    = VK_NULL_HANDLE;
   std::mutex                       m_parseOwnMutex;
