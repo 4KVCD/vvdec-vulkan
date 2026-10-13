@@ -104,6 +104,7 @@ struct Params
 int  chromaScaleX() { return WIDE ? 1 : pc.scaleX; }
 int  chromaScaleY() { return WIDE ? 1 : pc.scaleY; }
 int  numComponents() { return WIDE ? 3 : pc.numComp; }
+bool hasChroma() { return numComponents() > 1; }
 bool widePlanes() { return WIDE != 0 || pc.wide != 0; }
 bool wrapSps() { return WIDE == 0 && pc.wrapSps != 0; }
 bool wrapPps() { return WIDE == 0 && pc.wrapPps != 0; }
@@ -1812,11 +1813,12 @@ bool tileInside( int x, int y, int w, int h, int flags, int2 mv0, int2 mv1 )
   {
     if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) != 0 )
     {
-      const int2 m  = list == 0 ? mv0 : mv1;
-      const int  wx = x + ( m.x >> 4 ) - 3, wy = y + ( m.y >> 4 ) - 3;
-      const int  cx = ( x >> 1 ) + ( m.x >> 5 ) - 1, cy = ( y >> 1 ) + ( m.y >> 5 ) - 1;
-      inside        = inside && wx >= b.x && wx + w + 7 <= b.z + 1 && wy >= b.y && wy + h + 7 <= b.w + 1 && cx >= c.x
-               && cx + ( w >> 1 ) + 3 <= c.z + 1 && cy >= c.y && cy + ( h >> 1 ) + 3 <= c.w + 1;
+      const int2 m            = list == 0 ? mv0 : mv1;
+      const int  wx           = x + ( m.x >> 4 ) - 3, wy = y + ( m.y >> 4 ) - 3;
+      const int  cx           = ( x >> 1 ) + ( m.x >> 5 ) - 1, cy = ( y >> 1 ) + ( m.y >> 5 ) - 1;
+      const bool lumaInside   = wx >= b.x && wx + w + 7 <= b.z + 1 && wy >= b.y && wy + h + 7 <= b.w + 1;
+      const bool chromaInside = cx >= c.x && cx + ( w >> 1 ) + 3 <= c.z + 1 && cy >= c.y && cy + ( h >> 1 ) + 3 <= c.w + 1;
+      inside                  = inside && lumaInside && ( chromaInside || !hasChroma() );
     }
   }
   return inside;
@@ -1850,8 +1852,9 @@ bool tileNear( int x, int y, int flags, int2 mv0, int2 mv1 )
       const int2 m  = list == 0 ? mv0 : mv1;
       const int  wx = x + ( m.x >> 4 ) - 3, wy = y + ( m.y >> 4 ) - 3;
       const int  cx = ( x >> 1 ) + ( m.x >> 5 ) - 1, cy = ( y >> 1 ) + ( m.y >> 5 ) - 1;
-      near          = near && wx >= -16 && wx + YW <= pc.picWidth + 16 && wy >= -16 && wy + YW <= pc.picHeight + 16 && cx >= -8
-             && cx + CWD <= ( pc.picWidth >> 1 ) + 8 && cy >= -8 && cy + CWD <= ( pc.picHeight >> 1 ) + 8;
+      const bool lumaNear   = wx >= -16 && wx + YW <= pc.picWidth + 16 && wy >= -16 && wy + YW <= pc.picHeight + 16;
+      const bool chromaNear = cx >= -8 && cx + CWD <= ( pc.picWidth >> 1 ) + 8 && cy >= -8 && cy + CWD <= ( pc.picHeight >> 1 ) + 8;
+      near                  = near && lumaNear && ( chromaNear || !hasChroma() );
     }
   }
   return near;
@@ -2030,11 +2033,14 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
-      const int s   = k < 2 || !two ? 0 : 1;
-      const int col = cxs[s] - leadC[s] + 4 * ( cRem - 3 * cRow );
-      const int c0  = col + 4 <= 0 || col >= ( pc.picWidth >> 1 ) ? 0 : col;
-      cChunk[k]     = load8( ( ( k & 1 ) == 0 ? planeCb[s] : planeCr[s] ) - 16,
-                             uint( clamp( cys[s] + cRow, 0, ( pc.picHeight >> 1 ) - 1 ) * pc.stride12 + c0 + 16 ) );
+      if( hasChroma() )
+      {
+        const int s   = k < 2 || !two ? 0 : 1;
+        const int col = cxs[s] - leadC[s] + 4 * ( cRem - 3 * cRow );
+        const int c0  = col + 4 <= 0 || col >= ( pc.picWidth >> 1 ) ? 0 : col;
+        cChunk[k]     = load8( ( ( k & 1 ) == 0 ? planeCb[s] : planeCr[s] ) - 16,
+                               uint( clamp( cys[s] + cRow, 0, ( pc.picHeight >> 1 ) - 1 ) * pc.stride12 + c0 + 16 ) );
+      }
     }
     tileResiduals( flags, atY, atC, resY, resCb, resCr );
   }
@@ -2058,8 +2064,11 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
-      const uint i = ( k < 2 ? cFirst0 : cFirst1 ) + uint( cRow * pc.stride12 + 4 * ( cRem - nch * cRow ) );
-      cChunk[k]    = load8( k == 0 ? planeCb[0] : ( k == 1 ? planeCr[0] : ( k == 2 ? cb1 : cr1 ) ), i );
+      if( hasChroma() )
+      {
+        const uint i = ( k < 2 ? cFirst0 : cFirst1 ) + uint( cRow * pc.stride12 + 4 * ( cRem - nch * cRow ) );
+        cChunk[k]    = load8( k == 0 ? planeCb[0] : ( k == 1 ? planeCr[0] : ( k == 2 ? cb1 : cr1 ) ), i );
+      }
     }
     tileResiduals( flags, atY, atC, resY, resCb, resCr );
   }
@@ -2244,7 +2253,7 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   [unroll]
   for( int k = 0; k < 4; k++ )
   {
-    if( ( k < 2 || two ) && tid < cTasks )
+    if( hasChroma() && ( k < 2 || two ) && tid < cTasks )
     {
       storeFour( WC_AT( k ) + cRow * CS + 4 * ( cRem - nch * cRow ), cChunk[k] );
     }
@@ -2252,7 +2261,10 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   GroupMemoryBarrierWithGroupSync();
   if( edges )
   {
-    tileBorderChroma( tid, wcAt, cxs, two );
+    if( hasChroma() )
+    {
+      tileBorderChroma( tid, wcAt, cxs, two );
+    }
     GroupMemoryBarrierWithGroupSync();
   }
   // Where DMVR moved a list's integer position in chroma samples, the chroma windows too are rewritten to it.
@@ -2262,7 +2274,7 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   {
     dIC[s] = int2( ( mvR[s].x >> 5 ) - ( mvs[s].x >> 5 ), ( mvR[s].y >> 5 ) - ( mvs[s].y >> 5 ) );
   }
-  if( WaveReadLaneFirst( ( dIC[0].x | dIC[0].y | dIC[1].x | dIC[1].y ) != 0 ? 1 : 0 ) != 0 )
+  if( hasChroma() && WaveReadLaneFirst( ( dIC[0].x | dIC[0].y | dIC[1].x | dIC[1].y ) != 0 ? 1 : 0 ) != 0 )
   {
     tile16ShiftChroma( tid, wcAt, dIC );
   }
@@ -2287,7 +2299,7 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
     }
     crx0[s] = xFrac != 0 ? 0 : 1;
     cry0[s] = yFrac != 0 ? 0 : 1;
-    if( s < lists && xFrac != 0 && yFrac != 0 )
+    if( hasChroma() && s < lists && xFrac != 0 && yFrac != 0 )
     {
       const int shift1 = 6 - headRoom;
       tileChromaH( tid, wcAt[2 * s], CH_AT + 88 * 2 * s, cxC[s], shift1, -IF_INTERNAL_OFFS * ( 1 << shift1 ), rowsC, lg );
@@ -2308,14 +2320,17 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
     [unroll]
     for( int o = 0; o < 2; o++ )
     {
-      geoC[o] = geoWeight( job[9], ( ( x >> 1 ) + ci0 + o - ( cuX >> 1 ) ) << 1, ( ( y >> 1 ) + cj - ( cuY >> 1 ) ) << 1 );
+      if( hasChroma() )
+      {
+        geoC[o] = geoWeight( job[9], ( ( x >> 1 ) + ci0 + o - ( cuX >> 1 ) ) << 1, ( ( y >> 1 ) + cj - ( cuY >> 1 ) ) << 1 );
+      }
     }
   }
-  int2 predC[2];
+  int2 predC[2] = { int2( 0, 0 ), int2( 0, 0 ) };
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    if( s < lists )
+    if( hasChroma() && s < lists )
     {
       predC[s] = chromaPred( WC_AT( 2 * s + cc ) + leadC[s], CH_AT + 88 * ( 2 * s + cc ), cj, ci0, crx0[s], cry0[s], mvR[s].x & 31, mvR[s].y & 31,
                              cxC[s], cyC[s], hi );
@@ -2374,7 +2389,7 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   // (each component's plane first, then the thread's: see the residuals)
   int16_t* outCb = ( flags & FLAG_DEFER_CB ) != 0 ? pc.defer1 : pc.dst1;
   int16_t* outCr = ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2;
-  if( mineC )
+  if( hasChroma() && mineC )
   {
     *(uint*)at( cc == 0 ? outCb : outCr, atC ) = uint( vc.x & 0xffff ) | uint( vc.y ) << 16;
   }
