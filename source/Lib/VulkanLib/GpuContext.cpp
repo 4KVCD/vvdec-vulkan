@@ -559,19 +559,40 @@ struct Context::PipelineBinaries
 static constexpr uint32_t kBinariesMagic   = 0x42445656;   // "VVDB"
 static constexpr uint32_t kBinariesVersion = 2;
 
+static constexpr uint64_t kHashSeed = 0x9e3779b97f4a7c15ull;
+
+// h updated with a shader's SPIR-V words
+static uint64_t hashShader( uint64_t h, int shaderId )
+{
+  for( size_t w = 0; w < kShaders[shaderId].size / sizeof( uint32_t ); w++ )
+  {
+    h = ( h ^ kShaders[shaderId].words[w] ) * 0xff51afd7ed558ccdull;
+    h = ( h << 29 ) | ( h >> 35 );
+  }
+  return h;
+}
+
 // A hash of all the shaders' SPIR-V words (a millisecond or so)
 static uint64_t shadersHash()
 {
-  uint64_t h = 0x9e3779b97f4a7c15ull;
+  uint64_t h = kHashSeed;
   for( int i = 0; i < kShaderCount; i++ )
   {
-    for( size_t w = 0; w < kShaders[i].size / sizeof( uint32_t ); w++ )
-    {
-      h = ( h ^ kShaders[i].words[w] ) * 0xff51afd7ed558ccdull;
-      h = ( h << 29 ) | ( h >> 35 );
-    }
+    h = hashShader( h, i );
   }
   return h;
+}
+
+// A pipeline's key in the binaries' file: its shader (its name and its SPIR-V's hash) and whether it asks for waves of
+// 32 threads. (Not the driver's pipeline key, vkGetPipelineKeyKHR: AMD's makes it per program, as its shader cache.)
+static std::vector<uint8_t> pipelineKeyOf( int shaderId, bool wave32 )
+{
+  const char*          name = kShaders[shaderId].name;
+  std::vector<uint8_t> key( name, name + strlen( name ) );
+  const uint64_t       h = hashShader( kHashSeed, shaderId );
+  key.insert( key.end(), reinterpret_cast<const uint8_t*>( &h ), reinterpret_cast<const uint8_t*>( &h ) + sizeof( h ) );
+  key.push_back( wave32 ? 32 : 0 );
+  return key;
 }
 
 // The file name in the user's cache directory (its directory made when missing), or empty when there is none
@@ -760,80 +781,88 @@ void Context::closePipelineBinaries()
   m_binaries = nullptr;
 }
 
-VkResult Context::createPipeline( int shaderId, VkComputePipelineCreateInfo& info, VkPipeline& pipe )
+VkResult Context::createPipeline( int shaderId, bool wave32, VkComputePipelineCreateInfo& info, VkPipeline& pipe )
 {
-  PipelineBinaries* b = m_binaries;
-  if( !b )
+  if( !m_binaries )
   {
     return m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
   }
-  // the pipeline's key: its shader (its name and SPIR-V) and whether it asks for waves of 32 threads. (Not the driver's
-  // pipeline key, vkGetPipelineKeyKHR: AMD's makes it per program, as its shader cache.)
-  std::vector<uint8_t> pipelineKey( kShaders[shaderId].name, kShaders[shaderId].name + strlen( kShaders[shaderId].name ) );
-  uint64_t             h = 0x9e3779b97f4a7c15ull;
-  for( size_t w = 0; w < kShaders[shaderId].size / sizeof( uint32_t ); w++ )
+  const std::vector<uint8_t> key = pipelineKeyOf( shaderId, wave32 );
+  if( createFromBinaries( key, info, pipe ) )
   {
-    h = ( h ^ kShaders[shaderId].words[w] ) * 0xff51afd7ed558ccdull;
-    h = ( h << 29 ) | ( h >> 35 );
+    return VK_SUCCESS;
   }
-  pipelineKey.insert( pipelineKey.end(), reinterpret_cast<const uint8_t*>( &h ), reinterpret_cast<const uint8_t*>( &h ) + sizeof( h ) );
-  pipelineKey.push_back( info.stage.pNext ? 32 : 0 );
-  // made from its binaries, when the file has them
-  const auto found = pipelineKey.empty() ? b->pipelines.end() : b->pipelines.find( pipelineKey );
-  if( found != b->pipelines.end() && !found->second.empty() )
-  {
-    std::vector<VkPipelineBinaryKeyKHR>  keys;
-    std::vector<VkPipelineBinaryDataKHR> data;
-    for( const PipelineBinaries::Binary& binary: found->second )
-    {
-      VkPipelineBinaryKeyKHR k{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR };
-      k.keySize = uint32_t( binary.key.size() );
-      memcpy( k.key, binary.key.data(), binary.key.size() );
-      keys.push_back( k );
-      data.push_back( VkPipelineBinaryDataKHR{ binary.data.size(), const_cast<uint8_t*>( binary.data.data() ) } );
-    }
-    VkPipelineBinaryKeysAndDataKHR keysAndData{ uint32_t( keys.size() ), keys.data(), data.data() };
-    VkPipelineBinaryCreateInfoKHR  createInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR };
-    createInfo.pKeysAndDataInfo = &keysAndData;
-    std::vector<VkPipelineBinaryKHR> handles( keys.size(), VK_NULL_HANDLE );
-    VkPipelineBinaryHandlesInfoKHR   handlesInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR };
-    handlesInfo.pipelineBinaryCount = uint32_t( handles.size() );
-    handlesInfo.pPipelineBinaries   = handles.data();
-    VkResult result = b->create( m_device, &createInfo, nullptr, &handlesInfo );
-    if( result == VK_SUCCESS )
-    {
-      VkPipelineBinaryInfoKHR binaryInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR };
-      binaryInfo.binaryCount       = uint32_t( handles.size() );
-      binaryInfo.pPipelineBinaries = handles.data();
-      binaryInfo.pNext             = info.pNext;
-      info.pNext                   = &binaryInfo;
-      result                       = m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
-      info.pNext                   = binaryInfo.pNext;
-    }
-    for( VkPipelineBinaryKHR handle: handles )
-    {
-      if( handle )
-      {
-        b->destroy( m_device, handle, nullptr );
-      }
-    }
-    if( result == VK_SUCCESS )
-    {
-      return result;
-    }
-    b->pipelines.erase( found );   // (binaries the driver refused: compiled below)
-  }
-  // compiled, with its binaries kept
+  // Compiled, its binaries captured for the file
   VkPipelineCreateFlags2CreateInfoKHR flags{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR };
   flags.flags = VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;
   flags.pNext = info.pNext;
   info.pNext  = &flags;
   const VkResult result = m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
   info.pNext            = flags.pNext;
-  if( result != VK_SUCCESS || pipelineKey.empty() )
+  if( result == VK_SUCCESS )
   {
-    return result;
+    captureBinaries( key, pipe );
   }
+  return result;
+}
+
+// Creates the pipeline from the binaries the file has for key, if any; binaries the driver refuses are dropped (the
+// pipeline is then compiled).
+bool Context::createFromBinaries( const std::vector<uint8_t>& key, VkComputePipelineCreateInfo& info, VkPipeline& pipe )
+{
+  PipelineBinaries* b     = m_binaries;
+  const auto        found = b->pipelines.find( key );
+  if( found == b->pipelines.end() || found->second.empty() )
+  {
+    return false;
+  }
+  std::vector<VkPipelineBinaryKeyKHR>  keys;
+  std::vector<VkPipelineBinaryDataKHR> data;
+  for( const PipelineBinaries::Binary& binary: found->second )
+  {
+    VkPipelineBinaryKeyKHR k{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR };
+    k.keySize = uint32_t( binary.key.size() );
+    memcpy( k.key, binary.key.data(), binary.key.size() );
+    keys.push_back( k );
+    data.push_back( VkPipelineBinaryDataKHR{ binary.data.size(), const_cast<uint8_t*>( binary.data.data() ) } );
+  }
+  VkPipelineBinaryKeysAndDataKHR keysAndData{ uint32_t( keys.size() ), keys.data(), data.data() };
+  VkPipelineBinaryCreateInfoKHR  createInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR };
+  createInfo.pKeysAndDataInfo = &keysAndData;
+  std::vector<VkPipelineBinaryKHR> handles( keys.size(), VK_NULL_HANDLE );
+  VkPipelineBinaryHandlesInfoKHR   handlesInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR };
+  handlesInfo.pipelineBinaryCount = uint32_t( handles.size() );
+  handlesInfo.pPipelineBinaries   = handles.data();
+  VkResult result = b->create( m_device, &createInfo, nullptr, &handlesInfo );
+  if( result == VK_SUCCESS )
+  {
+    VkPipelineBinaryInfoKHR binaryInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR };
+    binaryInfo.binaryCount       = uint32_t( handles.size() );
+    binaryInfo.pPipelineBinaries = handles.data();
+    binaryInfo.pNext             = info.pNext;
+    info.pNext                   = &binaryInfo;
+    result                       = m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
+    info.pNext                   = binaryInfo.pNext;
+  }
+  for( VkPipelineBinaryKHR handle: handles )
+  {
+    if( handle )
+    {
+      b->destroy( m_device, handle, nullptr );
+    }
+  }
+  if( result != VK_SUCCESS )
+  {
+    b->pipelines.erase( found );
+  }
+  return result == VK_SUCCESS;
+}
+
+// Keeps the binaries of pipe (created with VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR) under key, for the file, and
+// releases the captured data
+void Context::captureBinaries( const std::vector<uint8_t>& key, VkPipeline pipe )
+{
+  PipelineBinaries*             b = m_binaries;
   VkPipelineBinaryCreateInfoKHR createInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR };
   createInfo.pipeline = pipe;
   VkPipelineBinaryHandlesInfoKHR handlesInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR };
@@ -865,15 +894,14 @@ VkResult Context::createPipeline( int shaderId, VkComputePipelineCreateInfo& inf
       }
       if( binaries.size() == handles.size() )
       {
-        b->pipelines[pipelineKey] = std::move( binaries );
-        b->added                  = true;
+        b->pipelines[key] = std::move( binaries );
+        b->added          = true;
       }
     }
   }
   VkReleaseCapturedPipelineDataInfoKHR releaseInfo{ VK_STRUCTURE_TYPE_RELEASE_CAPTURED_PIPELINE_DATA_INFO_KHR };
   releaseInfo.pipeline = pipe;
   b->release( m_device, &releaseInfo, nullptr );
-  return result;
 }
 
 void Context::addTime( const char* label, double milliseconds )
@@ -1173,6 +1201,15 @@ void Context::freeAfterQueued( Buffer& buf )
   free( buf );
 }
 
+// Whether the shader is one of inter's variants, which run in waves of 64 threads (the driver's choice). VideoQ 4K on
+// a Radeon 780M with all the shaders in waves of 32: intra 1.50 -> 1.31 ms, ALF luma 1.54 -> 1.36, the residuals
+// 0.33 -> 0.28, but inter 4.4 -> 5.2 ms; Beekeeper 4K slower preset: BDOF's tiles 1.31 -> 1.23 ms in waves of 64.
+static bool interShader( int shaderId )
+{
+  return shaderId == kShader_inter || shaderId == kShader_inter_bdof || shaderId == kShader_inter_affine || shaderId == kShader_inter_wide
+         || shaderId == kShader_inter_bdof_wide || shaderId == kShader_inter_affine_wide;
+}
+
 VkPipeline Context::pipeline( int shaderId )
 {
   std::lock_guard<std::mutex> lock( m_pipelineMutex );
@@ -1196,61 +1233,65 @@ VkPipeline Context::pipeline( int shaderId )
   info.stage.module = module;
   info.stage.pName  = "main";
   info.layout       = m_layout;
-  // waves of 32 threads, but for inter's variants (VideoQ 4K on a Radeon 780M: intra 1.50 -> 1.31 ms, ALF luma
-  // 1.54 -> 1.36, the residuals 0.33 -> 0.28, but inter 4.4 -> 5.2 ms; Beekeeper 4K slower preset: BDOF's tiles 1.31
-  // -> 1.23 ms in waves of 64), where the driver's choice, waves of 64, is better
+  // waves of 32 threads, but for inter's variants (interShader)
   VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
   size.requiredSubgroupSize = 32;
-  const bool inter = shaderId == kShader_inter || shaderId == kShader_inter_bdof || shaderId == kShader_inter_affine || shaderId == kShader_inter_wide
-                     || shaderId == kShader_inter_bdof_wide || shaderId == kShader_inter_affine_wide;
-  if( m_wave32 && !inter )
+  const bool wave32         = m_wave32 && !interShader( shaderId );
+  if( wave32 )
   {
     info.stage.pNext = &size;
   }
-  VkPipeline pipe   = VK_NULL_HANDLE;
-  const VkResult result = createPipeline( shaderId, info, pipe );
+  VkPipeline     pipe   = VK_NULL_HANDLE;
+  const VkResult result = createPipeline( shaderId, wave32, info, pipe );
   m_api.vkDestroyShaderModule( m_device, module, nullptr );
   if( result != VK_SUCCESS )
   {
     THROW_FATAL( "Vulkan: the pipeline of " << kShaders[shaderId].name << " failed (" << result << ")" );
   }
   m_pipelines[shaderId] = pipe;
+  reportShader( shaderId, pipe );
+  return pipe;
+}
 
-  if( m_getShaderInfo )
+// With VK_AMD_shader_info (profiling, or VVDEC_GPU_ISA): the shader's registers and shared memory, and with
+// VVDEC_GPU_ISA=<directory> its machine code into <directory>/<name>.isa
+void Context::reportShader( int shaderId, VkPipeline pipe ) const
+{
+  if( !m_getShaderInfo )
   {
-    VkShaderStatisticsInfoAMD stats{};
-    size_t                    size = sizeof( stats );
-    if( m_getShaderInfo( m_device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_STATISTICS_AMD, &size, &stats ) == VK_SUCCESS )
+    return;
+  }
+  VkShaderStatisticsInfoAMD stats{};
+  size_t                    size = sizeof( stats );
+  if( m_getShaderInfo( m_device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_STATISTICS_AMD, &size, &stats ) == VK_SUCCESS )
+  {
+    msg( INFO, "GPU shader %-16s VGPRs %3u (of %3u)  SGPRs %3u  shared memory %5zu bytes  scratch %5zu bytes\n", kShaders[shaderId].name,
+         stats.resourceUsage.numUsedVgprs, stats.numAvailableVgprs, stats.resourceUsage.numUsedSgprs, stats.resourceUsage.ldsUsageSizeInBytes,
+         stats.resourceUsage.scratchMemUsageInBytes );
+  }
+  // VVDEC_GPU_ISA=<directory>: the shader's machine code to <directory>/<name>.isa
+  if( !m_options.isaDir.empty() )
+  {
+    const char* dir = m_options.isaDir.c_str();
+    size_t textSize = 0;
+    if( m_getShaderInfo( m_device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &textSize, nullptr ) == VK_SUCCESS )
     {
-      msg( INFO, "GPU shader %-16s VGPRs %3u (of %3u)  SGPRs %3u  shared memory %5zu bytes  scratch %5zu bytes\n", kShaders[shaderId].name,
-           stats.resourceUsage.numUsedVgprs, stats.numAvailableVgprs, stats.resourceUsage.numUsedSgprs, stats.resourceUsage.ldsUsageSizeInBytes,
-           stats.resourceUsage.scratchMemUsageInBytes );
-    }
-    // VVDEC_GPU_ISA=<directory>: the shader's machine code to <directory>/<name>.isa
-    if( !m_options.isaDir.empty() )
-    {
-      const char* dir = m_options.isaDir.c_str();
-      size_t textSize = 0;
-      if( m_getShaderInfo( m_device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &textSize, nullptr ) == VK_SUCCESS )
+      std::vector<char> text( textSize );
+      if( m_getShaderInfo( m_device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &textSize, text.data() ) == VK_SUCCESS )
       {
-        std::vector<char> text( textSize );
-        if( m_getShaderInfo( m_device, pipe, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &textSize, text.data() ) == VK_SUCCESS )
+        const std::string path = std::string( dir ) + "/" + kShaders[shaderId].name + ".isa";
+        if( FILE* file = fopen( path.c_str(), "wb" ) )
         {
-          const std::string path = std::string( dir ) + "/" + kShaders[shaderId].name + ".isa";
-          if( FILE* file = fopen( path.c_str(), "wb" ) )
-          {
-            fwrite( text.data(), 1, textSize, file );
-            fclose( file );
-          }
-          else
-          {
-            msg( WARNING, "Vulkan: cannot write %s (does the directory exist?)\n", path.c_str() );
-          }
+          fwrite( text.data(), 1, textSize, file );
+          fclose( file );
+        }
+        else
+        {
+          msg( WARNING, "Vulkan: cannot write %s (does the directory exist?)\n", path.c_str() );
         }
       }
     }
   }
-  return pipe;
 }
 
 uint64_t Context::submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemaphore waitFront, uint64_t waitParse )

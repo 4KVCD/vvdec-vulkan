@@ -328,8 +328,12 @@ private:
   // PipelineBinaries; null without it)
   struct PipelineBinaries;
   PipelineBinaries*                m_binaries = nullptr;
-  // Creates the compute pipeline of info: from its binaries when the file has them, else compiled (its binaries kept)
-  VkResult                         createPipeline( int shaderId, VkComputePipelineCreateInfo& info, VkPipeline& pipe );
+  // Creates the compute pipeline of info (wave32: it asks for waves of 32 threads): from its binaries when the file has
+  // them, else compiled, its binaries kept for the file
+  VkResult                         createPipeline( int shaderId, bool wave32, VkComputePipelineCreateInfo& info, VkPipeline& pipe );
+  bool                             createFromBinaries( const std::vector<uint8_t>& key, VkComputePipelineCreateInfo& info, VkPipeline& pipe );
+  void                             captureBinaries( const std::vector<uint8_t>& key, VkPipeline pipe );   // (pipe compiled to capture them)
+  void                             reportShader( int shaderId, VkPipeline pipe ) const;   // its registers, its machine code (VVDEC_GPU_ISA)
   void                             openPipelineBinaries( const VkPhysicalDeviceProperties& props );
   void                             closePipelineBinaries();   // (the file rewritten when binaries were added)
 
