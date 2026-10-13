@@ -168,40 +168,16 @@ bool addCu()
   return true;
 }
 
-// Whether the map's entries inside the CU's block of channel type ch are ever looked up. The later CUs look up the
-// entries just left of and just above their blocks (cuAt's callers: the neighbours of contexts, of the QP prediction,
-// of the intra modes and of the partitioner), which are on the right column or the bottom row of the CUs there. Only
-// the CUs of a separate chroma tree look inside a luma CU: at the centre or the top-left of their own blocks
-// (coLocatedLumaCu, checkCclmAllowed, the QP of codingUnitAtPart).
-bool cuInsideLookedUp( Cu cu, int ch )
+// Whether the CUs of a separate chroma tree look inside the CU's luma block (coLocatedLumaCu, checkCclmAllowed, the QP
+// of codingUnitAtPart): with the dual tree, and in the areas of a single tree whose chroma is not split
+bool cuInsideLookedUp( Cu cu )
 {
-  return ch == 0 && ( g_dualTree || cu.treeType != TREE_D );
+  return g_dualTree || cu.treeType != TREE_D;
 }
 
-// Enters the map entry info for the units of the block of w4 x h4 units at index at: all of them, or only those of its
-// right column and bottom row (edgesOnly), the ones the later CUs look up. For a 128x128 CU that is 63 entries
-// instead of 1024.
-void setBlockEntries( int at, int w4, int h4, uint2 info, bool edgesOnly )
-{
-  if( edgesOnly )
-  {
-    // units 0 .. w4 - 1: the bottom row; then the right column above it
-    for( int u = g_lane; u < w4 + h4 - 1; u += 32 )
-    {
-      const bool bottom = u < w4;
-      mapSet( at + ( bottom ? h4 - 1 : u - w4 ) * kMapRow + ( bottom ? u : w4 - 1 ), info );
-    }
-    return;
-  }
-  const int lw4 = firstbithigh( uint( w4 ) );
-  for( int u = g_lane; u < w4 * h4; u += 32 )
-  {
-    mapSet( at + ( u >> lw4 ) * kMapRow + ( u & ( w4 - 1 ) ), info );
-  }
-}
-
-// Enters the finished CU into the CTU's maps: into the luma tree's map over its luma block, and into the chroma tree's
-// map over its chroma block (only where the later CUs look: cuInsideLookedUp)
+// Enters the finished CU as the last one parsed over the rows and columns of its blocks (s_left, s_above), in each
+// channel type it has a block of; and its luma block into the 64x64 area's luma entries when a separate chroma tree
+// looks inside it
 void writeCuInfo()
 {
   const Cu   cu   = g_cu;
@@ -226,8 +202,28 @@ void writeCuInfo()
     const uint2 info = uint2( base | uint( log2i( ch == 0 ? cu.lw : cu.cw ) ) << 26 | uint( log2i( ch == 0 ? cu.lh : cu.chh ) ) << 29, y );
     const int  w4  = max( bw >> 2, 1 );
     const int  h4  = max( bh >> 2, 1 );
-    const int  at  = ch * kMapChannel + ( ( by - y0 ) >> 2 ) * kMapRow + ( ( bx - x0 ) >> 2 );
-    setBlockEntries( at, w4, h4, info, !cuInsideLookedUp( cu, ch ) );
+    const int  col = ch * kMapRow + ( ( bx - x0 ) >> 2 );
+    const int  row = ch * kMapRow + ( ( by - y0 ) >> 2 );
+    // Thread u takes column u and row u of the block (the threads past one side's end write its last entry again)
+    for( int u = g_lane; u < max( w4, h4 ); u += 32 )
+    {
+      s_above[col + min( u, w4 - 1 )] = info;
+      s_left[row + min( u, h4 - 1 )]  = info;
+    }
+    if( ch == 0 && cuInsideLookedUp( cu ) )
+    {
+      // The whole luma block: it lies inside its 64x64 area, as separate trees split the CTU into such areas first
+      // (the masks keep every index inside the area all the same)
+      const int lw4 = firstbithigh( uint( w4 ) );
+      const int ax  = ( bx & 63 ) >> 2;
+      const int ay  = ( by & 63 ) >> 2;
+      for( int u = g_lane; u < w4 * h4; u += 32 )
+      {
+        const int i = ( ( ay + ( u >> lw4 ) ) & ( kLumaArea - 1 ) ) * kLumaArea + ( ( ax + ( u & ( w4 - 1 ) ) ) & ( kLumaArea - 1 ) );
+        s_lumaX[i] = info.x;
+        s_lumaY[i] = uint16_t( info.y );
+      }
+    }
   }
   GroupMemoryBarrierWithGroupSync();
 }
@@ -271,8 +267,8 @@ int predictQp( int prevQp )
   const int ch     = g_cu.chType;
   const int x      = ch == 0 ? g_cu.lx : g_cu.cx << g_csx;
   const int y      = ch == 0 ? g_cu.ly : g_cu.cy << g_csy;
-  const uint2 above = cuAt( x, y - stepY( ch ), ch );   // (zero when the CTU above is in another slice or tile)
-  const uint2 left  = cuAt( x - stepX( ch ), y, ch );
+  const uint2 above = cuAboveOf( x, ch );   // (zero when the CTU above is in another slice or tile)
+  const uint2 left  = cuLeftOf( y, ch );
   const int   mask  = g_ctuSize - 1;
   if( g_tileFirstCol && ( x & mask ) == 0 && ( y & mask ) == 0 && infoValid( above ) )
   {
@@ -317,7 +313,7 @@ void codingUnitAtPart( inout CuCtx ctx )
   const bool sepChroma   = picWord( kPicUseDqp ) != 0 && isSepTreeP() && g_cu.chType == 1;
   if( sepChroma )
   {
-    const uint2 colLuma = cuAt( ( g_cu.cx + ( g_cu.cw >> 1 ) ) << g_csx, ( g_cu.cy + ( g_cu.chh >> 1 ) ) << g_csy, 0 );
+    const uint2 colLuma = lumaCuAt( ( g_cu.cx + ( g_cu.cw >> 1 ) ) << g_csx, ( g_cu.cy + ( g_cu.chh >> 1 ) ) << g_csy );
     lumaQpLocal         = ctx.qp;
     if( infoValid( colLuma ) )
     {
@@ -767,12 +763,12 @@ void getIntraMpms( out int mpm[6] )
   int leftIntraDir  = PLANAR_IDX;
   int aboveIntraDir = PLANAR_IDX;
   const int x = g_cu.lx, y = g_cu.ly, w = g_cu.lw, h = g_cu.lh;
-  const uint2 cuLeft = cuAtRestricted( x - 1, y + h - 1, g_cu.local, 0 );
+  const uint2 cuLeft = cuLeftOf( y + h - 1, 0 );
   if( infoValid( cuLeft ) && infoPredMode( cuLeft ) == MODE_INTRA )
   {
     leftIntraDir = intraDirLumaOf( cuLeft );
   }
-  const uint2 cuAbove = cuAtRestricted( x + w - 1, y - 1, g_cu.local, 0 );
+  const uint2 cuAbove = cuAboveOf( x + w - 1, 0 );
   if( infoValid( cuAbove ) && infoPredMode( cuAbove ) == MODE_INTRA && ( y & ( g_ctuSize - 1 ) ) != 0 )
   {
     aboveIntraDir = intraDirLumaOf( cuAbove );
@@ -909,7 +905,7 @@ void intraLumaPredMode()
 // The luma CU at the centre of the CU's chroma block, as PU::getCoLocatedLumaPU finds it for a CU of a separate tree
 uint2 coLocatedLumaCu()
 {
-  return cuAt( ( g_cu.cx << g_csx ) + ( ( g_cu.cw << g_csx ) >> 1 ), ( g_cu.cy << g_csy ) + ( ( g_cu.chh << g_csy ) >> 1 ), 0 );
+  return lumaCuAt( ( g_cu.cx << g_csx ) + ( ( g_cu.cw << g_csx ) >> 1 ), ( g_cu.cy << g_csy ) + ( ( g_cu.chh << g_csy ) >> 1 ) );
 }
 
 // Whether the CU may use CCLM (CU::checkCCLMAllowed). Only the dual tree with CTUs of 64 or more restricts it, by how
@@ -942,7 +938,7 @@ bool checkCclmAllowed()
   }
   if( allow )
   {
-    const uint2 colLuma = cuAt( g_cu.cx << g_csx, g_cu.cy << g_csy, 0 );
+    const uint2 colLuma = lumaCuAt( g_cu.cx << g_csx, g_cu.cy << g_csy );
     if( infoDepth( colLuma ) > depthFor64x64Node && infoQtDepth( colLuma ) == depthFor64x64Node )
     {
       allow = false;

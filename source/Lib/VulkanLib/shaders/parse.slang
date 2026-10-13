@@ -947,9 +947,9 @@ void loadPicture()
   g_tileCols     = picWord( kPicTileCols );
 }
 
-// Prepares the maps for the CTU. It works out whether the CTUs to the left and above are in the same slice and tile,
-// clears the CTU's maps, fills s_above from the bottom rows the CTU above left (zeros when it is out of reach), and
-// clears s_left unless the CTU to the left is in reach: s_left then still holds that CTU's right column (endCtu).
+// Prepares the neighbours for the CTU. It works out whether the CTUs to the left and above are in the same slice and
+// tile, fills s_above from the bottom rows the CTU above left (zeros when it is out of reach), and clears s_left
+// unless the CTU to the left is in reach: s_left then still holds that CTU's right column.
 void beginCtu()
 {
   const uint info = uni( pc.ctuInfo[g_ctu * 2 + 1] );
@@ -962,10 +962,6 @@ void beginCtu()
     // workgroup of an earlier dispatch wrote)
     AllMemoryBarrierWithGroupSync();
   }
-  for( int i = g_lane; i < 2 * kMapChannel; i += 32 )
-  {
-    mapSet( i, uint2( 0, 0 ) );
-  }
   for( int i = g_lane; i < 2 * kMapRow; i += 32 )
   {
     s_above[i] = g_aboveAvail ? pc.bottomRows[bottomRowsAt( g_ctu - g_widthInCtus, i )] : uint2( 0, 0 );
@@ -977,19 +973,14 @@ void beginCtu()
   GroupMemoryBarrierWithGroupSync();
 }
 
-// Ends the CTU's maps: stores their bottom row in pc.bottomRows for the CTU below, and keeps their right column in
-// s_left for the next CTU
+// Ends the CTU: stores its bottom row (the last CUs parsed over its columns) in pc.bottomRows for the CTU below.
+// s_left keeps its right column for the next CTU.
 void endCtu()
 {
-  const int last = ( g_ctuSize >> 2 ) - 1;
   for( int i = g_lane; i < 2 * kMapRow; i += 32 )
   {
-    const int ch = i / kMapRow;
-    const int j  = i % kMapRow;
-    pc.bottomRows[bottomRowsAt( g_ctu, i )] = mapGet( ch * kMapChannel + last * kMapRow + j );
-    s_left[i]                               = mapGet( ch * kMapChannel + j * kMapRow + last );
+    pc.bottomRows[bottomRowsAt( g_ctu, i )] = s_above[i];
   }
-  GroupMemoryBarrierWithGroupSync();
 }
 
 // Saves where the substream's parse stands, for the next dispatch: its next CTU k (or that it is done), the context
