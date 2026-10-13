@@ -110,6 +110,43 @@ void sort1024( int tid )
   }
 }
 
+// Writes job's bands into the sorted list from place first on: each band a copy of the job's words, its word 7 its rows
+// (the first | the count << 16). With withWaits, each band's wait (pc.waits) too.
+void writeJobBands( uint* job, uint first, bool withWaits, uint wait )
+{
+  const int rows = bandRows( job );
+  const int h    = int( ( job[1] >> 8 ) & 0xff );
+  uint      at   = first;
+  for( int r = 0; r < h; r += rows, at++ )
+  {
+    if( at < uint( pc.capacity ) )
+    {
+      uint* band = pc.sorted + at * 12;
+      for( int k = 0; k < 12; k++ )
+      {
+        band[k] = job[k];
+      }
+      band[7] = uint( r ) | uint( min( rows, h - r ) ) << 16;
+      if( withWaits )
+      {
+        pc.waits[at] = wait;
+      }
+    }
+  }
+}
+
+// Stores the number of bands, and intra's indirect arguments: intra.slang runs one workgroup per band, in rows of 32768
+// workgroups
+void storeBandTotal( uint total )
+{
+  pc.bandSums[pc.numBlocks] = total;
+  pc.args[12]               = min( total, 32768u );
+  pc.args[13]               = ( total + 32767u ) / 32768u;
+  pc.args[14]               = 1;
+  pc.args[40]               = total;
+  pc.args[41]               = 0;
+}
+
 // SMALL (pass 7, one workgroup): see the passes above. The jobs are sorted as keys wave << 10 | job, so that the jobs'
 // order breaks the ties (a stable sort by wave; with at most 1024 jobs, the waves stay below 1024 too: each wave is one
 // above an earlier job's). In sorted order, an exclusive prefix sum of the jobs' bands gives each job's first band, and
@@ -180,33 +217,11 @@ void smallSort( int tid, uint n )
   // the job's bands (as PLACE writes them) and their waits (as WAITS does)
   if( valid )
   {
-    uint*     job  = pc.jobs + index * 12;
-    const int rows = bandRows( job );
-    const int h    = int( ( job[1] >> 8 ) & 0xff );
-    uint      at   = first;
-    for( int r = 0; r < h; r += rows, at++ )
-    {
-      if( at < uint( pc.capacity ) )
-      {
-        uint* band = pc.sorted + at * 12;
-        for( int k = 0; k < 12; k++ )
-        {
-          band[k] = job[k];
-        }
-        band[7]      = uint( r ) | uint( min( rows, h - r ) ) << 16;
-        pc.waits[at] = wait;
-      }
-    }
+    writeJobBands( pc.jobs + index * 12, first, true, wait );
   }
-  // the number of bands and intra's indirect arguments (as BSCAN stores them)
   if( tid == 0 )
   {
-    pc.bandSums[pc.numBlocks] = total;
-    pc.args[12]               = min( total, 32768u );
-    pc.args[13]               = ( total + 32767u ) / 32768u;
-    pc.args[14]               = 1;
-    pc.args[40]               = total;
-    pc.args[41]               = 0;
+    storeBandTotal( total );
   }
 }
 
@@ -405,21 +420,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       pc.waveFirst[wave] = first;
     }
-    const int rows = bandRows( job );
-    const int h    = int( ( job[1] >> 8 ) & 0xff );
-    uint      at   = first;
-    for( int r = 0; r < h; r += rows, at++ )
-    {
-      if( at < uint( pc.capacity ) )
-      {
-        uint* band = pc.sorted + at * 12;
-        for( int k = 0; k < 12; k++ )
-        {
-          band[k] = job[k];
-        }
-        band[7] = uint( r ) | uint( min( rows, h - r ) ) << 16;
-      }
-    }
+    writeJobBands( job, first, false, 0u );   // (their waits: WAITS, once every wave's first band is known)
     return;
   }
   if( pc.pass == 4 )
@@ -445,13 +446,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     }
     if( tid == 0 )
     {
-      pc.bandSums[pc.numBlocks] = total;
-      // intra.slang runs one workgroup per band, in rows of 32768 workgroups.
-      pc.args[12] = min( total, 32768u );
-      pc.args[13] = ( total + 32767u ) / 32768u;
-      pc.args[14] = 1;
-      pc.args[40] = total;
-      pc.args[41] = 0;
+      storeBandTotal( total );
     }
     return;
   }
