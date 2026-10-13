@@ -65,84 +65,101 @@ namespace vvdec
 namespace gpu
 {
 
+// The CU record's flags (CuRecord::kMerge ...)
+static uint32_t cuFlags( const CodingUnit& cu )
+{
+  uint32_t flags = 0;
+  flags |= cu.mergeFlag() ? CuRecord::kMerge : 0;
+  flags |= cu.skip() ? CuRecord::kSkip : 0;
+  flags |= cu.mmvdFlag() ? CuRecord::kMmvd : 0;
+  flags |= cu.affineFlag() ? CuRecord::kAffine : 0;
+  flags |= cu.geoFlag() ? CuRecord::kGeo : 0;
+  flags |= cu.ciipFlag() ? CuRecord::kCiip : 0;
+  flags |= cu.chType() == CHANNEL_TYPE_CHROMA ? CuRecord::kChroma : 0;
+  flags |= cu.affineType() == AFFINEMODEL_6PARAM ? CuRecord::kAffine6 : 0;
+  return flags;
+}
+
+// The record of cu, a CU of CTU ctuRsAddr, but for its TUs' range (word 16), which writeCuRecords sets
+static CuRecord cuRecord( const CodingStructure& cs, const CodingUnit& cu, int ctuRsAddr )
+{
+  CuRecord       r{};
+  const Position pos  = cu.lumaPos();
+  const Size     size = cu.lumaSize();
+  r.w[0] = uint32_t( pos.x ) | uint32_t( pos.y ) << 16;
+  r.w[1] = uint32_t( size.width ) | uint32_t( size.height ) << 8 | uint32_t( cu.predMode() ) << 16 | cuFlags( cu ) << 18;
+  r.w[2] = uint32_t( cu.mergeIdx() ) | uint32_t( cu.mmvdIdx & 63 ) << 3 | uint32_t( cu.geoSplitDir & 63 ) << 9 | uint32_t( cu.geoMergeIdx0() ) << 15
+           | uint32_t( cu.geoMergeIdx1() ) << 18 | uint32_t( cu.imv() ) << 21 | uint32_t( cu.BcwIdx() ) << 23 | uint32_t( cu.interDir() ) << 26
+           | uint32_t( cu.mvpIdx[0] & 1 ) << 28 | uint32_t( cu.mvpIdx[1] & 1 ) << 29;
+  r.w[3] = uint32_t( uint8_t( cu.refIdx[0] ) ) | uint32_t( uint8_t( cu.refIdx[1] ) ) << 8 | uint32_t( uint8_t( cu.qp ) ) << 16
+           | uint32_t( uint8_t( cu.chromaQpAdj ) ) << 24;
+  for( int list = 0; list < 2; list++ )
+  {
+    for( int k = 0; k < 3; k++ )
+    {
+      r.w[4 + 6 * list + 2 * k]     = uint32_t( cu.mv[list][k].getHor() );
+      r.w[4 + 6 * list + 2 * k + 1] = uint32_t( cu.mv[list][k].getVer() );
+    }
+  }
+  r.w[17] = uint32_t( cu.chType() ) | uint32_t( cu.treeType() ) << 1 | uint32_t( cu.modeType() ) << 3 | uint32_t( cu.ispMode() ) << 5
+            | uint32_t( cu.lfnstIdx() ) << 7 | ( cu.mipFlag() ? 1u << 9 : 0u ) | ( cu.mipTransposedFlag() ? 1u << 10 : 0u )
+            | uint32_t( cu.multiRefIdx() ) << 11 | ( cu.colorTransform() ? 1u << 13 : 0u ) | uint32_t( cu.bdpcmMode() ) << 14
+            | uint32_t( cu.bdpcmModeChroma() ) << 16 | ( cu.rootCbf() ? 1u << 18 : 0u ) | uint32_t( cu.sbtInfo() ) << 19
+            | ( cu.planeCbf( 0 ) ? 1u << 27 : 0u ) | ( cu.planeCbf( 1 ) ? 1u << 28 : 0u ) | ( cu.planeCbf( 2 ) ? 1u << 29 : 0u );
+  r.w[18] = uint32_t( uint8_t( cu.intraDir[0] ) ) | uint32_t( uint8_t( cu.intraDir[1] ) ) << 8 | uint32_t( cu.qtDepth ) << 16
+            | uint32_t( cu.depth ) << 20;
+  if( cu.blocks.size() > 1 && cu.blocks[COMPONENT_Cb].valid() )
+  {
+    const CompArea& b = cu.blocks[COMPONENT_Cb];
+    r.w[19]           = uint32_t( b.x ) | uint32_t( b.y ) << 16;
+    r.w[20]           = uint32_t( b.width ) | uint32_t( b.height ) << 8 | 1u << 16;
+  }
+  r.w[20] |= cu.blocks[COMPONENT_Y].valid() ? 1u << 17 : 0u;
+  // DMVR's refinements' place in the CTU's (set for luma CUs of 8x8 and more), the neighbours the parse found
+  const ptrdiff_t dmvrOff = cu.mvdL0SubPuOff - ptrdiff_t( ctuRsAddr ) * ptrdiff_t( cs.pcv->num8x8CtuBlks );
+  r.w[21] = ( dmvrOff >= 0 && dmvrOff < 0x10000 ? uint32_t( dmvrOff ) : 0u ) | ( cu.left ? 1u << 16 : 0u ) | ( cu.above ? 1u << 17 : 0u )
+            | ( cu.smvdMode() ? 1u << 18 : 0u );
+  return r;
+}
+
+// The record of tu, a TU of the CU of index cuIndex in its CTU
+static TuRecord tuRecord( const TransformUnit& tu, uint32_t cuIndex )
+{
+  TuRecord t{};
+  if( tu.blocks[COMPONENT_Y].valid() )
+  {
+    const CompArea& b = tu.blocks[COMPONENT_Y];
+    t.w[0]            = uint32_t( b.x ) | uint32_t( b.y ) << 16;
+    t.w[1]            = uint32_t( b.width ) | uint32_t( b.height ) << 8 | 1u << 16;
+  }
+  if( tu.blocks.size() > 1 && tu.blocks[COMPONENT_Cb].valid() )
+  {
+    const CompArea& b = tu.blocks[COMPONENT_Cb];
+    t.w[2]            = uint32_t( b.x ) | uint32_t( b.y ) << 16;
+    t.w[3]            = uint32_t( b.width ) | uint32_t( b.height ) << 8 | 1u << 16;
+  }
+  t.w[4] = uint32_t( tu.cbf ) | uint32_t( tu.jointCbCr ) << 3 | uint32_t( tu.mtsIdx( 0 ) ) << 5 | uint32_t( tu.mtsIdx( 1 ) ) << 8
+           | uint32_t( tu.mtsIdx( 2 ) ) << 9 | uint32_t( tu.chType() ) << 10;
+  t.w[5] = uint32_t( uint8_t( tu.chromaQp[0] ) ) | uint32_t( uint8_t( tu.chromaQp[1] ) ) << 8;
+  t.w[6] = uint32_t( tu.maxScanPosX[0] ) | uint32_t( tu.maxScanPosX[1] ) << 8 | uint32_t( tu.maxScanPosX[2] ) << 16;
+  t.w[7] = uint32_t( tu.maxScanPosY[0] ) | uint32_t( tu.maxScanPosY[1] ) << 8 | uint32_t( tu.maxScanPosY[2] ) << 16;
+  t.w[8] = cuIndex;
+  return t;
+}
+
 void writeCuRecords( CodingStructure& cs, int ctuRsAddr, std::vector<CuRecord>& out, std::vector<TuRecord>& tus )
 {
   for( const CodingUnit& cu: cs.traverseCUs( ctuRsAddr ) )
   {
-    CuRecord       r{};
-    const Position pos  = cu.lumaPos();
-    const Size     size = cu.lumaSize();
-    uint32_t       flags = 0;
-    flags |= cu.mergeFlag() ? CuRecord::kMerge : 0;
-    flags |= cu.skip() ? CuRecord::kSkip : 0;
-    flags |= cu.mmvdFlag() ? CuRecord::kMmvd : 0;
-    flags |= cu.affineFlag() ? CuRecord::kAffine : 0;
-    flags |= cu.geoFlag() ? CuRecord::kGeo : 0;
-    flags |= cu.ciipFlag() ? CuRecord::kCiip : 0;
-    flags |= cu.chType() == CHANNEL_TYPE_CHROMA ? CuRecord::kChroma : 0;
-    flags |= cu.affineType() == AFFINEMODEL_6PARAM ? CuRecord::kAffine6 : 0;
-    r.w[0] = uint32_t( pos.x ) | uint32_t( pos.y ) << 16;
-    r.w[1] = uint32_t( size.width ) | uint32_t( size.height ) << 8 | uint32_t( cu.predMode() ) << 16 | flags << 18;
-    r.w[2] = uint32_t( cu.mergeIdx() ) | uint32_t( cu.mmvdIdx & 63 ) << 3 | uint32_t( cu.geoSplitDir & 63 ) << 9 | uint32_t( cu.geoMergeIdx0() ) << 15
-             | uint32_t( cu.geoMergeIdx1() ) << 18 | uint32_t( cu.imv() ) << 21 | uint32_t( cu.BcwIdx() ) << 23 | uint32_t( cu.interDir() ) << 26
-             | uint32_t( cu.mvpIdx[0] & 1 ) << 28 | uint32_t( cu.mvpIdx[1] & 1 ) << 29;
-    r.w[3] = uint32_t( uint8_t( cu.refIdx[0] ) ) | uint32_t( uint8_t( cu.refIdx[1] ) ) << 8 | uint32_t( uint8_t( cu.qp ) ) << 16
-             | uint32_t( uint8_t( cu.chromaQpAdj ) ) << 24;
-    for( int list = 0; list < 2; list++ )
-    {
-      for( int k = 0; k < 3; k++ )
-      {
-        r.w[4 + 6 * list + 2 * k]     = uint32_t( cu.mv[list][k].getHor() );
-        r.w[4 + 6 * list + 2 * k + 1] = uint32_t( cu.mv[list][k].getVer() );
-      }
-    }
-    // its TUs
+    CuRecord       r       = cuRecord( cs, cu, ctuRsAddr );
     const uint32_t firstTu = uint32_t( tus.size() );
-    for( const TransformUnit* next = &cu.firstTU; next; next = next->next )   // (the CU's last TU ends the chain)
+    for( const TransformUnit* tu = &cu.firstTU; tu; tu = tu->next )   // (the CU's last TU ends the chain)
     {
-      const TransformUnit& tu = *next;
-      TuRecord             t{};
-      if( tu.blocks[COMPONENT_Y].valid() )
-      {
-        const CompArea& b = tu.blocks[COMPONENT_Y];
-        t.w[0]            = uint32_t( b.x ) | uint32_t( b.y ) << 16;
-        t.w[1]            = uint32_t( b.width ) | uint32_t( b.height ) << 8 | 1u << 16;
-      }
-      if( tu.blocks.size() > 1 && tu.blocks[COMPONENT_Cb].valid() )
-      {
-        const CompArea& b = tu.blocks[COMPONENT_Cb];
-        t.w[2]            = uint32_t( b.x ) | uint32_t( b.y ) << 16;
-        t.w[3]            = uint32_t( b.width ) | uint32_t( b.height ) << 8 | 1u << 16;
-      }
-      t.w[4] = uint32_t( tu.cbf ) | uint32_t( tu.jointCbCr ) << 3 | uint32_t( tu.mtsIdx( 0 ) ) << 5 | uint32_t( tu.mtsIdx( 1 ) ) << 8
-               | uint32_t( tu.mtsIdx( 2 ) ) << 9 | uint32_t( tu.chType() ) << 10;
-      t.w[5] = uint32_t( uint8_t( tu.chromaQp[0] ) ) | uint32_t( uint8_t( tu.chromaQp[1] ) ) << 8;
-      t.w[6] = uint32_t( tu.maxScanPosX[0] ) | uint32_t( tu.maxScanPosX[1] ) << 8 | uint32_t( tu.maxScanPosX[2] ) << 16;
-      t.w[7] = uint32_t( tu.maxScanPosY[0] ) | uint32_t( tu.maxScanPosY[1] ) << 8 | uint32_t( tu.maxScanPosY[2] ) << 16;
-      t.w[8] = uint32_t( out.size() );   // (the CU's index in its CTU's)
-      tus.push_back( t );
+      tus.push_back( tuRecord( *tu, uint32_t( out.size() ) ) );
     }
     const uint32_t numTus = uint32_t( tus.size() ) - firstTu;
     CHECK( numTus > 0xffff, "too many TUs in a CU" );
     r.w[16] = firstTu | numTus << 16;
-    r.w[17] = uint32_t( cu.chType() ) | uint32_t( cu.treeType() ) << 1 | uint32_t( cu.modeType() ) << 3 | uint32_t( cu.ispMode() ) << 5
-              | uint32_t( cu.lfnstIdx() ) << 7 | ( cu.mipFlag() ? 1u << 9 : 0u ) | ( cu.mipTransposedFlag() ? 1u << 10 : 0u )
-              | uint32_t( cu.multiRefIdx() ) << 11 | ( cu.colorTransform() ? 1u << 13 : 0u ) | uint32_t( cu.bdpcmMode() ) << 14
-              | uint32_t( cu.bdpcmModeChroma() ) << 16 | ( cu.rootCbf() ? 1u << 18 : 0u ) | uint32_t( cu.sbtInfo() ) << 19
-              | ( cu.planeCbf( 0 ) ? 1u << 27 : 0u ) | ( cu.planeCbf( 1 ) ? 1u << 28 : 0u ) | ( cu.planeCbf( 2 ) ? 1u << 29 : 0u );
-    r.w[18] = uint32_t( uint8_t( cu.intraDir[0] ) ) | uint32_t( uint8_t( cu.intraDir[1] ) ) << 8 | uint32_t( cu.qtDepth ) << 16
-              | uint32_t( cu.depth ) << 20;
-    if( cu.blocks.size() > 1 && cu.blocks[COMPONENT_Cb].valid() )
-    {
-      const CompArea& b = cu.blocks[COMPONENT_Cb];
-      r.w[19]           = uint32_t( b.x ) | uint32_t( b.y ) << 16;
-      r.w[20]           = uint32_t( b.width ) | uint32_t( b.height ) << 8 | 1u << 16;
-    }
-    r.w[20] |= cu.blocks[COMPONENT_Y].valid() ? 1u << 17 : 0u;
-    // DMVR's refinements' place in the CTU's (set for luma CUs of 8x8 and more), the neighbours the parse found
-    const ptrdiff_t dmvrOff = cu.mvdL0SubPuOff - ptrdiff_t( ctuRsAddr ) * ptrdiff_t( cs.pcv->num8x8CtuBlks );
-    r.w[21] = ( dmvrOff >= 0 && dmvrOff < 0x10000 ? uint32_t( dmvrOff ) : 0u ) | ( cu.left ? 1u << 16 : 0u ) | ( cu.above ? 1u << 17 : 0u )
-              | ( cu.smvdMode() ? 1u << 18 : 0u );
     out.push_back( r );
   }
 }
