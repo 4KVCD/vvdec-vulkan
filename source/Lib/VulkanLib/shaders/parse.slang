@@ -583,23 +583,30 @@ void startDecoder()
   g_bitsNeeded = -8;
 }
 
-// Decodes a bin with context model ctxId and updates the model (BinDecoder::decodeBin). With PROFILE, decodeBin times
-// decodeBinBody; without it, the #if folds the body into decodeBin. decodeBinEP below is built the same way.
-uint decodeBin( int ctxId )
+// Context model ctxId's two probability states and adaptation rates (s_ctx's word pair). Fetching the models of the
+// next bins together, before the first of them is decoded, waits for shared memory once.
+uint2 contextModel( int ctxId )
+{
+  return uni( s_ctx[ctxId] );
+}
+
+// Decodes a bin with context model ctxId, whose states and rates contextModel fetched as cr, and updates the model
+// (BinDecoder::decodeBin). With PROFILE, decodeBinWith times decodeBinBody; without it, the #if folds the body into
+// decodeBinWith. decodeBinEP below is built the same way.
+uint decodeBinWith( int ctxId, uint2 cr )
 {
   PROF_COUNT( kProfBins, 1 );
   g_binCount++;
 #if PROFILE
   PROF_BEGIN_CYCLES( binStart );
-  const uint bin = decodeBinBody( ctxId );
+  const uint bin = decodeBinBody( ctxId, cr );
   PROF_END_CYCLES( kProfDecode, binStart );
   return bin;
 }
 
-uint decodeBinBody( int ctxId )
+uint decodeBinBody( int ctxId, uint2 cr )
 {
 #endif
-  const uint2 cr   = uni( s_ctx[ctxId] );
   uint       s0    = cr.x & 0xffffu;
   uint       s1    = cr.x >> 16;
   const uint q     = ( s0 + s1 ) >> 8;
@@ -638,6 +645,12 @@ uint decodeBinBody( int ctxId )
   s1               = uint( int( s1 ) + ( d1 >> rate1 ) * 2 ) & 0xffffu;
   s_ctx[ctxId].x   = s0 | ( s1 << 16 );
   return bin;
+}
+
+// Decodes a bin with context model ctxId (decodeBinWith, the model fetched first)
+uint decodeBin( int ctxId )
+{
+  return decodeBinWith( ctxId, contextModel( ctxId ) );
 }
 
 // Decodes a bypass bin, one of equal probabilities (BinDecoder::decodeBinEP)

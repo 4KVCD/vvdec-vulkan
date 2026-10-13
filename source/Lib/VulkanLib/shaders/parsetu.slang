@@ -748,27 +748,31 @@ void mtsIdx( inout CuCtx ctx )
 // long, and what they take the reconstruction's shaders cannot have.)
 static const int kCodedPositions = 32 * 64;
 // its levels, in 16 bits: absolute while their group is parsed (regular coding), signed once it is (and in transform
-// skip blocks); and zeros two rows of 64 further, which templateAbsSum reads below the last coded row. (A magnitude of
+// skip blocks); and zeros two rows of 64 further, which the templates read below the last coded row. (A magnitude of
 // 2^15 is stored as -2^15 and reads back right through abs(); a conforming stream has no level of +2^15.)
 static const int kCoefWords = kCodedPositions + 2 * 64;
 groupshared int16_t s_coef[kCoefWords];
-// CtxTpl, a byte per position: the sum of the absolute first-pass levels in the position's template | the number of
-// nonzero ones << 5. After the templates' kTplWords words, one word a thread, never read: absVal1stPass's threads add
-// 0 there when they have no template to add to.
-static const int kTplWords = kCodedPositions / 4;
-groupshared uint s_tpl[kTplWords + 32];
 // With dependent quantization, a bit per position: the level is 2 |q| less 1 there (the quantizer's state was 2 or 3)
 static const int kDqWords = kCodedPositions / 32;
 groupshared uint s_dqBits[kDqWords];
-// (s_coef, s_tpl and s_dqBits are zero whenever a block starts: after each block, writeLevels clears what it set)
+// (s_coef and s_dqBits are zero whenever a block starts: after each block, writeLevels clears what it set)
+
+// The current coefficient group's templates (CoeffCodingContext's), a lane per position of the group (lane r: the
+// group's raster position r): the template of a position is the five positions one and two to its right, one and two
+// below it and below-right of it. g_tplSig holds the sum of the template's first-pass levels | the number of nonzero
+// ones << 5 (CtxTpl: the significance flag's and the greater-than flags' contexts); g_tplAbs the sum of the template's
+// absolute levels so far (templateAbsSum's: the Rice parameter). loadGroupTemplates works them out when the group
+// starts; the group's levels then add to them as they are decoded (addToGroupTemplates).
+static uint g_tplSig;
+static uint g_tplAbs;
 
 static int g_outCount;   // the block's nonzero levels
 
 // Lane arrays (laneValue, setLane). Of the current block, its scans as s_scanTab holds them, word k in thread k: the
 // scan inside a group (g_innerScan), and the scan of the groups (up to 64 words: g_groupScan0, then g_groupScan1);
-// initCctx loads them. Of the current group: the block position and the absolute level of its k-th nonzero level in
-// decoding order (g_sigPos, g_sigAbs), and for its k-th level greater than 1, that level's index among the nonzero
-// ones (g_gt1Sig).
+// initCctx loads them. Of the current group: the block position | the raster position in the group << 16, and the
+// absolute level, of its k-th nonzero level in decoding order (g_sigPos, g_sigAbs), and for its k-th level greater
+// than 1, that level's index among the nonzero ones (g_gt1Sig).
 static uint g_innerScan;
 static uint g_groupScan0;
 static uint g_groupScan1;
@@ -809,18 +813,86 @@ struct Cctx
 static Cctx g_cc;
 
 
-// The block position of scan position scanPos, which lies in the current group. vvdec's g_scanOrder[SCAN_GROUPED_4x4]
-// scans the groups diagonally and, within each group, its positions diagonally; the group's scan is g_innerScan.
-int blockPos( int scanPos )
+// The raster position in the current group of scan position scanPos, which lies in the group. vvdec's
+// g_scanOrder[SCAN_GROUPED_4x4] scans the groups diagonally and, within each group, its positions diagonally; the
+// group's scan is g_innerScan.
+int groupRaster( int scanPos )
 {
-  const int inner = int( laneValue( g_innerScan, uint( scanPos & ( ( 1 << g_cc.log2CGSize ) - 1 ) ) ) & 0xffffu );
+  return int( laneValue( g_innerScan, uint( scanPos & ( ( 1 << g_cc.log2CGSize ) - 1 ) ) ) & 0xffffu );
+}
+
+// The block position of the current group's raster position inner
+int blockPosOfRaster( int inner )
+{
   return g_cc.subBase + ( inner >> g_cc.log2CGW ) * g_cc.width + ( inner & ( ( 1 << g_cc.log2CGW ) - 1 ) );
 }
 
-// The template byte of position pos (CtxTpl)
-uint tplGet( int pos )
+// The block position of scan position scanPos, which lies in the current group
+int blockPos( int scanPos )
 {
-  return ( uni( s_tpl[pos >> 2] ) >> uint( ( pos & 3 ) * 8 ) ) & 0xffu;
+  return blockPosOfRaster( groupRaster( scanPos ) );
+}
+
+// The first-pass level (sig + gt1 + par + 2 gt3) that a level of magnitude v was decoded with: v up to 3, else 4 plus
+// its parity (the rest came in the remainder)
+int firstPassLevel( int v )
+{
+  return v <= 3 ? v : 4 + ( v & 1 );
+}
+
+// Works out the current group's templates (g_tplSig, g_tplAbs) from the levels decoded so far: those of the groups
+// right of and below it (its own positions hold no level yet, and the positions outside the block count as zero).
+// Each lane works out its position's template, the five positions in one round of reads.
+void loadGroupTemplates()
+{
+  const int r     = g_lane;
+  const int cgw   = 1 << g_cc.log2CGW;
+  const int x     = ( g_cc.subSetPosX << g_cc.log2CGW ) + ( r & ( cgw - 1 ) );
+  const int y     = ( g_cc.subSetPosY << g_cc.log2CGH ) + ( r >> g_cc.log2CGW );
+  const int pos   = y * g_cc.width + x;
+  const bool mine = r < ( 1 << g_cc.log2CGSize );
+  int        sum1 = 0, count = 0, sumAbs = 0;
+  [unroll]
+  for( int k = 0; k < 5; k++ )
+  {
+    const int  dx     = k == 0 || k == 4 ? 1 : ( k == 1 ? 2 : 0 );
+    const int  dy     = k == 2 || k == 4 ? 1 : ( k == 3 ? 2 : 0 );
+    const bool inside = mine && x + dx < g_cc.width && y + dy < g_cc.height;
+    const int  at     = inside ? pos + dy * g_cc.width + dx : 0;   // (a lane off the block reads position 0, unused)
+    const int  v      = inside ? abs( int( s_coef[at] ) ) : 0;
+    sum1 += firstPassLevel( v );
+    count += v != 0 ? 1 : 0;
+    sumAbs += v;
+  }
+  g_tplSig = uint( sum1 + ( count << 5 ) );
+  g_tplAbs = uint( sumAbs );
+}
+
+// The lanes (the current group's raster positions) whose templates hold raster position q of the group: the
+// positions one and two left of q, one and two above it, and above-left of it, inside the group
+uint groupTemplateMask( int q )
+{
+  const int cgw  = 1 << g_cc.log2CGW;
+  const int x    = q & ( cgw - 1 );
+  const int y    = q >> g_cc.log2CGW;
+  uint      mask = 0;
+  mask |= x >= 1 ? 1u << uint( q - 1 ) : 0u;
+  mask |= x >= 2 ? 1u << uint( q - 2 ) : 0u;
+  mask |= y >= 1 ? 1u << uint( q - cgw ) : 0u;
+  mask |= y >= 2 ? 1u << uint( q - 2 * cgw ) : 0u;
+  mask |= x >= 1 && y >= 1 ? 1u << uint( q - cgw - 1 ) : 0u;
+  return mask;
+}
+
+// A level decoded at the group's raster position q adds to the templates that hold q: sig to g_tplSig (the
+// first-pass level and the count of nonzero ones, 32 + level; 0 after the first pass), abs to g_tplAbs
+void addToGroupTemplates( int q, uint sig, uint abs )
+{
+  if( ( ( groupTemplateMask( q ) >> uint( g_lane ) ) & 1u ) != 0 )
+  {
+    g_tplSig += sig;
+    g_tplAbs += abs;
+  }
 }
 
 // The coded_sub_block_flag of the group at raster index pos among the groups
@@ -856,8 +928,8 @@ int tbAreaAfterCoefZeroOut( int t, int comp, int w, int h )
 }
 
 // Sets g_cc up for TU t's block of component comp, as CoeffCodingContext's constructor does, and zeroes g_outCount.
-// (vvdec's residual_coding and the constructor also clear the block's levels and templates; here s_coef and s_tpl are
-// already zero, as writeLevels clears them after each block.)
+// (vvdec's residual_coding and the constructor also clear the block's levels and templates; here s_coef is already
+// zero, as writeLevels clears it after each block, and the templates are the groups' lanes.)
 void initCctx( int t, int comp, bool signHide )
 {
   const int4 b      = tuBlock( t, comp );
@@ -925,16 +997,12 @@ uint groupScanWord( int k )
   return k < 32 ? laneValue( g_groupScan0, uint( k ) ) : laneValue( g_groupScan1, uint( k - 32 ) );
 }
 
-// Zeroes s_coef, s_tpl and s_dqBits when the workgroup starts; writeLevels keeps them zero between blocks from then on
+// Zeroes s_coef and s_dqBits when the workgroup starts; writeLevels keeps them zero between blocks from then on
 void clearResidualMemory()
 {
   for( int i = g_lane; i < kCoefWords; i += 32 )
   {
     s_coef[i] = int16_t( 0 );
-  }
-  for( int i = g_lane; i < kTplWords; i += 32 )
-  {
-    s_tpl[i] = 0;
   }
   for( int i = g_lane; i < kDqWords; i += 32 )
   {
@@ -967,14 +1035,15 @@ void initSubblock( int subSetId )
   }
 }
 
-// The context of sig_coeff_flag at blkPos, from its template and the dependent quantization state
-// (CoeffCodingContext::sigCtxIdAbs); keeps the template's values for ctxOffsetAbs
-int sigCtxIdAbs( int blkPos, int state )
+// The context of sig_coeff_flag at the current group's raster position q (block position blkPos), from its template
+// and the dependent quantization state (CoeffCodingContext::sigCtxIdAbs); keeps the template's values for
+// ctxOffsetAbs
+int sigCtxIdAbs( int q, int blkPos, int state )
 {
   const int posY   = blkPos >> g_cc.log2W;
   const int posX   = blkPos & ( g_cc.width - 1 );
   const int diag   = posX + posY;
-  const int tplVal = int( tplGet( blkPos ) );
+  const int tplVal = int( laneValue( g_tplSig, uint( q ) ) );
   const int numPos = tplVal >> 5;
   const int sumAbs = tplVal & 31;
   int       ctxOfs = min( ( sumAbs + 1 ) >> 1, 3 ) + ( diag < 2 ? 4 : 0 );
@@ -986,24 +1055,6 @@ int sigCtxIdAbs( int blkPos, int state )
   g_cc.tmplCpSum1 = sumAbs - numPos;
   const int set   = max( 0, state - 1 );
   return ( set == 0 ? g_cc.sigFlagCtx0 : ( set == 1 ? g_cc.sigFlagCtx1 : g_cc.sigFlagCtx2 ) ) + ctxOfs;
-}
-
-// Records the level the first pass decoded at blkPos, and adds it to the templates that contain blkPos: those of the
-// positions two and one above it, above-left of it, and two and one to its left (CoeffCodingContext::absVal1stPass).
-// Threads 0 to 4 add to one template each, all with one atomic add to shared memory: no round trip. The other threads,
-// and a thread whose position is off the block, add 0 to a word of their own: an if on the thread here made the
-// compiler run the whole parse as vector code.
-void absVal1stPass( int blkPos, int absLevel1 )
-{
-  s_coef[blkPos] = int16_t( absLevel1 );
-  const int  posY = blkPos >> g_cc.log2W;
-  const int  posX = blkPos & ( g_cc.width - 1 );
-  const int  w    = g_cc.width;
-  const int  l    = g_lane;
-  const bool add  = ( l == 0 && posY > 1 ) || ( l == 1 && posY > 0 && posX > 0 ) || ( l == 2 && posY > 0 ) || ( l == 3 && posX > 1 )
-                   || ( l == 4 && posX > 0 );
-  const int  pos  = blkPos - ( l == 0 ? 2 * w : ( l == 1 ? w + 1 : ( l == 2 ? w : ( l == 3 ? 2 : 1 ) ) ) );
-  InterlockedAdd( s_tpl[add ? pos >> 2 : kTplWords + l], add ? uint( 32 + absLevel1 ) << uint( ( pos & 3 ) * 8 ) : 0u );
 }
 
 // The context offset of the greater-than and parity flags at the position sigCtxIdAbs last looked at
@@ -1020,42 +1071,11 @@ int ctxOffsetAbs()
   return offset;
 }
 
-// The sum of the levels' magnitudes in blkPos's template (the positions one and two to its right, one and two below
-// it, and below-right of it), less 5 * baseLevel, clipped to 0..31 (CoeffCodingContext::templateAbsSum); it picks
-// the Rice parameter
-int templateAbsSum( int blkPos, int baseLevel )
+// The sum of the levels' magnitudes in the template of the current group's raster position q, less 5 * baseLevel,
+// clipped to 0..31 (CoeffCodingContext::templateAbsSum); it picks the Rice parameter
+int templateAbsSum( int q, int baseLevel )
 {
-  const int posY = blkPos >> g_cc.log2W;
-  const int posX = blkPos & ( g_cc.width - 1 );
-  const int w    = g_cc.width;
-  int       sum  = 0;
-  if( posX + 2 < w )
-  {
-    sum += abs( uni( int( s_coef[blkPos + 1] ) ) );
-    sum += abs( uni( int( s_coef[blkPos + 2] ) ) );
-    if( posY + 1 < g_cc.height )
-    {
-      sum += abs( uni( int( s_coef[blkPos + w + 1] ) ) );
-    }
-  }
-  else if( posX + 1 < w )
-  {
-    sum += abs( uni( int( s_coef[blkPos + 1] ) ) );
-    if( posY + 1 < g_cc.height )
-    {
-      sum += abs( uni( int( s_coef[blkPos + w + 1] ) ) );
-    }
-  }
-  if( posY + 2 < g_cc.height )
-  {
-    sum += abs( uni( int( s_coef[blkPos + w] ) ) );
-    sum += abs( uni( int( s_coef[blkPos + 2 * w] ) ) );
-  }
-  else if( posY + 1 < g_cc.height )
-  {
-    sum += abs( uni( int( s_coef[blkPos + w] ) ) );
-  }
-  return max( min( sum - 5 * baseLevel, 31 ), 0 );
+  return max( min( int( laneValue( g_tplAbs, uint( q ) ) ) - 5 * baseLevel, 31 ), 0 );
 }
 
 // Parses the last significant position (CABACReader::last_sig_coeff: its x and y prefixes, then their suffixes) and
@@ -1123,6 +1143,7 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
     return 0;
   }
   setSigGroup();
+  loadGroupTemplates();
 
   // First pass, while the budget of context-coded bins lasts: sig_coeff_flag, abs_level_gtx_flag[0] (greater than 1),
   // par_level_flag and abs_level_gtx_flag[1] (greater than 3)
@@ -1137,30 +1158,43 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
   int       sumAbsLevels = 0;   // the group's absolute levels added up, for sign data hiding
   for( ; nextSigPos >= minSubPos && remRegBins >= 4; nextSigPos-- )
   {
-    const int blkPos  = blockPos( nextSigPos );
+    const int q       = groupRaster( nextSigPos );
+    const int blkPos  = blockPosOfRaster( q );
     bool      sigFlag = numNonZero == 0 && nextSigPos == inferSigPos;
+    // The contexts of the significance flag and of the greater-than-1 flag, fetched together (the greater-than flags'
+    // and the parity flag's come from the template sigCtxIdAbs keeps; an inferred significance keeps the last one's,
+    // as vvdec's ctxOffsetAbs does)
+    const int sigCtx = sigFlag ? 0 : sigCtxIdAbs( q, blkPos, state );
+    const int ctxOff = ctxOffsetAbs();
+    const int gt1Ctx = g_cc.gtx1Ctx + ctxOff;
+    const uint2 sigModel = contextModel( sigCtx );
+    const uint2 gt1Model = contextModel( gt1Ctx );
     if( !sigFlag )
     {
-      sigFlag = decodeBin( sigCtxIdAbs( blkPos, state ) ) != 0;
+      sigFlag = decodeBinWith( sigCtx, sigModel ) != 0;
       remRegBins--;
     }
     if( sigFlag )
     {
-      const int ctxOff = ctxOffsetAbs();
       stateVal         = ( uint( state >> 1 ) & 1u ) | ( stateVal << 1 );
-      g_sigPos         = setLane( g_sigPos, numNonZero, blkPos );
+      g_sigPos         = setLane( g_sigPos, numNonZero, blkPos | q << 16 );
       numNonZero++;
       firstNZPos = nextSigPos;
       lastNZPos  = max( lastNZPos, nextSigPos );
-      const uint gt1Flag = decodeBin( g_cc.gtx1Ctx + ctxOff );
+      const uint gt1Flag = decodeBinWith( gt1Ctx, gt1Model );
       remRegBins--;
       int absVal;
       if( gt1Flag != 0 )
       {
-        const uint parFlag = decodeBin( g_cc.parFlagCtx + ctxOff );
+        // (the parity flag's and the greater-than-3 flag's contexts, fetched together)
+        const int   parCtx   = g_cc.parFlagCtx + ctxOff;
+        const int   gt3Ctx   = g_cc.gtx0Ctx + ctxOff;
+        const uint2 parModel = contextModel( parCtx );
+        const uint2 gt3Model = contextModel( gt3Ctx );
+        const uint parFlag = decodeBinWith( parCtx, parModel );
         numGt1++;
         remRegBins--;
-        const uint gt2Flag = decodeBin( g_cc.gtx0Ctx + ctxOff );
+        const uint gt2Flag = decodeBinWith( gt3Ctx, gt3Model );
         gt2Mask |= gt2Flag << uint( numGt1 - 1 );
         remRegBins--;
         g_gt1Sig             = setLane( g_gt1Sig, numGt1 - 1, numNonZero - 1 );
@@ -1174,7 +1208,8 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
       }
       g_sigAbs = setLane( g_sigAbs, numNonZero - 1, absVal );
       sumAbsLevels += absVal;
-      absVal1stPass( blkPos, absVal );
+      s_coef[blkPos] = int16_t( absVal );
+      addToGroupTemplates( q, 32u + uint( absVal ), uint( absVal ) );
     }
     else
     {
@@ -1189,13 +1224,16 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
     if( ( gt2Mask & 1u ) != 0 )
     {
       const int sig     = laneValue( g_gt1Sig, k );
-      const int pos     = laneValue( g_sigPos, sig );
-      const int sumAll  = templateAbsSum( pos, 4 );
+      const int posQ    = laneValue( g_sigPos, sig );
+      const int pos     = posQ & 0xffff;
+      const int q       = posQ >> 16;
+      const int sumAll  = templateAbsSum( q, 4 );
       const int ricePar = kGoRiceParsCoeff[sumAll];
       const int rem     = int( decodeRemAbsEP( ricePar, COEF_REMAIN_BIN_REDUCTION, g_cc.maxLog2TrRange ) );
       const int level   = laneValue( g_sigAbs, sig ) + ( rem << 1 );
       g_sigAbs          = setLane( g_sigAbs, sig, level );
       s_coef[pos]       = int16_t( level );
+      addToGroupTemplates( q, 0u, uint( rem << 1 ) );
       sumAbsLevels += rem << 1;
     }
   }
@@ -1203,8 +1241,9 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
   for( ; nextSigPos >= minSubPos; nextSigPos-- )
   {
     const int sub1   = ( state >> 1 ) & 1;
-    const int blkPos = blockPos( nextSigPos );
-    const int sumAll = templateAbsSum( blkPos, 0 );
+    const int q      = groupRaster( nextSigPos );
+    const int blkPos = blockPosOfRaster( q );
+    const int sumAll = templateAbsSum( q, 0 );
     const int rice   = kGoRiceParsCoeff[sumAll];
     const int pos0   = ( state < 2 ? 1 : 2 ) << rice;
     const int rem    = int( decodeRemAbsEP( rice, COEF_REMAIN_BIN_REDUCTION, g_cc.maxLog2TrRange ) );
@@ -1213,8 +1252,9 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
     if( tcoeff != 0 )
     {
       s_coef[blkPos] = int16_t( tcoeff );
+      addToGroupTemplates( q, 0u, uint( tcoeff ) );
       stateVal       = uint( sub1 ) | ( stateVal << 1 );
-      g_sigPos       = setLane( g_sigPos, numNonZero, blkPos );
+      g_sigPos       = setLane( g_sigPos, numNonZero, blkPos | q << 16 );
       g_sigAbs       = setLane( g_sigAbs, numNonZero, tcoeff );
       sumAbsLevels += tcoeff;
       numNonZero++;
@@ -1239,10 +1279,11 @@ int residualCodingSubblock( int stateTransTab, bool depQuant, inout int state )
   {
     const uint bit = uint( numNonZero - 1 - g_lane );
     const int  c   = g_sigAbs;
-    s_coef[g_sigPos] = int16_t( ( ( signs >> bit ) & 1u ) != 0 ? -c : c );
+    const int  pos = g_sigPos & 0xffff;
+    s_coef[pos]    = int16_t( ( ( signs >> bit ) & 1u ) != 0 ? -c : c );
     if( depQuant && ( ( stateVal >> bit ) & 1u ) != 0 )
     {
-      InterlockedOr( s_dqBits[g_sigPos >> 5], 1u << uint( g_sigPos & 31 ) );
+      InterlockedOr( s_dqBits[pos >> 5], 1u << uint( pos & 31 ) );
     }
   }
   g_outCount += numNonZero;
@@ -1510,8 +1551,7 @@ void writeLevelsBody( int t, int comp, int4 b, int w, int h, bool dq )
   const bool room = at + size <= uint( pc.levelCap );
   setTuLevels( t, comp, at, w );
   // Each thread takes one column of the rectangle (its lane's): writes its levels when there is room, then zeroes
-  // s_coef there and the s_tpl words (every level the block has, and every template its levels added to, lie inside
-  // the rectangle: the templates are above and left of their levels)
+  // s_coef there (every level the block has lies inside the rectangle)
   for( int u = g_lane; u < h << 5; u += 32 )
   {
     const int x = u & 31;
@@ -1532,10 +1572,6 @@ void writeLevelsBody( int t, int comp, int4 b, int w, int h, bool dq )
       pc.levels[at + uint( y * w + x )] = int16_t( v );
     }
     s_coef[pos] = int16_t( 0 );
-    if( ( x & 3 ) == 0 )
-    {
-      s_tpl[pos >> 2] = 0u;
-    }
   }
   GroupMemoryBarrierWithGroupSync();
   if( dq )
