@@ -340,6 +340,12 @@ private:
     bool shaderInfo = false, shaderClock = false, subgroupBallot = false, maintenance5 = false, pipelineBinary = false;
   };
   DeviceExtensions findExtensions() const;
+  // createDevice's steps: the queues to create (returns their number), whether the shaders may run in waves of 32
+  // threads, and whether the device has the optional features the decoder uses
+  uint32_t queueCreateInfos( const AsyncQueueLayout& async, VkDeviceQueueCreateInfo infos[3] ) const;
+  bool     wave32Possible( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl ) const;
+  bool     hasShaderClocks() const;
+  bool     hasPipelineBinaries() const;
   bool createDevice( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl, const AsyncQueueLayout& async );
   void getQueues( const AsyncQueueLayout& async );
   bool createPipelineLayout();

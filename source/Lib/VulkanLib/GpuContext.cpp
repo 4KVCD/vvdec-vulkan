@@ -390,113 +390,166 @@ Context::DeviceExtensions Context::findExtensions() const
   return found;
 }
 
-bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl, const AsyncQueueLayout& async )
+// The queues to create into infos: the compute queue, the copy queue, and the async family's (async.queues). Returns
+// their number.
+uint32_t Context::queueCreateInfos( const AsyncQueueLayout& async, VkDeviceQueueCreateInfo infos[3] ) const
 {
-  // the queues: the compute queue, the copy queue, the async family's
-  const float             priority                       = 1.0f;
-  const float             asyncPriorities[2 * kMaxAsync] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
-  VkDeviceQueueCreateInfo queueInfos[3]                  = { { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO },
-                                                             { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO },
-                                                             { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO } };
-  uint32_t                numQueueInfos                  = 0;
+  // every queue gets the same priority
+  static const float kPriorities[2 * kMaxAsync] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+  uint32_t           count                      = 0;
   for( const uint32_t family: { m_queueFamily, m_transferFamily, m_asyncFamily } )
   {
     if( family != UINT32_MAX )
     {
-      queueInfos[numQueueInfos].queueFamilyIndex = family;
-      queueInfos[numQueueInfos].queueCount       = family == m_asyncFamily ? async.queues : 1;
-      queueInfos[numQueueInfos].pQueuePriorities = family == m_asyncFamily ? asyncPriorities : &priority;
-      numQueueInfos++;
+      infos[count]                  = VkDeviceQueueCreateInfo{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
+      infos[count].queueFamilyIndex = family;
+      infos[count].queueCount       = family == m_asyncFamily ? async.queues : 1;
+      infos[count].pQueuePriorities = kPriorities;
+      count++;
     }
   }
+  return count;
+}
 
-  // waves of 32 threads where the shaders run better so (GPUs with both sizes, AMD's): the size, subgroup size control
+// Whether the shaders may ask for waves of 32 threads, on GPUs that run both sizes (AMD's), where the shaders run
+// better so: it takes Vulkan 1.3's subgroup size control for compute shaders, with 32 among the sizes
+bool Context::wave32Possible( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl ) const
+{
   VkPhysicalDeviceSubgroupSizeControlProperties sizes{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES };
   VkPhysicalDeviceProperties2                   props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
   props2.pNext = &sizes;
   m_api.vkGetPhysicalDeviceProperties2( m_physical, &props2 );
-  m_wave32 = props.apiVersion >= VK_API_VERSION_1_3 && subgroupSizeControl && sizes.minSubgroupSize <= 32 && sizes.maxSubgroupSize >= 32
-             && ( sizes.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT );
+  return props.apiVersion >= VK_API_VERSION_1_3 && subgroupSizeControl && sizes.minSubgroupSize <= 32 && sizes.maxSubgroupSize >= 32
+         && ( sizes.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT );
+}
 
-  // the features the decoder needs (checkFeatures)
-  VkPhysicalDeviceVulkan12Features enable12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
-  VkPhysicalDeviceVulkan11Features enable11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
-  VkPhysicalDeviceSubgroupSizeControlFeatures enableSize{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES };
-  enableSize.subgroupSizeControl    = VK_TRUE;
-  enable11.pNext                    = m_wave32 ? &enableSize : nullptr;
-  enable12.pNext                    = &enable11;
-  enable12.bufferDeviceAddress      = VK_TRUE;
-  enable12.storageBuffer8BitAccess  = VK_TRUE;
-  enable12.shaderInt8               = VK_TRUE;
-  enable12.timelineSemaphore        = asyncQueue() ? VK_TRUE : VK_FALSE;
-  enable11.storageBuffer16BitAccess = VK_TRUE;
-  VkPhysicalDeviceFeatures2 enable{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-  enable.pNext                = &enable12;
-  enable.features.shaderInt16 = VK_TRUE;
-  enable.features.shaderInt64 = VK_TRUE;
+// Whether the device has VK_KHR_shader_clock's subgroup clock and device clock (for the parse's profile:
+// shaders/parse.slang's PROFILE)
+bool Context::hasShaderClocks() const
+{
+  VkPhysicalDeviceShaderClockFeaturesKHR clock{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR };
+  VkPhysicalDeviceFeatures2              features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+  features.pNext = &clock;
+  m_api.vkGetPhysicalDeviceFeatures2( m_physical, &features );
+  return clock.shaderSubgroupClock && clock.shaderDeviceClock;
+}
 
-  // the extensions the decoder uses where the device has them
-  m_profiling                    = m_options.profile;
-  const DeviceExtensions found   = findExtensions();
-  bool                   hasClock = found.shaderClock;
-  std::vector<const char*> deviceExtensions;
-  // the subgroup's clock and the device's, for the parse's profile (shaders/parse.slang's PROFILE)
-  VkPhysicalDeviceShaderClockFeaturesKHR enableClock{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR };
-  if( hasClock )
+// Whether the device can give out the compiled pipelines' binaries (VK_KHR_pipeline_binary, which needs
+// VK_KHR_maintenance5)
+bool Context::hasPipelineBinaries() const
+{
+  VkPhysicalDeviceMaintenance5FeaturesKHR   maintenance5{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR };
+  VkPhysicalDevicePipelineBinaryFeaturesKHR binaries{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
+  VkPhysicalDeviceFeatures2                 features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+  maintenance5.pNext = &binaries;
+  features.pNext     = &maintenance5;
+  m_api.vkGetPhysicalDeviceFeatures2( m_physical, &features );
+  return maintenance5.maintenance5 && binaries.pipelineBinaries;
+}
+
+// The features vkCreateDevice turns on, chained from enable, and the names of the device extensions it turns on. The
+// chain points into the structure, so it is never copied.
+struct DeviceFeatures
+{
+  VkPhysicalDeviceFeatures2                   enable{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+  VkPhysicalDeviceVulkan12Features            enable12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+  VkPhysicalDeviceVulkan11Features            enable11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
+  VkPhysicalDeviceSubgroupSizeControlFeatures subgroupSize{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES };
+  VkPhysicalDeviceShaderClockFeaturesKHR      clock{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR };
+  VkPhysicalDeviceMaintenance5FeaturesKHR     maintenance5{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR };
+  VkPhysicalDevicePipelineBinaryFeaturesKHR   binaries{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
+  std::vector<const char*>                    extensions;
+
+  // The features the decoder needs (Context::checkFeatures): timeline semaphores for the async queues, and subgroup size
+  // control for waves of 32 threads
+  DeviceFeatures( bool timelineSemaphore, bool subgroupSizeControl )
   {
-    VkPhysicalDeviceFeatures2 features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-    features.pNext = &enableClock;
-    m_api.vkGetPhysicalDeviceFeatures2( m_physical, &features );
-    hasClock          = enableClock.shaderSubgroupClock && enableClock.shaderDeviceClock;
-    enableClock.pNext = nullptr;
+    enable.features.shaderInt16       = VK_TRUE;
+    enable.features.shaderInt64       = VK_TRUE;
+    enable12.bufferDeviceAddress      = VK_TRUE;
+    enable12.storageBuffer8BitAccess  = VK_TRUE;
+    enable12.shaderInt8               = VK_TRUE;
+    enable12.timelineSemaphore        = timelineSemaphore ? VK_TRUE : VK_FALSE;
+    enable11.storageBuffer16BitAccess = VK_TRUE;
+    subgroupSize.subgroupSizeControl  = VK_TRUE;
+    if( subgroupSizeControl )
+    {
+      chain( subgroupSize );
+    }
+    chain( enable11 );
+    chain( enable12 );
   }
-  if( hasClock )
+  DeviceFeatures( const DeviceFeatures& )            = delete;
+  DeviceFeatures& operator=( const DeviceFeatures& ) = delete;
+
+  // VK_KHR_shader_clock's subgroup and device clocks
+  void enableShaderClock()
   {
-    enableClock.pNext = enable.pNext;
-    enable.pNext      = &enableClock;
+    clock.shaderSubgroupClock = VK_TRUE;
+    clock.shaderDeviceClock   = VK_TRUE;
+    chain( clock );
+    extensions.push_back( kExtShaderClock );
   }
-  m_shaderClock = hasClock;
+
+  // VK_KHR_pipeline_binary, with the VK_KHR_maintenance5 it needs
+  void enablePipelineBinaries()
+  {
+    binaries.pipelineBinaries = VK_TRUE;
+    maintenance5.maintenance5 = VK_TRUE;
+    chain( binaries );
+    chain( maintenance5 );
+    extensions.push_back( kExtMaintenance5 );
+    extensions.push_back( kExtPipelineBinary );
+  }
+
+  // Puts feature (with nothing chained to it yet) at the front of the chain.
+  template<typename Feature>
+  void chain( Feature& feature )
+  {
+    feature.pNext = enable.pNext;
+    enable.pNext  = &feature;
+  }
+};
+
+bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl, const AsyncQueueLayout& async )
+{
+  VkDeviceQueueCreateInfo queueInfos[3];
+  const uint32_t          numQueueInfos = queueCreateInfos( async, queueInfos );
+  m_wave32                              = wave32Possible( props, subgroupSizeControl );
+
+  // The features the decoder needs, then the extensions it uses where the device has them: VVDEC_GPU_PROFILE=1's and
+  // VVDEC_GPU_ISA's (findExtensions), the parse's OpSubgroupReadInvocationKHR (GpuContext.h's subgroupBallot), and the
+  // compiled pipelines' binaries kept in a file (PipelineBinaries), unless VVDEC_GPU_CACHE=0.
+  DeviceFeatures         features( asyncQueue(), m_wave32 );
+  const DeviceExtensions found = findExtensions();
+  const bool binaries = found.maintenance5 && found.pipelineBinary && props.apiVersion >= VK_API_VERSION_1_3 && m_options.pipelineCache != "0"
+                        && hasPipelineBinaries();
+  m_profiling      = m_options.profile;
+  m_shaderClock    = found.shaderClock && hasShaderClocks();
+  m_subgroupBallot = found.subgroupBallot;
   if( found.shaderInfo )
   {
-    deviceExtensions.push_back( kExtShaderInfo );
+    features.extensions.push_back( kExtShaderInfo );
   }
-  if( hasClock )
+  if( m_shaderClock )
   {
-    deviceExtensions.push_back( kExtShaderClock );
+    features.enableShaderClock();
   }
-  // for the parse shader, OpSubgroupReadInvocationKHR (GpuContext.h's subgroupBallot)
-  if( found.subgroupBallot )
+  if( m_subgroupBallot )
   {
-    deviceExtensions.push_back( kExtSubgroupBallot );
-  }
-  m_subgroupBallot = found.subgroupBallot;
-  // the compiled pipelines' binaries kept in a file (PipelineBinaries), unless VVDEC_GPU_CACHE=0
-  VkPhysicalDeviceMaintenance5FeaturesKHR   enableMaintenance5{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR };
-  VkPhysicalDevicePipelineBinaryFeaturesKHR enableBinaries{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
-  bool binaries = found.maintenance5 && found.pipelineBinary && props.apiVersion >= VK_API_VERSION_1_3 && m_options.pipelineCache != "0";
-  if( binaries )
-  {
-    enableMaintenance5.pNext = &enableBinaries;
-    VkPhysicalDeviceFeatures2 features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-    features.pNext = &enableMaintenance5;
-    m_api.vkGetPhysicalDeviceFeatures2( m_physical, &features );
-    binaries = enableMaintenance5.maintenance5 && enableBinaries.pipelineBinaries;
+    features.extensions.push_back( kExtSubgroupBallot );
   }
   if( binaries )
   {
-    enableBinaries.pNext     = enable.pNext;
-    enableMaintenance5.pNext = &enableBinaries;
-    enable.pNext             = &enableMaintenance5;
-    deviceExtensions.push_back( kExtMaintenance5 );
-    deviceExtensions.push_back( kExtPipelineBinary );
+    features.enablePipelineBinaries();
   }
 
   VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
-  deviceInfo.pNext                   = &enable;
+  deviceInfo.pNext                   = &features.enable;
   deviceInfo.queueCreateInfoCount    = numQueueInfos;
   deviceInfo.pQueueCreateInfos       = queueInfos;
-  deviceInfo.enabledExtensionCount   = uint32_t( deviceExtensions.size() );
-  deviceInfo.ppEnabledExtensionNames = deviceExtensions.empty() ? nullptr : deviceExtensions.data();
+  deviceInfo.enabledExtensionCount   = uint32_t( features.extensions.size() );
+  deviceInfo.ppEnabledExtensionNames = features.extensions.empty() ? nullptr : features.extensions.data();
   if( m_api.vkCreateDevice( m_physical, &deviceInfo, nullptr, &m_device ) != VK_SUCCESS )
   {
     msg( WARNING, "Vulkan: creating the device on %s failed\n", props.deviceName );
