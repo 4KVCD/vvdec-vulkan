@@ -222,17 +222,14 @@ static void compareJobs( const CodingStructure& cs, int list, const uint32_t* gp
 static void compareSorted( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* waits, size_t count, const std::vector<std::vector<IntraJob>>& cpu,
                            FrontEndStats& stats )
 {
-  static constexpr int kBand = 256;
-  const auto    bandRows = []( const IntraJob& job ) { return std::max( 1, kBand / job.width() ); };
-  const auto    bands    = [&]( const IntraJob& job ) { return ( job.height() + bandRows( job ) - 1 ) / bandRows( job ); };
-  int           maxWave  = 0;
-  size_t        total    = 0;
+  int    maxWave = 0;
+  size_t total   = 0;
   for( const auto& ctu: cpu )
   {
     for( const IntraJob& job: ctu )
     {
       maxWave = std::max( maxWave, job.wave() );
-      total += bands( job );
+      total += job.bands();
     }
   }
   if( total != count )
@@ -250,7 +247,7 @@ static void compareSorted( const CodingStructure& cs, const uint32_t* gpu, const
   {
     for( const IntraJob& job: ctu )
     {
-      first[job.wave() + 1] += bands( job );
+      first[job.wave() + 1] += job.bands();
     }
   }
   for( int wave = 1; wave <= maxWave + 1; wave++ )
@@ -262,7 +259,7 @@ static void compareSorted( const CodingStructure& cs, const uint32_t* gpu, const
   {
     for( const IntraJob& job: ctu )
     {
-      const int rows = bandRows( job );
+      const int rows = job.bandRows();
       for( int row = 0; row < job.height(); row += rows )
       {
         const uint32_t at   = next[job.wave()]++;

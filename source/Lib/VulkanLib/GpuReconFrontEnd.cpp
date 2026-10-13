@@ -134,6 +134,12 @@ enum IntraSortPass
 // those of a workgroup per block of jobs, and those of a single workgroup
 static constexpr size_t kSortArgsBlocks = 50;
 static constexpr size_t kSortArgsSingle = 53;
+// intrasort.slang's sizes: the jobs of a block (its kBlock: a workgroup sorts a block), the bins of a digit's
+// histogram (the radix sort's digits have 8 bits), and the waves whose first band waveFirst holds (a wave past them
+// sets a flag)
+static constexpr size_t kSortBlockJobs = 1024;
+static constexpr size_t kSortDigitBins = 256;
+static constexpr size_t kSortMaxWaves  = 65536;
 // The words of the edge lists' firsts and counts (four lists of 2 words, and one more)
 static constexpr size_t kEdgeListsWords = 9;
 
@@ -717,28 +723,38 @@ void GpuRecon::recordJobWaves( const CodingStructure& cs, const PictureJobs& job
   dispatch( kShader_jobs_waves, push, uint32_t( cs.pcv->heightInCtus ) );
 }
 
-void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
+// The room for the picture's intra bands: with the front end, what the records can need; in the check mode, the CTU
+// tasks' jobs cut into bands as recordIntra cuts them.
+size_t GpuRecon::intraBandCapacity( const PictureJobs& jobs ) const
 {
-  // The room for intra bands: with the front end, what the records can need; in the check mode, the CTU tasks'
-  // jobs cut into bands as recordIntra cuts them.
-  size_t bands = m_useFrontEnd ? m_frontEnd.capacities.bands : 0;
-  static const std::vector<std::vector<IntraJob>> none;
-  for( const auto& ctu: m_useFrontEnd ? none : *jobs.intra )
+  if( m_useFrontEnd )
+  {
+    return m_frontEnd.capacities.bands;
+  }
+  size_t bands = 0;
+  for( const auto& ctu: *jobs.intra )
   {
     for( const IntraJob& job: ctu )
     {
-      const int rows = std::max( 1, 256 / job.width() );
-      bands += ( job.height() + rows - 1 ) / rows;
+      bands += job.bands();
     }
   }
-  FrontEndBuffers& fe = m_frontEnd;
-  fe.sortCapacity     = bands + 64;
-  fe.sortBlocks       = int( ( fe.jobCapacity[2] + 1023 ) / 1024 );
-  takeFrontEnd( fe.sortKeys, size_t( fe.sortBlocks ) * 1024 * 2 * sizeof( uint32_t ) );
-  takeFrontEnd( fe.sortHistogram, size_t( fe.sortBlocks ) * 256 * sizeof( uint32_t ) );
-  takeFrontEnd( fe.bandAt, size_t( fe.sortBlocks ) * 1024 * sizeof( uint32_t ) );
+  return bands;
+}
+
+// Takes the intra sort's buffers, for the room of the intra job list (m_frontEnd.jobCapacity[2]) and bands bands (64
+// more for safety), and in the check mode the host buffers compareFrontEnd reads; then zeroes the sort's flags.
+void GpuRecon::takeIntraSortBuffers( size_t bands )
+{
+  FrontEndBuffers& fe    = m_frontEnd;
+  fe.sortCapacity        = bands + 64;
+  fe.sortBlocks          = int( ( fe.jobCapacity[2] + kSortBlockJobs - 1 ) / kSortBlockJobs );
+  const size_t blockJobs = size_t( fe.sortBlocks ) * kSortBlockJobs;
+  takeFrontEnd( fe.sortKeys, blockJobs * 2 * sizeof( uint32_t ) );   // two halves: the keys before and after a digit
+  takeFrontEnd( fe.sortHistogram, size_t( fe.sortBlocks ) * kSortDigitBins * sizeof( uint32_t ) );
+  takeFrontEnd( fe.bandAt, blockJobs * sizeof( uint32_t ) );
   takeFrontEnd( fe.bandSums, ( size_t( fe.sortBlocks ) + 1 ) * sizeof( uint32_t ) );
-  m_ctx->ensure( fe.waveFirst, 65536 * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( fe.waveFirst, kSortMaxWaves * sizeof( uint32_t ), MemKind::Device );
   takeFrontEnd( fe.sortedBands, fe.sortCapacity * sizeof( IntraJob ) );
   takeFrontEnd( fe.bandWaits, fe.sortCapacity * sizeof( uint32_t ) );
   m_ctx->ensure( fe.sortFlags, 4 * sizeof( uint32_t ), MemKind::Device );
@@ -750,22 +766,34 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
   }
   m_ctx->api().vkCmdFillBuffer( m_cmd, fe.sortFlags.buffer, 0, VK_WHOLE_SIZE, 0 );
   transferToComputeBarrier();
+}
 
-  IntraSortPush push{};
-  push.jobs      = fe.jobs[2].addr;
-  push.count     = fe.jobBlocks.addr + ( size_t( fe.jobBlockCount ) * 5 + 2 ) * sizeof( uint32_t );   // jobs.slang's intra total
-  push.args      = fe.args.addr;
-  push.keysA     = fe.sortKeys.addr;
-  push.keysB     = fe.sortKeys.addr + size_t( fe.sortBlocks ) * 1024 * sizeof( uint32_t );
-  push.hist      = fe.sortHistogram.addr;
-  push.bandAt    = fe.bandAt.addr;
-  push.bandSums  = fe.bandSums.addr;
-  push.waveFirst = fe.waveFirst.addr;
-  push.sorted    = fe.sortedBands.addr;
-  push.waits     = fe.bandWaits.addr;
-  push.flags     = fe.sortFlags.addr;
-  push.numBlocks = fe.sortBlocks;
-  push.capacity  = int32_t( fe.sortCapacity );
+// intrasort.slang's push constants for the picture, but the pass and the digit's shift, which change per dispatch
+void GpuRecon::intraSortPush( IntraSortPush& push ) const
+{
+  const FrontEndBuffers& fe = m_frontEnd;
+  push                      = IntraSortPush{};
+  push.jobs                 = fe.jobs[2].addr;
+  push.count                = fe.jobBlocks.addr + ( size_t( fe.jobBlockCount ) * 5 + 2 ) * sizeof( uint32_t );   // jobs.slang's intra total
+  push.args                 = fe.args.addr;
+  push.keysA                = fe.sortKeys.addr;
+  push.keysB                = fe.sortKeys.addr + size_t( fe.sortBlocks ) * kSortBlockJobs * sizeof( uint32_t );
+  push.hist                 = fe.sortHistogram.addr;
+  push.bandAt               = fe.bandAt.addr;
+  push.bandSums             = fe.bandSums.addr;
+  push.waveFirst            = fe.waveFirst.addr;
+  push.sorted               = fe.sortedBands.addr;
+  push.waits                = fe.bandWaits.addr;
+  push.flags                = fe.sortFlags.addr;
+  push.numBlocks            = fe.sortBlocks;
+  push.capacity             = int32_t( fe.sortCapacity );
+}
+
+void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
+{
+  takeIntraSortBuffers( intraBandCapacity( jobs ) );
+  IntraSortPush push;
+  intraSortPush( push );
   bind( kShader_intrasort );
   // SMALL sorts up to 1024 jobs alone, and writes the workgroups of the passes after it: none then, else a workgroup
   // per block (or one)
@@ -774,7 +802,7 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
   pushConstants( push );
   dispatchGroups( 1 );
   // With room for one block of jobs (most B-pictures), SMALL sorts them all: the other passes are not recorded.
-  if( fe.sortBlocks <= 1 )
+  if( m_frontEnd.sortBlocks <= 1 )
   {
     computeBarrier();
     mark( "intrasort" );
@@ -785,7 +813,7 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
     push.pass  = p;
     push.shift = shift;
     pushConstants( push );
-    m_ctx->api().vkCmdDispatchIndirect( m_cmd, fe.args.buffer, ( perBlock ? kSortArgsBlocks : kSortArgsSingle ) * sizeof( uint32_t ) );
+    m_ctx->api().vkCmdDispatchIndirect( m_cmd, m_frontEnd.args.buffer, ( perBlock ? kSortArgsBlocks : kSortArgsSingle ) * sizeof( uint32_t ) );
     computeBarrier();
   };
   // the radix sort by wave, two digits of 8 bits (histograms, their sums, the scatter); then the bands

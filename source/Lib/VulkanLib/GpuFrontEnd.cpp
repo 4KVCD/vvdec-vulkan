@@ -254,11 +254,10 @@ static size_t pieces( uint32_t n )
   return count;
 }
 
-// a job's bands of rows (GpuRecon::recordIntra's)
+// a job's bands of rows (IntraJob::bands)
 static size_t bandsOf( uint32_t width, uint32_t height )
 {
-  const uint32_t rows = std::max<uint32_t>( 1, 256 / std::max<uint32_t>( width, 1 ) );
-  return ( height + rows - 1 ) / rows;
+  return size_t( IntraJob::bands( int( width ), int( height ) ) );
 }
 
 FrontCapacities frontCapacities( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus )

@@ -169,6 +169,15 @@ struct IntraJob
   // On the GPU the wave's word holds the rows of the block that one workgroup makes instead: GpuRecon::recordIntra
   // cuts big blocks into bands.
   void setRows( int first, int count ) { w[7] = uint32_t( first ) | uint32_t( count ) << 16; }
+
+  // The bands: a band holds at most kBandSamples samples (intrasort.slang's kBand), so a block of the given width is cut
+  // into bands of bandRows( width ) rows (the last one may have fewer), bands( width, height ) of them. A wave of jobs
+  // lasts as long as its slowest workgroup, which is the one with the most samples per thread (intra.slang).
+  static constexpr int kBandSamples = 256;
+  static int           bandRows( int width ) { return std::max( 1, kBandSamples / std::max( width, 1 ) ); }
+  static int           bands( int width, int height ) { return ( height + bandRows( width ) - 1 ) / bandRows( width ); }
+  int                  bandRows() const { return bandRows( width() ); }
+  int                  bands() const { return bands( width(), height() ); }
 };
 
 // A tile of up to 16x16 luma samples of an inter CU, with its chroma, that inter.slang predicts (with DMVR, the tile

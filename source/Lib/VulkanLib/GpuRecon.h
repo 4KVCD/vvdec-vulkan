@@ -89,6 +89,7 @@ namespace gpu
 
 struct JobsPush;       // (GpuReconFrontEnd.cpp)
 struct DbParamsPush;   // (GpuReconFrontEnd.cpp)
+struct IntraSortPush;  // (GpuReconFrontEnd.cpp)
 struct InterPush;      // (GpuReconPrediction.cpp)
 
 // What a decoder's GpuRecon instances share.
@@ -359,6 +360,9 @@ private:
   void   jobsPush( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus, JobsPush& push ) const;
   void   allocateJobBuffers( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );
   void   recordIntraOrder( const PictureJobs& jobs );
+  size_t intraBandCapacity( const PictureJobs& jobs ) const;   // the room the picture's intra bands need
+  void   takeIntraSortBuffers( size_t bands );
+  void   intraSortPush( IntraSortPush& push ) const;
   void   copyJobsForCheck( const PictureJobs& jobs );
   void   recordEdges( const CodingStructure& cs, const PictureJobs& jobs );
 
@@ -552,7 +556,7 @@ private:
     // band), the bands in wave order with each band's wait, and flags (a wave past 65535)
     Buffer sortKeys, sortHistogram, bandAt, bandSums, waveFirst, sortedBands, bandWaits, sortFlags;
     size_t sortCapacity = 0;   // the room for bands
-    int    sortBlocks   = 0;   // blocks of 1024 jobs
+    int    sortBlocks   = 0;   // blocks of jobs (kSortBlockJobs each, GpuReconFrontEnd.cpp)
     // Deblocking edges (edges.slang): per CTU, its edge counts; the four lists' first edge and count; the edges
     Buffer edgeCounts, edgeLists, edges;
     size_t edgeCapacity = 0;

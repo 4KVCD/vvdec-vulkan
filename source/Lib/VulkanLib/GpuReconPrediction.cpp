@@ -430,11 +430,7 @@ static_assert( sizeof( IntraPush ) == 136, "IntraPush: the layout of intra.slang
 
 size_t GpuRecon::uploadIntraJobs( const std::vector<std::vector<IntraJob>>& jobs )
 {
-  // The jobs, wave by wave, with a big block cut into bands of rows of at most kBand samples, one workgroup each: a
-  // wave lasts as long as its slowest workgroup, which is the one with the most samples per thread (intra.slang).
-  static constexpr int kBand = 256;
-  const auto bandRows = []( const IntraJob& job ) { return std::max( 1, kBand / job.width() ); };
-  const auto bands    = [&]( const IntraJob& job ) { return ( job.height() + bandRows( job ) - 1 ) / bandRows( job ); };
+  // The jobs, wave by wave, with a big block cut into bands of rows (IntraJob::bands), one workgroup each.
   int    maxWave = 0;
   size_t total   = 0;
   for( const auto& ctu: jobs )
@@ -442,7 +438,7 @@ size_t GpuRecon::uploadIntraJobs( const std::vector<std::vector<IntraJob>>& jobs
     for( const IntraJob& job: ctu )
     {
       maxWave = std::max( maxWave, job.wave() );
-      total  += bands( job );
+      total  += job.bands();
     }
   }
   if( total == 0 )
@@ -455,7 +451,7 @@ size_t GpuRecon::uploadIntraJobs( const std::vector<std::vector<IntraJob>>& jobs
   {
     for( const IntraJob& job: ctu )
     {
-      first[job.wave() + 1] += bands( job );
+      first[job.wave() + 1] += job.bands();
     }
   }
   for( int wave = 1; wave <= maxWave + 1; wave++ )
@@ -477,7 +473,7 @@ size_t GpuRecon::uploadIntraJobs( const std::vector<std::vector<IntraJob>>& jobs
   {
     for( const IntraJob& job: ctu )
     {
-      const int rows = bandRows( job );
+      const int rows = job.bandRows();
       for( int row = 0; row < job.height(); row += rows )
       {
         const uint32_t at   = next[job.wave()]++;
