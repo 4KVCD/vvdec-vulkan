@@ -439,12 +439,17 @@ void DecCu::xGpuIntraJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu
         const int sx = getComponentScaleX( compID, cu.chromaFormat );
         const int sy = getComponentScaleY( compID, cu.chromaFormat );
         const int lx = area.x << sx, ly = area.y << sy, lw = area.width << sx, lh = area.height << sy;
-        // (no further right than the CTU right of the block's: CCLM's luma is
-        // never there, and the CTU after it, in the row above, may or may not
-        // have its waves yet -- the waves would vary from run to run)
+        // No further right than the CTU right of the block's, and no further
+        // down than the bottom of the block's CTU row: CCLM's luma is never
+        // there. On the GPU (jobs.slang's jobRects, which must match), the CTU
+        // after it in the row above may or may not have its waves yet, and so
+        // may the CTUs below (a row whose CTUs have no intra jobs waits for
+        // nothing): the waves would vary from run to run.
         const int ctuLog2 = getLog2( cu.cs->pcv->maxCUWidth );
         const int right   = ( ( lx >> ctuLog2 ) + 2 ) << ctuLog2;
-        wave = std::max( wave, waves.maxIn( COMPONENT_Y, lx - 4, ly - 4, std::min( 2 * lw + 8, right - ( lx - 4 ) ), 2 * lh + 8 ) );
+        const int bottom  = ( ( ly >> ctuLog2 ) + 1 ) << ctuLog2;
+        wave = std::max( wave, waves.maxIn( COMPONENT_Y, lx - 4, ly - 4, std::min( 2 * lw + 8, right - ( lx - 4 ) ),
+                                            std::min( 2 * lh + 8, bottom - ( ly - 4 ) ) ) );
       }
       job.setWave( wave + 1 );
       waves.set( compID, area.x, area.y, area.width, area.height, wave + 1 );

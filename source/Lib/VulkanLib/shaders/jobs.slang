@@ -1949,9 +1949,11 @@ void jobRects( uint job[12], out uint2 packed[6] )
   }
   if( kind == kIntraCclm )
   {
-    const int lx    = x << pc.csx, ly = y << pc.csy, lw = w << pc.csx, lh = h << pc.csy;
-    const int right = ( ( lx >> pc.log2Ctu ) + 2 ) << pc.log2Ctu;
-    r4              = mapRect( 0, lx - 4, ly - 4, min( 2 * lw + 8, right - ( lx - 4 ) ), 2 * lh + 8 );
+    // (as DecCu's: up to the CTU right of the block's and down to the bottom of its CTU row)
+    const int lx     = x << pc.csx, ly = y << pc.csy, lw = w << pc.csx, lh = h << pc.csy;
+    const int right  = ( ( lx >> pc.log2Ctu ) + 2 ) << pc.log2Ctu;
+    const int bottom = ( ( ly >> pc.log2Ctu ) + 1 ) << pc.log2Ctu;
+    r4               = mapRect( 0, lx - 4, ly - 4, min( 2 * lw + 8, right - ( lx - 4 ) ), min( 2 * lh + 8, bottom - ( ly - 4 ) ) );
   }
   packed[0] = packRect( r0 );
   packed[1] = packRect( r1 );
