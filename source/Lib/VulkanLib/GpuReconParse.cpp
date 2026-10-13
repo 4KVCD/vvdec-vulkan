@@ -77,15 +77,6 @@ struct ParseCheckPush
 };
 static_assert( sizeof( ParseCheckPush ) == 80, "ParseCheckPush: the layout of parsecompact.slang's CHECK Params" );
 
-// Makes buf hold at least size bytes of kind, in steps of 64 KB.
-static void ensureParseBuffer( Context* ctx, Buffer& buf, size_t size, MemKind kind )
-{
-  if( buf.size < size )
-  {
-    ctx->free( buf );
-    buf = ctx->alloc( ( size + 65535 ) & ~size_t( 65535 ), kind );
-  }
-}
 
 bool GpuRecon::parsesPicture( const Picture& pic, const SPS& sps )
 {
@@ -156,7 +147,7 @@ uint32_t GpuRecon::runParse( ParseSlot& slot )
       // more records than the CPU's parse made (the comparison will tell), or more levels than the samples (the
       // chunks' unused ends): room for what the parse counted
       Buffer levels = slot.takeLevels();
-      ensureParseBuffer( m_ctx, levels, ( slot.levelsCounted() * 5 / 4 + 4096 ) * sizeof( int16_t ), MemKind::Device );
+      m_ctx->ensure( levels, ( slot.levelsCounted() * 5 / 4 + 4096 ) * sizeof( int16_t ), MemKind::Device );
       StagedRecords staged = slot.takeStaged();
       ParseSlot::growStaged( m_ctx, staged, slot.cusCounted() * 5 / 4 + 64, slot.tusCounted() * 5 / 4 + 64 );
       slot.restart( staged, levels );
@@ -203,12 +194,12 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
   const int    csy           = chroma ? int( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
   const size_t chromaSamples = chroma ? size_t( pcv.lumaWidth >> csx ) * ( pcv.lumaHeight >> csy ) : 0;
   Buffer       levels        = slot.takeLevels();
-  ensureParseBuffer( m_ctx, levels, ( size_t( pcv.lumaWidth ) * pcv.lumaHeight + 2 * chromaSamples ) * sizeof( int16_t ), MemKind::Device );
+  m_ctx->ensure( levels, ( size_t( pcv.lumaWidth ) * pcv.lumaHeight + 2 * chromaSamples ) * sizeof( int16_t ), MemKind::Device );
   // VVDEC_GPU_PROFILE with the shader clock: parse_prof's cycle counts, added up over the pictures (parse_prof reads
   // threads' values as parse does: with VK_EXT_shader_subgroup_ballot)
   if( m_ctx->profiling() && m_ctx->shaderClock() && m_ctx->subgroupBallot() )
   {
-    ensureParseBuffer( m_ctx, m_parse.prof, 16 * sizeof( uint32_t ), MemKind::HostCached );
+    m_ctx->ensure( m_parse.prof, 16 * sizeof( uint32_t ), MemKind::HostCached );
     if( !m_parse.profRead )
     {
       memset( m_parse.prof.mapped, 0, 16 * sizeof( uint32_t ) );
@@ -230,10 +221,10 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
   }
 
   // the records in raster order, in host memory: copied in m_cmd (the picture's first part)
-  ensureParseBuffer( m_ctx, m_parse.outCus, std::max<size_t>( slot.numCus(), 1 ) * sizeof( CuRecord ), MemKind::HostCached );
-  ensureParseBuffer( m_ctx, m_parse.outTus, std::max<size_t>( slot.numTus(), 1 ) * sizeof( TuRecord ), MemKind::HostCached );
-  ensureParseBuffer( m_ctx, m_parse.outCtus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::HostCached );
-  ensureParseBuffer( m_ctx, m_parse.check, 4 * sizeof( uint32_t ), MemKind::HostCached );
+  m_ctx->ensure( m_parse.outCus, std::max<size_t>( slot.numCus(), 1 ) * sizeof( CuRecord ), MemKind::HostCached );
+  m_ctx->ensure( m_parse.outTus, std::max<size_t>( slot.numTus(), 1 ) * sizeof( TuRecord ), MemKind::HostCached );
+  m_ctx->ensure( m_parse.outCtus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::HostCached );
+  m_ctx->ensure( m_parse.check, 4 * sizeof( uint32_t ), MemKind::HostCached );
   slot.recordScatter( m_cmd, m_parse.outCus.addr, m_parse.outTus.addr, m_parse.outCtus.addr );
   computeBarrier();
 

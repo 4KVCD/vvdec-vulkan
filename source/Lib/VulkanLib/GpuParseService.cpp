@@ -157,15 +157,6 @@ struct ParseCompactPush
 };
 static_assert( sizeof( ParseCompactPush ) == 128, "ParseCompactPush: the layout of parsecompact.slang's Params" );
 
-// Makes buf hold at least size bytes of kind, in steps of 64 KB.
-static void ensureBuffer( Context* ctx, Buffer& buf, size_t size, MemKind kind )
-{
-  if( buf.size < size )
-  {
-    ctx->free( buf );
-    buf = ctx->alloc( ( size + 65535 ) & ~size_t( 65535 ), kind );
-  }
-}
 
 // Records into cmd the dispatch of shader with the push constants push over groups workgroups (in rows of
 // kGroupsPerRow).
@@ -240,10 +231,10 @@ bool ParseSlot::prepare( const CodingStructure& cs, StagedRecords staged, Buffer
   // substreams, the CTUs in decoding order and their slices and tiles, the slices' parameters and contexts, the
   // picture's parameters, the scans
   const auto upload = [&]( Buffer& buf, const void* data, size_t size ) {
-    ensureBuffer( m_ctx, buf, std::max<size_t>( size, 16 ), MemKind::Upload );
+    m_ctx->ensure( buf, std::max<size_t>( size, 16 ), MemKind::Upload );
     memcpy( buf.mapped, data, size );
   };
-  ensureBuffer( m_ctx, m_bits, m_in.bits.size() + 256, MemKind::Upload );
+  m_ctx->ensure( m_bits, m_in.bits.size() + 256, MemKind::Upload );
   memcpy( m_bits.mapped, m_in.bits.data(), m_in.bits.size() );
   memset( m_bits.mapped + m_in.bits.size(), 0, 256 );
   upload( m_streams, m_in.streams.data(), m_in.streams.size() * sizeof( uint32_t ) );
@@ -253,19 +244,19 @@ bool ParseSlot::prepare( const CodingStructure& cs, StagedRecords staged, Buffer
   upload( m_pic, m_in.pic.data(), m_in.pic.size() * sizeof( int32_t ) );
   if( !m_scans.mapped )
   {
-    ensureBuffer( m_ctx, m_scans, kParseScanTab * sizeof( uint32_t ), MemKind::Upload );
+    m_ctx->ensure( m_scans, kParseScanTab * sizeof( uint32_t ), MemKind::Upload );
     writeParseScans( reinterpret_cast<uint32_t*>( m_scans.mapped ) );
   }
 
   // what the parse writes
-  ensureBuffer( m_ctx, m_bottomRows, m_numCtus * 64 * 2 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, m_wpp, std::max<size_t>( m_in.wppSlots, 1 ) * m_in.contexts * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, m_sync, ( 2 + m_numCtus ) * sizeof( uint32_t ), MemKind::HostCached );
-  ensureBuffer( m_ctx, m_state, std::max<size_t>( m_in.numStreams, 1 ) * kParseStateWords * sizeof( uint32_t ), MemKind::HostCached );
-  ensureBuffer( m_ctx, m_ctuOut, m_numCtus * kParseCtuOutWords * sizeof( uint32_t ), MemKind::HostCached );
-  ensureBuffer( m_ctx, m_counters, kParseCounters * sizeof( uint32_t ), MemKind::Device );   // (an atomic a CU: fast in GPU memory)
-  ensureBuffer( m_ctx, m_ctus, m_numCtus * sizeof( CtuRecord ), MemKind::HostCached );
-  ensureBuffer( m_ctx, m_totals, 2 * kParseTotals * sizeof( uint32_t ), MemKind::HostCached );   // (two halves: recordCompaction)
+  m_ctx->ensure( m_bottomRows, m_numCtus * 64 * 2 * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( m_wpp, std::max<size_t>( m_in.wppSlots, 1 ) * m_in.contexts * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( m_sync, ( 2 + m_numCtus ) * sizeof( uint32_t ), MemKind::HostCached );
+  m_ctx->ensure( m_state, std::max<size_t>( m_in.numStreams, 1 ) * kParseStateWords * sizeof( uint32_t ), MemKind::HostCached );
+  m_ctx->ensure( m_ctuOut, m_numCtus * kParseCtuOutWords * sizeof( uint32_t ), MemKind::HostCached );
+  m_ctx->ensure( m_counters, kParseCounters * sizeof( uint32_t ), MemKind::Device );   // (an atomic a CU: fast in GPU memory)
+  m_ctx->ensure( m_ctus, m_numCtus * sizeof( CtuRecord ), MemKind::HostCached );
+  m_ctx->ensure( m_totals, 2 * kParseTotals * sizeof( uint32_t ), MemKind::HostCached );   // (two halves: recordCompaction)
   setStaged( staged );
   clear();
   return true;
@@ -288,10 +279,10 @@ void ParseSlot::setStaged( StagedRecords staged )
 
 void ParseSlot::growStaged( Context* ctx, StagedRecords& staged, size_t cus, size_t tus )
 {
-  ensureBuffer( ctx, staged.cus, std::max<size_t>( cus, 1 ) * sizeof( CuRecord ), MemKind::Device );
-  ensureBuffer( ctx, staged.cuMeta, std::max<size_t>( cus, 1 ) * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( ctx, staged.tus, std::max<size_t>( tus, 1 ) * sizeof( TuRecord ), MemKind::Device );
-  ensureBuffer( ctx, staged.tuMeta, std::max<size_t>( tus, 1 ) * sizeof( uint32_t ), MemKind::Device );
+  ctx->ensure( staged.cus, std::max<size_t>( cus, 1 ) * sizeof( CuRecord ), MemKind::Device );
+  ctx->ensure( staged.cuMeta, std::max<size_t>( cus, 1 ) * sizeof( uint32_t ), MemKind::Device );
+  ctx->ensure( staged.tus, std::max<size_t>( tus, 1 ) * sizeof( TuRecord ), MemKind::Device );
+  ctx->ensure( staged.tuMeta, std::max<size_t>( tus, 1 ) * sizeof( uint32_t ), MemKind::Device );
 }
 
 StagedRecords ParseSlot::takeStaged()

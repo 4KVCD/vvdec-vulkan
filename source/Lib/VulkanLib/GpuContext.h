@@ -155,6 +155,9 @@ public:
   // Allocates a buffer (throws on failure) and frees one (not a range of a RangeArena's: give() takes those back).
   Buffer alloc( size_t size, MemKind kind );
   void   free( Buffer& buf );
+  // Makes buf hold at least size bytes of kind: when it is smaller, frees it and allocates one of size rounded up to
+  // 64 KB (so that a buffer whose need grows a little at a time is not allocated again each time).
+  void   ensure( Buffer& buf, size_t size, MemKind kind );
   // Frees a buffer once the work queued on the compute queue so far is done (it waits for that work): for a buffer that
   // other threads' queued work may still use, such as the instances' shared planes. (Freed while queued work still
   // uses it, its memory would go while the GPU reads it: a GPU fault.)

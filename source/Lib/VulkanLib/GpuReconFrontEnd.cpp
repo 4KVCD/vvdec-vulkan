@@ -124,15 +124,6 @@ static constexpr size_t kSortArgsSingle = 53;
 // The words of the edge lists' firsts and counts (four lists of 2 words, and one more)
 static constexpr size_t kEdgeListsWords = 9;
 
-// Makes buf hold at least size bytes of kind, in steps of 64 KB.
-static void ensureBuffer( Context* ctx, Buffer& buf, size_t size, MemKind kind )
-{
-  if( buf.size < size )
-  {
-    ctx->free( buf );
-    buf = ctx->alloc( ( size + 65535 ) & ~size_t( 65535 ), kind );
-  }
-}
 
 // The address of the picture's slice table (writeSliceTable)
 static VkDeviceAddress sliceTable( const CodingStructure& cs )
@@ -270,7 +261,7 @@ size_t GpuRecon::uploadRecords( const CodingStructure& cs, const PictureJobs& jo
   }
   else
   {
-    ensureBuffer( m_ctx, m_check.motion, motionBytes( pcv ), MemKind::HostCached );
+    m_ctx->ensure( m_check.motion, motionBytes( pcv ), MemKind::HostCached );
   }
 
   // the records, written in order by the CPU
@@ -319,20 +310,20 @@ void GpuRecon::ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, 
   const int            heightIn4 = int( ( pcv.lumaHeight + 3 ) >> 2 );
   if( records )
   {
-    ensureBuffer( m_ctx, m_frontEnd.cus, std::max<size_t>( numCus, 1 ) * sizeof( CuRecord ), MemKind::Upload );
-    ensureBuffer( m_ctx, m_frontEnd.tus, std::max<size_t>( numTus, 1 ) * sizeof( TuRecord ), MemKind::Upload );
-    ensureBuffer( m_ctx, m_frontEnd.ctus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::Upload );
+    m_ctx->ensure( m_frontEnd.cus, std::max<size_t>( numCus, 1 ) * sizeof( CuRecord ), MemKind::Upload );
+    m_ctx->ensure( m_frontEnd.tus, std::max<size_t>( numTus, 1 ) * sizeof( TuRecord ), MemKind::Upload );
+    m_ctx->ensure( m_frontEnd.ctus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::Upload );
   }
   {
     std::lock_guard<std::mutex> lock( m_shared->frontEndMutex );
     m_shared->frontEnd.setChunkSize( RangeArena::chunkSizeFor( size_t( pcv.lumaWidth ) * pcv.lumaHeight ) );
   }
-  ensureBuffer( m_ctx, m_frontEnd.cuMapLuma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, m_frontEnd.cuMapChroma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( m_frontEnd.cuMapLuma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( m_frontEnd.cuMapChroma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
   takeFrontEnd( m_frontEnd.cuMotion, std::max<size_t>( numCus, 1 ) * 16 * sizeof( int32_t ) );
-  ensureBuffer( m_ctx, m_frontEnd.motion, motionBytes( pcv ), MemKind::Device );
+  m_ctx->ensure( m_frontEnd.motion, motionBytes( pcv ), MemKind::Device );
   // (mider.slang's progress: per CTU row and tile column, then the segments taken)
-  ensureBuffer( m_ctx, m_frontEnd.rowProgress, ( size_t( pcv.heightInCtus ) * cs.pps->getNumTileColumns() + 1 ) * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( m_frontEnd.rowProgress, ( size_t( pcv.heightInCtus ) * cs.pps->getNumTileColumns() + 1 ) * sizeof( uint32_t ), MemKind::Device );
 }
 
 void GpuRecon::takeFrontEnd( Buffer& buf, size_t size )
@@ -426,13 +417,13 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
 {
   const PreCalcValues& pcv    = *cs.pcv;
   const bool           chroma = isChromaEnabled( pcv.chrFormat );
-  ensureBuffer( m_ctx, m_frontEnd.lfp, lfpBytes( pcv ), MemKind::Device );
+  m_ctx->ensure( m_frontEnd.lfp, lfpBytes( pcv ), MemKind::Device );
   if( !m_useFrontEnd )
   {
-    ensureBuffer( m_ctx, m_check.lfp, lfpBytes( pcv ), MemKind::HostCached );
+    m_ctx->ensure( m_check.lfp, lfpBytes( pcv ), MemKind::HostCached );
   }
   // per CTU, its subpicture's index and whether loop filtering crosses the subpicture's boundaries
-  ensureBuffer( m_ctx, m_frontEnd.ctuInfo, pcv.sizeInCtus * sizeof( uint32_t ), MemKind::Upload );
+  m_ctx->ensure( m_frontEnd.ctuInfo, pcv.sizeInCtus * sizeof( uint32_t ), MemKind::Upload );
   uint32_t* info = reinterpret_cast<uint32_t*>( m_frontEnd.ctuInfo.mapped );
   for( unsigned ctu = 0; ctu < pcv.sizeInCtus; ctu++ )
   {
@@ -557,7 +548,7 @@ void GpuRecon::allocateJobBuffers( const CodingStructure& cs, const PictureJobs&
     takeFrontEnd( m_frontEnd.jobs[k], m_frontEnd.jobCapacity[k] * kJobWords[k] * sizeof( uint32_t ) );
     if( !m_useFrontEnd )
     {
-      ensureBuffer( m_ctx, m_check.jobs[k], m_frontEnd.jobCapacity[k] * kJobWords[k] * sizeof( uint32_t ), MemKind::HostCached );
+      m_ctx->ensure( m_check.jobs[k], m_frontEnd.jobCapacity[k] * kJobWords[k] * sizeof( uint32_t ), MemKind::HostCached );
     }
   }
   if( !m_frontEnd.jobTables.valid() )
@@ -565,10 +556,10 @@ void GpuRecon::allocateJobBuffers( const CodingStructure& cs, const PictureJobs&
     m_frontEnd.jobTables = m_ctx->alloc( kJobTableWords * sizeof( uint32_t ), MemKind::Upload );
     writeJobTables( reinterpret_cast<uint32_t*>( m_frontEnd.jobTables.mapped ) );
   }
-  ensureBuffer( m_ctx, m_frontEnd.jobSlices, cs.picture->slices.size() * 256 * sizeof( uint32_t ), MemKind::Upload );
+  m_ctx->ensure( m_frontEnd.jobSlices, cs.picture->slices.size() * 256 * sizeof( uint32_t ), MemKind::Upload );
   writeJobSlices( cs, *jobs.refs, reinterpret_cast<uint32_t*>( m_frontEnd.jobSlices.mapped ) );
   // the scaling lists' matrix offsets (setDequantOffsets): per list (6), log2 width and log2 height (0..6)
-  ensureBuffer( m_ctx, m_frontEnd.jobScaling, 6 * 7 * 7 * sizeof( uint32_t ), MemKind::Upload );
+  m_ctx->ensure( m_frontEnd.jobScaling, 6 * 7 * 7 * sizeof( uint32_t ), MemKind::Upload );
   uint32_t* scaling = reinterpret_cast<uint32_t*>( m_frontEnd.jobScaling.mapped );
   for( size_t i = 0; i < 6 * 7 * 7; i++ )
   {
@@ -580,12 +571,12 @@ void GpuRecon::allocateJobBuffers( const CodingStructure& cs, const PictureJobs&
   takeFrontEnd( m_frontEnd.jobBlocks, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ) );
   if( !m_useFrontEnd )
   {
-    ensureBuffer( m_ctx, m_check.jobBlocks, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ), MemKind::HostCached );
+    m_ctx->ensure( m_check.jobBlocks, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ), MemKind::HostCached );
   }
   const int widthIn4  = int( ( pcv.lumaWidth + 3 ) >> 2 );
   const int heightIn4 = int( ( pcv.lumaHeight + 3 ) >> 2 );
-  ensureBuffer( m_ctx, m_frontEnd.waveMap, size_t( widthIn4 ) * heightIn4 * 3 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, m_frontEnd.jobProgress, ( pcv.heightInCtus + 1 ) * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( m_frontEnd.waveMap, size_t( widthIn4 ) * heightIn4 * 3 * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( m_frontEnd.jobProgress, ( pcv.heightInCtus + 1 ) * sizeof( uint32_t ), MemKind::Device );
 }
 
 void GpuRecon::jobsPush( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus, JobsPush& push ) const
@@ -714,15 +705,15 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
   takeFrontEnd( fe.sortHistogram, size_t( fe.sortBlocks ) * 256 * sizeof( uint32_t ) );
   takeFrontEnd( fe.bandAt, size_t( fe.sortBlocks ) * 1024 * sizeof( uint32_t ) );
   takeFrontEnd( fe.bandSums, ( size_t( fe.sortBlocks ) + 1 ) * sizeof( uint32_t ) );
-  ensureBuffer( m_ctx, fe.waveFirst, 65536 * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( fe.waveFirst, 65536 * sizeof( uint32_t ), MemKind::Device );
   takeFrontEnd( fe.sortedBands, fe.sortCapacity * sizeof( IntraJob ) );
   takeFrontEnd( fe.bandWaits, fe.sortCapacity * sizeof( uint32_t ) );
-  ensureBuffer( m_ctx, fe.sortFlags, 4 * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( fe.sortFlags, 4 * sizeof( uint32_t ), MemKind::Device );
   if( !m_useFrontEnd )
   {
-    ensureBuffer( m_ctx, m_check.sortedBands, fe.sortCapacity * sizeof( IntraJob ), MemKind::HostCached );
-    ensureBuffer( m_ctx, m_check.bandWaits, fe.sortCapacity * sizeof( uint32_t ), MemKind::HostCached );
-    ensureBuffer( m_ctx, m_check.sortInfo, 4 * sizeof( uint32_t ), MemKind::HostCached );
+    m_ctx->ensure( m_check.sortedBands, fe.sortCapacity * sizeof( IntraJob ), MemKind::HostCached );
+    m_ctx->ensure( m_check.bandWaits, fe.sortCapacity * sizeof( uint32_t ), MemKind::HostCached );
+    m_ctx->ensure( m_check.sortInfo, 4 * sizeof( uint32_t ), MemKind::HostCached );
   }
   m_ctx->api().vkCmdFillBuffer( m_cmd, fe.sortFlags.buffer, 0, VK_WHOLE_SIZE, 0 );
   transferToComputeBarrier();
@@ -829,12 +820,12 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs )
   }
   m_frontEnd.edgeCapacity = m_useFrontEnd ? m_frontEnd.capacities.edges : cpu + 64;
   takeFrontEnd( m_frontEnd.edges, m_frontEnd.edgeCapacity * sizeof( Edge ) );
-  ensureBuffer( m_ctx, m_frontEnd.edgeCounts, size_t( pcv.sizeInCtus ) * 4 * sizeof( uint32_t ), MemKind::Device );
-  ensureBuffer( m_ctx, m_frontEnd.edgeLists, kEdgeListsWords * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( m_frontEnd.edgeCounts, size_t( pcv.sizeInCtus ) * 4 * sizeof( uint32_t ), MemKind::Device );
+  m_ctx->ensure( m_frontEnd.edgeLists, kEdgeListsWords * sizeof( uint32_t ), MemKind::Device );
   if( !m_useFrontEnd )
   {
-    ensureBuffer( m_ctx, m_check.edges, m_frontEnd.edgeCapacity * sizeof( Edge ), MemKind::HostCached );
-    ensureBuffer( m_ctx, m_check.edgeLists, kEdgeListsWords * sizeof( uint32_t ), MemKind::HostCached );
+    m_ctx->ensure( m_check.edges, m_frontEnd.edgeCapacity * sizeof( Edge ), MemKind::HostCached );
+    m_ctx->ensure( m_check.edgeLists, kEdgeListsWords * sizeof( uint32_t ), MemKind::HostCached );
   }
   const bool chroma = isChromaEnabled( pcv.chrFormat );
   EdgesPush  push{};

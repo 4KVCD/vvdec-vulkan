@@ -441,11 +441,7 @@ void GpuRecon::recordSao( const CodingStructure& cs, const Planes& planes, VkDev
   // right of it
   const int    ringSlot = 2 * ( int( pcv.maxCUWidth ) + 2 ) + 2 * int( pcv.maxCUHeight );
   const size_t ringSize = size_t( m_prepared.saoEntries ) * size_t( ringSlot ) * sizeof( int16_t );
-  if( m_saoRing.size < ringSize )
-  {
-    m_ctx->free( m_saoRing );
-    m_saoRing = m_ctx->alloc( ( ringSize + 65535 ) & ~size_t( 65535 ), MemKind::Device );
-  }
+  m_ctx->ensure( m_saoRing, ringSize, MemKind::Device );
   SaoPush push{};
   push.plane0       = planes.addr[COMPONENT_Y];
   push.plane1       = planes.addr[COMPONENT_Cb];

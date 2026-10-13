@@ -1145,6 +1145,16 @@ void Context::free( Buffer& buf )
   buf = Buffer();
 }
 
+void Context::ensure( Buffer& buf, size_t size, MemKind kind )
+{
+  static constexpr size_t kGranule = 65536;
+  if( buf.size < size )
+  {
+    free( buf );
+    buf = alloc( ( size + kGranule - 1 ) & ~( kGranule - 1 ), kind );
+  }
+}
+
 void Context::freeAfterQueued( Buffer& buf )
 {
   if( !buf.valid() )
