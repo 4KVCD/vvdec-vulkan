@@ -160,43 +160,34 @@ uint32_t GpuRecon::runParse( ParseSlot& slot )
   }
 }
 
-void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, const Planes& cpuLevels )
+// The number of records in lists of records per CTU
+template<typename Record>
+static size_t countRecords( const std::vector<std::vector<Record>>& perCtu )
 {
-  m_parse.recorded = false;
-  if( m_parse.contexts == 0 )
+  size_t count = 0;
+  for( const auto& ctu: perCtu )
   {
-    m_parse.contexts = checkParseContexts() ? 1 : -1;
+    count += ctu.size();
   }
-  if( m_parse.contexts < 0 )
+  return count;
+}
+
+// The bytes of a picture's coefficient levels: room for a level of 16 bits a sample of each plane
+static size_t levelsBytes( const PreCalcValues& pcv )
+{
+  size_t samples = size_t( pcv.lumaWidth ) * pcv.lumaHeight;
+  if( isChromaEnabled( pcv.chrFormat ) )
   {
-    return;
+    samples += 2 * size_t( pcv.lumaWidth >> getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) )
+               * ( pcv.lumaHeight >> getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) );
   }
-  const PreCalcValues& pcv    = *cs.pcv;
-  size_t               numCus = 0;
-  size_t               numTus = 0;
-  for( const auto& ctu: *jobs.cus )
-  {
-    numCus += ctu.size();
-  }
-  for( const auto& ctu: *jobs.tus )
-  {
-    numTus += ctu.size();
-  }
-  if( !m_parse.slot )
-  {
-    m_parse.slot = std::make_unique<ParseSlot>( m_ctx );
-  }
-  ParseSlot& slot = *m_parse.slot;
-  // the levels into the slot's own buffer (the CPU's parse has its levels in the picture), for the check below: the
-  // one of the picture before, with room for a level a sample of each plane
-  const bool   chroma        = isChromaEnabled( pcv.chrFormat );
-  const int    csx           = chroma ? int( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
-  const int    csy           = chroma ? int( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
-  const size_t chromaSamples = chroma ? size_t( pcv.lumaWidth >> csx ) * ( pcv.lumaHeight >> csy ) : 0;
-  Buffer       levels        = slot.takeLevels();
-  m_ctx->ensure( levels, ( size_t( pcv.lumaWidth ) * pcv.lumaHeight + 2 * chromaSamples ) * sizeof( int16_t ), MemKind::Device );
-  // VVDEC_GPU_PROFILE with the shader clock: parse_prof's cycle counts, added up over the pictures (parse_prof reads
-  // threads' values as parse does: with VK_EXT_shader_subgroup_ballot)
+  return samples * sizeof( int16_t );
+}
+
+// With VVDEC_GPU_PROFILE and the shader clock, the slot's parse runs parse_prof, whose cycle counts are added up over
+// the pictures in m_parse.prof (parse_prof reads threads' values as parse does: with VK_EXT_shader_subgroup_ballot).
+void GpuRecon::setParseProfile( ParseSlot& slot )
+{
   if( m_ctx->profiling() && m_ctx->shaderClock() && m_ctx->subgroupBallot() )
   {
     m_ctx->ensure( m_parse.prof, 16 * sizeof( uint32_t ), MemKind::HostCached );
@@ -206,30 +197,15 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
     }
     slot.setProfile( m_parse.prof.addr );
   }
-  // room for as many records as the CPU's parse made
-  StagedRecords staged = slot.takeStaged();
-  ParseSlot::growStaged( m_ctx, staged, numCus, numTus );
-  if( !slot.prepare( cs, staged, levels ) )
-  {
-    return;
-  }
-  m_parse.stats.submissions += runParse( slot );
-  m_parse.recorded = true;
-  if( slot.failed )
-  {
-    return;   // (compareParse counts it)
-  }
+}
 
-  // the records in raster order, in host memory: copied in m_cmd (the picture's first part)
-  m_ctx->ensure( m_parse.outCus, std::max<size_t>( slot.numCus(), 1 ) * sizeof( CuRecord ), MemKind::HostCached );
-  m_ctx->ensure( m_parse.outTus, std::max<size_t>( slot.numTus(), 1 ) * sizeof( TuRecord ), MemKind::HostCached );
-  m_ctx->ensure( m_parse.outCtus, pcv.sizeInCtus * sizeof( CtuRecord ), MemKind::HostCached );
-  m_ctx->ensure( m_parse.check, 4 * sizeof( uint32_t ), MemKind::HostCached );
-  slot.recordScatter( m_cmd, m_parse.outCus.addr, m_parse.outTus.addr, m_parse.outCtus.addr );
-  computeBarrier();
-
-  // The levels against the CPU's parse's (in the picture in host memory, which the residual pass reads), one
-  // workgroup per TU
+// Records the check of the slot's levels against the CPU's parse's (cpuLevels: in the picture in host memory, which the
+// residual pass reads), one workgroup per TU of the records in m_parse.outTus; the differences are counted in
+// m_parse.check.
+void GpuRecon::recordLevelsCheck( const CodingStructure& cs, const ParseSlot& slot, const Planes& cpuLevels )
+{
+  const PreCalcValues& pcv    = *cs.pcv;
+  const bool           chroma = isChromaEnabled( pcv.chrFormat );
   m_ctx->api().vkCmdFillBuffer( m_cmd, m_parse.check.buffer, 0, VK_WHOLE_SIZE, 0 );
   transferToComputeBarrier();
   ParseCheckPush check{};
@@ -244,8 +220,8 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
   check.cpuStride12 = chroma ? cpuLevels.stride[COMPONENT_Cb] : 0;
   check.width       = int32_t( pcv.lumaWidth );
   check.height      = int32_t( pcv.lumaHeight );
-  check.csx         = csx;
-  check.csy         = csy;
+  check.csx         = chroma ? int( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  check.csy         = chroma ? int( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
   if( slot.numTus() > 0 )
   {
     bind( kShader_parsecheck );
@@ -253,6 +229,51 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
     dispatchJobs( slot.numTus() );
     computeBarrier();
   }
+}
+
+void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, const Planes& cpuLevels )
+{
+  m_parse.recorded = false;
+  if( m_parse.contexts == 0 )
+  {
+    m_parse.contexts = checkParseContexts() ? 1 : -1;
+  }
+  if( m_parse.contexts < 0 )
+  {
+    return;
+  }
+  if( !m_parse.slot )
+  {
+    m_parse.slot = std::make_unique<ParseSlot>( m_ctx );
+  }
+  ParseSlot& slot = *m_parse.slot;
+  // the levels into the slot's own buffer (the CPU's parse has its levels in the picture), for the check below: the
+  // one of the picture before, with room for the picture's
+  Buffer levels = slot.takeLevels();
+  m_ctx->ensure( levels, levelsBytes( *cs.pcv ), MemKind::Device );
+  setParseProfile( slot );
+  // room for as many records as the CPU's parse made
+  StagedRecords staged = slot.takeStaged();
+  ParseSlot::growStaged( m_ctx, staged, countRecords( *jobs.cus ), countRecords( *jobs.tus ) );
+  if( !slot.prepare( cs, staged, levels ) )
+  {
+    return;
+  }
+  m_parse.stats.submissions += runParse( slot );
+  m_parse.recorded = true;
+  if( slot.failed )
+  {
+    return;   // (compareParse counts it)
+  }
+
+  // the records in raster order, in host memory: copied in m_cmd (the picture's first part)
+  m_ctx->ensure( m_parse.outCus, std::max<size_t>( slot.numCus(), 1 ) * sizeof( CuRecord ), MemKind::HostCached );
+  m_ctx->ensure( m_parse.outTus, std::max<size_t>( slot.numTus(), 1 ) * sizeof( TuRecord ), MemKind::HostCached );
+  m_ctx->ensure( m_parse.outCtus, cs.pcv->sizeInCtus * sizeof( CtuRecord ), MemKind::HostCached );
+  m_ctx->ensure( m_parse.check, 4 * sizeof( uint32_t ), MemKind::HostCached );
+  slot.recordScatter( m_cmd, m_parse.outCus.addr, m_parse.outTus.addr, m_parse.outCtus.addr );
+  computeBarrier();
+  recordLevelsCheck( cs, slot, cpuLevels );
   mark( "parse checks" );
 }
 

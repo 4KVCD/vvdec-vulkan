@@ -372,6 +372,8 @@ private:
   // coefficient levels against the CPU's parse's (cpuLevels: the picture in host memory, where the CPU's parse left
   // them).
   void     recordParse( const CodingStructure& cs, const PictureJobs& jobs, const Planes& cpuLevels );
+  void     setParseProfile( ParseSlot& slot );   // VVDEC_GPU_PROFILE's cycle counts of the parse (parse_prof)
+  void     recordLevelsCheck( const CodingStructure& cs, const ParseSlot& slot, const Planes& cpuLevels );
   // Runs the slot's parse on the compute queue, a few dispatches per submission, until every substream is parsed or
   // none advances any more. Returns the number of submissions.
   uint32_t runParse( ParseSlot& slot );
