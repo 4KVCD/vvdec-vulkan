@@ -90,6 +90,7 @@ namespace gpu
 struct JobsPush;       // (GpuReconFrontEnd.cpp)
 struct DbParamsPush;   // (GpuReconFrontEnd.cpp)
 struct DeblockPush;    // (GpuReconFilters.cpp)
+struct AlfPush;        // (GpuReconFilters.cpp)
 struct IntraSortPush;  // (GpuReconFrontEnd.cpp)
 struct InterPush;      // (GpuReconPrediction.cpp)
 
@@ -425,6 +426,8 @@ private:
   // SAO in place, on the CTUs whose SAO is on (sao.slang)
   void recordSao( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params );
   void recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params );
+  void recordAlfLuma( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params, AlfPush& push );
+  void recordAlfChroma( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params, AlfPush& push );
 
   // --- State ---
   static constexpr uint32_t kMaxMarks       = 64;   // profiling marks per picture

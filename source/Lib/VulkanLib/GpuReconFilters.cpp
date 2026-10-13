@@ -610,24 +610,16 @@ bool GpuRecon::prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& 
   return bounds;
 }
 
-void GpuRecon::recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params )
+// alf.slang's workgroups along a side of samples samples: a workgroup takes 32x32 samples (8x8 threads of 4x4)
+static uint32_t alfGroups( int samples )
+{
+  return uint32_t( ( ( samples + 3 ) / 4 + 7 ) / 8 );
+}
+
+// Luma (alf.slang loads and stores the rows 8 bytes at a time, from multiples of 4 samples)
+void GpuRecon::recordAlfLuma( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params, AlfPush& push )
 {
   const PreCalcValues& pcv = *cs.pcv;
-
-  AlfPush push{};
-  push.ctus        = params + kAlfCtus;
-  push.ctuLog2     = getLog2( pcv.maxCUWidth );
-  push.widthInCtus = pcv.widthInCtus;
-  push.bitDepth    = cs.sps->getBitDepth();
-  push.lumaWidth   = pcv.lumaWidth;
-  push.lumaHeight  = pcv.lumaHeight;
-  push.lumaStride  = src.stride[COMPONENT_Y];
-  // with boundaries (prepareAlf), the BOUNDS variants
-  const bool bounds = m_prepared.alfBounds;
-  setVirtualBoundaries( *cs.picHeader, push );
-
-  // luma (its shader loads and stores the rows 8 bytes at a time, from multiples of 4 samples); one workgroup per
-  // 32x32 samples
   CHECK_FATAL( src.addr[COMPONENT_Y] % 8 != 0 || src.stride[COMPONENT_Y] % 4 != 0 || dst.addr[COMPONENT_Y] % 8 != 0 || dst.stride[COMPONENT_Y] % 4 != 0,
                "Vulkan: the luma rows are not 8-byte aligned" );
   push.src0      = src.addr[COMPONENT_Y];
@@ -638,49 +630,71 @@ void GpuRecon::recordAlf( const CodingStructure& cs, const Planes& src, const Pl
   push.dstStride = dst.stride[COMPONENT_Y];
   push.width     = pcv.lumaWidth;
   push.height    = pcv.lumaHeight;
-  dispatch( bounds ? kShader_alf_luma_bounds : kShader_alf_luma, push, uint32_t( ( ( push.width + 3 ) / 4 + 7 ) / 8 ),
-            uint32_t( ( ( push.height + 3 ) / 4 + 7 ) / 8 ) );
+  dispatch( m_prepared.alfBounds ? kShader_alf_luma_bounds : kShader_alf_luma, push, alfGroups( push.width ), alfGroups( push.height ) );
   mark( "alf luma" );
+}
 
+// Chroma, ALF and CC-ALF. Pass 0 filters the blocks of the CTUs with ALF or CC-ALF on a chroma component into the
+// scratch planes (dst); pass 1 copies those blocks back into the twin (src), where the others stay (the caller swaps
+// only the luma planes).
+void GpuRecon::recordAlfChroma( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params, AlfPush& push )
+{
+  const PreCalcValues& pcv = *cs.pcv;
+  CHECK( src.stride[COMPONENT_Cb] != src.stride[COMPONENT_Cr] || dst.stride[COMPONENT_Cb] != dst.stride[COMPONENT_Cr],
+         "the chroma planes differ in stride" );
+  push.src0      = src.addr[COMPONENT_Cb];
+  push.dst0      = dst.addr[COMPONENT_Cb];
+  push.src1      = src.addr[COMPONENT_Cr];
+  push.dst1      = dst.addr[COMPONENT_Cr];
+  push.srcLuma   = src.addr[COMPONENT_Y];
+  push.coeff     = params + kAlfChromaCoeff;
+  push.clip      = params + kAlfChromaClip;
+  push.ccCoeff   = params + kAlfCcCoeff;
+  push.srcStride = src.stride[COMPONENT_Cb];
+  push.dstStride = dst.stride[COMPONENT_Cb];
+  push.scaleX    = getComponentScaleX( COMPONENT_Cb, pcv.chrFormat );
+  push.scaleY    = getComponentScaleY( COMPONENT_Cb, pcv.chrFormat );
+  push.width     = pcv.lumaWidth >> push.scaleX;
+  push.height    = pcv.lumaHeight >> push.scaleY;
+  // the chroma blocks' rows read and written 8 bytes at a time where all the planes' rows start 8-byte aligned
+  push.aligned = 1;
+  for( const Planes* p: { &src, &dst } )
+  {
+    for( const ComponentID comp: { COMPONENT_Cb, COMPONENT_Cr } )
+    {
+      push.aligned &= p->addr[comp] % 8 == 0 && p->stride[comp] % 4 == 0 ? 1 : 0;
+    }
+  }
+  const uint32_t groupsX = alfGroups( push.width );
+  const uint32_t groupsY = alfGroups( push.height );
+  push.pass              = 0;
+  dispatch( m_prepared.alfBounds ? kShader_alf_chroma_bounds : kShader_alf_chroma, push, groupsX, groupsY );
+  computeBarrier();
+  push.pass = 1;
+  std::swap( push.src0, push.dst0 );
+  std::swap( push.src1, push.dst1 );
+  std::swap( push.srcStride, push.dstStride );
+  dispatch( kShader_alf_chroma, push, groupsX, groupsY );
+  mark( "alf chroma" );
+}
+
+void GpuRecon::recordAlf( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params )
+{
+  const PreCalcValues& pcv = *cs.pcv;
+  AlfPush              push{};
+  push.ctus        = params + kAlfCtus;
+  push.ctuLog2     = getLog2( pcv.maxCUWidth );
+  push.widthInCtus = pcv.widthInCtus;
+  push.bitDepth    = cs.sps->getBitDepth();
+  push.lumaWidth   = pcv.lumaWidth;
+  push.lumaHeight  = pcv.lumaHeight;
+  push.lumaStride  = src.stride[COMPONENT_Y];
+  setVirtualBoundaries( *cs.picHeader, push );
+  // (with boundaries, m_prepared.alfBounds from prepareAlf: the BOUNDS variants)
+  recordAlfLuma( cs, src, dst, params, push );
   if( isChromaEnabled( pcv.chrFormat ) )
   {
-    CHECK( src.stride[COMPONENT_Cb] != src.stride[COMPONENT_Cr] || dst.stride[COMPONENT_Cb] != dst.stride[COMPONENT_Cr],
-           "the chroma planes differ in stride" );
-    push.src0      = src.addr[COMPONENT_Cb];
-    push.dst0      = dst.addr[COMPONENT_Cb];
-    push.src1      = src.addr[COMPONENT_Cr];
-    push.dst1      = dst.addr[COMPONENT_Cr];
-    push.srcLuma   = src.addr[COMPONENT_Y];
-    push.coeff     = params + kAlfChromaCoeff;
-    push.clip      = params + kAlfChromaClip;
-    push.ccCoeff   = params + kAlfCcCoeff;
-    push.srcStride = src.stride[COMPONENT_Cb];
-    push.dstStride = dst.stride[COMPONENT_Cb];
-    push.scaleX    = getComponentScaleX( COMPONENT_Cb, pcv.chrFormat );
-    push.scaleY    = getComponentScaleY( COMPONENT_Cb, pcv.chrFormat );
-    push.width     = pcv.lumaWidth >> push.scaleX;
-    push.height    = pcv.lumaHeight >> push.scaleY;
-    // the chroma blocks' rows read and written 8 bytes at a time where all the planes' rows start 8-byte aligned
-    push.aligned = 1;
-    for( const Planes* p: { &src, &dst } )
-    {
-      for( const ComponentID comp: { COMPONENT_Cb, COMPONENT_Cr } )
-      {
-        push.aligned &= p->addr[comp] % 8 == 0 && p->stride[comp] % 4 == 0 ? 1 : 0;
-      }
-    }
-    // pass 0: the blocks of the CTUs with ALF or CC-ALF on a chroma component, filtered into the scratch planes; pass 1:
-    // those blocks back into the twin, where the others stay (the caller swaps only the luma planes)
-    const uint32_t groupsX = uint32_t( ( ( push.width + 3 ) / 4 + 7 ) / 8 ), groupsY = uint32_t( ( ( push.height + 3 ) / 4 + 7 ) / 8 );
-    push.pass = 0;
-    dispatch( bounds ? kShader_alf_chroma_bounds : kShader_alf_chroma, push, groupsX, groupsY );
-    computeBarrier();
-    push.pass = 1;
-    std::swap( push.src0, push.dst0 );
-    std::swap( push.src1, push.dst1 );
-    std::swap( push.srcStride, push.dstStride );
-    dispatch( kShader_alf_chroma, push, groupsX, groupsY );
-    mark( "alf chroma" );
+    recordAlfChroma( cs, src, dst, params, push );
   }
 }
 
