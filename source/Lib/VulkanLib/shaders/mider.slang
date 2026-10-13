@@ -896,10 +896,21 @@ int neighbourCu( Cur cur, int2 p, NeighbourWords n )
   return k >= 0 && ( g_nbAvail & ( 1u << k ) ) != 0 ? n.idx : -1;
 }
 
-// The kind of motion spanMotion and the others wrote into the block's word 4
+// The kind of motion spanMotion and the others wrote into the block's word 4 (packBlockWord)
 int blockKind( NeighbourWords n )
 {
   return int( ( n.w >> 16 ) & 0xff );
+}
+
+// A translational CU's BCW index and AMVR's half-sample flag, from the block's word 4 (packBlockWord)
+int blockBcw( NeighbourWords n )
+{
+  return int( ( n.w >> 24 ) & 7 );
+}
+
+bool blockHpel( NeighbourWords n )
+{
+  return ( ( n.w >> 27 ) & 1 ) != 0;
 }
 
 // Whether the block's CU is an inter CU (CU::isInter): intra CUs' blocks are kNotInter, IBC CUs' kIbc
@@ -935,7 +946,7 @@ bool neighbourBlock( Cur cur, int k, out int cuIdx, out Motion m )
 int neighbourBcw( int k, int cuIdx )
 {
   const NeighbourWords n = neighbourWords( k );
-  return blockKind( n ) == kTranslation ? int( ( n.w >> 24 ) & 7 ) : loadCuMotion( cuIdx ).bcw;
+  return blockKind( n ) == kTranslation ? blockBcw( n ) : loadCuMotion( cuIdx ).bcw;
 }
 
 // Neighbouring block k's motion if cur may use it and its CU is an inter CU, with what the CU keeps: BCW and AMVR's
@@ -950,8 +961,8 @@ bool neighbourAt( Cur cur, int k, out int cuIdx, out Motion m )
   const NeighbourWords n = neighbourWords( k );
   if( blockKind( n ) == kTranslation )
   {
-    m.bcw  = int( ( n.w >> 24 ) & 7 );
-    m.hpel = ( ( n.w >> 27 ) & 1 ) != 0;
+    m.bcw  = blockBcw( n );
+    m.hpel = blockHpel( n );
   }
   else
   {
@@ -2412,6 +2423,14 @@ void spanGeo( Cur cur, int splitDir, Motion m0, Motion m1 )
 // A CU
 // --------------------------------------------------------------------------------------------------------------------
 
+// A motion block's word 4: its reference indices (a signed byte each), the kind of motion its CU wrote (kNotInter,
+// kTranslation, ...), and a translational CU's BCW index and AMVR's half-sample flag (which neighbourAt reads there)
+int packBlockWord( int refIdx0, int refIdx1, int kind, int bcw, bool hpel )
+{
+  return int( ( uint( refIdx0 ) & 0xff ) | ( ( uint( refIdx1 ) & 0xff ) << 8 ) | ( uint( kind ) << 16 ) | ( ( uint( bcw ) & 7 ) << 24 )
+              | ( hpel ? 1u << 27 : 0u ) );
+}
+
 // Fills the CU's 4x4 blocks with one motion.
 void spanMotion( Cur cur, Motion m, int kind )
 {
@@ -2422,9 +2441,7 @@ void spanMotion( Cur cur, Motion m, int kind )
   int*      first   = pc.motion + ( ( ctuOf( cur.cu.x, cur.cu.y ) << ( 2 * log2C4 ) ) + ( ( cur.cu.y & ctuMask ) >> 2 << log2C4 )
                                   + ( ( cur.cu.x & ctuMask ) >> 2 ) ) * 5;
   const int w4      = 1 << lw4;
-  // The packed word: the reference indices, the kind, then BCW and AMVR's half-sample flag (for neighbourAt)
-  const int packed  = int( ( uint( m.refIdx[0] ) & 0xff ) | ( ( uint( m.refIdx[1] ) & 0xff ) << 8 ) | ( uint( kind ) << 16 )
-                            | ( ( uint( m.bcw ) & 7 ) << 24 ) | ( m.hpel ? 1u << 27 : 0u ) );
+  const int packed  = packBlockWord( m.refIdx[0], m.refIdx[1], kind, m.bcw, m.hpel );
   for( int u = g_lane; u < w4 * ( cur.cu.h >> 2 ); u += 32 )
   {
     int* mi = first + ( ( ( u >> lw4 ) << log2C4 ) + ( u & ( w4 - 1 ) ) ) * 5;
@@ -2461,7 +2478,7 @@ void storeNoMotion( int ctu, int first, int count )
     }
   }
   const Motion m      = noMotion();
-  const int    packed = int( ( uint( m.refIdx[0] ) & 0xff ) | ( ( uint( m.refIdx[1] ) & 0xff ) << 8 ) | ( uint( kNotInter ) << 16 ) );
+  const int    packed = packBlockWord( m.refIdx[0], m.refIdx[1], kNotInter, 0, false );
   const int    log2C4 = pc.log2Ctu - 2;
   const int    x0     = ( ctu % pc.widthInCtus ) << pc.log2Ctu;
   const int    y0     = ( ctu / pc.widthInCtus ) << pc.log2Ctu;
