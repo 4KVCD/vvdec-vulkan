@@ -3388,150 +3388,194 @@ int chunkRow( int t, int n )
   return n == 4 ? t >> 2 : ( n == 2 ? t >> 1 : t / 3 );
 }
 
-// The tile from boxes, after affineMain worked out its subblocks' motion (s_sbMv, s_cbMv); returns false, having done
-// nothing, where the boxes do not fit. hi: the predictions are kept at 14 bits (bi-prediction or weighted prediction).
-bool affineBoxTile( int tid, uint job[24], int x, int y, int w, int h, int flags, bool bi, bool hi )
+// The boxes of an affine tile's lists, in slots: slot 0 takes the first list the tile uses, slot 1 list 1 when the tile
+// uses both (with one list, slot 1 repeats slot 0)
+struct AffineTileBoxes
 {
-  const int  nsx   = w >> 2;   // the luma subblocks across and down
-  const int  nsy   = h >> 2;
-  const int  ncx   = w >> 3;   // the chroma subblocks (4:2:0)
-  const int  ncy   = h >> 3;
-  // The lists' slots: the first list used goes in slot 0; with both lists, L1 goes in slot 1.
-  const bool l0        = ( flags & FLAG_L0 ) != 0;
-  const int  lists     = bi ? 2 : 1;
-  const int  listOf[2] = { l0 ? 0 : 1, 1 };
-  AffineBox  yBox[2], cBox[2];
-  bool       fits = true;
-  [unroll]
-  for( int s = 0; s < 2; s++ )
-  {
-    const int list = s < lists ? listOf[s] : listOf[0];   // (with one list, slot 1 repeats slot 0)
-    yBox[s]        = affineBox( s_sbMv[list][0], s_sbMv[list][nsx - 1], s_sbMv[list][nsx * ( nsy - 1 )], s_sbMv[list][nsx * nsy - 1], 4 * ( nsx - 1 ),
-                                4 * ( nsy - 1 ), 4, 2, 9 );
-    cBox[s]        = affineBox( s_cbMv[list][0], s_cbMv[list][ncx - 1], s_cbMv[list][ncx * ( ncy - 1 )], s_cbMv[list][ncx * ncy - 1], 4 * ( ncx - 1 ),
-                                4 * ( ncy - 1 ), 5, 1, 7 );
-    fits           = fits && affineBoxFits( yBox[s], x, y, pc.picWidth, pc.picHeight, AB_S, AB_ROWS )
-           && affineBoxFits( cBox[s], x >> 1, y >> 1, pc.picWidth >> 1, pc.picHeight >> 1, AC_S, AC_ROWS );
-  }
-  if( !fits )
-  {
-    return false;
-  }
-  const int maxVal = ( 1 << pc.bitDepth ) - 1;
+  int       lists;       // the lists the tile uses: 1 or 2
+  int       listOf[2];   // the list of each slot
+  AffineBox yBox[2];     // a slot's luma box
+  AffineBox cBox[2];     // and its chroma box (4:2:0)
+};
 
-  // All of the tile's reads, none in a branch (as tile's). Each read takes one plane, the same in all the threads, as a
-  // scalar base for at(). Luma boxes: rows of n chunks of 16 bytes from the lead sample, two reads a thread per list (a
-  // thread past the last chunk reads the last one again, and stores nothing). Chroma boxes: rows of chunks of 8 bytes, a
-  // read a thread per component and list.
-  int16_t* planeY[2];
-  int16_t* planeCb[2];
-  int16_t* planeCr[2];
-  int      yLead[2], yNch[2], yTasks[2], cLead[2], cNch[2], cTasks[2];
-  uint     yFirst[2], cFirst[2];
+// Works out the tile's boxes from its corner subblocks' motion (s_sbMv, s_cbMv); false where a box does not fit
+bool affineTileBoxes( int x, int y, int w, int h, int flags, bool bi, out AffineTileBoxes b )
+{
+  const int nsx = w >> 2;   // the luma subblocks across and down
+  const int nsy = h >> 2;
+  const int ncx = w >> 3;   // the chroma subblocks (4:2:0)
+  const int ncy = h >> 3;
+  const bool l0 = ( flags & FLAG_L0 ) != 0;
+  b.lists       = bi ? 2 : 1;
+  b.listOf[0]   = l0 ? 0 : 1;
+  b.listOf[1]   = 1;
+  bool fits     = true;
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    const int list = s < lists ? listOf[s] : listOf[0];
+    const int list = s < b.lists ? b.listOf[s] : b.listOf[0];   // (with one list, slot 1 repeats slot 0)
+    b.yBox[s]      = affineBox( s_sbMv[list][0], s_sbMv[list][nsx - 1], s_sbMv[list][nsx * ( nsy - 1 )], s_sbMv[list][nsx * nsy - 1], 4 * ( nsx - 1 ),
+                                4 * ( nsy - 1 ), 4, 2, 9 );
+    b.cBox[s]      = affineBox( s_cbMv[list][0], s_cbMv[list][ncx - 1], s_cbMv[list][ncx * ( ncy - 1 )], s_cbMv[list][ncx * ncy - 1], 4 * ( ncx - 1 ),
+                                4 * ( ncy - 1 ), 5, 1, 7 );
+    fits           = fits && affineBoxFits( b.yBox[s], x, y, pc.picWidth, pc.picHeight, AB_S, AB_ROWS )
+           && affineBoxFits( b.cBox[s], x >> 1, y >> 1, pc.picWidth >> 1, pc.picHeight >> 1, AC_S, AC_ROWS );
+  }
+  return fits;
+}
+
+// An affine tile's reads of its boxes and where they lie: per slot, the luma box's lead sample, chunks a row and chunks
+// in all, and the chroma box's; then the chunks this thread read (yChunk[2 * slot + k], cChunk[2 * slot + component - 1])
+struct AffineTileReads
+{
+  int   yLead[2], yNch[2], yTasks[2], cLead[2], cNch[2], cTasks[2];
+  uint4 yChunk[4];
+  uint2 cChunk[4];
+};
+
+// All of the tile's box reads, none in a branch (as tile's). Each read takes one plane, the same in all the threads, as
+// a scalar base for at(). Luma boxes: rows of n chunks of 16 bytes from the lead sample, two reads a thread per list (a
+// thread past the last chunk reads the last one again, and stores nothing). Chroma boxes: rows of chunks of 8 bytes, a
+// read a thread per component and list.
+AffineTileReads affineTileReads( int tid, uint job[24], int x, int y, AffineTileBoxes b )
+{
+  AffineTileReads r;
+  int16_t*        planeY[2];
+  int16_t*        planeCb[2];
+  int16_t*        planeCr[2];
+  uint            yFirst[2], cFirst[2];
+  [unroll]
+  for( int s = 0; s < 2; s++ )
+  {
+    const int list = s < b.lists ? b.listOf[s] : b.listOf[0];
     const int slot = int( ( job[7] >> ( 8 * list ) ) & 255 );
     planeY[s]      = uniPtr( refPlane( slot, 0 ) );
     planeCb[s]     = uniPtr( refPlane( slot, 1 ) );
     planeCr[s]     = uniPtr( refPlane( slot, 2 ) );
-    const int bx   = x + yBox[s].x0, by = y + yBox[s].y0;
-    yLead[s]       = bx & 1;
-    yNch[s]        = ( yBox[s].w + yLead[s] + 7 ) >> 3;
-    yTasks[s]      = yNch[s] * yBox[s].h;
-    yFirst[s]      = uint( by * pc.stride0 + bx - yLead[s] );
-    const int cx   = ( x >> 1 ) + cBox[s].x0, cy = ( y >> 1 ) + cBox[s].y0;
-    cLead[s]       = cx & 1;
-    cNch[s]        = ( cBox[s].w + cLead[s] + 3 ) >> 2;
-    cTasks[s]      = cNch[s] * cBox[s].h;
-    cFirst[s]      = uint( cy * pc.stride12 + cx - cLead[s] );
+    const int bx   = x + b.yBox[s].x0, by = y + b.yBox[s].y0;
+    r.yLead[s]     = bx & 1;
+    r.yNch[s]      = ( b.yBox[s].w + r.yLead[s] + 7 ) >> 3;
+    r.yTasks[s]    = r.yNch[s] * b.yBox[s].h;
+    yFirst[s]      = uint( by * pc.stride0 + bx - r.yLead[s] );
+    const int cx   = ( x >> 1 ) + b.cBox[s].x0, cy = ( y >> 1 ) + b.cBox[s].y0;
+    r.cLead[s]     = cx & 1;
+    r.cNch[s]      = ( b.cBox[s].w + r.cLead[s] + 3 ) >> 2;
+    r.cTasks[s]    = r.cNch[s] * b.cBox[s].h;
+    cFirst[s]      = uint( cy * pc.stride12 + cx - r.cLead[s] );
   }
-  uint4 yChunk[4];   // [2 * slot + k]
   [unroll]
   for( int k = 0; k < 4; k++ )
   {
     const int s   = k >> 1;
-    const int c   = min( tid + THREADS * ( k & 1 ), yTasks[s] - 1 );
-    const int row = chunkRow( c, yNch[s] );
-    yChunk[k]     = load16( planeY[s], yFirst[s] + uint( row * pc.stride0 + 8 * ( c - yNch[s] * row ) ) );
+    const int c   = min( tid + THREADS * ( k & 1 ), r.yTasks[s] - 1 );
+    const int row = chunkRow( c, r.yNch[s] );
+    r.yChunk[k]   = load16( planeY[s], yFirst[s] + uint( row * pc.stride0 + 8 * ( c - r.yNch[s] * row ) ) );
   }
-  uint2 cChunk[4];   // [2 * slot + component - 1]
   [unroll]
   for( int k = 0; k < 4; k++ )
   {
     const int s   = k >> 1;
-    const int c   = min( tid, cTasks[s] - 1 );
-    const int row = chunkRow( c, cNch[s] );
-    cChunk[k]     = load8( ( k & 1 ) != 0 ? planeCr[s] : planeCb[s], cFirst[s] + uint( row * pc.stride12 + 4 * ( c - cNch[s] * row ) ) );
+    const int c   = min( tid, r.cTasks[s] - 1 );
+    const int row = chunkRow( c, r.cNch[s] );
+    r.cChunk[k]   = load8( ( k & 1 ) != 0 ? planeCr[s] : planeCb[s], cFirst[s] + uint( row * pc.stride12 + 4 * ( c - r.cNch[s] * row ) ) );
   }
-  // The residuals where the thread's predictions go, when the tile has any: luma, row v of the subblock sb (a thread
-  // past the subblocks takes the last one's place, and stores nothing); chroma, (cj, ci0 .. ci0 + 1) of component cc,
-  // 2^lg threads a row (a thread past the rows takes the last one).
-  const int  sb    = tid >> 2;
-  const int  v     = tid & 3;
-  const bool mine  = sb < nsx * nsy;
-  const int  sbc   = min( sb, nsx * nsy - 1 );
-  const uint atY   = uint( ( y + 4 * ( sbc / nsx ) + v ) * pc.stride0 + x + 4 * ( sbc % nsx ) );
-  const int  lg    = w == 16 ? 2 : 1;
-  const int  cc    = tid >> 5;
-  const int  cjAll = ( tid & 31 ) >> lg;
-  const bool mineC = cjAll < ( h >> 1 );
-  const int  cj    = min( cjAll, ( h >> 1 ) - 1 );
-  const int  ci0   = ( tid & ( ( 1 << lg ) - 1 ) ) << 1;
-  const uint atC   = uint( ( ( y >> 1 ) + cj ) * pc.stride12 + ( x >> 1 ) + ci0 );
-  uint2      resY  = uint2( 0, 0 );
-  uint       resCb = 0, resCr = 0;
+  return r;
+}
+
+// Where an affine tile's thread puts its predictions, and the residuals there: luma, row v of the subblock sb (a thread
+// past the subblocks takes the last one's place, and stores nothing); chroma, (cj, ci0 .. ci0 + 1) of component cc,
+// 2^lg threads a row (a thread past the rows takes the last one)
+struct AffineTileThread
+{
+  int   sb, v, sbc;   // the luma subblock (sbc: the last one for a thread past them), the row in it
+  bool  mine;         // the thread has a luma subblock
+  uint  atY;          // where its luma predictions go
+  int   cc, cj, ci0;  // its chroma component (0 Cb, 1 Cr), row and first sample
+  bool  mineC;        // the thread has a chroma row
+  uint  atC;          // where its chroma predictions go
+  uint2 resY;         // the residuals there (zero without)
+  uint  resC;
+};
+
+AffineTileThread affineTileThread( int tid, int x, int y, int w, int h, int flags )
+{
+  const int        nsx = w >> 2;
+  const int        nsy = h >> 2;
+  AffineTileThread p;
+  p.sb             = tid >> 2;
+  p.v              = tid & 3;
+  p.mine           = p.sb < nsx * nsy;
+  p.sbc            = min( p.sb, nsx * nsy - 1 );
+  p.atY            = uint( ( y + 4 * ( p.sbc / nsx ) + p.v ) * pc.stride0 + x + 4 * ( p.sbc % nsx ) );
+  const int lg     = w == 16 ? 2 : 1;
+  p.cc             = tid >> 5;
+  const int cjAll  = ( tid & 31 ) >> lg;
+  p.mineC          = cjAll < ( h >> 1 );
+  p.cj             = min( cjAll, ( h >> 1 ) - 1 );
+  p.ci0            = ( tid & ( ( 1 << lg ) - 1 ) ) << 1;
+  p.atC            = uint( ( ( y >> 1 ) + p.cj ) * pc.stride12 + ( x >> 1 ) + p.ci0 );
+  p.resY           = uint2( 0, 0 );
+  uint resCb = 0, resCr = 0;
   if( ( flags & FLAG_RES_Y ) != 0 )
   {
-    resY = *(uint2*)at( pc.dst0, atY );
+    p.resY = *(uint2*)at( pc.dst0, p.atY );
   }
   if( ( flags & ( ( FLAG_RES_Y << 1 ) | ( FLAG_RES_Y << 2 ) ) ) != 0 )
   {
-    resCb = *(uint*)at( pc.dst1, atC );
-    resCr = *(uint*)at( pc.dst2, atC );
+    resCb = *(uint*)at( pc.dst1, p.atC );
+    resCr = *(uint*)at( pc.dst2, p.atC );
   }
-  const uint resC = cc == 0 ? resCb : resCr;
+  p.resC = p.cc == 0 ? resCb : resCr;
+  return p;
+}
 
-  // Luma, a list at a time: its box into the pool (a chunk a store), then the thread's predictions from its subblock's
-  // window there (with PROF where the list has it).
-  int4 predY[2] = { int4( 0, 0, 0, 0 ), int4( 0, 0, 0, 0 ) };
+// Luma, a list at a time: its box into the pool (a chunk a store), then the thread's predictions from its subblock's
+// window there (with PROF where the list has it)
+void affineTileLuma( int tid, uint job[24], int w, bool hi, AffineTileBoxes b, AffineTileReads r, AffineTileThread p,
+                     out int4 predY[2] )
+{
+  const int nsx = w >> 2;
+  predY[0]      = int4( 0, 0, 0, 0 );
+  predY[1]      = int4( 0, 0, 0, 0 );
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    if( s < lists )
+    if( s < b.lists )
     {
       [unroll]
       for( int k = 0; k < 2; k++ )
       {
         const int c = tid + THREADS * k;
-        if( c < yTasks[s] )
+        if( c < r.yTasks[s] )
         {
-          const int row = chunkRow( c, yNch[s] );
-          storeEight( row * AB_S + 8 * ( c - yNch[s] * row ), yChunk[2 * s + k] );
+          const int row = chunkRow( c, r.yNch[s] );
+          storeEight( row * AB_S + 8 * ( c - r.yNch[s] * row ), r.yChunk[2 * s + k] );
         }
       }
       GroupMemoryBarrierWithGroupSync();
-      const int  list = listOf[s];
+      const int  list = b.listOf[s];
       const bool prof = ( ( job[12] >> ( 16 + list ) ) & 1 ) != 0;
-      const int2 mv   = s_sbMv[list][sbc];
+      const int2 mv   = s_sbMv[list][p.sbc];
       // (the subblock's window: from 2 samples before its integer position)
-      const int  at   = ( 4 * ( sbc / nsx ) + ( mv.y >> 4 ) - 2 - yBox[s].y0 ) * AB_S + 4 * ( sbc % nsx ) + ( mv.x >> 4 ) - 2 - yBox[s].x0 + yLead[s];
-      int4       p    = affineLumaFilter( at, AB_S, sbc, v, mv.x & 15, mv.y & 15, hi || prof );
+      const int  at   = ( 4 * ( p.sbc / nsx ) + ( mv.y >> 4 ) - 2 - b.yBox[s].y0 ) * AB_S + 4 * ( p.sbc % nsx ) + ( mv.x >> 4 ) - 2 - b.yBox[s].x0
+                       + r.yLead[s];
+      int4       q    = affineLumaFilter( at, AB_S, p.sbc, p.v, mv.x & 15, mv.y & 15, hi || prof );
       if( prof )
       {
-        affineProf( job, list, sbc, v, mine, at, AB_S, mv.x & 15, mv.y & 15, hi, p );
+        affineProf( job, list, p.sbc, p.v, p.mine, at, AB_S, mv.x & 15, mv.y & 15, hi, q );
       }
-      predY[s] = p;
+      predY[s] = q;
       GroupMemoryBarrierWithGroupSync();   // the box is read: the next one replaces it
     }
   }
+}
 
-  // Average the luma predictions (with BCW's weights), apply LMCS's mapping, add the residuals and write the results:
-  // only the threads of the tile's subblocks. (A thread past them has no final predictions: affineProf leaves its 14-bit
-  // ones, which as LMCS's table index read far outside the table, and the GPU faulted.)
-  const int bcwW1 = int( ( job[7] >> 16 ) & 15 ) - 2;
-  if( mine )
+// The luma predictions averaged (with BCW's weights), mapped by LMCS, plus the residuals, written: only by the threads of
+// the tile's subblocks. (A thread past them has no final predictions: affineProf leaves its 14-bit ones, which as LMCS's
+// table index read far outside the table, and the GPU faulted.)
+void affineTileLumaOut( uint job[24], int flags, int bcwW1, int maxVal, int4 predY[2], AffineTileThread p )
+{
+  if( p.mine )
   {
     int4 vy;
     [unroll]
@@ -3545,38 +3589,43 @@ bool affineBoxTile( int tid, uint job[24], int x, int y, int w, int h, int flags
     }
     if( ( flags & FLAG_RES_Y ) != 0 )
     {
-      vy = clamp( vy + unpackSamples( resY ), 0, maxVal );
+      vy = clamp( vy + unpackSamples( p.resY ), 0, maxVal );
     }
-    *(uint2*)at( ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0, atY ) = packSamples( vy );
+    *(uint2*)at( ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0, p.atY ) = packSamples( vy );
   }
+}
 
-  // Chroma: the boxes into the pool (a chunk a store), then the thread's two samples of each list from its chroma
-  // subblock's window.
+// Chroma: the boxes into the pool (a chunk a store), then the thread's two samples of each list from its chroma
+// subblock's window, averaged, plus the residuals, written
+void affineTileChroma( int tid, uint job[24], int w, int flags, bool hi, int bcwW1, int maxVal, AffineTileBoxes b, AffineTileReads r,
+                       AffineTileThread p )
+{
+  const int ncx = w >> 3;
   [unroll]
   for( int k = 0; k < 4; k++ )
   {
     const int s = k >> 1;
-    if( s < lists && tid < cTasks[s] )
+    if( s < b.lists && tid < r.cTasks[s] )
     {
-      const int row = chunkRow( tid, cNch[s] );
-      storeFour( AC_AT( k ) + row * AC_S + 4 * ( tid - cNch[s] * row ), cChunk[k] );
+      const int row = chunkRow( tid, r.cNch[s] );
+      storeFour( AC_AT( k ) + row * AC_S + 4 * ( tid - r.cNch[s] * row ), r.cChunk[k] );
     }
   }
   GroupMemoryBarrierWithGroupSync();
-  int2 predC[2] = { int2( 0, 0 ), int2( 0, 0 ) };
-  const int cb  = ( cj >> 2 ) * ncx + ( ci0 >> 2 );   // the thread's chroma subblock
+  int2      predC[2] = { int2( 0, 0 ), int2( 0, 0 ) };
+  const int cb       = ( p.cj >> 2 ) * ncx + ( p.ci0 >> 2 );   // the thread's chroma subblock
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    if( s < lists )
+    if( s < b.lists )
     {
-      const int2 mv = s_cbMv[listOf[s]][cb];
-      const int  at = AC_AT( 2 * s + cc ) + ( 4 * ( cb / ncx ) + ( mv.y >> 5 ) - 1 - cBox[s].y0 ) * AC_S + 4 * ( cb % ncx ) + ( mv.x >> 5 ) - 1 - cBox[s].x0
-                     + cLead[s];
+      const int2 mv = s_cbMv[b.listOf[s]][cb];
+      const int  at = AC_AT( 2 * s + p.cc ) + ( 4 * ( cb / ncx ) + ( mv.y >> 5 ) - 1 - b.cBox[s].y0 ) * AC_S + 4 * ( cb % ncx ) + ( mv.x >> 5 ) - 1
+                     - b.cBox[s].x0 + r.cLead[s];
       [unroll]
       for( int o = 0; o < 2; o++ )
       {
-        predC[s][o] = affineChromaSample( at, AC_S, ( ci0 & 3 ) + o, cj & 3, mv.x & 31, mv.y & 31, hi );
+        predC[s][o] = affineChromaSample( at, AC_S, ( p.ci0 & 3 ) + o, p.cj & 3, mv.x & 31, mv.y & 31, hi );
       }
     }
   }
@@ -3584,18 +3633,37 @@ bool affineBoxTile( int tid, uint job[24], int x, int y, int w, int h, int flags
   [unroll]
   for( int o = 0; o < 2; o++ )
   {
-    vc[o] = combineLists( flags, 1 + cc, predC[0][o], predC[1][o], 0, job[9 + cc], job[11], bcwW1 );
+    vc[o] = combineLists( flags, 1 + p.cc, predC[0][o], predC[1][o], 0, job[9 + p.cc], job[11], bcwW1 );
   }
-  if( ( flags & ( FLAG_RES_Y << ( 1 + cc ) ) ) != 0 )
+  if( ( flags & ( FLAG_RES_Y << ( 1 + p.cc ) ) ) != 0 )
   {
-    vc = clamp( vc + int2( lo16( resC ), hi16( resC ) ), 0, maxVal );
+    vc = clamp( vc + int2( lo16( p.resC ), hi16( p.resC ) ), 0, maxVal );
   }
-  if( mineC )
+  if( p.mineC )
   {
     int16_t* outCb = ( flags & FLAG_DEFER_CB ) != 0 ? pc.defer1 : pc.dst1;
     int16_t* outCr = ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2;
-    *(uint*)at( cc == 0 ? outCb : outCr, atC ) = packPair( vc );
+    *(uint*)at( p.cc == 0 ? outCb : outCr, p.atC ) = packPair( vc );
   }
+}
+
+// The tile from boxes, after affineMain worked out its subblocks' motion (s_sbMv, s_cbMv); returns false, having done
+// nothing, where the boxes do not fit. hi: the predictions are kept at 14 bits (bi-prediction or weighted prediction).
+bool affineBoxTile( int tid, uint job[24], int x, int y, int w, int h, int flags, bool bi, bool hi )
+{
+  AffineTileBoxes boxes;
+  if( !affineTileBoxes( x, y, w, h, flags, bi, boxes ) )
+  {
+    return false;
+  }
+  const int              maxVal = ( 1 << pc.bitDepth ) - 1;
+  const int              bcwW1  = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW's L1 weight
+  const AffineTileReads  reads  = affineTileReads( tid, job, x, y, boxes );
+  const AffineTileThread place  = affineTileThread( tid, x, y, w, h, flags );
+  int4                   predY[2];
+  affineTileLuma( tid, job, w, hi, boxes, reads, place, predY );
+  affineTileLumaOut( job, flags, bcwW1, maxVal, predY, place );
+  affineTileChroma( tid, job, w, flags, hi, bcwW1, maxVal, boxes, reads, place );
   return true;
 }
 
