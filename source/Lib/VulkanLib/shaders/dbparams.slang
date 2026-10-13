@@ -468,6 +468,47 @@ void boundaryStrength( int dir, inout Lfp lfp, Cu cuQ, int2 localPos, Cu cuP )
 // LoopFilter::xSetMaxFilterLengthPQFromTransformSizes
 // --------------------------------------------------------------------------------------------------------------------
 
+// Luma's maximum filter lengths on the P and Q sides of a transform edge, as sideMaxFiltLength holds them (P << 4 | Q,
+// plus 128): 1 next to a block of 4 samples or fewer, else 7 next to a block of 32 or more (5 for an affine P side)
+// and 3 otherwise
+int lumaMaxFilterLengths( int sizeP, int sizeQ, Cu cuP )
+{
+  int maxFLPQ;
+  if( sizeP <= 4 || sizeQ <= 4 )
+  {
+    maxFLPQ = 17;
+  }
+  else
+  {
+    maxFLPQ = sizeP >= 32 ? ( affineOf( cuP ) ? 5 : 7 ) : 3;
+    maxFLPQ <<= 4;
+    maxFLPQ += sizeQ >= 32 ? 7 : 3;
+  }
+  return maxFLPQ + 128;
+}
+
+// Marks a transform edge in the boundary strength: bsSet( 3, 3 ) where the edge already has a strength or is the
+// CU's edge too (sameCuTu), else bsSet( 1, 3 )
+void markTransformEdge( inout Lfp lfp, bool sameCuTu )
+{
+  if( lfp.bs != 0 || sameCuTu )
+  {
+    lfp.bs |= bsSet( 3, 3 );
+  }
+  else
+  {
+    lfp.bs |= bsSet( 1, 3 );
+  }
+}
+
+// How far along the edge, from posQ (d into the Q side's transform block tb), the P side's transform block tuP
+// reaches: the run whose parameters are the same
+int sharedEdgeRun( int dir, Tu tuP, int ch, int2 posQ, int4 tb, int d )
+{
+  const int distance = parl( dir, tuP.blk[ch].xy ) + parlSize( dir, tuP.blk[ch] ) - parl( dir, posQ );
+  return min( distance, parlSize( dir, tb ) - d );
+}
+
 void filterLengthsFromTransforms( int dir, Cu cu, Tu currTu, bool bValue, bool deriveBdStrngt, bool pqSameCtu )
 {
   int start = 0, end = 1;
@@ -530,11 +571,7 @@ void filterLengthsFromTransforms( int dir, Cu cu, Tu currTu, bool bValue, bool d
           storeLfp( ptr, lfp );
           if( !isIntra( cu ) && !isIntra( cuP ) && cuP.index == cuPfstCh.index && !geoOf( cu ) && !geoOf( cuP ) )
           {
-            int distance = parl( dir, tuP.blk[ch].xy ) + parlSize( dir, tuP.blk[ch] ) - parl( dir, posQ );
-            if( distance > parlSize( dir, tb ) - d )
-            {
-              distance = parlSize( dir, tb ) - d;
-            }
+            const int distance = sharedEdgeRun( dir, tuP, ch, posQ, tb, d );
             if( distance > inc && !affineOf( cuP ) && !( mergeOf( cuP ) && mergeTypeOf( cuP ) == MRG_TYPE_SUBPU_ATMVP ) )
             {
               for( int j = inc; j < distance; j += inc, d += inc, dFst += incFst )
@@ -563,9 +600,9 @@ void filterLengthsFromTransforms( int dir, Cu cu, Tu currTu, bool bValue, bool d
           uint*      ptr      = lfpPtr( dir, lp.x, lp.y );
           Lfp        lfp      = loadLfp( ptr );
           setFilterEdge( lfp, cu.chType, bValue );
-          if( ( lfp.bs != 0 || sameCuTu ) && bValue )
+          if( bValue )
           {
-            lfp.bs |= bsSet( 3, 3 );
+            markTransformEdge( lfp, sameCuTu );
           }
           else
           {
@@ -573,20 +610,7 @@ void filterLengthsFromTransforms( int dir, Cu cu, Tu currTu, bool bValue, bool d
           }
           if( ch == 0 )
           {
-            int        maxFLPQ;
-            const bool smallBlock = sizeP <= 4 || sizeQ <= 4;
-            if( smallBlock )
-            {
-              maxFLPQ = 17;
-            }
-            else
-            {
-              maxFLPQ = sizeP >= 32 ? ( affineOf( cuP ) ? 5 : 7 ) : 3;
-              maxFLPQ <<= 4;
-              maxFLPQ += sizeQ >= 32 ? 7 : 3;
-            }
-            maxFLPQ += 128;
-            lfp.sideMaxFiltLength = maxFLPQ;
+            lfp.sideMaxFiltLength = lumaMaxFilterLengths( sizeP, sizeQ, cuP );
           }
           else
           {
@@ -612,11 +636,7 @@ void filterLengthsFromTransforms( int dir, Cu cu, Tu currTu, bool bValue, bool d
         const Cu   cuP      = loadCu( cuAt( ch, posP ) );
         const Tu   tuP      = tuAt( cuP, posP, ch );
         const int  sizeP    = perpSize( dir, tuP.blk[ch] );
-        int        distance = parl( dir, tuP.blk[ch].xy ) + parlSize( dir, tuP.blk[ch] ) - parl( dir, posQ );
-        if( distance > parlSize( dir, tb ) - d )
-        {
-          distance = parlSize( dir, tb ) - d;
-        }
+        const int  distance = sharedEdgeRun( dir, tuP, ch, posQ, tb, d );
         if( ch == 0 )
         {
           uint* ptr = lfpPtr( dir, lp.x, lp.y );
@@ -624,28 +644,8 @@ void filterLengthsFromTransforms( int dir, Cu cu, Tu currTu, bool bValue, bool d
           setFilterEdge( lfp, cu.chType, bValue );
           if( bValue )
           {
-            if( lfp.bs != 0 || sameCuTu )
-            {
-              lfp.bs |= bsSet( 3, 3 );
-            }
-            else
-            {
-              lfp.bs |= bsSet( 1, 3 );
-            }
-            int        maxFLPQ;
-            const bool smallBlock = sizeP <= 4 || sizeQ <= 4;
-            if( smallBlock )
-            {
-              maxFLPQ = 17;
-            }
-            else
-            {
-              maxFLPQ = sizeP >= 32 ? ( affineOf( cuP ) ? 5 : 7 ) : 3;
-              maxFLPQ <<= 4;
-              maxFLPQ += sizeQ >= 32 ? 7 : 3;
-            }
-            maxFLPQ += 128;
-            lfp.sideMaxFiltLength = maxFLPQ;
+            markTransformEdge( lfp, sameCuTu );
+            lfp.sideMaxFiltLength = lumaMaxFilterLengths( sizeP, sizeQ, cuP );
           }
           storeLfp( ptr, lfp );
           if( distance > inc )
@@ -670,14 +670,7 @@ void filterLengthsFromTransforms( int dir, Cu cu, Tu currTu, bool bValue, bool d
               setFilterEdge( lfp, cu.chType, bValue );
               if( bValue )
               {
-                if( lfp.bs != 0 || sameCuTu )
-                {
-                  lfp.bs |= bsSet( 3, 3 );
-                }
-                else
-                {
-                  lfp.bs |= bsSet( 1, 3 );
-                }
+                markTransformEdge( lfp, sameCuTu );
               }
             }
             setFilterCMFL( lfp, sizeQ >= 8 && sizeP >= 8 );
