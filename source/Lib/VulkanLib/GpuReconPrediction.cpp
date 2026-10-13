@@ -102,57 +102,74 @@ struct TrafoPush
 };
 static_assert( sizeof( TrafoPush ) == 112, "TrafoPush: the layout of trafo.slang's Params" );
 
+// Room for size bytes in buf, an upload buffer of the CTU tasks' jobs. When it is smaller, it is replaced with one of
+// twice the size, so that the next pictures, which may have a few more jobs, seldom need a new one.
+static void ensureJobUpload( Context* ctx, Buffer& buf, size_t size )
+{
+  if( buf.size < size )
+  {
+    ctx->free( buf );
+    buf = ctx->alloc( size * 2, MemKind::Upload );
+  }
+}
+
+size_t GpuRecon::uploadTrafoJobs( const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf )
+{
+  size_t total = 0;
+  for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
+  {
+    total += jobs[ctu].size();
+  }
+  if( total == 0 )
+  {
+    return 0;
+  }
+  ensureJobUpload( m_ctx, buf, total * sizeof( TrafoJob ) );
+  TrafoJob* all = reinterpret_cast<TrafoJob*>( buf.mapped );
+  for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
+  {
+    memcpy( all, jobs[ctu].data(), jobs[ctu].size() * sizeof( TrafoJob ) );
+    all += jobs[ctu].size();
+  }
+  return total;
+}
+
 void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
                             const Planes& levels, const Planes& planes )
 {
-  // Without the front end, the CTU tasks' jobs are uploaded.
-  size_t total = 0;
-  if( !m_useFrontEnd )
-  {
-    for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
-    {
-      total += jobs[ctu].size();
-    }
-    if( total == 0 )
-    {
-      return;
-    }
-    const size_t size = total * sizeof( TrafoJob );
-    if( buf.size < size )
-    {
-      m_ctx->free( buf );
-      buf = m_ctx->alloc( size * 2, MemKind::Upload );
-    }
-    TrafoJob* all = reinterpret_cast<TrafoJob*>( buf.mapped );
-    for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
-    {
-      memcpy( all, jobs[ctu].data(), jobs[ctu].size() * sizeof( TrafoJob ) );
-      all += jobs[ctu].size();
-    }
-  }
-
-  TrafoPush push{};
-  push.jobs     = m_useFrontEnd ? m_frontEnd.jobs[0].addr : buf.addr;
-  push.plane0   = planes.addr[COMPONENT_Y];
-  push.plane1   = planes.addr[COMPONENT_Cb];
-  push.plane2   = planes.addr[COMPONENT_Cr];
-  push.levels0  = levels.addr[COMPONENT_Y];
-  push.levels1  = levels.addr[COMPONENT_Cb];
-  push.levels2  = levels.addr[COMPONENT_Cr];
-  push.parsedLevels = m_frontEnd.recordLevels;   // (the GPU parse's: its jobs say where in them)
-  push.matrices = m_tables.transform.addr;
-  push.lfnst    = m_tables.lfnst.addr;
-  push.scaling  = m_scalingOn ? m_scaling.addr : 0;
-  push.stride0  = planes.stride[COMPONENT_Y];
-  push.stride12 = planes.stride[COMPONENT_Cb];
-  push.count    = m_useFrontEnd ? -1 : int32_t( total );
-  push.countAt  = frontEndCount( kPassTrafo );
-  push.bitDepth = cs.sps->getBitDepth();
   CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
   // (the levels in the picture in host memory, when the CPU parsed it: none for a picture the GPU parsed, whose levels
   // are in parsedLevels)
   CHECK( levels.addr[COMPONENT_Y] && ( levels.stride[COMPONENT_Y] != planes.stride[COMPONENT_Y] || levels.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cb] ),
          "the levels laid out differently" );
+  // Without the front end, the CTU tasks' jobs are uploaded.
+  size_t total = 0;
+  if( !m_useFrontEnd )
+  {
+    total = uploadTrafoJobs( jobs, ctuBegin, ctuEnd, buf );
+    if( total == 0 )
+    {
+      return;
+    }
+  }
+
+  TrafoPush push{};
+  push.jobs         = m_useFrontEnd ? m_frontEnd.jobs[0].addr : buf.addr;
+  push.plane0       = planes.addr[COMPONENT_Y];
+  push.plane1       = planes.addr[COMPONENT_Cb];
+  push.plane2       = planes.addr[COMPONENT_Cr];
+  push.levels0      = levels.addr[COMPONENT_Y];
+  push.levels1      = levels.addr[COMPONENT_Cb];
+  push.levels2      = levels.addr[COMPONENT_Cr];
+  push.parsedLevels = m_frontEnd.recordLevels;   // (the GPU parse's: its jobs say where in them)
+  push.matrices     = m_tables.transform.addr;
+  push.lfnst        = m_tables.lfnst.addr;
+  push.scaling      = m_scalingOn ? m_scaling.addr : 0;
+  push.stride0      = planes.stride[COMPONENT_Y];
+  push.stride12     = planes.stride[COMPONENT_Cb];
+  push.count        = m_useFrontEnd ? -1 : int32_t( total );
+  push.countAt      = frontEndCount( kPassTrafo );
+  push.bitDepth     = cs.sps->getBitDepth();
 
   // one workgroup per job
   bind( kShader_trafo );
@@ -207,12 +224,7 @@ GpuRecon::InterCounts GpuRecon::uploadInterJobs( const std::vector<std::vector<I
   {
     return counts;
   }
-  const size_t size = total * sizeof( InterJob );
-  if( buf.size < size )
-  {
-    m_ctx->free( buf );
-    buf = m_ctx->alloc( size * 2, MemKind::Upload );
-  }
+  ensureJobUpload( m_ctx, buf, total * sizeof( InterJob ) );
   // The BDOF tiles go after the others, then the affine ones (two jobs each), for dispatches of the inter_bdof and
   // inter_affine variants of their own: their code would slow the others down. (The front end lays its jobs out the
   // same way.)
@@ -460,12 +472,7 @@ size_t GpuRecon::uploadIntraJobs( const std::vector<std::vector<IntraJob>>& jobs
   }
   // The bands, then each band's wait: the number of bands of the waves before its own, which must be done first
   // (intra.slang).
-  const size_t size = total * ( sizeof( IntraJob ) + sizeof( uint32_t ) );
-  if( m_cpuJobs.intra.size < size )
-  {
-    m_ctx->free( m_cpuJobs.intra );
-    m_cpuJobs.intra = m_ctx->alloc( size * 2, MemKind::Upload );
-  }
+  ensureJobUpload( m_ctx, m_cpuJobs.intra, total * ( sizeof( IntraJob ) + sizeof( uint32_t ) ) );
   IntraJob*             sorted = reinterpret_cast<IntraJob*>( m_cpuJobs.intra.mapped );
   uint32_t*             waits  = reinterpret_cast<uint32_t*>( sorted + total );
   std::vector<uint32_t> next( first.begin(), first.end() - 1 );
