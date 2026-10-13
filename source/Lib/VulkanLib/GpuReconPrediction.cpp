@@ -327,11 +327,11 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   }
   // The shader's tile paths (wide) load the planes' rows in aligned pieces of 16 and 8 bytes, up to 7 luma (3 chroma)
   // samples before a window and 9 (5) after it. So the rows must start 16-byte aligned and the margins be wide enough
-  // (the reference pictures' planes are laid out as this one's); their chroma windows are 4:2:0's, and monochrome
-  // pictures take them without chroma. With RPR,
+  // (the reference pictures' planes are laid out as this one's). Their own chroma code is 4:2:0's: 4:2:2 and 4:4:4
+  // tiles have chromaTile's, and monochrome pictures none. With RPR,
   // subpictures treated as pictures or wraparound, the shader takes them only for the jobs they suit (tileJob: no
   // scaled reference; borderTiles: inside the bounds).
-  push.wide = pcv.chrFormat == CHROMA_420 || pcv.chrFormat == CHROMA_400 ? 1 : 0;
+  push.wide = 1;
   for( int comp = 0; comp < (int) cs.picture->m_bufs[PIC_RECONSTRUCTION].bufs.size(); comp++ )
   {
     const PelStorage&  pic   = cs.picture->m_bufs[PIC_RECONSTRUCTION];
