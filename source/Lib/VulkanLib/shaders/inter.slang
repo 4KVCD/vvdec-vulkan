@@ -556,8 +556,9 @@ void rprBlock( int tid, int slot, int comp, int bx, int by, int ox, int oy, int 
   const int         half     = taps / 2 - 1;
   const int         headRoom = max( 2, 14 - pc.bitDepth );
   const int         bandRows = min( h, kRprBandRows );
-  // The window's columns, from the first column's first tap to the last column's last; and a band's rows at most
-  // (the rows' positions step evenly, so any band spans as many reference rows as the first, give or take one)
+  // The window spans the reference columns from the first tap of the tile's first column to the last tap of its last
+  // column. A band of rows needs at most rowsMax reference rows: the rows' positions step evenly, so any band spans as
+  // many reference rows as the first band, give or take one.
   const int xFirst  = rprAxisPosition( g.x0, g.stepX, ox, g.sx, comp ).x - half;
   const int cols    = rprAxisPosition( g.x0, g.stepX, ox + w - 1, g.sx, comp ).x + taps - half - xFirst;
   const int rowsMax = ( ( ( bandRows - 1 ) * g.stepY ) >> 10 ) + 2 + taps - 1;
@@ -1382,10 +1383,11 @@ void tile16ShiftChroma( int tid, int at[4], int2 dI[2] )
   GroupMemoryBarrierWithGroupSync();
 }
 
-// tile's horizontal pass of a list's 2-D luma filter (whose taps start at the window's first row and column): the
-// window's rows (the tile's + 7) at at, the tile's width of each in groups of 4, 2^lg groups a row (a 16x16 tile's: a
-// thread's group in rows 0 .. 15, and one in rows 16 .. 22 for the first 28 threads), into tmp (rows of 16). A thread
-// works out its reads' place once: each read is that plus a constant.
+// The horizontal pass of a list's 2-D luma filter in tile: it filters the window at at (whose first row and column are
+// where the taps start) across, row by row, into tmp (rows of 16). The window has the tile's rows plus 7, and each row
+// is filtered over the tile's width in groups of 4 samples, 2^lg groups a row. In a 16x16 tile, each thread takes one
+// group in rows 0 to 15, and the first 28 threads one more in rows 16 to 22. A thread works out where its reads start
+// once; each read is that place plus a constant.
 void tileLumaH( int tid, int at, int tmp, int16_t cx[8], int shift1, int offset1, int rows, int lg )
 {
   const int gi = ( tid & ( ( 1 << lg ) - 1 ) ) << 2;
@@ -1416,10 +1418,10 @@ void tileLumaH( int tid, int at, int tmp, int16_t cx[8], int shift1, int offset1
   }
 }
 
-// tile's horizontal passes of a list's 2-D chroma filters: the rows (the tile's + 3) of the Cb window at at and
-// those of the Cr window CWD rows past it (as one window of 2 CWD rows), the tile's width of each in pairs, 2^lg pairs
-// a row (a 16x16 tile's: a thread's pair in rows 0 .. 15, and one in rows 16 .. 21 for the first 24 threads), into
-// tmp (Cb's rows of 8, then Cr's).
+// The horizontal passes of a list's 2-D chroma filters in tile: they filter the Cb window at at and the Cr window CWD
+// rows after it (as one window of 2 CWD rows, each with the tile's rows plus 3) across, into tmp (Cb's rows of 8, then
+// Cr's). Each row is filtered over the tile's width in pairs of samples, 2^lg pairs a row. In a 16x16 tile, each
+// thread takes one pair in rows 0 to 15, and the first 24 threads one more in rows 16 to 21.
 void tileChromaH( int tid, int at, int tmp, int16_t cx[4], int shift1, int offset1, int rows, int lg )
 {
   const int gi = ( tid & ( ( 1 << lg ) - 1 ) ) << 1;
@@ -1878,10 +1880,11 @@ bool tileNear( int x, int y, int flags, int2 mv0, int2 mv1 )
   return near;
 }
 
-// A border tile's window row of n samples at s_pool[at], its first at the picture's column x0: the reads took the
-// samples beside the picture from its planes' margins, which hold no border extension on the GPU; the row's samples
-// left of column 0 get column 0's, those right of the last column the last column's, as vvdec's border extension of the
-// reference picture holds them. (tileNear leaves both columns in the row.)
+// Fixes a border tile's window row of n samples at s_pool[at], whose first sample is at column x0 of the picture. The
+// reads took the samples beside the picture from the planes' margins, which hold no border extension on the GPU. So the
+// samples left of column 0 are set to column 0's value, and those right of the last column to the last column's value,
+// which is what vvdec's border extension of the reference picture holds there. (tileNear leaves both columns in the
+// row.)
 void tileBorderRow( int at, int x0, int n, int width )
 {
   const int first = -x0;              // the row's sample at column 0
@@ -2118,10 +2121,11 @@ struct TileChroma
   bool edges;      // a border tile (its windows reach past the picture's edges)
 };
 
-// Where each list's chroma window starts (list slot s): a sample before its motion's integer position. With DMVR that
-// is the refined motion's, dI from the merge motion's: the window's rows are the merge motion's window's, clamped into
-// it, and its columns past that window are set by chromaFixRow (xPrefetchPad's padding). A row is read from x0, after a
-// lead sample when x0 is odd (the reads start 4-byte aligned). xFrac, yFrac: the refined motion's fractions.
+// Where each list's chroma window starts (per list slot s): one sample before the integer position of the motion. With
+// DMVR that is the integer position of the refined motion, dI away from that of the merge motion. The window then keeps
+// the rows of the merge motion's window (clamped into it), and chromaFixRow sets its columns past that window
+// (xPrefetchPad's padding). A row is read from x0, after a lead sample when x0 is odd, so that the reads start 4-byte
+// aligned. xFrac and yFrac are the refined motion's fractions.
 struct ChromaWindows
 {
   int  x0[2], y0[2], lead[2];
@@ -2150,8 +2154,8 @@ ChromaWindows chromaWindowsOf( int x, int y, ChromaTileLayout L, TileChroma tile
 // Reads the round's windows (component k = w / lists, list slot s = w % lists of the round, from component first) in
 // chunks of 4 samples, two a thread at most; all the reads are issued before the first store. A thread past the last
 // chunk (or window) reads one that exists again and stores nothing. A border tile's rows are clamped into the picture,
-// and a chunk wholly beside it is read from its first column instead (chromaFixRow sets those samples); its reads
-// index from the margin's sample 16 left of the plane's first, as tile's border reads do.
+// and a chunk wholly beside it is read from its first column instead (chromaFixRow sets those samples). A border tile's
+// reads index from the margin sample 16 to the left of the plane's first sample, as tile's border reads do.
 void readChromaWindows( int tid, ChromaTileLayout L, TileChroma tile, ChromaWindows cw, int first, out uint2 chunk[4][2] )
 {
   const bool bi      = tile.lists == 2;
