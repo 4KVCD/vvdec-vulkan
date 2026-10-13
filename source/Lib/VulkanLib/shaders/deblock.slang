@@ -336,48 +336,19 @@ void normalLine( inout int s[16], int tc, bool sw, int thrCut, bool filterSecond
 // The samples of the edge's 4 lines are loaded 8 bytes at a time into v[16]. With DIR 0 (a vertical edge at x),
 // line i is row y + i, and v[4 i + g] holds its samples x - 8 + 4 g .. x - 5 + 4 g: g = 1 and 2 hold p3 .. q3, and
 // g = 0 and 3 the long filters' p7 .. p4 and q4 .. q7. With DIR 1 (a horizontal edge at y), v[r] holds row
-// y - 8 + r, and its sample i belongs to line i (columns x .. x + 3). (Before, a thread made some 40 loads of 2 bytes,
-// and VideoQ 4K's vertical edges took 8% longer. A vertical edge still costs twice as much as a horizontal one,
-// because of cache lines: each of its 4 lines is in a different cache line, of which it uses only 16 bytes.)
+// y - 8 + r, and its sample i belongs to line i (columns x .. x + 3). Don't load the samples 2 bytes at a time: some 40
+// loads a thread made VideoQ 4K's vertical edges take 8% longer. A vertical edge still costs twice as much as a
+// horizontal one, because each of its 4 lines is in a different cache line, of which it uses only 16 bytes.
 #if DIR == 0
 #define SMP( i, k ) sample4( v[4 * ( i ) + ( ( k ) >> 2 )], ( k ) & 3 )
 #else
 #define SMP( i, k ) sample4( v[k], i )
 #endif
 
-[shader( "compute" )]
-[numthreads( 64, 1, 1 )]
-void main( uint3 id : SV_DispatchThreadID )
+// Loads the edge's samples into v (see above): p3 .. q3, and the long filters' p7 .. p4 or q4 .. q7 on a large side;
+// all the loads are issued at once. Returns where the samples start: line 0's x - 8 (DIR 0), or row y - 8 (DIR 1).
+int16_t* loadEdge( int x, int y, bool largeP, bool largeQ, out uint2 v[16] )
 {
-  if( int( id.x ) >= edgeCount() )
-  {
-    return;
-  }
-  const uint2 edge = pc.edges[firstEdge() + id.x];   // .y: qp | bs << 8 | sideMaxFiltLength << 16
-  const int   x    = int( edge.x & 0xffff );
-  const int   y    = int( edge.x >> 16 );
-  const int   bs   = int( edge.y >> 8 ) & 3;
-  if( bs == 0 || ctuParam( x, y, 0 ) != 0 )
-  {
-    return;
-  }
-
-  const int sideMax          = int( ( edge.y >> 16 ) & 255 );
-  const int maxFilterLengthP = ( sideMax >> 4 ) & 7;
-  const int maxFilterLengthQ = sideMax & 7;
-  bool      largeP           = maxFilterLengthP > 3;
-  const bool largeQ          = maxFilterLengthQ > 3;
-#if DIR == 1
-  if( ( y & ( ( 1 << pc.ctuLog2 ) - 1 ) ) == 0 )
-  {
-    largeP = false;
-  }
-#endif
-
-  const int maxVal           = ( 1 << pc.bitDepth ) - 1;
-
-  // Issue all the loads at once.
-  uint2 v[16];
   [unroll]
   for( int a = 0; a < 16; a++ )
   {
@@ -423,17 +394,25 @@ void main( uint3 id : SV_DispatchThreadID )
     }
   }
 #endif
+  return at;
+}
 
-  // The filter decisions use lines 0 and 3.
-  int l0[16], l3[16];
-  [unroll]
-  for( int k = 0; k < 16; k++ )
-  {
-    l0[k] = SMP( 0, k );
-    l3[k] = SMP( 3, k );
-  }
-  // The edge's QP (with LADF, shifted by the luma level of p0 and q0 in lines 0
-  // and 3), then tc and beta.
+// How an edge is filtered (xEdgeFilterLuma's decisions, on lines 0 and 3)
+struct EdgeFilter
+{
+  int  mode;                // 0: not filtered, 1: the normal filters, 2: the long filters
+  int  nP, nQ;              // the long filters' samples on each side
+  bool sw;                  // the normal filters: the strong filter,
+  bool filterP, filterQ;    // or the weak one, which also changes the second sample on these sides
+  int  tc, thrCut;          // tc, and the weak filter's threshold
+  int  changedP, changedQ;  // the samples the filters may change on each side
+};
+
+// Decides how the edge is filtered, from its QP and boundary strength (edge.y), its CTU's beta and tc offsets, and
+// its lines 0 and 3 (l0, l3; with LADF, the luma level of p0 and q0 there shifts the QP).
+EdgeFilter decideEdge( uint2 edge, int x, int y, int bs, int l0[16], int l3[16], bool largeP, bool largeQ, int maxFilterLengthP,
+                       int maxFilterLengthQ )
+{
   int qp = int( int8_t( edge.y & 255 ) );
   if( pc.ladfNum > 0 )
   {
@@ -446,7 +425,6 @@ void main( uint3 id : SV_DispatchThreadID )
   const int tc             = tcFromTable( indexTc );
   const int beta           = kBetaTable[indexB] << ( pc.bitDepth - 8 );
   const int sideThreshold  = ( beta + ( beta >> 1 ) ) >> 3;
-  const int thrCut         = tc * 10;
   const int dp0 = abs( l0[5] - 2 * l0[6] + l0[7] );    // |p2 - 2 p1 + p0|
   const int dq0 = abs( l0[8] - 2 * l0[9] + l0[10] );   // |q0 - 2 q1 + q2|
   const int dp3 = abs( l3[5] - 2 * l3[6] + l3[7] );
@@ -454,12 +432,15 @@ void main( uint3 id : SV_DispatchThreadID )
   const int d0  = dp0 + dq0;
   const int d3  = dp3 + dq3;
 
-  // mode: 0 = no filtering, 1 = the normal filters, 2 = the long filters
-  int  mode    = 0;
-  int  nP      = 3, nQ = 3;
-  bool sw      = false;
-  bool filterP = false;
-  bool filterQ = false;
+  EdgeFilter f;
+  f.mode    = 0;
+  f.nP      = 3;
+  f.nQ      = 3;
+  f.sw      = false;
+  f.filterP = false;
+  f.filterQ = false;
+  f.tc      = tc;
+  f.thrCut  = tc * 10;
   if( largeP || largeQ )
   {
     const int dp0L = largeP ? ( ( dp0 + abs( l0[2] - 2 * l0[3] + l0[4] ) + 1 ) >> 1 ) : dp0;   // |p5 - 2 p4 + p3|
@@ -471,30 +452,32 @@ void main( uint3 id : SV_DispatchThreadID )
     if( d0L + d3L < beta && strongLine( l0, 2 * d0L, beta, tc, largeP, largeQ, maxFilterLengthP, maxFilterLengthQ )
         && strongLine( l3, 2 * d3L, beta, tc, largeP, largeQ, maxFilterLengthP, maxFilterLengthQ ) )
     {
-      mode = 2;
-      nP   = largeP ? maxFilterLengthP : 3;
-      nQ   = largeQ ? maxFilterLengthQ : 3;
+      f.mode = 2;
+      f.nP   = largeP ? maxFilterLengthP : 3;
+      f.nQ   = largeQ ? maxFilterLengthQ : 3;
     }
   }
-  if( mode == 0 && d0 + d3 < beta )
+  if( f.mode == 0 && d0 + d3 < beta )
   {
-    mode = 1;
+    f.mode = 1;
     if( maxFilterLengthP > 1 && maxFilterLengthQ > 1 )
     {
-      filterP = dp0 + dp3 < sideThreshold;
-      filterQ = dq0 + dq3 < sideThreshold;
+      f.filterP = dp0 + dp3 < sideThreshold;
+      f.filterQ = dq0 + dq3 < sideThreshold;
     }
     if( maxFilterLengthP > 2 && maxFilterLengthQ > 2 )
     {
-      sw = strongLine( l0, 2 * d0, beta, tc, false, false, 7, 7 ) && strongLine( l3, 2 * d3, beta, tc, false, false, 7, 7 );
+      f.sw = strongLine( l0, 2 * d0, beta, tc, false, false, 7, 7 ) && strongLine( l3, 2 * d3, beta, tc, false, false, 7, 7 );
     }
   }
-  if( mode == 0 )
-  {
-    return;
-  }
+  f.changedP = f.mode == 2 ? f.nP : ( f.sw ? 3 : ( f.filterP ? 2 : 1 ) );
+  f.changedQ = f.mode == 2 ? f.nQ : ( f.sw ? 3 : ( f.filterQ ? 2 : 1 ) );
+  return f;
+}
 
-  // Filter each line and pack the result back into v.
+// Filters the edge's 4 lines as f says and packs the results back into v.
+void filterEdge( inout uint2 v[16], EdgeFilter f, int maxVal )
+{
   [unroll]
   for( int i = 0; i < 4; i++ )
   {
@@ -504,13 +487,13 @@ void main( uint3 id : SV_DispatchThreadID )
     {
       s[k] = SMP( i, k );
     }
-    if( mode == 2 )
+    if( f.mode == 2 )
     {
-      longLine( s, nP, nQ, tc );
+      longLine( s, f.nP, f.nQ, f.tc );
     }
     else
     {
-      normalLine( s, tc, sw, thrCut, filterP, filterQ, maxVal );
+      normalLine( s, f.tc, f.sw, f.thrCut, f.filterP, f.filterQ, maxVal );
     }
 #if DIR == 0
     [unroll]
@@ -535,11 +518,12 @@ void main( uint3 id : SV_DispatchThreadID )
     }
 #endif
   }
+}
 
-  // Store the samples the filters may change, plus neighbouring samples only where no other edge's filter changes
-  // them (VVC keeps the edges of one direction far enough apart for that).
-  const int changedP = mode == 2 ? nP : ( sw ? 3 : ( filterP ? 2 : 1 ) );
-  const int changedQ = mode == 2 ? nQ : ( sw ? 3 : ( filterQ ? 2 : 1 ) );
+// Stores the samples the filters may change, plus neighbouring samples only where no other edge's filter changes
+// them (VVC keeps the edges of one direction far enough apart for that). at is where loadEdge's samples start.
+void storeEdge( int16_t* at, uint2 v[16], EdgeFilter f, int maxFilterLengthP, int maxFilterLengthQ )
+{
 #if DIR == 0
   // Vertical edge: store p3 .. p0 as 8 bytes when the P side's filters may reach 3 samples (the next edge is then at
   // least 8 samples away), else p1 and p0 as 4 bytes. Store the long filters' p4 .. p7 as far as they reach (p7 is
@@ -556,11 +540,11 @@ void main( uint3 id : SV_DispatchThreadID )
     {
       *(uint*)( line + 6 ) = v[4 * i + 1].y;
     }
-    if( changedP == 7 )
+    if( f.changedP == 7 )
     {
       *(uint2*)line = v[4 * i];
     }
-    else if( changedP == 5 )
+    else if( f.changedP == 5 )
     {
       line[3] = int16_t( v[4 * i].y >> 16 );   // p4
     }
@@ -572,11 +556,11 @@ void main( uint3 id : SV_DispatchThreadID )
     {
       *(uint*)( line + 8 ) = v[4 * i + 2].x;
     }
-    if( changedQ == 7 )
+    if( f.changedQ == 7 )
     {
       *(uint2*)( line + 12 ) = v[4 * i + 3];
     }
-    else if( changedQ == 5 )
+    else if( f.changedQ == 5 )
     {
       line[12] = int16_t( v[4 * i + 3].x & 0xffff );   // q4
     }
@@ -586,16 +570,66 @@ void main( uint3 id : SV_DispatchThreadID )
   [unroll]
   for( int j = 0; j < 7; j++ )
   {
-    if( j < changedP )
+    if( j < f.changedP )
     {
       *(uint2*)( at + ( 7 - j ) * pc.stride ) = v[7 - j];
     }
-    if( j < changedQ )
+    if( j < f.changedQ )
     {
       *(uint2*)( at + ( 8 + j ) * pc.stride ) = v[8 + j];
     }
   }
 #endif
+}
+
+// One thread per luma edge of 4 lines (the edges' list from edges.slang): its samples, the filter decisions, the
+// filtering and the store.
+[shader( "compute" )]
+[numthreads( 64, 1, 1 )]
+void main( uint3 id : SV_DispatchThreadID )
+{
+  if( int( id.x ) >= edgeCount() )
+  {
+    return;
+  }
+  const uint2 edge = pc.edges[firstEdge() + id.x];   // .y: qp | bs << 8 | sideMaxFiltLength << 16
+  const int   x    = int( edge.x & 0xffff );
+  const int   y    = int( edge.x >> 16 );
+  const int   bs   = int( edge.y >> 8 ) & 3;
+  if( bs == 0 || ctuParam( x, y, 0 ) != 0 )
+  {
+    return;
+  }
+
+  const int  sideMax          = int( ( edge.y >> 16 ) & 255 );
+  const int  maxFilterLengthP = ( sideMax >> 4 ) & 7;
+  const int  maxFilterLengthQ = sideMax & 7;
+  bool       largeP           = maxFilterLengthP > 3;
+  const bool largeQ           = maxFilterLengthQ > 3;
+#if DIR == 1
+  if( ( y & ( ( 1 << pc.ctuLog2 ) - 1 ) ) == 0 )
+  {
+    largeP = false;
+  }
+#endif
+
+  uint2    v[16];
+  int16_t* at = loadEdge( x, y, largeP, largeQ, v );
+  // The filter decisions use lines 0 and 3.
+  int l0[16], l3[16];
+  [unroll]
+  for( int k = 0; k < 16; k++ )
+  {
+    l0[k] = SMP( 0, k );
+    l3[k] = SMP( 3, k );
+  }
+  const EdgeFilter f = decideEdge( edge, x, y, bs, l0, l3, largeP, largeQ, maxFilterLengthP, maxFilterLengthQ );
+  if( f.mode == 0 )
+  {
+    return;
+  }
+  filterEdge( v, f, ( 1 << pc.bitDepth ) - 1 );
+  storeEdge( at, v, f, maxFilterLengthP, maxFilterLengthQ );
 }
 
 #else   // CHROMA
