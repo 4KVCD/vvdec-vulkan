@@ -29,6 +29,7 @@
 // them out for the inter, inter_bdof and inter_affine passes.
 
 #include "common.slang"
+#include "intrajob.slang"
 #include "scan.slang"
 
 // COUNT_ONLY=1: the variant for pass 0 (jobs_count). With the writes off at compile time, the compiler drops the work
@@ -147,18 +148,6 @@ static const uint kTrafoTransformSkip = 1;
 static const uint kTrafoBdpcmHor      = 2;
 static const uint kTrafoBdpcmVer      = 4;
 static const uint kTrafoZero          = 8;
-
-static const int  kIntraAngular = 0;
-static const int  kIntraBdpcm   = 1;
-static const int  kIntraCclm    = 2;
-static const int  kIntraIbc     = 3;
-static const int  kIntraMip     = 4;
-static const int  kIntraLmcs    = 5;
-static const int  kIntraCiip    = 6;
-static const uint kIntraResidual      = 1;
-static const uint kIntraFiltered      = 2;
-static const uint kIntraMipTransposed = 4;
-static const uint kIntraIsp           = 8;
 
 static const uint kInterL0        = 1;
 static const uint kInterL1        = 2;

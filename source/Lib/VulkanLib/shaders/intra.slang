@@ -42,6 +42,7 @@
 //   9: LMCS: 1 scaling | 2 left available | 4 above available | log2 of the samples per side << 4
 
 #include "common.slang"
+#include "intrajob.slang"
 
 struct Params
 {
@@ -977,11 +978,11 @@ void make( int tid, uint job[12] )
   const int   comp   = int( ( job[1] >> 16 ) & 255 );
   const int   kind   = int( job[1] >> 24 );
   const int   mode   = int( job[2] & 255 );
-  const int   flags  = int( ( job[2] >> 8 ) & 255 );
+  const uint  flags  = ( job[2] >> 8 ) & 255;
   const int   refLine = int( ( job[2] >> 24 ) & 3 );   // MRL
   const int   maxVal = ( 1 << pc.bitDepth ) - 1;
-  const bool  filtered = ( flags & 2 ) != 0;
-  const bool  residual = ( flags & 1 ) != 0;
+  const bool  filtered = ( flags & kIntraFiltered ) != 0;
+  const bool  residual = ( flags & kIntraResidual ) != 0;
   const int   log2W  = log2Int( w );
   // The workgroup makes the block's rows first to first + count - 1: m samples
   // (at most 256, four per thread); its sample i is the block's sample s0 + i.
@@ -994,14 +995,14 @@ void make( int tid, uint job[12] )
   const uint lmcsInfo = job[9];
   const bool lmcs     = ( lmcsInfo & 1 ) != 0;
 
-  if( kind == 3 || kind == 5 )
+  if( kind == kIntraIbc || kind == kIntraLmcs )
   {
     // IBC: copy the block from elsewhere in the picture and add the residual.
     // The chroma of an inter CU under LMCS: add the residual to the prediction
     // kept aside. All the reads are issued together, then the writes.
     const int bvx = int( int16_t( job[6] & 0xffff ) );
     const int bvy = int( int16_t( job[6] >> 16 ) );
-    int16_t*  src = kind == 5 ? ( comp == 1 ? pc.defer1 : pc.defer2 ) : dst;
+    int16_t*  src = kind == kIntraLmcs ? ( comp == 1 ? pc.defer1 : pc.defer2 ) : dst;
     int       pred[4];
     int       res[4];
     [unroll]
@@ -1010,7 +1011,7 @@ void make( int tid, uint job[12] )
       const int i = tid + 64 * k;
       const int x = ( s0 + i ) & ( w - 1 );
       const int y = ( s0 + i ) >> log2W;
-      pred[k]     = i < m ? ( kind == 5 ? int( src[( y0 + y ) * stride + x0 + x] ) : sampleAt( comp, x0 + x + bvx, y0 + y + bvy ) ) : 0;
+      pred[k]     = i < m ? ( kind == kIntraLmcs ? int( src[( y0 + y ) * stride + x0 + x] ) : sampleAt( comp, x0 + x + bvx, y0 + y + bvy ) ) : 0;
       res[k]      = i < m && residual ? int( dst[( y0 + y ) * stride + x0 + x] ) : 0;
     }
     int scale = 0;
@@ -1036,11 +1037,11 @@ void make( int tid, uint job[12] )
   // The block that the prediction covers (pw x ph; the job's block starts xoff
   // samples into it), the size that decides the wide-angle modes, and the
   // references' lengths. All are the job's block's own, except for ISP
-  // sub-partitions (flag 8): the size is the CU's, the top (left) length is
+  // sub-partitions (kIntraIsp): the size is the CU's, the top (left) length is
   // the CU's width (height) plus the block's, and the sub-partitions of a
   // vertical split that are 1 or 2 samples wide share one prediction block 4
   // samples wide (CU::isPredRegDiffFromTB).
-  const bool isp   = ( flags & 8 ) != 0;
+  const bool isp   = ( flags & kIntraIsp ) != 0;
   const IspCu cu    = ispCuOf( job );   // (meaningful with isp only)
   const bool region = isp && cu.ver && ( cu.w == 4 || ( cu.w == 8 && cu.h > 4 ) );
   const int  pw    = region ? 4 : w;
@@ -1067,7 +1068,7 @@ void make( int tid, uint job[12] )
   }
   const bool       lmAbove = ( ( job[4] >> 16 ) & 1 ) != 0;
   const bool       lmLeft  = ( ( job[4] >> 17 ) & 1 ) != 0;
-  if( kind == 2 )
+  if( kind == kIntraCclm )
   {
     // CCLM: the downsampled luma of the template samples, one thread each (the block's samples follow below)
     const CclmPicks picks = cclmPicks( job[4], job[5] );
@@ -1076,7 +1077,7 @@ void make( int tid, uint job[12] )
       s_tmpl[tid] = cclmTemplateLuma( x0, y0, job[4], picks, tid );
     }
   }
-  if( kind == 2 || kind == 6 || residual )
+  if( kind == kIntraCclm || kind == kIntraCiip || residual )
   {
     // (CIIP keeps inter's prediction where CCLM keeps its luma, in s_luma)
     int16_t* inter = comp == 0 ? pc.defer0 : ( comp == 1 ? pc.defer1 : pc.defer2 );
@@ -1088,8 +1089,8 @@ void make( int tid, uint job[12] )
       const int i = tid + 64 * k;
       const int x = ( s0 + i ) & ( w - 1 );
       const int y = ( s0 + i ) >> log2W;
-      luma[k]     = i < m && kind == 2 ? lumaDown( x0 << pc.scaleX, y0 << pc.scaleY, x, y, lmAbove, lmLeft )
-                    : ( i < m && kind == 6 ? int( inter[( y0 + y ) * stride + x0 + x] ) : 0 );
+      luma[k]     = i < m && kind == kIntraCclm ? lumaDown( x0 << pc.scaleX, y0 << pc.scaleY, x, y, lmAbove, lmLeft )
+                    : ( i < m && kind == kIntraCiip ? int( inter[( y0 + y ) * stride + x0 + x] ) : 0 );
       res[k]      = i < m && residual ? int( dst[( y0 + y ) * stride + x0 + x] ) : 0;
     }
     [unroll]
@@ -1103,7 +1104,7 @@ void make( int tid, uint job[12] )
       }
     }
   }
-  if( kind == 0 && comp == 0 )
+  if( kind == kIntraAngular && comp == 0 )
   {
     s_cubic[tid]      = kCubic[tid];
     s_cubic[tid + 64] = kCubic[tid + 64];
@@ -1123,7 +1124,7 @@ void make( int tid, uint job[12] )
     GroupMemoryBarrierWithGroupSync();
   }
   Angular ang;
-  if( kind == 2 )
+  if( kind == kIntraCclm )
   {
     if( tid == 0 )
     {
@@ -1131,7 +1132,7 @@ void make( int tid, uint job[12] )
     }
     GroupMemoryBarrierWithGroupSync();
   }
-  else if( kind == 0 && mode == DC_IDX )
+  else if( kind == kIntraAngular && mode == DC_IDX )
   {
     if( tid == 0 )
     {
@@ -1139,12 +1140,12 @@ void make( int tid, uint job[12] )
     }
     GroupMemoryBarrierWithGroupSync();
   }
-  else if( kind == 0 && mode != PLANAR_IDX )
+  else if( kind == kIntraAngular && mode != PLANAR_IDX )
   {
     ang = setupAngular( comp, pw, ph, mode, refLine, sizeW, sizeH, topLength, leftLength, isp );
   }
   const int mipPred = mipSizeId( w, h ) < 2 ? 4 : 8;
-  if( kind == 4 )
+  if( kind == kIntraMip )
   {
     // MIP: the reduced boundary, then the reduced prediction (one thread per element)
     const int sizeId = mipSizeId( w, h );
@@ -1156,7 +1157,7 @@ void make( int tid, uint job[12] )
     GroupMemoryBarrierWithGroupSync();
     if( tid < mipPred * mipPred )
     {
-      mipReducedPred( tid, sizeId, mode, ( flags & 4 ) != 0 );
+      mipReducedPred( tid, sizeId, mode, ( flags & kIntraMipTransposed ) != 0 );
     }
     GroupMemoryBarrierWithGroupSync();
   }
@@ -1164,7 +1165,7 @@ void make( int tid, uint job[12] )
   const int3 model = s_model;
 
   const int  bdpcmDir = int( ( job[2] >> 16 ) & 255 );
-  const bool doPdpcPlanarDc = ( kind == 0 || kind == 6 ) && ( mode == PLANAR_IDX || mode == DC_IDX ) && pw >= 4 && ph >= 4 && refLine == 0;
+  const bool doPdpcPlanarDc = ( kind == kIntraAngular || kind == kIntraCiip ) && ( mode == PLANAR_IDX || mode == DC_IDX ) && pw >= 4 && ph >= 4 && refLine == 0;
   const int  ciipIntra      = int( job[6] );   // CIIP: planar's weight
 
   // Compute the samples, from shared memory only.
@@ -1173,15 +1174,15 @@ void make( int tid, uint job[12] )
     const int x = ( s0 + i ) & ( w - 1 );
     const int y = ( s0 + i ) >> log2W;
     int       v;
-    if( kind == 2 )
+    if( kind == kIntraCclm )
     {
       v = clip3( 0, maxVal, ( ( model.x * int( s_luma[i] ) ) >> model.z ) + model.y );
     }
-    else if( kind == 1 )
+    else if( kind == kIntraBdpcm )
     {
       v = bdpcmDir == 1 ? refL( false, y + 1 ) : refT( false, x + 1 );
     }
-    else if( kind == 4 )
+    else if( kind == kIntraMip )
     {
       v = mipSample( x, y, w, h, mipPred );
     }
@@ -1197,7 +1198,7 @@ void make( int tid, uint job[12] )
     {
       v = ang.isVer ? predictAngular( ang, comp, filtered, x + xoff, y, maxVal ) : predictAngular( ang, comp, filtered, y, x + xoff, maxVal );
     }
-    if( kind == 6 )
+    if( kind == kIntraCiip )
     {
       // predBlendIntraCiip
       v = ( ( 4 - ciipIntra ) * int( s_luma[i] ) + ciipIntra * v + 2 ) >> 2;

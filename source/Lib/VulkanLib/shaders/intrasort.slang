@@ -23,6 +23,7 @@
 //            theirs. (Ten dispatches with a barrier after each took ~0.18 ms of the front end for a few jobs.)
 
 #include "common.slang"
+#include "intrajob.slang"
 
 struct Params
 {
@@ -65,15 +66,14 @@ static const int kPassSmall    = 7;
 static const int kArgsBlocks = 50;
 static const int kArgsSingle = 53;
 
-// The words of an intra job (GpuJobs.h's IntraJob) that this pass uses. Word 1 holds the block's width and height in
+// The words of an intra job (intrajob.slang) that this pass uses. Word 1 holds the block's width and height in
 // samples (bits 0-7 and 8-15). Word kWaveWord holds the job's wave, which jobs.slang sets; in a band's copy of the job,
 // that word holds the band's rows instead (first | count << 16).
-static const int kJobWords = 12;
 static const int kWaveWord = 7;
 
 uint* jobAt( uint index )
 {
-  return pc.jobs + index * kJobWords;
+  return pc.jobs + index * kIntraJobWords;
 }
 
 int jobWidth( uint* job )
@@ -165,8 +165,8 @@ void writeJobBands( uint* job, uint first, bool withWaits, uint wait )
   {
     if( at < uint( pc.capacity ) )
     {
-      uint* band = pc.sorted + at * kJobWords;
-      for( int k = 0; k < kJobWords; k++ )
+      uint* band = pc.sorted + at * kIntraJobWords;
+      for( int k = 0; k < kIntraJobWords; k++ )
       {
         band[k] = job[k];
       }
