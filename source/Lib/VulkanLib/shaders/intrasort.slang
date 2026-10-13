@@ -55,9 +55,42 @@ static const int kBlock = 1024;
 static const int kArgsBlocks = 50;
 static const int kArgsSingle = 53;
 
-int  bandRows( uint* job ) { return max( 1, kBand / int( job[1] & 0xff ) ); }
-int  bandsOf( uint* job ) { const int rows = bandRows( job ); return ( int( ( job[1] >> 8 ) & 0xff ) + rows - 1 ) / rows; }
-uint waveOf( uint index ) { return pc.jobs[index * 12 + 7]; }
+// An intra job's words (GpuJobs.h's IntraJob): word 1 holds its width and height in samples (bits 0-7 and 8-15), word
+// kWaveWord its wave (jobs.slang), which a band's copy replaces with the band's rows (first | count << 16)
+static const int kJobWords = 12;
+static const int kWaveWord = 7;
+
+uint* jobAt( uint index )
+{
+  return pc.jobs + index * kJobWords;
+}
+
+int jobWidth( uint* job )
+{
+  return int( job[1] & 0xff );
+}
+
+int jobHeight( uint* job )
+{
+  return int( ( job[1] >> 8 ) & 0xff );
+}
+
+uint waveOf( uint index )
+{
+  return jobAt( index )[kWaveWord];
+}
+
+// The rows of the job's bands: as many as hold kBand samples, one at least
+int bandRows( uint* job )
+{
+  return max( 1, kBand / jobWidth( job ) );
+}
+
+int bandsOf( uint* job )
+{
+  const int rows = bandRows( job );
+  return ( jobHeight( job ) + rows - 1 ) / rows;
+}
 
 groupshared uint s_scan[1024];
 groupshared uint s_hist[256];
@@ -110,23 +143,23 @@ void sort1024( int tid )
   }
 }
 
-// Writes job's bands into the sorted list from place first on: each band a copy of the job's words, its word 7 its rows
-// (the first | the count << 16). With withWaits, each band's wait (pc.waits) too.
+// Writes job's bands into the sorted list from place first on: each band a copy of the job's words, with its rows in
+// word kWaveWord (the first | the count << 16). With withWaits, each band's wait (pc.waits) too.
 void writeJobBands( uint* job, uint first, bool withWaits, uint wait )
 {
   const int rows = bandRows( job );
-  const int h    = int( ( job[1] >> 8 ) & 0xff );
+  const int h    = jobHeight( job );
   uint      at   = first;
   for( int r = 0; r < h; r += rows, at++ )
   {
     if( at < uint( pc.capacity ) )
     {
-      uint* band = pc.sorted + at * 12;
-      for( int k = 0; k < 12; k++ )
+      uint* band = pc.sorted + at * kJobWords;
+      for( int k = 0; k < kJobWords; k++ )
       {
         band[k] = job[k];
       }
-      band[7] = uint( r ) | uint( min( rows, h - r ) ) << 16;
+      band[kWaveWord] = uint( r ) | uint( min( rows, h - r ) ) << 16;
       if( withWaits )
       {
         pc.waits[at] = wait;
@@ -187,7 +220,7 @@ void smallSort( int tid, uint n )
   const uint wave  = key >> 10;
 
   // each sorted job's first band
-  s_scan[tid] = valid ? uint( bandsOf( pc.jobs + index * 12 ) ) : 0u;
+  s_scan[tid] = valid ? uint( bandsOf( jobAt( index ) ) ) : 0u;
   GroupMemoryBarrierWithGroupSync();
   const uint total = scan1024( tid );
   const uint first = s_scan[tid];
@@ -212,7 +245,7 @@ void smallSort( int tid, uint n )
   // the job's bands (as PLACE writes them) and their waits (as WAITS does)
   if( valid )
   {
-    writeJobBands( pc.jobs + index * 12, first, true, wait );
+    writeJobBands( jobAt( index ), first, true, wait );
   }
   if( tid == 0 )
   {
@@ -391,7 +424,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   if( pc.pass == 3 || pc.pass == 5 )
   {
     // BANDS counts each sorted job's bands and sums them over the block; PLACE writes each job's bands in place.
-    s_scan[tid] = i < n ? uint( bandsOf( pc.jobs + pc.keysA[i] * 12 ) ) : 0u;
+    s_scan[tid] = i < n ? uint( bandsOf( jobAt( pc.keysA[i] ) ) ) : 0u;
     GroupMemoryBarrierWithGroupSync();
     const uint total = scan1024( tid );
     if( pc.pass == 3 )
@@ -407,7 +440,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       return;
     }
     const uint index = pc.keysA[i];
-    uint*      job   = pc.jobs + index * 12;
+    uint*      job   = jobAt( index );
     const uint first = pc.bandSums[block] + s_scan[tid];
     const uint wave  = waveOf( index );
     pc.bandAt[i]     = first;
@@ -453,7 +486,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const uint index = pc.keysA[i];
   const uint wave  = waveOf( index );
   const uint wait  = wave < 65536u ? pc.waveFirst[wave] : 0u;
-  const int  b     = bandsOf( pc.jobs + index * 12 );
+  const int  b     = bandsOf( jobAt( index ) );
   for( int k = 0; k < b; k++ )
   {
     const uint at = pc.bandAt[i] + uint( k );
