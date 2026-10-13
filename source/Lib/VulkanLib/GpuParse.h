@@ -68,6 +68,7 @@ namespace gpu
 static constexpr int kParsePicWords    = 160 + 3 * 128;   // the picture's: 160 parameter words, 3 chroma QP maps of 128
 static constexpr int kParseSliceWords  = 16;    // a slice's parameter words (its initial contexts follow them)
 static constexpr int kParseStreamWords = 8;     // a substream's words
+static constexpr int kParseStreamSize  = 1;     // the word of a substream's that holds its size in bytes
 static constexpr int kParseCtuOutWords = 16;    // the words parse.slang writes per CTU besides the records (ctuOut)
 static constexpr int kParseScanTab     = 961;   // the scan table's words (writeParseScans)
 

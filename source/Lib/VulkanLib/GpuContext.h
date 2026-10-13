@@ -67,6 +67,12 @@ namespace vvdec
 namespace gpu
 {
 
+// v rounded up to a multiple of alignment (a power of 2)
+constexpr size_t alignUp( size_t v, size_t alignment )
+{
+  return ( v + alignment - 1 ) & ~( alignment - 1 );
+}
+
 // The Vulkan functions the decoder uses, loaded at run time from vulkan-1.dll (or libvulkan.so).
 #define VVDEC_VK_INSTANCE_FUNCS( X )                                                                                    \
   X( vkDestroyInstance ) X( vkEnumeratePhysicalDevices ) X( vkGetPhysicalDeviceProperties )                              \

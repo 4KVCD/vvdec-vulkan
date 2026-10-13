@@ -18,6 +18,9 @@
 #  define CHECK 0
 #endif
 
+// The totals' word that holds the number of the parse's step they are of (GpuParseService.cpp's kParseTotalsSerial)
+static const int kTotalsSerial = 15;
+
 #if CHECK
 struct Params
 {
@@ -123,7 +126,7 @@ struct Params
   uint* tus;        // out (pass 2): the TU records in raster order of the CTUs
   uint* ctus;       // the CTU records (CtuRecord, 4 words each): pass 0 writes them, passes 1 to 3 read them
   uint* ctusOut;    // out (pass 3): a copy of the CTU records
-  uint* totals;     // out (pass 0): the numbers of CUs and TUs, then the parse's 8 counters; [15] serial
+  uint* totals;     // out (pass 0): the numbers of CUs and TUs, then the parse's 8 counters; [kTotalsSerial] serial
   int   numCtus;
   int   numCus;     // the CU records staged (passes 1 to 3)
   int   numTus;     // the TU records staged
@@ -208,7 +211,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       {
         pc.totals[2 + i] = pc.counters[i];
       }
-      pc.totals[15] = pc.serial;
+      pc.totals[kTotalsSerial] = pc.serial;
     }
     return;
   }

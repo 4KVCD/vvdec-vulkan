@@ -694,7 +694,7 @@ VkDeviceAddress GpuRecon::subpicRects( const CodingStructure& cs )
   {
     return 0;
   }
-  const size_t size = ( size_t( pcv.sizeInCtus ) * 4 * sizeof( uint16_t ) + 255 ) & ~size_t( 255 );
+  const size_t size = alignUp( size_t( pcv.sizeInCtus ) * 4 * sizeof( uint16_t ), 256 );
   if( m_subpics.size < size )
   {
     m_ctx->free( m_subpics );
@@ -751,7 +751,7 @@ void GpuRecon::setPicture( const PelStorage& pic, const LmcsTables* tables, bool
     if( m_scaling.size < scalingCount )
     {
       m_ctx->free( m_scaling );
-      m_scaling = m_ctx->alloc( ( scalingCount + 255 ) & ~size_t( 255 ), MemKind::Upload );
+      m_scaling = m_ctx->alloc( alignUp( scalingCount, 256 ), MemKind::Upload );
     }
     for( size_t i = 0; i < scalingCount; i++ )
     {
@@ -789,7 +789,7 @@ void GpuRecon::bindDeferPlanes( const PelStorage& pic )
   for( size_t comp = 0; comp < pic.bufs.size(); comp++ )
   {
     at[comp] = size;
-    size    += ( size_t( pic.bufs[comp].stride ) * pic.bufs[comp].height * sizeof( Pel ) + 255 ) & ~size_t( 255 );
+    size    += alignUp( size_t( pic.bufs[comp].stride ) * pic.bufs[comp].height * sizeof( Pel ), 256 );
   }
   if( m_defer.size < size )
   {
@@ -838,7 +838,7 @@ void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptive
   m_prepared.dbSize   = deblockParamSize( cs );
   m_prepared.alfSize  = alf ? alfParamSize( cs ) : 0;
   m_prepared.saoSize  = sao ? saoParamSize( cs ) : 0;
-  m_prepared.lmcsSize = m_lmcsOn ? ( size_t( cs.pcv->sizeInCtus ) + 255 ) & ~size_t( 255 ) : 0;
+  m_prepared.lmcsSize = m_lmcsOn ? alignUp( size_t( cs.pcv->sizeInCtus ), 256 ) : 0;
   uint8_t* base       = params( m_prepared.dbSize + m_prepared.alfSize + m_prepared.saoSize + m_prepared.lmcsSize );
   if( m_lmcsOn )
   {

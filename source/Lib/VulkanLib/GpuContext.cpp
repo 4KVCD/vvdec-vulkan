@@ -985,7 +985,7 @@ void Context::addTime( const char* label, double milliseconds )
 
 Buffer Context::allocPooled( size_t size )
 {
-  const VkDeviceSize rounded = ( size + 255 ) & ~size_t( 255 );
+  const VkDeviceSize rounded = alignUp( size, 256 );
   {
     std::lock_guard<std::mutex> lock( m_poolMutex );
     for( auto it = m_pool.begin(); it != m_pool.end(); ++it )
@@ -1151,7 +1151,7 @@ Buffer Context::alloc( size_t size, MemKind kind )
 {
   Buffer buf;
   buf.kind = kind;
-  buf.size = ( size + 255 ) & ~size_t( 255 );
+  buf.size = alignUp( size, 256 );
 
   VkBufferCreateInfo info{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
   info.size  = buf.size;
@@ -1243,7 +1243,7 @@ void Context::ensure( Buffer& buf, size_t size, MemKind kind )
   if( buf.size < size )
   {
     free( buf );
-    buf = alloc( ( size + kGranule - 1 ) & ~( kGranule - 1 ), kind );
+    buf = alloc( alignUp( size, kGranule ), kind );
   }
 }
 

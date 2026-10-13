@@ -80,6 +80,7 @@ static constexpr uint32_t kParseMaxStalls    = 4;         // submissions in a ro
 static constexpr uint32_t kParseLocalBits    = 12;        // a meta word: the CTU above the record's place in the CTU
 static constexpr size_t   kParseCounters     = 8;         // the staged CUs and TUs, the room of the 5 job lists, the levels
 static constexpr size_t   kParseTotals       = 16;        // the CUs and TUs, then the counters (compaction pass 0)
+static constexpr size_t   kParseTotalsSerial = 15;        // the totals' word that holds the number of the step they are of
 static constexpr size_t   kParseLevelChunk   = 4096;      // parse.slang's kLevelChunk: the levels a substream takes at a time
 static constexpr size_t   kGroupsPerRow      = 32768;     // the shaders take group.y as rows of 32768 workgroups
 
@@ -118,7 +119,7 @@ static uint32_t largestStreamBytes( const ParseInput& in )
   uint32_t most = 0;
   for( uint32_t s = 0; s < in.numStreams; s++ )
   {
-    most = std::max( most, in.streams[size_t( s ) * kParseStreamWords + 1] );
+    most = std::max( most, in.streams[size_t( s ) * kParseStreamWords + kParseStreamSize] );
   }
   return most;
 }
@@ -397,7 +398,7 @@ ParseSlot::Progress ParseSlot::progress( uint32_t serial )
   // (the state is read as it is now: a step after the one asked about may have parsed the last CTUs, and then the
   // totals of the step asked about are not the picture's: the next step's are)
   m_half = serial & 1u;
-  if( serial != 0 && totals()[15] != serial )
+  if( serial != 0 && totals()[kParseTotalsSerial] != serial )
   {
     return Progress::Parsing;
   }

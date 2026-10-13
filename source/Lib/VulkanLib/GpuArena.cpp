@@ -73,13 +73,13 @@ RangeArena::~RangeArena()
 
 Buffer RangeArena::take( VkDeviceSize size )
 {
-  size = ( std::max<VkDeviceSize>( size, 1 ) + kAlign - 1 ) & ~( kAlign - 1 );
+  size = alignUp( std::max<VkDeviceSize>( size, 1 ), kAlign );
   Chunk*       chunk = nullptr;
   VkDeviceSize start = 0;
   if( !bestGap( size, chunk, start ) )
   {
     // none holds it: a new chunk (one of its own for a range larger than the chunks)
-    chunk = &addChunk( std::max( m_chunkSize, ( size + kLarge - 1 ) & ~( kLarge - 1 ) ) );
+    chunk = &addChunk( std::max<VkDeviceSize>( m_chunkSize, alignUp( size, kLarge ) ) );
     start = 0;
   }
   const auto         gap  = chunk->gaps.find( start );

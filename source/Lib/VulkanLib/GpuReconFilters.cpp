@@ -186,7 +186,7 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
 // offsets of luma, Cb and Cr)
 size_t GpuRecon::deblockParamSize( const CodingStructure& cs )
 {
-  return ( size_t( cs.pcv->sizeInCtus ) * 8 + 255 ) & ~size_t( 255 );
+  return alignUp( size_t( cs.pcv->sizeInCtus ) * 8, 256 );
 }
 
 bool GpuRecon::prepareDeblock( const CodingStructure& cs, uint8_t* base )
@@ -374,7 +374,7 @@ static size_t saoListOffset( const CodingStructure& cs )
 
 size_t GpuRecon::saoParamSize( const CodingStructure& cs )
 {
-  return ( saoListOffset( cs ) + size_t( cs.pcv->sizeInCtus ) * 3 * sizeof( uint32_t ) + 255 ) & ~size_t( 255 );
+  return alignUp( saoListOffset( cs ) + size_t( cs.pcv->sizeInCtus ) * 3 * sizeof( uint32_t ), 256 );
 }
 
 bool GpuRecon::prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8_t* base )
@@ -493,12 +493,12 @@ constexpr size_t kAlfLumaClip    = kAlfLumaCoeff + NUM_TOTAL_FILTER_SETS * kAlfS
 constexpr size_t kAlfChromaCoeff = kAlfLumaClip + NUM_TOTAL_FILTER_SETS * kAlfSetSize * sizeof( int16_t );
 constexpr size_t kAlfChromaClip  = kAlfChromaCoeff + kAlfChromaSize * sizeof( int16_t );
 constexpr size_t kAlfCcCoeff     = kAlfChromaClip + kAlfChromaSize * sizeof( int16_t );
-constexpr size_t kAlfCtus        = ( kAlfCcCoeff + kAlfCcSize * sizeof( int16_t ) + 255 ) & ~size_t( 255 );
+constexpr size_t kAlfCtus        = alignUp( kAlfCcCoeff + kAlfCcSize * sizeof( int16_t ), 256 );
 static_assert( kAlfSetSize == 4 * 25 * 13, "the layout of shaders/alf.slang" );
 
 size_t GpuRecon::alfParamSize( const CodingStructure& cs )
 {
-  return ( kAlfCtus + size_t( cs.pcv->sizeInCtus ) * 8 + 255 ) & ~size_t( 255 );
+  return alignUp( kAlfCtus + size_t( cs.pcv->sizeInCtus ) * 8, 256 );
 }
 
 bool GpuRecon::prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alfFilter, uint8_t* base )
