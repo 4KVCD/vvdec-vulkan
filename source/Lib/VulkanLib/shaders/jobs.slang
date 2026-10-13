@@ -1303,74 +1303,93 @@ void wpJob( int bcw, uint* jslice, int refIdx0, int refIdx1, uint flags, inout u
   w[11] = ( uint( offset[1][0] ) & 255 ) | ( uint( offset[1][1] ) & 255 ) << 8 | ( uint( offset[1][2] ) & 255 ) << 16 | uint( n == 2 ) << 24;
 }
 
-// The lists of a block that motionCompensation predicts with one motion, and their references' slots. A bi-prediction
-// from one picture with one vector predicts from list 0 alone, unless DMVR refines it or the weighted bi-prediction
-// weighs the lists.
-uint mcLists( uint* slice, uint* jslice, int refIdx0, int refIdx1, int2 mv0, int2 mv1, bool dmvr, out int ref0, out int ref1 )
+// A block that motionCompensation predicts with one motion: a translational CU's (mcBlock), or a run of SbTMVP sub-PUs
+// (sbtmvpJobs)
+struct McBlock
+{
+  uint flags;       // its jobs' flags: the CU's, the lists (setMcLists), DMVR and BDOF
+  int  bcw;         // the CU's BCW index
+  bool ciip;        // a CIIP CU's block, which has no BCW
+  int  refIdx[2];   // per list: the reference index (-1: the list is not used),
+  int2 mv[2];       //           the vector,
+  int  ref[2];      //           and the reference picture's slot in the reference table (setMcLists)
+  int2 pos;         // the block's top-left corner
+  int  width;       // and its width: the reach of the clip of the motion
+};
+
+// Adds to b's flags the lists that motionCompensation predicts b from, and sets their references' slots. A
+// bi-prediction from one picture with one vector predicts from list 0 alone, unless DMVR refines it or the weighted
+// bi-prediction weighs the lists.
+void setMcLists( uint* slice, uint* jslice, bool dmvr, inout McBlock b )
 {
   uint lists = 0;
-  ref0       = 0;
-  ref1       = 0;
-  if( refIdx0 >= 0 )
+  b.ref[0]   = 0;
+  b.ref[1]   = 0;
+  if( b.refIdx[0] >= 0 )
   {
     lists |= kInterL0;
-    ref0 = refSlot( jslice, 0, refIdx0 );
+    b.ref[0] = refSlot( jslice, 0, b.refIdx[0] );
   }
-  if( refIdx1 >= 0 )
+  if( b.refIdx[1] >= 0 )
   {
     lists |= kInterL1;
-    ref1 = refSlot( jslice, 1, refIdx1 );
+    b.ref[1] = refSlot( jslice, 1, b.refIdx[1] );
   }
-  if( !dmvr && refIdx0 >= 0 && refIdx1 >= 0 && isInterB( slice ) && ( pc.ph & kPpsWpBi ) == 0 && refPoc( slice, 0, refIdx0 ) == refPoc( slice, 1, refIdx1 )
-      && all( mv0 == mv1 ) )
+  if( !dmvr && b.refIdx[0] >= 0 && b.refIdx[1] >= 0 && isInterB( slice ) && ( pc.ph & kPpsWpBi ) == 0
+      && refPoc( slice, 0, b.refIdx[0] ) == refPoc( slice, 1, b.refIdx[1] ) && all( b.mv[0] == b.mv[1] ) )
   {
     lists &= ~kInterL1;
   }
-  return lists;
+  b.flags |= lists;
 }
 
-// The job of a tile of such a block: the tile at (x, y), the block at (bx, by) and bw wide (the reach of the clip of
-// the motion). bflags holds the block's flags, bcw the CU's BCW index; ciip: a CIIP CU's block, which has no BCW.
-void mcTile( uint bflags, int bcw, bool ciip, uint* jslice, int x, int y, int tileW, int tileH, int bx, int by, int bw, int2 mv0, int2 mv1,
-             int ref0, int ref1, int refIdx0, int refIdx1, int dmvrIndex, inout uint w[12] )
+// The job of b's tile at (x, y), tileW x tileH; dmvrIndex: the tile's DMVR refinement's
+void mcTile( McBlock b, uint* jslice, int x, int y, int tileW, int tileH, int dmvrIndex, inout uint w[12] )
 {
-  setInter( w, x, y, tileW, tileH, bflags, mv0, mv1, bx, by, ref0, ref1, dmvrIndex );
-  w[7] |= uint( bw ) << 20;   // setClipWidth
-  if( ( bflags & kInterL1 ) != 0 && ( bflags & kInterL0 ) != 0 && bcw != 0 && !ciip )
+  setInter( w, x, y, tileW, tileH, b.flags, b.mv[0], b.mv[1], b.pos.x, b.pos.y, b.ref[0], b.ref[1], dmvrIndex );
+  w[7] |= uint( b.width ) << 20;   // setClipWidth
+  if( ( b.flags & kInterL1 ) != 0 && ( b.flags & kInterL0 ) != 0 && b.bcw != 0 && !b.ciip )
   {
     w[1] |= kInterBcw << 16;
-    w[7] |= ( pc.tables[T_BCW1 + bcw] + 2 ) << 16;
+    w[7] |= ( pc.tables[T_BCW1 + b.bcw] + 2 ) << 16;
   }
-  wpJob( bcw, jslice, refIdx0, refIdx1, bflags, w );
+  wpJob( b.bcw, jslice, b.refIdx[0], b.refIdx[1], b.flags, w );
 }
 
-// Emits the jobs of a translational CU's block, which motionCompensation predicts with one motion, in tiles of up to
-// 16 x 16.
-void mcBlock( Cu cu, Motion m, uint* slice, uint* jslice, uint flags, int bx, int by, int bw, int bh, int refIdx0, int refIdx1, int2 mv0, int2 mv1,
-              inout Out o )
+// Emits the jobs of a translational CU, which motionCompensation predicts with the CU's motion, in tiles of up to
+// 16 x 16. flags: the CU's job flags.
+void mcBlock( Cu cu, Motion m, uint* slice, uint* jslice, uint flags, inout Out o )
 {
-  const bool dmvr = dmvrCondition( cu, m, slice, jslice ) && !( refIdx0 >= 0 && refScaled( jslice, 0, refIdx0 ) )
-                    && !( refIdx1 >= 0 && refScaled( jslice, 1, refIdx1 ) );
-  int        ref0, ref1;
-  uint       bflags = flags | mcLists( slice, jslice, refIdx0, refIdx1, mv0, mv1, dmvr, ref0, ref1 );
+  const int4 area = cu.blk[0];
+  const bool dmvr = dmvrCondition( cu, m, slice, jslice ) && !( m.refIdx[0] >= 0 && refScaled( jslice, 0, m.refIdx[0] ) )
+                    && !( m.refIdx[1] >= 0 && refScaled( jslice, 1, m.refIdx[1] ) );
+  McBlock b;
+  b.flags  = flags;
+  b.bcw    = m.bcw;
+  b.ciip   = ( cu.flags & kCiip ) != 0;
+  b.refIdx = m.refIdx;
+  b.mv[0]  = m.mv[0][0];
+  b.mv[1]  = m.mv[1][0];
+  b.pos    = area.xy;
+  b.width  = area.z;
+  setMcLists( slice, jslice, dmvr, b );
   if( bdofCondition( cu, m, slice, jslice ) )
   {
-    bflags |= kInterBdof;
+    b.flags |= kInterBdof;
   }
   if( dmvr )
   {
-    bflags |= kInterDmvr;
+    b.flags |= kInterDmvr;
   }
-  const int tileW = min( bw, 16 );
-  const int tileH = min( bh, 16 );
+  const int tileW = min( area.z, 16 );
+  const int tileH = min( area.w, 16 );
   int       num   = 0;
-  for( int y = by; y < by + bh; y += tileH )
+  for( int y = area.y; y < area.y + area.w; y += tileH )
   {
-    for( int x = bx; x < bx + bw; x += tileW )
+    for( int x = area.x; x < area.x + area.z; x += tileW )
     {
       uint w[12];
-      mcTile( bflags, m.bcw, ( cu.flags & kCiip ) != 0, jslice, x, y, tileW, tileH, bx, by, bw, mv0, mv1, ref0, ref1, refIdx0, refIdx1,
-              dmvr ? cu.dmvrOff + num : 0, w );
+      mcTile( b, jslice, x, y, tileW, tileH, dmvr ? cu.dmvrOff + num : 0, w );
       emitInter( o, w );
       num++;
     }
@@ -1636,7 +1655,7 @@ void interJobs( Cu cu, Motion m, inout Out o, inout Units cache )
   }
   else
   {
-    mcBlock( cu, m, slice, jslice, flags, y4.x, y4.y, y4.z, y4.w, m.refIdx[0], m.refIdx[1], m.mv[0][0], m.mv[1][0], o );
+    mcBlock( cu, m, slice, jslice, flags, o );
   }
 
   if( ( cu.flags & kCiip ) != 0 )
@@ -2157,25 +2176,26 @@ void sbtmvpJobs( int tid, int index, inout Out o )
     {
       // The tile of two sub-PUs, in the block of the run's even length; or the run's last sub-PU alone, in its own
       // block, where the length is odd. The run's motion is its first sub-PU's.
-      const bool alone   = ( ( e - s ) & 1 ) != 0 && k == e - 1;
-      const int  from    = alone ? k : s;   // the block's first sub-PU, and its length
-      const int  length  = alone ? 1 : ( e - s ) & ~1;
-      const int  first   = line * n1 + s;
-      const int4 mv      = s_sbMv[first];
-      const uint r       = s_sbRef[first];
-      const int  refIdx0 = int( int8_t( r & 0xff ) );
-      const int  refIdx1 = int( int8_t( r >> 8 ) );
-      int        ref0, ref1;
-      const uint bflags  = uint( info.y ) | mcLists( slice, jslice, refIdx0, refIdx1, mv.xy, mv.zw, false, ref0, ref1 );
-      uint       w[12];
-      if( !verMC )
-      {
-        mcTile( bflags, info.z, false, jslice, x, y, alone ? 8 : 16, 8, y4.x + 8 * from, y, 8 * length, mv.xy, mv.zw, ref0, ref1, refIdx0, refIdx1, 0, w );
-      }
-      else
-      {
-        mcTile( bflags, info.z, false, jslice, x, y, 8, alone ? 8 : 16, x, y4.y + 8 * from, 8, mv.xy, mv.zw, ref0, ref1, refIdx0, refIdx1, 0, w );
-      }
+      const bool alone  = ( ( e - s ) & 1 ) != 0 && k == e - 1;
+      const int  from   = alone ? k : s;   // the block's first sub-PU, and its length
+      const int  length = alone ? 1 : ( e - s ) & ~1;
+      const int  first  = line * n1 + s;
+      const int4 mv     = s_sbMv[first];
+      const uint r      = s_sbRef[first];
+      McBlock    b;
+      b.flags     = uint( info.y );
+      b.bcw       = info.z;
+      b.ciip      = false;
+      b.refIdx[0] = int( int8_t( r & 0xff ) );
+      b.refIdx[1] = int( int8_t( r >> 8 ) );
+      b.mv[0]     = mv.xy;
+      b.mv[1]     = mv.zw;
+      b.pos       = verMC ? int2( x, y4.y + 8 * from ) : int2( y4.x + 8 * from, y );
+      b.width     = verMC ? 8 : 8 * length;
+      setMcLists( slice, jslice, false, b );
+      const int tileLength = alone ? 8 : 16;   // along the run: two sub-PUs, or the last one alone
+      uint      w[12];
+      mcTile( b, jslice, x, y, verMC ? 8 : tileLength, verMC ? tileLength : 8, 0, w );
       writeInter( info.w + int( job ), w );
     }
   }
