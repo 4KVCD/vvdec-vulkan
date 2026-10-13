@@ -4,7 +4,8 @@
 # always run after another would always get less), 16 threads, medians.
 # A spec is a program name (vvdecapp_<name>.exe here) with an optional mode: <name> (the GPU parses: VVDEC_GPU_PARSE=2),
 # <name>:hyb (the CPU parses, the GPU does the rest), <name>:cpu (the CPU decoder, --gpu 0); and environment variables
-# of its own after the name: <name>+VAR=value+VAR2=value[:mode].
+# of its own after the name: <name>+VAR=value+VAR2=value[:mode]. The variable THREADS sets the decoder's threads (-t;
+# 16 by default) instead of the environment.
 # Each run's output is kept in ab_logs/<stream>_<spec>_run<n>.log; a run that fails or lacks its marks stops the timing.
 import os
 import re
@@ -46,14 +47,24 @@ def environment(spec):
         env['VVDEC_GPU_PARSE'] = '2'
     for v in variables:
         key, _, value = v.partition('=')
-        env[key] = value
+        if key != 'THREADS':
+            env[key] = value
     return env
+
+
+def threads(spec):
+    """The decoder threads (-t) of a spec's runs: its THREADS variable's, else 16."""
+    for v in spec.partition(':')[0].split('+')[1:]:
+        key, _, value = v.partition('=')
+        if key == 'THREADS':
+            return value
+    return '16'
 
 
 # A short decode of each spec first, so that no timed run compiles shaders (the stream's own variants included)
 for spec in specs:
     name, mode = program(spec), spec.partition(':')[2]
-    subprocess.run([os.path.join(S, f'vvdecapp_{name}.exe'), '-b', stream, '-f', '8', '-t', '16', '-v', '0', '--gpu', '0' if mode == 'cpu' else '1'],
+    subprocess.run([os.path.join(S, f'vvdecapp_{name}.exe'), '-b', stream, '-f', '8', '-t', threads(spec), '-v', '0', '--gpu', '0' if mode == 'cpu' else '1'],
                    env=environment(spec), capture_output=True)
 runs = {}
 for r in range(rounds):
@@ -61,7 +72,7 @@ for r in range(rounds):
         name, mode = program(spec), spec.partition(':')[2]
         env = environment(spec)
         gpu = '0' if mode == 'cpu' else '1'
-        cmd = [PROC, '--mark', 'VVdeC,', '--mark', 'SizeInfo', '--mark', 'frames decoded @', '--', S + rf'\vvdecapp_{name}.exe', '-b', stream, '-f', str(frames), '-t', '16', '-v', '3', '--gpu', gpu] + EXTRA
+        cmd = [PROC, '--mark', 'VVdeC,', '--mark', 'SizeInfo', '--mark', 'frames decoded @', '--', S + rf'\vvdecapp_{name}.exe', '-b', stream, '-f', str(frames), '-t', threads(spec), '-v', '3', '--gpu', gpu] + EXTRA
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, errors='replace')
         out = proc.stdout + proc.stderr
         log = os.path.join(LOGS, f'{os.path.splitext(os.path.basename(stream))[0]}_{re.sub(r"[^A-Za-z0-9_.=-]", "_", spec)}_run{r + 1}.log')
