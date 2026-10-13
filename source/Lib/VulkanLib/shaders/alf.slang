@@ -190,73 +190,24 @@ int fetch( int16_t* p, int stride, int x, int y, Region r, int w, int h )
 }
 #endif
 
-#if CHROMA == 0 && BOUNDS
+#if CHROMA == 0
+// The luma filter's steps that both variants (BOUNDS's and the tiled one) share
 
 static const int kTh[16] = { 0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4 };
 static const int kTransposeTable[8] = { 0, 1, 0, 2, 2, 3, 1, 3 };
 
-// One thread per 4x4 luma block: classifies the block from the Laplacians of
-// the 2x2 cells around it, then filters it, reading every sample through the
-// block's region (fetch).
-[shader( "compute" )]
-[numthreads( 8, 8, 1 )]
-void main( uint3 id : SV_DispatchThreadID )
+// A 4x4 block's class and transpose (AdaptiveLoopFilter::deriveClassificationBlk)
+struct AlfClass
 {
-  const int bx = int( id.x ) * 4;
-  const int by = int( id.y ) * 4;
-  if( bx >= pc.width || by >= pc.height )
-  {
-    return;
-  }
-  const int ctu = ( by >> pc.ctuLog2 ) * pc.widthInCtus + ( bx >> pc.ctuLog2 );
-  const int set = int( pc.ctus[ctu * 8 + CTU_LUMA_SET] );
-  if( set == 255 )
-  {
-    for( int dy = 0; dy < 4; dy++ )
-    {
-      for( int dx = 0; dx < 4; dx++ )
-      {
-        storePel( pc.dst0, pc.dstStride, bx + dx, by + dy, loadPel( pc.src0, pc.srcStride, bx + dx, by + dy ) );
-      }
-    }
-    return;
-  }
-  const Region rg    = regionOf( bx, by );
-  const int    vbH   = 1 << pc.ctuLog2;
-  const int    vbPos = vbH - 4;
-  const int    byVb  = by & ( vbH - 1 );
+  int classIdx;
+  int transposeIdx;
+};
 
-  // Classification: sum the Laplacians over the block's window, the 4x4 cells
-  // from ( bx - 2, by - 2 ), except the rows that the virtual boundary hides.
-  int sumV = 0, sumH = 0, sumD0 = 0, sumD1 = 0;
-  const int rFirst = byVb == vbPos ? 1 : 0;
-  const int rLast  = byVb == vbPos - 4 ? 2 : 3;
-  for( int r = rFirst; r <= rLast; r++ )
-  {
-    const int y0  = by - 2 + 2 * r;
-    int       ym1 = y0 - 1;
-    int       yp2 = y0 + 2;
-    if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos - 2 )
-    {
-      yp2 = y0 + 1;
-    }
-    else if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos )
-    {
-      ym1 = y0;
-    }
-    for( int c = 0; c < 4; c++ )
-    {
-      const int x0 = bx - 2 + 2 * c;
-#define S( X, Y ) fetch( pc.src0, pc.srcStride, X, Y, rg, pc.width, pc.height )
-      const int a = S( x0, y0 ) << 1;
-      const int b = S( x0 + 1, y0 + 1 ) << 1;
-      sumV  += abs( a - S( x0, ym1 ) - S( x0, y0 + 1 ) ) + abs( b - S( x0 + 1, y0 ) - S( x0 + 1, yp2 ) );
-      sumH  += abs( a - S( x0 + 1, y0 ) - S( x0 - 1, y0 ) ) + abs( b - S( x0 + 2, y0 + 1 ) - S( x0, y0 + 1 ) );
-      sumD0 += abs( a - S( x0 - 1, ym1 ) - S( x0 + 1, y0 + 1 ) ) + abs( b - S( x0, y0 ) - S( x0 + 2, yp2 ) );
-      sumD1 += abs( a - S( x0 - 1, y0 + 1 ) - S( x0 + 1, ym1 ) ) + abs( b - S( x0, yp2 ) - S( x0 + 2, y0 ) );
-    }
-  }
-
+// The block's class and transpose from the Laplacians summed over its window (vertical, horizontal and the two
+// diagonals): its activity, and its main direction and how strong it is. byVb: the block's row in its CTU, next to the
+// virtual boundary (vbPos) the window has fewer rows and the activity is scaled up.
+AlfClass alfClassOf( int sumV, int sumH, int sumD0, int sumD1, int byVb, int vbPos )
+{
   const int shift    = pc.bitDepth + 4;
   const int tempAct  = sumV + sumH;
   const int scale    = ( byVb == vbPos - 4 || byVb == vbPos ) ? 96 : 64;
@@ -303,63 +254,169 @@ void main( uint3 id : SV_DispatchThreadID )
   {
     classIdx += ( ( ( mainDirection & 1 ) << 1 ) + directionStrength ) * 5;
   }
-  const int transposeIdx = kTransposeTable[mainDirection * 2 + ( secondaryDirection >> 1 )];
+  AlfClass cls;
+  cls.classIdx     = classIdx;
+  cls.transposeIdx = kTransposeTable[mainDirection * 2 + ( secondaryDirection >> 1 )];
+  return cls;
+}
 
-  const int base = set * LUMA_SET_SIZE + transposeIdx * NUM_CLASSES * LUMA_COEFF + classIdx * LUMA_COEFF;
-  int c[12], k[12];
+// The 12 coefficients and clipping values of the class's filter in the CTU's filter set
+void loadLumaFilter( int set, AlfClass cls, out int c[12], out int k[12] )
+{
+  const int base = set * LUMA_SET_SIZE + cls.transposeIdx * NUM_CLASSES * LUMA_COEFF + cls.classIdx * LUMA_COEFF;
   for( int i = 0; i < 12; i++ )
   {
     c[i] = int( pc.coeff[base + i] );
     k[i] = int( pc.clip[base + i] );
   }
+}
 
+// The rows the filter reads around row y: r1, r3, r5 below and r2, r4, r6 above. Next to the virtual boundary (vbPos
+// in each CTU of vbH rows) the rows past it are replaced by the nearest ones before it, and the filter's sum is scaled
+// down on the two rows next to it (nearVb).
+struct AlfRows
+{
+  int  r1, r2, r3, r4, r5, r6;
+  bool nearVb;
+};
+
+AlfRows alfRowsOf( int y, int vbH, int vbPos )
+{
+  const int yVb = y & ( vbH - 1 );
+  AlfRows   r;
+  r.r1 = y + 1;
+  r.r2 = y - 1;
+  r.r3 = y + 2;
+  r.r4 = y - 2;
+  r.r5 = y + 3;
+  r.r6 = y - 3;
+  if( yVb < vbPos && yVb >= vbPos - 4 )
+  {
+    r.r1 = yVb == vbPos - 1 ? y : r.r1;
+    r.r3 = yVb >= vbPos - 2 ? r.r1 : r.r3;
+    r.r5 = yVb >= vbPos - 3 ? r.r3 : r.r5;
+    r.r2 = yVb == vbPos - 1 ? y : r.r2;
+    r.r4 = yVb >= vbPos - 2 ? r.r2 : r.r4;
+    r.r6 = yVb >= vbPos - 3 ? r.r4 : r.r6;
+  }
+  else if( yVb >= vbPos && yVb <= vbPos + 3 )
+  {
+    r.r2 = yVb == vbPos ? y : r.r2;
+    r.r4 = yVb <= vbPos + 1 ? r.r2 : r.r4;
+    r.r6 = yVb <= vbPos + 2 ? r.r4 : r.r6;
+    r.r1 = yVb == vbPos ? y : r.r1;
+    r.r3 = yVb <= vbPos + 1 ? r.r1 : r.r3;
+    r.r5 = yVb <= vbPos + 2 ? r.r3 : r.r5;
+  }
+  r.nearVb = yVb == vbPos - 1 || yVb == vbPos;
+  return r;
+}
+#endif
+
+#if CHROMA == 0 && BOUNDS
+
+// A sample of the luma source through the block's region (fetch)
+#define S( X, Y ) fetch( pc.src0, pc.srcStride, X, Y, rg, pc.width, pc.height )
+
+// The 4x4 block's Laplacians summed over its window: the 4x4 cells of 2x2 samples from ( bx - 2, by - 2 ), except the
+// rows that the virtual boundary hides (where a cell's row past it reads its own row instead), each sample read
+// through the block's region
+AlfClass classifyBlockBounded( int bx, int by, Region rg, int vbH, int vbPos )
+{
+  const int byVb = by & ( vbH - 1 );
+  int sumV = 0, sumH = 0, sumD0 = 0, sumD1 = 0;
+  const int rFirst = byVb == vbPos ? 1 : 0;
+  const int rLast  = byVb == vbPos - 4 ? 2 : 3;
+  for( int r = rFirst; r <= rLast; r++ )
+  {
+    const int y0  = by - 2 + 2 * r;
+    int       ym1 = y0 - 1;
+    int       yp2 = y0 + 2;
+    if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos - 2 )
+    {
+      yp2 = y0 + 1;
+    }
+    else if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos )
+    {
+      ym1 = y0;
+    }
+    for( int c = 0; c < 4; c++ )
+    {
+      const int x0 = bx - 2 + 2 * c;
+      const int a  = S( x0, y0 ) << 1;
+      const int b  = S( x0 + 1, y0 + 1 ) << 1;
+      sumV  += abs( a - S( x0, ym1 ) - S( x0, y0 + 1 ) ) + abs( b - S( x0 + 1, y0 ) - S( x0 + 1, yp2 ) );
+      sumH  += abs( a - S( x0 + 1, y0 ) - S( x0 - 1, y0 ) ) + abs( b - S( x0 + 2, y0 + 1 ) - S( x0, y0 + 1 ) );
+      sumD0 += abs( a - S( x0 - 1, ym1 ) - S( x0 + 1, y0 + 1 ) ) + abs( b - S( x0, y0 ) - S( x0 + 2, yp2 ) );
+      sumD1 += abs( a - S( x0 - 1, y0 + 1 ) - S( x0 + 1, ym1 ) ) + abs( b - S( x0, yp2 ) - S( x0 + 2, y0 ) );
+    }
+  }
+  return alfClassOf( sumV, sumH, sumD0, sumD1, byVb, vbPos );
+}
+
+// Filters the 4x4 block at (bx, by) with its class's filter, each sample read through the block's region
+void filterBlockBounded( int bx, int by, Region rg, int set, AlfClass cls, int vbH, int vbPos )
+{
+  int c[12], k[12];
+  loadLumaFilter( set, cls, c, k );
   const int maxVal = ( 1 << pc.bitDepth ) - 1;
   for( int dy = 0; dy < 4; dy++ )
   {
-    const int y   = by + dy;
-    const int yVb = y & ( vbH - 1 );
-    int r1 = y + 1, r2 = y - 1, r3 = y + 2, r4 = y - 2, r5 = y + 3, r6 = y - 3;
-    if( yVb < vbPos && yVb >= vbPos - 4 )
-    {
-      r1 = yVb == vbPos - 1 ? y : r1;
-      r3 = yVb >= vbPos - 2 ? r1 : r3;
-      r5 = yVb >= vbPos - 3 ? r3 : r5;
-      r2 = yVb == vbPos - 1 ? y : r2;
-      r4 = yVb >= vbPos - 2 ? r2 : r4;
-      r6 = yVb >= vbPos - 3 ? r4 : r6;
-    }
-    else if( yVb >= vbPos && yVb <= vbPos + 3 )
-    {
-      r2 = yVb == vbPos ? y : r2;
-      r4 = yVb <= vbPos + 1 ? r2 : r4;
-      r6 = yVb <= vbPos + 2 ? r4 : r6;
-      r1 = yVb == vbPos ? y : r1;
-      r3 = yVb <= vbPos + 1 ? r1 : r3;
-      r5 = yVb <= vbPos + 2 ? r3 : r5;
-    }
-    const bool nearVb = yVb == vbPos - 1 || yVb == vbPos;
+    const int     y  = by + dy;
+    const AlfRows rs = alfRowsOf( y, vbH, vbPos );
     for( int dx = 0; dx < 4; dx++ )
     {
       const int x   = bx + dx;
       const int cur = S( x, y );
       int       sum = 0;
-      sum += c[0]  * clipAlf( k[0],  cur, S( x,     r5 ), S( x,     r6 ) );
-      sum += c[1]  * clipAlf( k[1],  cur, S( x + 1, r3 ), S( x - 1, r4 ) );
-      sum += c[2]  * clipAlf( k[2],  cur, S( x,     r3 ), S( x,     r4 ) );
-      sum += c[3]  * clipAlf( k[3],  cur, S( x - 1, r3 ), S( x + 1, r4 ) );
-      sum += c[4]  * clipAlf( k[4],  cur, S( x + 2, r1 ), S( x - 2, r2 ) );
-      sum += c[5]  * clipAlf( k[5],  cur, S( x + 1, r1 ), S( x - 1, r2 ) );
-      sum += c[6]  * clipAlf( k[6],  cur, S( x,     r1 ), S( x,     r2 ) );
-      sum += c[7]  * clipAlf( k[7],  cur, S( x - 1, r1 ), S( x + 1, r2 ) );
-      sum += c[8]  * clipAlf( k[8],  cur, S( x - 2, r1 ), S( x + 2, r2 ) );
-      sum += c[9]  * clipAlf( k[9],  cur, S( x + 3, y ),  S( x - 3, y ) );
-      sum += c[10] * clipAlf( k[10], cur, S( x + 2, y ),  S( x - 2, y ) );
-      sum += c[11] * clipAlf( k[11], cur, S( x + 1, y ),  S( x - 1, y ) );
-#undef S
-      sum = nearVb ? ( sum + ( 1 << 9 ) ) >> 10 : ( sum + 64 ) >> 7;
+      sum += c[0]  * clipAlf( k[0],  cur, S( x,     rs.r5 ), S( x,     rs.r6 ) );
+      sum += c[1]  * clipAlf( k[1],  cur, S( x + 1, rs.r3 ), S( x - 1, rs.r4 ) );
+      sum += c[2]  * clipAlf( k[2],  cur, S( x,     rs.r3 ), S( x,     rs.r4 ) );
+      sum += c[3]  * clipAlf( k[3],  cur, S( x - 1, rs.r3 ), S( x + 1, rs.r4 ) );
+      sum += c[4]  * clipAlf( k[4],  cur, S( x + 2, rs.r1 ), S( x - 2, rs.r2 ) );
+      sum += c[5]  * clipAlf( k[5],  cur, S( x + 1, rs.r1 ), S( x - 1, rs.r2 ) );
+      sum += c[6]  * clipAlf( k[6],  cur, S( x,     rs.r1 ), S( x,     rs.r2 ) );
+      sum += c[7]  * clipAlf( k[7],  cur, S( x - 1, rs.r1 ), S( x + 1, rs.r2 ) );
+      sum += c[8]  * clipAlf( k[8],  cur, S( x - 2, rs.r1 ), S( x + 2, rs.r2 ) );
+      sum += c[9]  * clipAlf( k[9],  cur, S( x + 3, y ),     S( x - 3, y ) );
+      sum += c[10] * clipAlf( k[10], cur, S( x + 2, y ),     S( x - 2, y ) );
+      sum += c[11] * clipAlf( k[11], cur, S( x + 1, y ),     S( x - 1, y ) );
+      sum = rs.nearVb ? ( sum + ( 1 << 9 ) ) >> 10 : ( sum + 64 ) >> 7;
       storePel( pc.dst0, pc.dstStride, x, y, clip3( 0, maxVal, sum + cur ) );
     }
   }
+}
+#undef S
+
+// One thread per 4x4 luma block: classifies the block from the Laplacians of the 2x2 cells around it, then filters
+// it (or copies it, where the CTU has ALF off), reading every sample through the block's region (fetch).
+[shader( "compute" )]
+[numthreads( 8, 8, 1 )]
+void main( uint3 id : SV_DispatchThreadID )
+{
+  const int bx = int( id.x ) * 4;
+  const int by = int( id.y ) * 4;
+  if( bx >= pc.width || by >= pc.height )
+  {
+    return;
+  }
+  const int ctu = ( by >> pc.ctuLog2 ) * pc.widthInCtus + ( bx >> pc.ctuLog2 );
+  const int set = int( pc.ctus[ctu * 8 + CTU_LUMA_SET] );
+  if( set == 255 )
+  {
+    for( int dy = 0; dy < 4; dy++ )
+    {
+      for( int dx = 0; dx < 4; dx++ )
+      {
+        storePel( pc.dst0, pc.dstStride, bx + dx, by + dy, loadPel( pc.src0, pc.srcStride, bx + dx, by + dy ) );
+      }
+    }
+    return;
+  }
+  const Region rg    = regionOf( bx, by );
+  const int    vbH   = 1 << pc.ctuLog2;
+  const int    vbPos = vbH - 4;
+  filterBlockBounded( bx, by, rg, set, classifyBlockBounded( bx, by, rg, vbH, vbPos ), vbH, vbPos );
 }
 
 #elif CHROMA == 0
@@ -432,9 +489,6 @@ Row tileRow( int y, int G )
   return r;
 }
 
-static const int kTh[16] = { 0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4 };
-static const int kTransposeTable[8] = { 0, 1, 0, 2, 2, 3, 1, 3 };
-
 // Loads the workgroup's tile (s_x0, s_y0) with its margins into s_tile, in 4-sample groups, by the workgroup's 64
 // threads; the samples past the picture's edges are the nearest ones inside. Rows start 8-byte aligned
 // (GpuRecon::recordAlf), and so do the groups.
@@ -500,13 +554,6 @@ void cellLaplacians( int tid, int vbH, int vbPos )
   }
 }
 
-// A 4x4 block's class and transpose (AdaptiveLoopFilter::deriveClassificationBlk)
-struct AlfClass
-{
-  int classIdx;
-  int transposeIdx;
-};
-
 // Classifies the 4x4 block at (bx, by): sums the Laplacians over its window, the 4x4 cells from ( bx - 2, by - 2 )
 // except the rows that the virtual boundary hides, then works out its activity and directions.
 AlfClass classifyBlock( int bx, int by, int vbH, int vbPos )
@@ -533,105 +580,29 @@ AlfClass classifyBlock( int bx, int by, int vbH, int vbPos )
     }
   }
 
-  const int shift    = pc.bitDepth + 4;
-  const int tempAct  = sumV + sumH;
-  const int scale    = ( byVb == vbPos - 4 || byVb == vbPos ) ? 96 : 64;
-  const int activity = clip3( 0, 15, ( tempAct * scale ) >> shift );
-  int       classIdx = kTh[activity];
-
-  int hv1, hv0, d1, d0, dirTempHV, dirTempD;
-  if( sumV > sumH )
-  {
-    hv1 = sumV; hv0 = sumH; dirTempHV = 1;
-  }
-  else
-  {
-    hv1 = sumH; hv0 = sumV; dirTempHV = 3;
-  }
-  if( sumD0 > sumD1 )
-  {
-    d1 = sumD0; d0 = sumD1; dirTempD = 0;
-  }
-  else
-  {
-    d1 = sumD1; d0 = sumD0; dirTempD = 2;
-  }
-  int hvd1, hvd0, mainDirection, secondaryDirection;
-  // 32-bit unsigned products that wrap around, as vvdec's do
-  if( uint( d1 ) * uint( hv0 ) > uint( hv1 ) * uint( d0 ) )
-  {
-    hvd1 = d1; hvd0 = d0; mainDirection = dirTempD; secondaryDirection = dirTempHV;
-  }
-  else
-  {
-    hvd1 = hv1; hvd0 = hv0; mainDirection = dirTempHV; secondaryDirection = dirTempD;
-  }
-  int directionStrength = 0;
-  if( hvd1 > 2 * hvd0 )
-  {
-    directionStrength = 1;
-  }
-  if( hvd1 * 2 > 9 * hvd0 )
-  {
-    directionStrength = 2;
-  }
-  if( directionStrength != 0 )
-  {
-    classIdx += ( ( ( mainDirection & 1 ) << 1 ) + directionStrength ) * 5;
-  }
-  AlfClass cls;
-  cls.classIdx     = classIdx;
-  cls.transposeIdx = kTransposeTable[mainDirection * 2 + ( secondaryDirection >> 1 )];
-  return cls;
+  return alfClassOf( sumV, sumH, sumD0, sumD1, byVb, vbPos );
 }
 
 // Filters the 4x4 block at (bx, by), the tile's group G, with the filter of its class in the CTU's filter set, one row
-// at a time: its 4 samples ( bx + i, y ) are sample j = 4 + i of each Row. Next to the virtual boundary the rows past
-// it are replaced by the nearest ones before it, and the filter's sum is scaled down.
+// at a time (alfRowsOf's rows around it): its 4 samples ( bx + i, y ) are sample j = 4 + i of each Row.
 void filterBlock( int bx, int by, int G, int set, AlfClass cls, int vbH, int vbPos )
 {
-  const int base = set * LUMA_SET_SIZE + cls.transposeIdx * NUM_CLASSES * LUMA_COEFF + cls.classIdx * LUMA_COEFF;
   int c[12], k[12];
-  for( int i = 0; i < 12; i++ )
-  {
-    c[i] = int( pc.coeff[base + i] );
-    k[i] = int( pc.clip[base + i] );
-  }
-
+  loadLumaFilter( set, cls, c, k );
   const int maxVal = ( 1 << pc.bitDepth ) - 1;
   [unroll]
   for( int dy = 0; dy < 4; dy++ )
   {
-    const int y   = by + dy;
-    const int yVb = y & ( vbH - 1 );
-    int r1 = y + 1, r2 = y - 1, r3 = y + 2, r4 = y - 2, r5 = y + 3, r6 = y - 3;
-    if( yVb < vbPos && yVb >= vbPos - 4 )
-    {
-      r1 = yVb == vbPos - 1 ? y : r1;
-      r3 = yVb >= vbPos - 2 ? r1 : r3;
-      r5 = yVb >= vbPos - 3 ? r3 : r5;
-      r2 = yVb == vbPos - 1 ? y : r2;
-      r4 = yVb >= vbPos - 2 ? r2 : r4;
-      r6 = yVb >= vbPos - 3 ? r4 : r6;
-    }
-    else if( yVb >= vbPos && yVb <= vbPos + 3 )
-    {
-      r2 = yVb == vbPos ? y : r2;
-      r4 = yVb <= vbPos + 1 ? r2 : r4;
-      r6 = yVb <= vbPos + 2 ? r4 : r6;
-      r1 = yVb == vbPos ? y : r1;
-      r3 = yVb <= vbPos + 1 ? r1 : r3;
-      r5 = yVb <= vbPos + 2 ? r3 : r5;
-    }
-    const bool nearVb = yVb == vbPos - 1 || yVb == vbPos;
-
-    const Row s0 = tileRow( y, G );
-    const Row s1 = tileRow( r1, G );
-    const Row s2 = tileRow( r2, G );
-    const Row s3 = tileRow( r3, G );
-    const Row s4 = tileRow( r4, G );
-    const Row s5 = tileRow( r5, G );
-    const Row s6 = tileRow( r6, G );
+    const int     y      = by + dy;
+    const AlfRows rs     = alfRowsOf( y, vbH, vbPos );
+    const bool    nearVb = rs.nearVb;
+    const Row     s0     = tileRow( y, G );
+    const Row     s1     = tileRow( rs.r1, G );
+    const Row     s2     = tileRow( rs.r2, G );
+    const Row     s3     = tileRow( rs.r3, G );
+    const Row     s4     = tileRow( rs.r4, G );
+    const Row     s5     = tileRow( rs.r5, G );
+    const Row     s6     = tileRow( rs.r6, G );
     int       out[4];
     [unroll]
     for( int i = 0; i < 4; i++ )
