@@ -2513,16 +2513,15 @@ void restrictBi( Cur cur, inout Motion m )
   }
 }
 
-// DecCu::xDeriveCUMV: derives the CU's motion and writes it to the CU's motion record and its 4x4 blocks
-void deriveCu( Cur cur )
+// The CU's motion as the parse leaves it: the motion vector differences where the derivation sets no motion, the
+// reference indices, the inter direction, BCW's index, AMVR's half-sample flag and the 6-parameter affine flag
+CuMotion parsedCuMotion( Cu cu )
 {
-  Cu cu = cur.cu;
-  fetchNeighbours( cu );   // (for the lists below)
   CuMotion c = noCuMotion();
-  c.affine6   = affine6Of( cu );
-  c.hpel      = imvOf( cu ) == 3;   // the parse's imv, unless the derivation sets it
-  c.bcw       = bcwIdxOf( cu );
-  c.interDir  = interDirOf( cu );
+  c.affine6  = affine6Of( cu );
+  c.hpel     = imvOf( cu ) == 3;   // the parse's imv, unless the derivation sets it
+  c.bcw      = bcwIdxOf( cu );
+  c.interDir = interDirOf( cu );
   for( int l = 0; l < 2; l++ )
   {
     for( int k = 0; k < 3; k++ )
@@ -2531,164 +2530,175 @@ void deriveCu( Cur cur )
     }
     c.refIdx[l] = refIdxOf( cu, l );
   }
+  return c;
+}
 
-  if( cu.predMode == MODE_IBC )
+// An IBC CU: its block vector from the IBC merge list (getIBCMergeCandidates + setMergeInfo: imv 0, BCW default), or
+// from the first two merge candidates rounded to whole or 4 samples plus the vector difference (fillIBCMvpCand); then
+// IBC's history, for blocks of more than 16 samples.
+void deriveIbc( Cur cur, CuMotion c )
+{
+  Cu cu      = cur.cu;
+  c.kind     = kIbc;
+  c.interDir = 1;
+  Motion m   = noMotion();
+  if( ( cu.flags & kMerge ) != 0 )
   {
-    c.kind     = kIbc;
-    c.interDir = 1;
-    Motion m   = noMotion();
-    if( ( cu.flags & kMerge ) != 0 )
-    {
-      // getIBCMergeCandidates + setMergeInfo: imv 0, BCW default
-      const int idx = mergeIdx( cu );
-      ibcMergeCandidates( cur, idx );
-      const Motion b = cand( idx );
-      c.mv[0][0]     = b.mv[0];
-      c.mv[1][0]     = b.mv[1];
-      c.refIdx[0]    = b.refIdx[0];
-      c.refIdx[1]    = b.refIdx[1];
-      c.hpel         = false;
-      c.bcw          = 0;
-      c.mrgType      = MRG_TYPE_IBC;
-    }
-    else
-    {
-      // fillIBCMvpCand: the first two merge candidates, rounded to whole or 4 samples
-      ibcMergeCandidates( cur, 1 );
-      const int  imv = imvOf( cu );
-      const int2 p   = roundToPrecision( s_candMv[0][mvpIdx( cu, 0 )], 6, imv == 2 ? 0 : 2 );
-      const int2 d   = imv != 0 ? changePrecision( mvdOf( cu, 0, 0 ), amvrPrecision( imv ), 6 ) : mvdOf( cu, 0, 0 ) * 16;
-      c.mv[0][0]     = wrapMv2( p + d );
-    }
-    // spanMotionInfo: no reference indices for IBC
-    m.mv[0] = c.mv[0][0];
-    m.mv[1] = c.mv[1][0];
-    storeCuMotion( cu.index, c );
-    spanMotion( cur, m, kIbc );
-    // IBC's history (not for blocks of 16 samples or fewer)
-    if( cu.w * cu.h > 16 )
-    {
-      Motion h    = m;
-      h.refIdx[0] = 0;   // MH_NOT_VALID + 1
-      h.bcw       = 0;
-      h.hpel      = c.hpel;
-      addToLut( 1, h );
-    }
-    return;
+    const int idx = mergeIdx( cu );
+    ibcMergeCandidates( cur, idx );
+    const Motion b = cand( idx );
+    c.mv[0][0]     = b.mv[0];
+    c.mv[1][0]     = b.mv[1];
+    c.refIdx[0]    = b.refIdx[0];
+    c.refIdx[1]    = b.refIdx[1];
+    c.hpel         = false;
+    c.bcw          = 0;
+    c.mrgType      = MRG_TYPE_IBC;
   }
+  else
+  {
+    ibcMergeCandidates( cur, 1 );
+    const int  imv = imvOf( cu );
+    const int2 p   = roundToPrecision( s_candMv[0][mvpIdx( cu, 0 )], 6, imv == 2 ? 0 : 2 );
+    const int2 d   = imv != 0 ? changePrecision( mvdOf( cu, 0, 0 ), amvrPrecision( imv ), 6 ) : mvdOf( cu, 0, 0 ) * 16;
+    c.mv[0][0]     = wrapMv2( p + d );
+  }
+  // spanMotionInfo: no reference indices for IBC
+  m.mv[0] = c.mv[0][0];
+  m.mv[1] = c.mv[1][0];
+  storeCuMotion( cu.index, c );
+  spanMotion( cur, m, kIbc );
+  if( cu.w * cu.h > 16 )
+  {
+    Motion h    = m;
+    h.refIdx[0] = 0;   // MH_NOT_VALID + 1
+    h.bcw       = 0;
+    h.hpel      = c.hpel;
+    addToLut( 1, h );
+  }
+}
 
 #if !LITE
-  if( ( cu.flags & kMerge ) != 0 && ( cu.flags & kGeo ) != 0 )
-  {
-    // getGeoMergeCandidates (from the full merge list) + spanGeoMotionInfo
-    c.kind        = kGpm;
-    const int num = mergeCandidates( cur, -1 );
-    Motion    m0  = geoCandidate( num, geoIdx( cu, 0 ) );
-    Motion    m1  = geoCandidate( num, geoIdx( cu, 1 ) );
-    c.mv[0][1]    = m0.mv[interDir( m0 ) == 1 ? 0 : 1];
-    c.mv[1][1]    = m1.mv[interDir( m1 ) == 1 ? 0 : 1];
-    storeCuMotion( cu.index, c );
-    // The partitions' inter direction << 4 | reference index (CodingUnit's interDirrefIdxGeo0, 1)
-    const uint g0 = uint( interDir( m0 ) ) << 4 | uint( m0.refIdx[interDir( m0 ) == 1 ? 0 : 1] );
-    const uint g1 = uint( interDir( m1 ) ) << 4 | uint( m1.refIdx[interDir( m1 ) == 1 ? 0 : 1] );
-    pc.cuMotion[cu.index * 16 + 13] = int( g0 | g1 << 8 );
-    spanGeo( cur, geoSplitDir( cu ), m0, m1 );
-    return;
-  }
+// A GPM CU: its two partitions' motion from the full merge list (getGeoMergeCandidates), the partitions' inter
+// direction << 4 | reference index (CodingUnit's interDirrefIdxGeo0 and 1), and the blocks' motion (spanGeoMotionInfo)
+void deriveGpm( Cur cur, CuMotion c )
+{
+  Cu cu         = cur.cu;
+  c.kind        = kGpm;
+  const int num = mergeCandidates( cur, -1 );
+  Motion    m0  = geoCandidate( num, geoIdx( cu, 0 ) );
+  Motion    m1  = geoCandidate( num, geoIdx( cu, 1 ) );
+  c.mv[0][1]    = m0.mv[interDir( m0 ) == 1 ? 0 : 1];
+  c.mv[1][1]    = m1.mv[interDir( m1 ) == 1 ? 0 : 1];
+  storeCuMotion( cu.index, c );
+  const uint g0 = uint( interDir( m0 ) ) << 4 | uint( m0.refIdx[interDir( m0 ) == 1 ? 0 : 1] );
+  const uint g1 = uint( interDir( m1 ) ) << 4 | uint( m1.refIdx[interDir( m1 ) == 1 ? 0 : 1] );
+  pc.cuMotion[cu.index * 16 + 13] = int( g0 | g1 << 8 );
+  spanGeo( cur, geoSplitDir( cu ), m0, m1 );
+}
 
-  if( ( cu.flags & kAffine ) != 0 && ( cu.flags & kMerge ) != 0 )
+// An affine merge CU: its entry of the subblock merge list (SbTMVP, inherited and constructed affine, zero candidates).
+// Returns true for an SbTMVP entry, whose sub-PUs' motion is in the 4x4 blocks already and whose CU record is then
+// written (with the reference indices of the list's entry, as in vvdec); otherwise sets the control points' motion.
+bool deriveAffineMerge( Cur cur, inout CuMotion c )
+{
+  Cu cu         = cur.cu;
+  const int idx = mergeIdx( cu );
+  affineMergeCandidates( cur, idx );
+  c.interDir = s_affDir[idx];
+  c.affine6  = s_affType[idx] != 0;
+  c.bcw      = s_affBcw[idx];
+  c.mrgType  = s_affMrgType[idx];
+  if( c.mrgType == MRG_TYPE_SUBPU_ATMVP )
   {
-    // The subblock merge list: SbTMVP, inherited and constructed affine, and zero candidates
-    const int idx = mergeIdx( cu );
-    affineMergeCandidates( cur, idx );
-    c.interDir = s_affDir[idx];
-    c.affine6  = s_affType[idx] != 0;
-    c.bcw      = s_affBcw[idx];
-    c.mrgType  = s_affMrgType[idx];
-    if( c.mrgType == MRG_TYPE_SUBPU_ATMVP )
+    c.kind      = kSbtmvp;
+    c.refIdx[0] = s_affRef[0][idx];
+    c.refIdx[1] = s_affRef[1][idx];
+    storeCuMotion( cu.index, c );
+    return true;
+  }
+  c.kind = kAffineCu;
+  for( int l = 0; l < 2; l++ )
+  {
+    if( numRefIdx( cur.slice, l ) > 0 )
     {
-      // (the sub-PUs' motion is already in the 4x4 blocks; the CU's reference
-      // indices are those of the list's first entry, as in vvdec)
-      c.kind      = kSbtmvp;
-      c.refIdx[0] = s_affRef[0][idx];
-      c.refIdx[1] = s_affRef[1][idx];
-      storeCuMotion( cu.index, c );
-      return;
-    }
-    c.kind = kAffineCu;
-    for( int l = 0; l < 2; l++ )
-    {
-      if( numRefIdx( cur.slice, l ) > 0 )
-      {
-        c.refIdx[l] = s_affRef[l][idx];
-        setAllAffineMv( cur, c, s_affMv[l][0][idx], s_affMv[l][1][idx], s_affMv[l][2][idx], l, false, c.interDir );
-      }
+      c.refIdx[l] = s_affRef[l][idx];
+      setAllAffineMv( cur, c, s_affMv[l][0][idx], s_affMv[l][1][idx], s_affMv[l][2][idx], l, false, c.interDir );
     }
   }
-  else if( ( cu.flags & kAffine ) != 0 )
+  return false;
+}
+
+// An affine AMVP CU: per list it uses, the control points' predictors plus their vector differences (in AMVR's
+// precision), then the control points' motion
+void deriveAffineAmvp( Cur cur, inout CuMotion c )
+{
+  Cu cu         = cur.cu;
+  c.kind        = kAffineCu;
+  const int imv = imvOf( cu );
+  const int sh  = imv == 2 ? 2 : 0;
+  for( int l = 0; l < 2; l++ )
   {
-    // Affine AMVP
-    c.kind        = kAffineCu;
-    const int imv = imvOf( cu );
-    const int sh  = imv == 2 ? 2 : 0;
-    for( int l = 0; l < 2; l++ )
+    if( numRefIdx( cur.slice, l ) > 0 && ( c.interDir & ( 1 << l ) ) != 0 )
     {
-      if( numRefIdx( cur.slice, l ) > 0 && ( c.interDir & ( 1 << l ) ) != 0 )
+      int2 p[3];
+      affineAmvpCandidate( cur, l, c.refIdx[l], imv, mvpIdx( cu, l ), c.affine6, p );
+      const int2 d0 = mvdOf( cu, l, 0 ) * ( 1 << sh );
+      const int2 d1 = mvdOf( cu, l, 1 ) * ( 1 << sh );
+      int2       lt = p[0] + d0;
+      int2       rt = p[1] + d1 + d0;
+      if( imv != 1 )
       {
-        int2 p[3];
-        affineAmvpCandidate( cur, l, c.refIdx[l], imv, mvpIdx( cu, l ), c.affine6, p );
-        const int2 d0 = mvdOf( cu, l, 0 ) * ( 1 << sh );
-        const int2 d1 = mvdOf( cu, l, 1 ) * ( 1 << sh );
-        int2       lt = p[0] + d0;
-        int2       rt = p[1] + d1 + d0;
+        lt = changePrecision( lt, 4, 6 );
+        rt = changePrecision( rt, 4, 6 );
+      }
+      int2 lb = int2( 0, 0 );
+      if( c.affine6 )
+      {
+        const int2 d2 = mvdOf( cu, l, 2 ) * ( 1 << sh );
+        lb            = p[2] + d2 + d0;
         if( imv != 1 )
         {
-          lt = changePrecision( lt, 4, 6 );
-          rt = changePrecision( rt, 4, 6 );
+          lb = changePrecision( lb, 4, 6 );
         }
-        int2 lb = int2( 0, 0 );
-        if( c.affine6 )
-        {
-          const int2 d2 = mvdOf( cu, l, 2 ) * ( 1 << sh );
-          lb            = p[2] + d2 + d0;
-          if( imv != 1 )
-          {
-            lb = changePrecision( lb, 4, 6 );
-          }
-        }
-        setAllAffineMv( cur, c, lt, rt, lb, l, true, c.interDir );
       }
+      setAllAffineMv( cur, c, lt, rt, lb, l, true, c.interDir );
     }
   }
+}
 
-  if( c.kind == kAffineCu )
+// spanMotionInfo for an affine CU: each 4x4 block gets the lists' reference indices, and the motion of a list the CU
+// does not use is zeroed; then the CU's record is written
+void spanAffine( Cur cur, CuMotion c )
+{
+  Cu        cu  = cur.cu;
+  const int w4  = cu.w >> 2;
+  const int lw4 = log2Of( w4 );
+  for( int u = g_lane; u < w4 * ( cu.h >> 2 ); u += 32 )
   {
-    // spanMotionInfo for affine: set the lists' reference indices, and zero the motion of the unused lists
-    const int w4  = cu.w >> 2;
-    const int lw4 = log2Of( w4 );
-    for( int u = g_lane; u < w4 * ( cu.h >> 2 ); u += 32 )
+    const int x  = ( u & ( w4 - 1 ) ) * 4;
+    const int y  = ( u >> lw4 ) * 4;
+    int*      mi = motionPtr( cu.x + x, cu.y + y );
+    for( int l = 0; l < 2; l++ )
     {
+      if( c.refIdx[l] < 0 )
       {
-        const int x  = ( u & ( w4 - 1 ) ) * 4;
-        const int y  = ( u >> lw4 ) * 4;
-        int*      mi = motionPtr( cu.x + x, cu.y + y );
-        for( int l = 0; l < 2; l++ )
-        {
-          if( c.refIdx[l] < 0 )
-          {
-            mi[2 * l]     = 0;
-            mi[2 * l + 1] = 0;
-          }
-        }
-        mi[4] = int( ( uint( c.refIdx[0] ) & 0xff ) | ( ( uint( c.refIdx[1] ) & 0xff ) << 8 ) | ( uint( kAffineCu ) << 16 ) );
+        mi[2 * l]     = 0;
+        mi[2 * l + 1] = 0;
       }
     }
-    storeCuMotion( cu.index, c );
-    return;
+    mi[4] = int( ( uint( c.refIdx[0] ) & 0xff ) | ( ( uint( c.refIdx[1] ) & 0xff ) << 8 ) | ( uint( kAffineCu ) << 16 ) );
   }
+  storeCuMotion( cu.index, c );
+}
 #endif
 
-  // Translational motion
+// A translational CU: a merge candidate (MMVD's base candidate plus its offset, or the regular list's entry; CIIP CUs
+// as well), or per list the AMVP candidate plus the vector difference (with SMVD, the second list's motion comes from
+// the parse); then the CU's record, the blocks' motion, and the history (subject to the parallel merge level)
+void deriveTranslation( Cur cur, CuMotion c )
+{
+  Cu cu    = cur.cu;
   c.kind   = kTranslation;
   Motion m = noMotion();
   if( ( cu.flags & kMerge ) != 0 )
@@ -2714,7 +2724,6 @@ void deriveCu( Cur cur )
     }
     else
     {
-      // (CIIP CUs as well)
       const int idx = mergeIdx( cu );
       mergeCandidates( cur, idx );
       m     = cand( idx );
@@ -2727,7 +2736,7 @@ void deriveCu( Cur cur )
   }
   else
   {
-    // AMVP (with or without applyImv, the same here); with SMVD, the second list's motion comes from the parse
+    // (with or without applyImv, the same here)
     const int amvr = imvOf( cu );
     m.hpel         = amvr == 3;
     m.bcw          = bcwIdxOf( cu );
@@ -2750,7 +2759,6 @@ void deriveCu( Cur cur )
   storeCuMotion( cu.index, c );
   spanMotion( cur, m, kTranslation );
 
-  // Update the history (not for affine or GPM CUs; subject to the parallel merge level)
   const bool on = ( ( cu.x + cu.w ) >> pc.plevel ) > ( cu.x >> pc.plevel ) && ( ( cu.y + cu.h ) >> pc.plevel ) > ( cu.y >> pc.plevel );
   if( on )
   {
@@ -2759,6 +2767,43 @@ void deriveCu( Cur cur )
     h.hpel   = c.hpel;
     addToLut( 0, h );
   }
+}
+
+// DecCu::xDeriveCUMV: derives the CU's motion and writes it to the CU's motion record and its 4x4 blocks
+void deriveCu( Cur cur )
+{
+  Cu cu = cur.cu;
+  fetchNeighbours( cu );   // (for the lists the derivations build)
+  CuMotion c = parsedCuMotion( cu );
+  if( cu.predMode == MODE_IBC )
+  {
+    deriveIbc( cur, c );
+    return;
+  }
+#if !LITE
+  if( ( cu.flags & kMerge ) != 0 && ( cu.flags & kGeo ) != 0 )
+  {
+    deriveGpm( cur, c );
+    return;
+  }
+  if( ( cu.flags & kAffine ) != 0 )
+  {
+    if( ( cu.flags & kMerge ) != 0 )
+    {
+      if( deriveAffineMerge( cur, c ) )
+      {
+        return;   // (SbTMVP)
+      }
+    }
+    else
+    {
+      deriveAffineAmvp( cur, c );
+    }
+    spanAffine( cur, c );
+    return;
+  }
+#endif
+  deriveTranslation( cur, c );
 }
 
 // --------------------------------------------------------------------------------------------------------------------
