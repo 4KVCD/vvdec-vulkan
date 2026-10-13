@@ -2927,13 +2927,46 @@ int2 affineVer( uint job[24], int list )
   return list == 0 ? int2( int( job[15] ), int( job[16] ) ) : int2( int( job[19] ), int( job[20] ) );
 }
 
-// The motion of the CU's luma subblock (sx, sy).
-int2 affineMv( uint job[24], int list, int sx, int sy, int cw, int ch, bool spread )
+// An affine pair's tile and CU, from the pair's words: the tile at (x, y), w x h; its CU at (cuX, cuY), cw x ch
+struct AffineArea
+{
+  int x, y, w, h;
+  int cuX, cuY, cw, ch;
+};
+
+AffineArea affineArea( uint job[24] )
+{
+  AffineArea a;
+  a.x   = int( job[0] & 0xffff );
+  a.y   = int( job[0] >> 16 );
+  a.w   = int( job[1] & 255 );
+  a.h   = int( ( job[1] >> 8 ) & 255 );
+  a.cuX = int( job[6] & 0xffff );
+  a.cuY = int( job[6] >> 16 );
+  a.cw  = int( job[12] & 255 );
+  a.ch  = int( ( job[12] >> 8 ) & 255 );
+  return a;
+}
+
+// A list's flags in the pair's word 12: PROF, and the motion spread too far for subblocks (every subblock then takes
+// the motion of the CU's centre: isSubblockVectorSpreadOverLimit)
+bool affineProfOf( uint job[24], int list )
+{
+  return ( ( job[12] >> ( 16 + list ) ) & 1 ) != 0;
+}
+
+bool affineSpreadOf( uint job[24], int list )
+{
+  return ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
+}
+
+// The motion of the CU's luma subblock (sx, sy) (a: the pair's tile and CU).
+int2 affineMv( uint job[24], int list, AffineArea a, int sx, int sy )
 {
   const int2 base = affineBase( job, list );
   const int2 hor  = affineHor( job, list );
   const int2 ver  = affineVer( job, list );
-  const int2 pos  = spread ? int2( cw >> 1, ch >> 1 ) : int2( 2 + 4 * sx, 2 + 4 * sy );
+  const int2 pos  = affineSpreadOf( job, list ) ? int2( a.cw >> 1, a.ch >> 1 ) : int2( 2 + 4 * sx, 2 + 4 * sy );
   const int2 v    = base + hor * pos.x + ver * pos.y;
   return clipStorage( int2( roundAffine( v.x, 7 ), roundAffine( v.y, 7 ) ) );
 }
@@ -3125,18 +3158,17 @@ void affineProf( uint job[24], int list, int sb, int v, bool mine, int at, int s
 // predicts its row's four samples (affineLumaFilter, affineProf). Each subblock's filter reads 9 x 9 reference samples
 // from 2 before the subblock's integer position, which its four threads load into shared memory together, a sample at
 // a time. (The tiles whose windows fit in boxes take affineBoxTile instead.)
-void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, int cuX, int cuY, int cw, int ch, bool spread, bool prof, bool bi,
-                 out int4 pred )
+void affineLuma( int tid, uint job[24], int list, AffineArea a, bool bi, out int4 pred )
 {
   pred              = int4( 0, 0, 0, 0 );
   const int  slot   = int( ( job[7] >> ( 8 * list ) ) & 255 );
-  const int  nsx    = w >> 2;
-  const int  nsb    = nsx * ( h >> 2 );
+  const int  nsx    = a.w >> 2;
+  const int  nsb    = nsx * ( a.h >> 2 );
   const int  sb     = tid >> 2;   // the thread's subblock in the tile, and its row in it
   const int  v      = tid & 3;
   const bool mine   = sb < nsb;
-  const int  ox     = ( x - cuX ) >> 2;   // the tile's first subblock in the CU
-  const int  oy     = ( y - cuY ) >> 2;
+  const int  ox     = ( a.x - a.cuX ) >> 2;   // the tile's first subblock in the CU
+  const int  oy     = ( a.y - a.cuY ) >> 2;
   const int  sx     = ox + sb % nsx;      // the thread's subblock in the CU
   const int  sy     = oy + sb / nsx;
   if( refScaled( slot ) )
@@ -3146,11 +3178,11 @@ void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, in
     const RefPlanes r = pc.refs[slot];
     if( mine )
     {
-      const int2 mv = affineClipScaled( affineMv( job, list, sx, sy, cw, ch, spread ), cuX, cuY );
+      const int2 mv = affineClipScaled( affineMv( job, list, a, sx, sy ), a.cuX, a.cuY );
       [unroll]
       for( int o = 0; o < 4; o++ )
       {
-        pred[o] = rprSample( rprGeometry( r, 0, cuX + 4 * sx, cuY + 4 * sy, mv, false, 2 ), r.y, 0, o, v, bi );
+        pred[o] = rprSample( rprGeometry( r, 0, a.cuX + 4 * sx, a.cuY + 4 * sy, mv, false, 2 ), r.y, 0, o, v, bi );
       }
     }
     return;
@@ -3163,8 +3195,8 @@ void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, in
   {
     const int2 mv   = s_sbMv[list][sb];
     const bool wrap = wrapPps() && s_sbWrap[list][sb] != 0;   // (wrapPps(): constant in the WIDE variants)
-    const int  bx   = cuX + 4 * sx + ( mv.x >> 4 ) - 2;
-    const int  by   = cuY + 4 * sy + ( mv.y >> 4 ) - 2;
+    const int  bx   = a.cuX + 4 * sx + ( mv.x >> 4 ) - 2;
+    const int  by   = a.cuY + 4 * sy + ( mv.y >> 4 ) - 2;
     for( int r = v; r < 9; r += 4 )
     {
       [unroll]
@@ -3179,6 +3211,7 @@ void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, in
   const int2 mv    = s_sbMv[list][sbf];
   const int  xFrac = mv.x & 15;
   const int  yFrac = mv.y & 15;
+  const bool prof  = affineProfOf( job, list );
   pred             = affineLumaFilter( sbf * 81, 9, sbf, v, xFrac, yFrac, bi || prof );
   if( !mine )
   {
@@ -3195,17 +3228,17 @@ void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, in
 // by affineClip (wrap is affineClip's). In 4:4:4 it is the luma subblock's motion; otherwise the rounded average of
 // two luma subblocks' motion: the two the chroma subblock covers (4:2:2), or the top-left and bottom-right of the
 // four (4:2:0).
-int2 affineChromaMv( uint job[24], int list, int csx, int csy, int cw, int ch, bool spread, int cuX, int cuY, out bool wrap )
+int2 affineChromaMv( uint job[24], int list, AffineArea a, int csx, int csy, out bool wrap )
 {
-  const int lx = cuX + ( ( 4 * csx ) << chromaScaleX() );   // the subblock's luma position
-  const int ly = cuY + ( ( 4 * csy ) << chromaScaleY() );
+  const int lx = a.cuX + ( ( 4 * csx ) << chromaScaleX() );   // the subblock's luma position
+  const int ly = a.cuY + ( ( 4 * csy ) << chromaScaleY() );
   if( chromaScaleX() == 0 )
   {
-    return affineClip( affineMv( job, list, csx, csy, cw, ch, spread ), lx, ly, 4, cuX, cuY, wrap );
+    return affineClip( affineMv( job, list, a, csx, csy ), lx, ly, 4, a.cuX, a.cuY, wrap );
   }
   const int  sy  = csy << chromaScaleY();
-  const int2 sum = affineMv( job, list, 2 * csx, sy, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, sy + chromaScaleY(), cw, ch, spread );
-  return affineClip( int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) ), lx, ly, 4 << chromaScaleX(), cuX, cuY, wrap );
+  const int2 sum = affineMv( job, list, a, 2 * csx, sy ) + affineMv( job, list, a, 2 * csx + 1, sy + chromaScaleY() );
+  return affineClip( int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) ), lx, ly, 4 << chromaScaleX(), a.cuX, a.cuY, wrap );
 }
 
 // A list's chroma prediction of the sample (u, v) of a 4x4 chroma subblock, at 14 bits for a bi-prediction, else final,
@@ -3253,8 +3286,7 @@ int affineChromaSample( int at, int stride, int u, int v, int xFrac, int yFrac, 
 
 // A list's chroma prediction of the tile for component comp: the thread's samples t = tid + THREADS k, at 14 bits
 // for a bi-prediction, else final (affineChromaSample). Each subblock's 7 x 7 window is loaded a sample at a time.
-void affineChroma( int tid, uint job[24], int list, int comp, int x, int y, int w, int h, int cuX, int cuY, int cw, int ch, bool spread,
-                   bool bi, out int pred[PER_THREAD] )
+void affineChroma( int tid, uint job[24], int list, int comp, AffineArea a, bool bi, out int pred[PER_THREAD] )
 {
   const int slot = int( ( job[7] >> ( 8 * list ) ) & 255 );
   if( refScaled( slot ) )
@@ -3262,31 +3294,31 @@ void affineChroma( int tid, uint job[24], int list, int comp, int x, int y, int 
     // A scaled reference (RPR): each chroma 4x4 block by xPredInterBlkRPR with
     // filter index 2, its motion clipped as the luma's is.
     const RefPlanes r     = pc.refs[slot];
-    const int       tw    = w >> chromaScaleX();
+    const int       tw    = a.w >> chromaScaleX();
     const int       log2T = firstbithigh( uint( tw ) );
     for( int k = 0; k < PER_THREAD; k++ )
     {
       const int t = tid + THREADS * k;
       pred[k]     = 0;
-      if( t < tw * ( h >> chromaScaleY() ) )
+      if( t < tw * ( a.h >> chromaScaleY() ) )
       {
         const int i   = t & ( tw - 1 );
         const int j   = t >> log2T;
-        const int csx = ( ( ( x - cuX ) >> chromaScaleX() ) >> 2 ) + ( i >> 2 );
-        const int csy = ( ( ( y - cuY ) >> chromaScaleY() ) >> 2 ) + ( j >> 2 );
+        const int csx = ( ( ( a.x - a.cuX ) >> chromaScaleX() ) >> 2 ) + ( i >> 2 );
+        const int csy = ( ( ( a.y - a.cuY ) >> chromaScaleY() ) >> 2 ) + ( j >> 2 );
         int2      mv;
         if( chromaScaleX() == 0 )
         {
-          mv = affineMv( job, list, csx, csy, cw, ch, spread );
+          mv = affineMv( job, list, a, csx, csy );
         }
         else
         {
           const int  ly  = csy << chromaScaleY();
-          const int2 sum = affineMv( job, list, 2 * csx, ly, cw, ch, spread ) + affineMv( job, list, 2 * csx + 1, ly + chromaScaleY(), cw, ch, spread );
+          const int2 sum = affineMv( job, list, a, 2 * csx, ly ) + affineMv( job, list, a, 2 * csx + 1, ly + chromaScaleY() );
           mv             = int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) );
         }
-        mv      = affineClipScaled( mv, cuX, cuY );
-        const RprGeometry g = rprGeometry( r, comp, ( cuX >> chromaScaleX() ) + 4 * csx, ( cuY >> chromaScaleY() ) + 4 * csy, mv, false, 2 );
+        mv      = affineClipScaled( mv, a.cuX, a.cuY );
+        const RprGeometry g = rprGeometry( r, comp, ( a.cuX >> chromaScaleX() ) + 4 * csx, ( a.cuY >> chromaScaleY() ) + 4 * csy, mv, false, 2 );
         pred[k]             = rprSample( g, comp == 1 ? r.cb : r.cr, comp, i & 3, j & 3, bi );
       }
     }
@@ -3295,12 +3327,12 @@ void affineChroma( int tid, uint job[24], int list, int comp, int x, int y, int 
   int16_t*  ref      = refPlane( slot, comp );
   const int sx       = chromaScaleX();
   const int sy       = chromaScaleY();
-  const int tw       = w >> sx;   // the tile's chroma size
-  const int th       = h >> sy;
+  const int tw       = a.w >> sx;   // the tile's chroma size
+  const int th       = a.h >> sy;
   const int ncx      = tw >> 2;   // the tile's chroma subblocks across
   const int ncb      = ncx * ( th >> 2 );
-  const int ocx      = ( ( x - cuX ) >> sx ) >> 2;   // the tile's first chroma subblock in the CU
-  const int ocy      = ( ( y - cuY ) >> sy ) >> 2;
+  const int ocx      = ( ( a.x - a.cuX ) >> sx ) >> 2;   // the tile's first chroma subblock in the CU
+  const int ocy      = ( ( a.y - a.cuY ) >> sy ) >> 2;
   const int log2W    = log2Int( tw );
 
   // Each subblock's reference samples: 7 x 7, starting 1 sample before its integer position.
@@ -3313,7 +3345,7 @@ void affineChroma( int tid, uint job[24], int list, int comp, int x, int y, int 
     const int  csy  = ocy + cb / ncx;
     const int2 mv   = s_cbMv[list][cb];
     const bool wrap = wrapPps() && s_cbWrap[list][cb] != 0;   // (wrapPps(): constant in the WIDE variants)
-    s_pool[s]       = int16_t( refAt( ref, comp, ( cuX >> sx ) + 4 * csx + ( mv.x >> ( 4 + sx ) ) - 1 + c, ( cuY >> sy ) + 4 * csy + ( mv.y >> ( 4 + sy ) ) - 1 + r, wrap ) );
+    s_pool[s]       = int16_t( refAt( ref, comp, ( a.cuX >> sx ) + 4 * csx + ( mv.x >> ( 4 + sx ) ) - 1 + c, ( a.cuY >> sy ) + 4 * csy + ( mv.y >> ( 4 + sy ) ) - 1 + r, wrap ) );
   }
   GroupMemoryBarrierWithGroupSync();
   for( int k = 0; k < PER_THREAD; k++ )
@@ -3554,7 +3586,7 @@ void affineTileLuma( int tid, uint job[24], int w, bool hi, AffineTileBoxes b, A
       }
       GroupMemoryBarrierWithGroupSync();
       const int  list = b.listOf[s];
-      const bool prof = ( ( job[12] >> ( 16 + list ) ) & 1 ) != 0;
+      const bool prof = affineProfOf( job, list );
       const int2 mv   = s_sbMv[list][p.sbc];
       // (the subblock's window: from 2 samples before its integer position)
       const int  at   = ( 4 * ( p.sbc / nsx ) + ( mv.y >> 4 ) - 2 - b.yBox[s].y0 ) * AB_S + 4 * ( p.sbc % nsx ) + ( mv.x >> 4 ) - 2 - b.yBox[s].x0
@@ -3679,17 +3711,14 @@ void affineMain( int tid, int index )
     job[4 * k + 2]   = q.z;
     job[4 * k + 3]   = q.w;
   }
-  const int  x      = int( job[0] & 0xffff );
-  const int  y      = int( job[0] >> 16 );
-  const int  w      = int( job[1] & 255 );
-  const int  h      = int( ( job[1] >> 8 ) & 255 );
-  const int  flags  = int( job[1] >> 16 );
-  const int  cuX    = int( job[6] & 0xffff );
-  const int  cuY    = int( job[6] >> 16 );
-  const int  bcwW1  = int( ( job[7] >> 16 ) & 15 ) - 2;
-  const int  cw     = int( job[12] & 255 );
-  const int  ch     = int( ( job[12] >> 8 ) & 255 );
-  setBounds( cuX, cuY );
+  const AffineArea area   = affineArea( job );
+  const int        x      = area.x;   // the tile
+  const int        y      = area.y;
+  const int        w      = area.w;
+  const int        h      = area.h;
+  const int        flags  = int( job[1] >> 16 );
+  const int        bcwW1  = int( ( job[7] >> 16 ) & 15 ) - 2;
+  setBounds( area.cuX, area.cuY );
   const bool bi     = ( flags & ( FLAG_L0 | FLAG_L1 ) ) == ( FLAG_L0 | FLAG_L1 );
   const int  maxVal = ( 1 << pc.bitDepth ) - 1;
 
@@ -3699,23 +3728,22 @@ void affineMain( int tid, int index )
     const int e    = tid & 31;
     if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) != 0 )
     {
-      const bool spread = ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
       const int  nsx    = w >> 2;
       const int  ncx    = ( w >> chromaScaleX() ) >> 2;
       bool       wrap;
       if( e < 16 && e < nsx * ( h >> 2 ) )
       {
-        const int sx       = ( ( x - cuX ) >> 2 ) + e % nsx;
-        const int sy       = ( ( y - cuY ) >> 2 ) + e / nsx;
-        s_sbMv[list][e]    = affineClip( affineMv( job, list, sx, sy, cw, ch, spread ), cuX + 4 * sx, cuY + 4 * sy, 4, cuX, cuY, wrap );
+        const int sx       = ( ( x - area.cuX ) >> 2 ) + e % nsx;
+        const int sy       = ( ( y - area.cuY ) >> 2 ) + e / nsx;
+        s_sbMv[list][e]    = affineClip( affineMv( job, list, area, sx, sy ), area.cuX + 4 * sx, area.cuY + 4 * sy, 4, area.cuX, area.cuY, wrap );
         s_sbWrap[list][e]  = wrap ? 1 : 0;
       }
       else if( e >= 16 && numComponents() > 1 && e - 16 < ncx * ( ( h >> chromaScaleY() ) >> 2 ) )
       {
         const int c        = e - 16;
-        const int csx      = ( ( ( x - cuX ) >> chromaScaleX() ) >> 2 ) + c % ncx;
-        const int csy      = ( ( ( y - cuY ) >> chromaScaleY() ) >> 2 ) + c / ncx;
-        s_cbMv[list][c]    = affineChromaMv( job, list, csx, csy, cw, ch, spread, cuX, cuY, wrap );
+        const int csx      = ( ( ( x - area.cuX ) >> chromaScaleX() ) >> 2 ) + c % ncx;
+        const int csy      = ( ( ( y - area.cuY ) >> chromaScaleY() ) >> 2 ) + c / ncx;
+        s_cbMv[list][c]    = affineChromaMv( job, list, area, csx, csy, wrap );
         s_cbWrap[list][c]  = wrap ? 1 : 0;
       }
     }
@@ -3737,10 +3765,8 @@ void affineMain( int tid, int index )
     {
       continue;
     }
-    const bool prof   = ( ( job[12] >> ( 16 + list ) ) & 1 ) != 0;
-    const bool spread = ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
-    int4       p;
-    affineLuma( tid, job, list, x, y, w, h, cuX, cuY, cw, ch, spread, prof, hi, p );
+    int4 p;
+    affineLuma( tid, job, list, area, hi, p );
     if( list == 0 || ( flags & FLAG_L0 ) == 0 )
     {
       luma0 = p;
@@ -3787,9 +3813,8 @@ void affineMain( int tid, int index )
       {
         continue;
       }
-      const bool spread = ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
-      int        p[PER_THREAD];
-      affineChroma( tid, job, list, comp, x, y, w, h, cuX, cuY, cw, ch, spread, hi, p );
+      int p[PER_THREAD];
+      affineChroma( tid, job, list, comp, area, hi, p );
       if( list == 0 || ( flags & FLAG_L0 ) == 0 )
       {
         pred0 = p;
