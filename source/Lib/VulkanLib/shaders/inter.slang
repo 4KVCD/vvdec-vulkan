@@ -3742,62 +3742,142 @@ bool affineBoxTile( int tid, uint job[24], int x, int y, int w, int h, int flags
   return true;
 }
 
-void affineMain( int tid, int index )
+// An affine pair's 24 words: its two jobs (jobs.slang's affineJobs)
+void loadAffinePair( int index, out uint job[24] )
 {
-  uint job[24];
   [unroll]
   for( int k = 0; k < 6; k++ )
   {
-    const uint4 q    = *(uint4*)( jobBase() + index * 24 + 4 * k );
-    job[4 * k]       = q.x;
-    job[4 * k + 1]   = q.y;
-    job[4 * k + 2]   = q.z;
-    job[4 * k + 3]   = q.w;
+    const uint4 q  = *(uint4*)( jobBase() + index * 24 + 4 * k );
+    job[4 * k]     = q.x;
+    job[4 * k + 1] = q.y;
+    job[4 * k + 2] = q.z;
+    job[4 * k + 3] = q.w;
   }
-  const AffineArea area   = affineArea( job );
-  const int        x      = area.x;   // the tile
-  const int        y      = area.y;
-  const int        w      = area.w;
-  const int        h      = area.h;
-  const int        flags  = int( job[1] >> 16 );
-  const int        bcwW1  = int( ( job[7] >> 16 ) & 15 ) - 2;
-  setBounds( area.cuX, area.cuY );
-  const bool bi     = ( flags & ( FLAG_L0 | FLAG_L1 ) ) == ( FLAG_L0 | FLAG_L1 );
-  const int  maxVal = ( 1 << pc.bitDepth ) - 1;
+}
 
-  // The subblocks' motion, per list: one thread each (list tid / 32; luma subblock tid % 32, or chroma tid % 32 - 16)
+// The motion of the tile's subblocks per list, into s_sbMv / s_sbWrap (luma) and s_cbMv / s_cbWrap (chroma), a thread
+// each: list tid / 32; luma subblock tid % 32, or chroma subblock tid % 32 - 16
+void affineSubblockMotion( int tid, uint job[24], AffineArea a, int flags )
+{
+  const int list = tid >> 5;
+  const int e    = tid & 31;
+  if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) == 0 )
   {
-    const int list = tid >> 5;
-    const int e    = tid & 31;
-    if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) != 0 )
+    return;
+  }
+  const int nsx = a.w >> 2;
+  const int ncx = ( a.w >> chromaScaleX() ) >> 2;
+  bool      wrap;
+  if( e < 16 && e < nsx * ( a.h >> 2 ) )
+  {
+    const int sx      = ( ( a.x - a.cuX ) >> 2 ) + e % nsx;
+    const int sy      = ( ( a.y - a.cuY ) >> 2 ) + e / nsx;
+    s_sbMv[list][e]   = affineClip( affineMv( job, list, a, sx, sy ), a.cuX + 4 * sx, a.cuY + 4 * sy, 4, a.cuX, a.cuY, wrap );
+    s_sbWrap[list][e] = wrap ? 1 : 0;
+  }
+  else if( e >= 16 && numComponents() > 1 && e - 16 < ncx * ( ( a.h >> chromaScaleY() ) >> 2 ) )
+  {
+    const int c       = e - 16;
+    const int csx     = ( ( ( a.x - a.cuX ) >> chromaScaleX() ) >> 2 ) + c % ncx;
+    const int csy     = ( ( ( a.y - a.cuY ) >> chromaScaleY() ) >> 2 ) + c / ncx;
+    s_cbMv[list][c]   = affineChromaMv( job, list, a, csx, csy, wrap );
+    s_cbWrap[list][c] = wrap ? 1 : 0;
+  }
+}
+
+// Writes the thread's four luma samples (of its subblock's row, as affineLuma predicted them): the lists' predictions
+// averaged (with BCW's weights), mapped by LMCS, plus the residual
+void writeAffineLuma( int tid, uint job[24], AffineArea a, int flags, int4 luma0, int4 luma1 )
+{
+  const int nsx = a.w >> 2;
+  if( ( tid >> 2 ) >= nsx * ( a.h >> 2 ) )
+  {
+    return;
+  }
+  const int maxVal = ( 1 << pc.bitDepth ) - 1;
+  const int bcwW1  = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW's L1 weight
+  const int sb     = tid >> 2;
+  const int row    = a.y + 4 * ( sb / nsx ) + ( tid & 3 );
+  [unroll]
+  for( int o = 0; o < 4; o++ )
+  {
+    const int at = row * pc.stride0 + a.x + 4 * ( sb % nsx ) + o;
+    int       v  = combineLists( flags, 0, luma0[o], luma1[o], 0, job[8], job[11], bcwW1 );
+    if( ( flags & FLAG_LUMA_MAP ) != 0 )
     {
-      const int  nsx    = w >> 2;
-      const int  ncx    = ( w >> chromaScaleX() ) >> 2;
-      bool       wrap;
-      if( e < 16 && e < nsx * ( h >> 2 ) )
-      {
-        const int sx       = ( ( x - area.cuX ) >> 2 ) + e % nsx;
-        const int sy       = ( ( y - area.cuY ) >> 2 ) + e / nsx;
-        s_sbMv[list][e]    = affineClip( affineMv( job, list, area, sx, sy ), area.cuX + 4 * sx, area.cuY + 4 * sy, 4, area.cuX, area.cuY, wrap );
-        s_sbWrap[list][e]  = wrap ? 1 : 0;
-      }
-      else if( e >= 16 && numComponents() > 1 && e - 16 < ncx * ( ( h >> chromaScaleY() ) >> 2 ) )
-      {
-        const int c        = e - 16;
-        const int csx      = ( ( ( x - area.cuX ) >> chromaScaleX() ) >> 2 ) + c % ncx;
-        const int csy      = ( ( ( y - area.cuY ) >> chromaScaleY() ) >> 2 ) + c / ncx;
-        s_cbMv[list][c]    = affineChromaMv( job, list, area, csx, csy, wrap );
-        s_cbWrap[list][c]  = wrap ? 1 : 0;
-      }
+      v = int( pc.lmcsFwd[v] );
+    }
+    if( ( flags & FLAG_RES_Y ) != 0 )
+    {
+      v = clip3( 0, maxVal, v + int( pc.dst0[at] ) );
+    }
+    ( ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0 )[at] = int16_t( v );
+  }
+}
+
+// Chroma component comp of the tile: each list's prediction (affineChroma), combined (with BCW's weights), plus the
+// residual, written; the thread's samples t = tid + THREADS k
+void affineChromaComponent( int tid, uint job[24], AffineArea a, int flags, bool hi, int comp )
+{
+  const int maxVal = ( 1 << pc.bitDepth ) - 1;
+  const int bcwW1  = int( ( job[7] >> 16 ) & 15 ) - 2;
+  const int tw     = a.w >> chromaScaleX();   // the tile's chroma size
+  const int th     = a.h >> chromaScaleY();
+  const int log2C  = log2Int( tw );
+  int       pred0[PER_THREAD], pred1[PER_THREAD];
+  for( int list = 0; list < 2; list++ )
+  {
+    if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) == 0 )
+    {
+      continue;
+    }
+    int p[PER_THREAD];
+    affineChroma( tid, job, list, comp, a, hi, p );
+    if( list == 0 || ( flags & FLAG_L0 ) == 0 )
+    {
+      pred0 = p;
+    }
+    else
+    {
+      pred1 = p;
     }
   }
+  int16_t* dst = comp == 1 ? pc.dst1 : pc.dst2;
+  for( int k = 0; k < PER_THREAD; k++ )
+  {
+    const int t = tid + THREADS * k;
+    if( t < tw * th )
+    {
+      const int at = ( ( a.y >> chromaScaleY() ) + ( t >> log2C ) ) * pc.stride12 + ( a.x >> chromaScaleX() ) + ( t & ( tw - 1 ) );
+      int       v  = combineLists( flags, comp, pred0[k], pred1[k], 0, job[8 + comp], job[11], bcwW1 );
+      if( ( flags & ( FLAG_RES_Y << comp ) ) != 0 )
+      {
+        v = clip3( 0, maxVal, v + int( dst[at] ) );
+      }
+      ( ( flags & ( FLAG_DEFER_CB << ( comp - 1 ) ) ) != 0 ? ( comp == 1 ? pc.defer1 : pc.defer2 ) : dst )[at] = int16_t( v );
+    }
+  }
+}
+
+// An affine pair's tile: the subblocks' motion, then the tile from boxes where they fit (nearly always; only in the
+// WIDE variants, whose boxes read neither scaled references nor past a subpicture's or the wraparound's bounds), or
+// else subblock by subblock: the lists' luma, combined and written, then each chroma component.
+void affineMain( int tid, int index )
+{
+  uint job[24];
+  loadAffinePair( index, job );
+  const AffineArea area  = affineArea( job );
+  const int        flags = int( job[1] >> 16 );
+  setBounds( area.cuX, area.cuY );
+  const bool bi = ( flags & ( FLAG_L0 | FLAG_L1 ) ) == ( FLAG_L0 | FLAG_L1 );
+
+  affineSubblockMotion( tid, job, area, flags );
   GroupMemoryBarrierWithGroupSync();
 
   // (weighted prediction starts from the 14-bit predictions, for a uni-prediction too)
   const bool hi = bi || ( flags & FLAG_WP ) != 0;
-  // Nearly every tile reads its windows as boxes; the others subblock by subblock (below). (Only in the WIDE variants:
-  // the boxes read neither scaled references nor past a subpicture's or the wraparound's bounds.)
-  if( WIDE != 0 && affineBoxTile( tid, job, x, y, w, h, flags, bi, hi ) )
+  if( WIDE != 0 && affineBoxTile( tid, job, area.x, area.y, area.w, area.h, flags, bi, hi ) )
   {
     return;
   }
@@ -3819,69 +3899,10 @@ void affineMain( int tid, int index )
       luma1 = p;
     }
   }
-
-  // Average the predictions (with BCW's weights), apply LMCS's mapping, add the residuals and write the results: the
-  // thread's four samples of its subblock's row (affineLuma).
-  const int nsx = w >> 2;
-  if( ( tid >> 2 ) < nsx * ( h >> 2 ) )
-  {
-    const int sb  = tid >> 2;
-    const int row = y + 4 * ( sb / nsx ) + ( tid & 3 );
-    [unroll]
-    for( int o = 0; o < 4; o++ )
-    {
-      const int at = row * pc.stride0 + x + 4 * ( sb % nsx ) + o;
-      int       v  = combineLists( flags, 0, luma0[o], luma1[o], 0, job[8], job[11], bcwW1 );
-      if( ( flags & FLAG_LUMA_MAP ) != 0 )
-      {
-        v = int( pc.lmcsFwd[v] );
-      }
-      if( ( flags & FLAG_RES_Y ) != 0 )
-      {
-        v = clip3( 0, maxVal, v + int( pc.dst0[at] ) );
-      }
-      ( ( flags & FLAG_DEFER_Y ) != 0 ? pc.defer0 : pc.dst0 )[at] = int16_t( v );
-    }
-  }
-  int pred0[PER_THREAD], pred1[PER_THREAD];
-  // The chroma, one component at a time.
-  const int tw    = w >> chromaScaleX();   // the tile's chroma size
-  const int th    = h >> chromaScaleY();
-  const int log2C = log2Int( tw );
+  writeAffineLuma( tid, job, area, flags, luma0, luma1 );
   for( int comp = 1; comp < numComponents(); comp++ )
   {
-    for( int list = 0; list < 2; list++ )
-    {
-      if( ( flags & ( list == 0 ? FLAG_L0 : FLAG_L1 ) ) == 0 )
-      {
-        continue;
-      }
-      int p[PER_THREAD];
-      affineChroma( tid, job, list, comp, area, hi, p );
-      if( list == 0 || ( flags & FLAG_L0 ) == 0 )
-      {
-        pred0 = p;
-      }
-      else
-      {
-        pred1 = p;
-      }
-    }
-    int16_t* dst = comp == 1 ? pc.dst1 : pc.dst2;
-    for( int k = 0; k < PER_THREAD; k++ )
-    {
-      const int t = tid + THREADS * k;
-      if( t < tw * th )
-      {
-        const int at = ( ( y >> chromaScaleY() ) + ( t >> log2C ) ) * pc.stride12 + ( x >> chromaScaleX() ) + ( t & ( tw - 1 ) );
-        int       v  = combineLists( flags, comp, pred0[k], pred1[k], 0, job[8 + comp], job[11], bcwW1 );
-        if( ( flags & ( FLAG_RES_Y << comp ) ) != 0 )
-        {
-          v = clip3( 0, maxVal, v + int( dst[at] ) );
-        }
-        ( ( flags & ( FLAG_DEFER_CB << ( comp - 1 ) ) ) != 0 ? ( comp == 1 ? pc.defer1 : pc.defer2 ) : dst )[at] = int16_t( v );
-      }
-    }
+    affineChromaComponent( tid, job, area, flags, hi, comp );
   }
 }
 #endif
