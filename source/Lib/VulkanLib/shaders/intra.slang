@@ -246,18 +246,40 @@ References loadReferences( int tid, RefFill f )
   return refs;
 }
 
-// initIntraPatternChTypeISP: the references of the prediction block (px, py,
-// pw x ph) of one sub-partition of an ISP CU (cx, cy, cw x ch; f is the CU's
-// own fill, as for a block of the CU's size). The first sub-partition uses the
-// CU's references. For the later ones, a horizontal split uses the row above
-// (the previous sub-partition, its last sample repeated) and the CU's left
-// column from that row down; a vertical split uses the CU's row above from
-// that column on and the column to the left (the previous sub-partition, its
-// last sample repeated). When the CU has no neighbours on that side, the
-// previous sub-partition's sample next to the corner stands in for all of them.
-References loadReferencesIsp( int tid, RefFill f, int px, int py, int pw, int ph, int cx, int cy, int cw, int ch, bool ver, bool leftAvail,
-                              bool aboveAvail )
+// An ISP CU, from an ISP sub-partition's job (words 4 and 5, GpuJobs.h's IntraJob::setIsp): its block, whether its
+// split is vertical, and whether it has neighbours to the left and above
+struct IspCu
 {
+  int  x, y, w, h;
+  bool ver;
+  bool leftAvail, aboveAvail;
+};
+
+IspCu ispCuOf( uint job[12] )
+{
+  IspCu cu;
+  cu.x          = int( job[4] & 0xffff );
+  cu.y          = int( job[4] >> 16 );
+  cu.w          = int( job[5] & 255 );
+  cu.h          = int( ( job[5] >> 8 ) & 255 );
+  cu.ver        = ( ( job[5] >> 16 ) & 3 ) == 2;
+  cu.leftAvail  = ( ( job[5] >> 18 ) & 1 ) != 0;
+  cu.aboveAvail = ( ( job[5] >> 19 ) & 1 ) != 0;
+  return cu;
+}
+
+// initIntraPatternChTypeISP: the references of the prediction block (px, py,
+// pw x ph) of one sub-partition of ISP CU cu (f is the CU's own fill, as for
+// a block of the CU's size). The first sub-partition uses the CU's references.
+// For the later ones, a horizontal split uses the row above (the previous
+// sub-partition, its last sample repeated) and the CU's left column from that
+// row down; a vertical split uses the CU's row above from that column on and
+// the column to the left (the previous sub-partition, its last sample
+// repeated). When the CU has no neighbours on that side, the previous
+// sub-partition's sample next to the corner stands in for all of them.
+References loadReferencesIsp( int tid, RefFill f, int px, int py, int pw, int ph, IspCu cu )
+{
+  const int  cx = cu.x, cy = cu.y, cw = cu.w, ch = cu.h;
   const bool first = px == cx && py == cy;
   References refs;
   [unroll]
@@ -271,15 +293,15 @@ References loadReferencesIsp( int tid, RefFill f, int px, int py, int pw, int ph
       fromFill = true;
       at       = topSource( f, j );
     }
-    else if( ver )
+    else if( cu.ver )
     {
-      fromFill = aboveAvail;
-      at       = aboveAvail ? topSource( f, px - cx + j ) : int2( px - 1, cy );
+      fromFill = cu.aboveAvail;
+      at       = cu.aboveAvail ? topSource( f, px - cx + j ) : int2( px - 1, cy );
     }
     else if( j == 0 )
     {
-      fromFill = leftAvail;
-      at       = leftAvail ? leftSource( f, py - cy ) : int2( cx, py - 1 );
+      fromFill = cu.leftAvail;
+      at       = cu.leftAvail ? leftSource( f, py - cy ) : int2( cx, py - 1 );
     }
     else
     {
@@ -299,15 +321,15 @@ References loadReferencesIsp( int tid, RefFill f, int px, int py, int pw, int ph
       fromFill = true;
       at       = leftSource( f, i );
     }
-    else if( ver )
+    else if( cu.ver )
     {
       fromFill = false;
       at       = int2( px - 1, cy + min( max( i - 1, 0 ), ph - 1 ) );   // (l[0] is t[0])
     }
     else
     {
-      fromFill = leftAvail;
-      at       = leftAvail ? leftSource( f, py - cy + i ) : int2( cx, py - 1 );
+      fromFill = cu.leftAvail;
+      at       = cu.leftAvail ? leftSource( f, py - cy + i ) : int2( cx, py - 1 );
     }
     refs.l[k] = i <= ch + ph ? ( fromFill ? fillValue( f, at ) : sampleAt( 0, at.x, at.y ) ) : 0;
   }
@@ -1019,19 +1041,15 @@ void make( int tid, uint job[12] )
   // vertical split that are 1 or 2 samples wide share one prediction block 4
   // samples wide (CU::isPredRegDiffFromTB).
   const bool isp   = ( flags & 8 ) != 0;
-  const int  cx    = int( job[4] & 0xffff );
-  const int  cy    = int( job[4] >> 16 );
-  const int  cw    = int( job[5] & 255 );
-  const int  ch    = int( ( job[5] >> 8 ) & 255 );
-  const bool ver   = ( ( job[5] >> 16 ) & 3 ) == 2;
-  const bool region = isp && ver && ( cw == 4 || ( cw == 8 && ch > 4 ) );
+  const IspCu cu    = ispCuOf( job );   // (meaningful with isp only)
+  const bool region = isp && cu.ver && ( cu.w == 4 || ( cu.w == 8 && cu.h > 4 ) );
   const int  pw    = region ? 4 : w;
   const int  ph    = h;
-  const int  xoff  = region ? ( x0 - cx ) & 3 : 0;
-  const int  sizeW = isp ? cw : pw;
-  const int  sizeH = isp ? ch : ph;
-  const int  topLength  = isp ? cw + pw : pw << 1;
-  const int  leftLength = isp ? ch + ph : ph << 1;
+  const int  xoff  = region ? ( x0 - cu.x ) & 3 : 0;
+  const int  sizeW = isp ? cu.w : pw;
+  const int  sizeH = isp ? cu.h : ph;
+  const int  topLength  = isp ? cu.w + pw : pw << 1;
+  const int  leftLength = isp ? cu.h + ph : ph << 1;
 
   // The reads: first the references, then, while those are in flight, the
   // residual, CCLM's luma, and kCubic for luma's angular modes.
@@ -1040,8 +1058,8 @@ void make( int tid, uint job[12] )
   if( isp )
   {
     // the CU's fill, as for a block of the CU's size
-    const RefFill f = refFill( comp, cx, cy, cw << 1, ch << 1, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), 0 );
-    refs = loadReferencesIsp( tid, f, x0 - xoff, y0, pw, ph, cx, cy, cw, ch, ver, ( ( job[5] >> 18 ) & 1 ) != 0, ( ( job[5] >> 19 ) & 1 ) != 0 );
+    const RefFill f = refFill( comp, cu.x, cu.y, cu.w << 1, cu.h << 1, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), 0 );
+    refs = loadReferencesIsp( tid, f, x0 - xoff, y0, pw, ph, cu );
   }
   else
   {
