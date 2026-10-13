@@ -117,6 +117,19 @@ static_assert( sizeof( EdgesPush ) == 96, "EdgesPush: the layout of edges.slang'
 static constexpr size_t kJobWords[3] = { sizeof( TrafoJob ) / sizeof( uint32_t ), sizeof( InterJob ) / sizeof( uint32_t ), sizeof( IntraJob ) / sizeof( uint32_t ) };
 // The words of the passes' dispatch arguments and job counts (FrontPass)
 static constexpr size_t kArgsWords = 64;
+// intrasort.slang's passes (its pc.pass and kPass*): two digits of a radix sort by wave (HIST, SCAN, SCATTER), then the
+// jobs' bands (BANDS, BSCAN, PLACE, WAITS); SMALL does all of it in one workgroup for up to 1024 jobs.
+enum IntraSortPass
+{
+  kSortHist     = 0,
+  kSortScan     = 1,
+  kSortScatter  = 2,
+  kSortBands    = 3,
+  kSortBandScan = 4,
+  kSortPlace    = 5,
+  kSortWaits    = 6,
+  kSortSmall    = 7,
+};
 // Where intrasort.slang's SMALL pass writes the dispatch arguments of its other passes in those words (its kArgs*):
 // those of a workgroup per block of jobs, and those of a single workgroup
 static constexpr size_t kSortArgsBlocks = 50;
@@ -734,9 +747,9 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
   push.numBlocks = fe.sortBlocks;
   push.capacity  = int32_t( fe.sortCapacity );
   bind( kShader_intrasort );
-  // SMALL (pass 7) sorts up to 1024 jobs alone, and writes the workgroups of the passes after it: none then, else a
-  // workgroup per block (or one)
-  push.pass  = 7;
+  // SMALL sorts up to 1024 jobs alone, and writes the workgroups of the passes after it: none then, else a workgroup
+  // per block (or one)
+  push.pass  = kSortSmall;
   push.shift = 0;
   pushConstants( push );
   dispatchGroups( 1 );
@@ -748,25 +761,24 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
     return;
   }
   indirectBarrier();
-  const auto pass = [&]( int p, int shift, bool perBlock ) {
+  const auto pass = [&]( IntraSortPass p, int shift, bool perBlock ) {
     push.pass  = p;
     push.shift = shift;
     pushConstants( push );
     m_ctx->api().vkCmdDispatchIndirect( m_cmd, fe.args.buffer, ( perBlock ? kSortArgsBlocks : kSortArgsSingle ) * sizeof( uint32_t ) );
     computeBarrier();
   };
-  // the radix sort by wave, two digits of 8 bits (passes 0 to 2: histograms, their sums, the scatter); then the
-  // bands (passes 3 to 6)
+  // the radix sort by wave, two digits of 8 bits (histograms, their sums, the scatter); then the bands
   for( int shift = 0; shift <= 8; shift += 8 )
   {
-    pass( 0, shift, true );
-    pass( 1, shift, false );
-    pass( 2, shift, true );
+    pass( kSortHist, shift, true );
+    pass( kSortScan, shift, false );
+    pass( kSortScatter, shift, true );
   }
-  pass( 3, 0, true );
-  pass( 4, 0, false );
-  pass( 5, 0, true );
-  pass( 6, 0, true );
+  pass( kSortBands, 0, true );
+  pass( kSortBandScan, 0, false );
+  pass( kSortPlace, 0, true );
+  pass( kSortWaits, 0, true );
   mark( "intrasort" );
 }
 
