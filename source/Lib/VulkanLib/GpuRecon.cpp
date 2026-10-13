@@ -65,8 +65,12 @@ namespace vvdec
 namespace gpu
 {
 
-// The job shaders find their job at workgroup x + kJobsPerRow * workgroup y (dispatchJobs).
-static constexpr size_t kJobsPerRow = 32768;
+// The job shaders find their job at workgroup x + kGroupsPerRow * workgroup y (dispatchJobs; common.slang's
+// workgroupIndex).
+static constexpr size_t kGroupsPerRow = 32768;
+// The word of the front end's argument buffer where the passes' job counts begin (FrontPass; common.slang's
+// kFrontCounts)
+static constexpr size_t kFrontCounts = 32;
 
 // ====================================================================================================================
 // The constant tables
@@ -539,7 +543,7 @@ void GpuRecon::dispatchGroups( uint32_t groupsX, uint32_t groupsY )
 
 void GpuRecon::dispatchJobs( size_t count )
 {
-  dispatchGroups( uint32_t( std::min<size_t>( count, kJobsPerRow ) ), uint32_t( ( count + kJobsPerRow - 1 ) / kJobsPerRow ) );
+  dispatchGroups( uint32_t( std::min<size_t>( count, kGroupsPerRow ) ), uint32_t( ( count + kGroupsPerRow - 1 ) / kGroupsPerRow ) );
 }
 
 void GpuRecon::dispatchIndirect( FrontPass pass )
@@ -549,7 +553,7 @@ void GpuRecon::dispatchIndirect( FrontPass pass )
 
 VkDeviceAddress GpuRecon::frontEndCount( FrontPass pass ) const
 {
-  return m_frontEnd.args.addr + VkDeviceSize( 32 + 2 * pass ) * sizeof( uint32_t );
+  return m_frontEnd.args.addr + VkDeviceSize( kFrontCounts + 2 * pass ) * sizeof( uint32_t );
 }
 
 // ====================================================================================================================

@@ -466,7 +466,7 @@ void transformSamples( int tid, TrafoBlock t, int16_t* mVer, int16_t* mHor, int 
 [numthreads( THREADS, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
-  const int index = int( group.x ) + int( group.y ) * 32768;
+  const int index = int( workgroupIndex( group ) );
   const int count = pc.count >= 0 ? pc.count : int( pc.countAt[0] );
   if( index >= count )
   {

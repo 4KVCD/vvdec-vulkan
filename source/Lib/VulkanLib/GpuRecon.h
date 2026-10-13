@@ -121,7 +121,7 @@ struct SharedReconBuffers
 
 // The passes whose job counts the GPU front end works out (jobs.slang, intrasort.slang, edges.slang). For pass p,
 // the front end's argument buffer holds the pass's indirect dispatch (3 words) at word 3 * p, and its job count and
-// first job at words 32 + 2 * p and 33 + 2 * p.
+// first job at words 32 + 2 * p and 33 + 2 * p (GpuRecon.cpp's kFrontCounts; common.slang's storePassArgs).
 enum FrontPass
 {
   kPassTrafo            = 0,
@@ -281,7 +281,7 @@ private:
     pushConstants( &push, sizeof( Push ) );
   }
   void dispatchGroups( uint32_t groupsX, uint32_t groupsY = 1 );
-  void dispatchJobs( size_t count );         // one workgroup per job, in rows of 32768 workgroups
+  void dispatchJobs( size_t count );         // one workgroup per job, in rows of 32768 workgroups (kGroupsPerRow)
   void dispatchIndirect( FrontPass pass );   // with the front end's dispatch arguments for pass
   // Binds shader, sets push and dispatches groupsX x groupsY workgroups.
   template<class Push>

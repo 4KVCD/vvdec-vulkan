@@ -14,7 +14,7 @@
 // just before it (isProcessDisabled).
 //
 // The filter compares with the deblocked samples, while the CTUs around may already be filtered. So two passes run,
-// a workgroup per list entry each (entry x + 32768 y, in rows of 32768 workgroups): pass 0 saves the deblocked samples
+// a workgroup per list entry each (workgroupIndex's entry): pass 0 saves the deblocked samples
 // around the CTU (the row above it and the row below it, each from the column left of it to the column right of it,
 // then the column left of it and the column right of it) into the entry's ring; pass 1 filters the CTU in bands of
 // BAND rows: it reads a band and the rows above and below it into shared memory (from the plane, the ring, or for the
@@ -310,7 +310,7 @@ void filterBand( Ctu c, uint4 prm, int type, int y0, int bh, int groups, bool al
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
   const int  tid = int( local.x );
-  const uint e   = group.x + group.y * 32768u;
+  const uint e   = workgroupIndex( group );
   if( e >= uint( pc.count ) )
   {
     return;   // (the whole workgroup: the last row of workgroups has more than entries)

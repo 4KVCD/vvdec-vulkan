@@ -79,7 +79,7 @@ struct Params
   uint  waveTag;        // WAVES: the picture's tag in the wave map (see mapWave)
   uint* waveMap;        // WAVES: per component, the wave of each area of 4x4 luma samples (GpuJobs.h's WaveMap)
   Atomic<uint>* progress;   // WAVES: per CTU row, the CTUs done; then the rows taken (zeroed before the dispatch)
-  uint* args;        // SCAN: the front end's indirect arguments (GpuRecon's m_frontArgs): residual and inter passes
+  uint* args;        // SCAN: the front end's indirect arguments (GpuRecon's m_frontEnd.args): residual and inter passes
 };
 
 [[vk::push_constant]] Params pc;
@@ -2219,21 +2219,18 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         at[k] += v;
       }
     }
-    // The indirect dispatches: one workgroup per job (per pair, for affine), in rows of 32768 workgroups.
+    // The indirect dispatches: one workgroup per job (per pair, for affine).
     if( tid == 0 )
     {
-      // (inter's lists lie one after another in its buffer; first[] holds their first jobs)
+      // (total[] and first[] by pass: residual, inter, BDOF, affine. Inter's lists lie one after another in its
+      // buffer; first[] holds their first jobs.)
       const uint regular  = pc.blocks[pc.numBlocks * kLists + 1];
       const uint bdof     = pc.blocks[pc.numBlocks * kLists + 3];
       const uint total[4] = { pc.blocks[pc.numBlocks * kLists + 0], regular, bdof, pc.blocks[pc.numBlocks * kLists + 4] / 2 };
       const uint first[4] = { 0, 0, regular, regular + bdof };
-      for( int d = 0; d < 4; d++ )
+      for( int pass = kPassTrafo; pass <= kPassInterAffine; pass++ )
       {
-        pc.args[3 * d]          = min( total[d], 32768u );
-        pc.args[3 * d + 1]      = ( total[d] + 32767u ) / 32768u;
-        pc.args[3 * d + 2]      = 1;
-        pc.args[32 + 2 * d]     = total[d];
-        pc.args[32 + 2 * d + 1] = first[d];
+        storeJobPassArgs( pc.args, pass, total[pass], first[pass] );
       }
     }
     return;

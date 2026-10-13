@@ -3822,7 +3822,7 @@ void affineMain( int tid, int index )
 [numthreads( THREADS, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
-  const int index = int( group.x ) + int( group.y ) * 32768;
+  const int index = int( workgroupIndex( group ) );
   if( index >= ( pc.count >= 0 ? pc.count : int( pc.countAt[0] ) ) )
   {
     return;   // (the whole workgroup returns here)

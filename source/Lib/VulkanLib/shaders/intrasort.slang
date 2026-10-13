@@ -135,16 +135,11 @@ void writeJobBands( uint* job, uint first, bool withWaits, uint wait )
   }
 }
 
-// Stores the number of bands, and intra's indirect arguments: intra.slang runs one workgroup per band, in rows of 32768
-// workgroups
+// Stores the number of bands, and intra's indirect arguments (intra.slang runs a workgroup per band)
 void storeBandTotal( uint total )
 {
   pc.bandSums[pc.numBlocks] = total;
-  pc.args[12]               = min( total, 32768u );
-  pc.args[13]               = ( total + 32767u ) / 32768u;
-  pc.args[14]               = 1;
-  pc.args[40]               = total;
-  pc.args[41]               = 0;
+  storeJobPassArgs( pc.args, kPassIntra, total, 0u );
 }
 
 // SMALL (pass 7, one workgroup): see the passes above. The jobs are sorted as keys wave << 10 | job, so that the jobs'

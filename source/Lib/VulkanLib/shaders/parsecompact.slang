@@ -48,7 +48,7 @@ struct Params
 [numthreads( 64, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
-  const int t = int( group.x ) + int( group.y ) * 32768;
+  const int t = int( workgroupIndex( group ) );
   if( t >= pc.numTus )
   {
     return;
@@ -215,7 +215,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     }
     return;
   }
-  const uint first = ( group.x + group.y * 32768u ) * 1024u;   // the workgroup's first word of the records copied
+  const uint first = workgroupIndex( group ) * 1024u;   // the workgroup's first word of the records copied
   if( pc.pass == 1 )
   {
     // Pass 1: each 32 threads copy a staged CU record to its place: its CTU's first CU + its index in the CTU

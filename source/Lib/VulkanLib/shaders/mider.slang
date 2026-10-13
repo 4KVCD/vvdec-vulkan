@@ -2769,7 +2769,7 @@ void deriveCu( Cur cur )
 [numthreads( 64, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
-  const int index = int( group.y * 32768 + group.x );
+  const int index = int( workgroupIndex( group ) );
   if( index >= pc.numCus )
   {
     return;

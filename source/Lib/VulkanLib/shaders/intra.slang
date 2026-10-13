@@ -1205,7 +1205,7 @@ void main( uint3 local : SV_GroupThreadID )
   const uint index = WaveReadLaneFirst( s_job );
   if( index >= ( pc.count >= 0 ? uint( pc.count ) : pc.countAt[0] ) )
   {
-    return;   // (the whole workgroup: the dispatch, in rows of 32768 workgroups, has more workgroups than jobs)
+    return;   // (the whole workgroup: the dispatch, in rows of kGroupsPerRow workgroups, has more workgroups than jobs)
   }
   // Load the job while the workgroup waits for the earlier jobs.
   const uint4 a = *(uint4*)( pc.jobs + index * 12 );

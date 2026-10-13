@@ -71,6 +71,41 @@ int loadClamped( int16_t* p, int stride, int x, int y, int w, int h )
   return int( *at( p, uint( clamp( y, 0, h - 1 ) * stride + clamp( x, 0, w - 1 ) ) ) );
 }
 
+// A dispatch of a workgroup per job (or per entry, per record...) runs its workgroups in rows of kGroupsPerRow:
+// GpuRecon::dispatchJobs, the front end's indirect dispatches (storeJobPassArgs) and GpuParseService's dispatch.
+static const uint kGroupsPerRow = 32768;
+
+// The index of the workgroup at group in such a dispatch: its job
+uint workgroupIndex( uint3 group )
+{
+  return group.x + group.y * kGroupsPerRow;
+}
+
+// The front end's indirect arguments (GpuRecon's m_frontEnd.args) hold, for pass p of GpuRecon.h's FrontPass, the
+// pass's workgroups (x, y, z) at word 3 * p, and its job count and first job at words kFrontCounts + 2 * p and the next.
+static const int kFrontCounts        = 32;
+static const int kPassTrafo          = 0;
+static const int kPassInterAffine    = 3;   // (after kPassInter and kPassInterBdof)
+static const int kPassIntra          = 4;
+static const int kPassDeblockLumaVer = 5;   // the first of the four deblocking passes, in edges.slang's list order
+
+// Stores pass's arguments: groupsX x groupsY workgroups, which take count jobs from the job first on
+void storePassArgs( uint* args, int pass, uint groupsX, uint groupsY, uint count, uint first )
+{
+  args[3 * pass]                    = groupsX;
+  args[3 * pass + 1]                = groupsY;
+  args[3 * pass + 2]                = 1;
+  args[kFrontCounts + 2 * pass]     = count;
+  args[kFrontCounts + 2 * pass + 1] = first;
+}
+
+// Stores the arguments of pass, which runs a workgroup per job (in rows of kGroupsPerRow): count jobs from the job
+// first on
+void storeJobPassArgs( uint* args, int pass, uint count, uint first )
+{
+  storePassArgs( args, pass, min( count, kGroupsPerRow ), ( count + kGroupsPerRow - 1 ) / kGroupsPerRow, count, first );
+}
+
 // Synchronizes the workgroup's threads and makes their writes to global and shared memory visible to each other.
 // The barrier has workgroup scope, which suffices for data shared within the workgroup. Data written by other
 // workgroups would need AllMemoryBarrierWithGroupSync's device scope, which on AMD GPUs also invalidates the
