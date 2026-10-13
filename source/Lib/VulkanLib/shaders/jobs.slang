@@ -770,11 +770,70 @@ void trTypes( Cu cu, Tu tu, int comp, out int typeHor, out int typeVer )
   }
 }
 
+// The QP of a transform block of component comp (QpParam): the CU's QP for luma, the parse's chroma QPs otherwise,
+// then ACT's offset; at least the minimum QP of transform skip (ts)
+int trafoQp( Cu cu, Tu tu, int comp, bool ts )
+{
+  int baseQp = comp == 0 ? cu.qp + pc.qpBdOffset : tu.chromaQp[comp - 1];
+  if( cu.act )
+  {
+    const bool jointQp = comp != 0 && kIctModes[0][tu.jointCbCr] == 2;
+    baseQp             = clip3( 0, 63 + pc.qpBdOffset, baseQp + kDeltaQpAct[jointQp ? 3 : comp] );
+  }
+  return ts ? max( baseQp, pc.tsMinQp ) : baseQp;
+}
+
+// Whether the explicit scaling list applies to the block, as Quant::dequant decides it
+bool usesScalingList( Cu cu, int comp, bool ts, uint* jslice )
+{
+  const bool lfnstApplied = cu.lfnst > 0 && ( isSepTree( cu ) || comp == 0 );
+  return sliceScalingList( jslice ) && !ts && !( lfnstApplied && ( pc.sps & kSpsNoSlLfnst ) != 0 )
+         && !( ( pc.sps & kSpsNoSlAct ) != 0 && ( ( pc.sps & kSpsSlActSpace ) != 0 ) == cu.act );
+}
+
+// A block's dequantization (Quant::dequantParam): the scale, the right shift, and the largest input value
+struct Dequant
+{
+  int scale;
+  int rightShift;
+  int inputMax;
+};
+
+Dequant dequantOf( int qp, int log2W, int log2H, bool ts, bool depQuant, bool scalingList )
+{
+  const bool sqrtAdj    = !ts && ( ( log2W + log2H ) & 1 ) == 1;
+  const int  trShift    = 15 - pc.bitDepth - ( ( log2W + log2H ) >> 1 ) + ( sqrtAdj ? -1 : 0 );
+  const int  qpPer      = depQuant ? ( qp + 1 ) / 6 : qp / 6;
+  const int  qpRem      = depQuant ? qp + 1 - 6 * qpPer : qp - 6 * qpPer;
+  const int  rightShift = 6 + ( depQuant ? 1 : 0 ) - ( ( ts ? 0 : trShift ) + qpPer ) + ( scalingList ? 4 : 0 );
+  const int  target     = min( 15 + 1, 32 + rightShift - 7 );
+  Dequant    d;
+  d.scale      = kInvQuantScales[sqrtAdj ? 1 : 0][qpRem];
+  d.rightShift = rightShift;
+  d.inputMax   = ( 1 << ( target - 1 ) ) - 1;
+  return d;
+}
+
+// The job's LFNST word: the CU's LFNST index, the set and the orientation that follow from the block's intra mode
+// (TrQuant::xInvLfnst), and whether the block is at least 8x8, or 4x4 or 8x8
+uint lfnstWord( Cu cu, Tu tu, int comp, int4 block )
+{
+  const int  ch   = chOf( comp );
+  int        mode = isMip( cu, ch ) ? PLANAR_IDX : isLmcMode( cu.intraDir[ch] ) ? intraDirLuma( coLocatedLuma( cu ) ) : finalIntraMode( cu, ch );
+  const int  wide = wideAngIntraMode( cu, tu, mode, comp );
+  mode            = wide < 0 ? wide + 14 + NUM_LUMA_MODE : wide >= NUM_LUMA_MODE ? wide + 14 : wide;
+  const bool tr   = ( mode >= NUM_LUMA_MODE && mode >= NUM_LUMA_MODE + 14 ) || ( mode < NUM_LUMA_MODE && mode > DIA_IDX );
+  return uint( cu.lfnst ) | pc.tables[T_LFNST + mode] << 2 | uint( tr ) << 4 | uint( block.z >= 8 && block.w >= 8 ) << 5
+         | uint( ( block.z == 4 && block.w == 4 ) || ( block.z == 8 && block.w == 8 ) ) << 6;
+}
+
+// The CU's transform jobs: one per transform block with a residual (Cb's job also makes Cr's with joint Cb-Cr), with
+// its dequantization, transform types, BDPCM, LFNST and scaling list
 void trafoJobs( Cu cu, inout Out o )
 {
-  uint*      jslice   = jobSliceOfCtu( cu.ctu );
-  const bool sign     = ( pc.ph & kPhJointSign ) != 0;
-  const int  numComp  = pc.chromaFormat == 0 ? 1 : 3;
+  uint*      jslice  = jobSliceOfCtu( cu.ctu );
+  const bool sign    = ( pc.ph & kPhJointSign ) != 0;
+  const int  numComp = pc.chromaFormat == 0 ? 1 : 3;
   for( int t = 0; t < cu.numTus; t++ )
   {
     const Tu tu = loadTu( cu.firstTu + t );
@@ -799,38 +858,15 @@ void trafoJobs( Cu cu, inout Out o )
       {
         continue;
       }
-      const int4 block = tu.blk[chOf( comp )];
-      const bool ts    = tu.mts[comp] == 1;   // MTS_SKIP
-
-      // QpParam: the CU's QP (luma) or the parse's chroma QPs (QpParam without ACT's offset), then ACT's offset
-      int baseQp = comp == 0 ? cu.qp + pc.qpBdOffset : tu.chromaQp[comp - 1];
-      if( cu.act )
-      {
-        const bool jointQp = comp != 0 && kIctModes[0][tu.jointCbCr] == 2;
-        baseQp             = clip3( 0, 63 + pc.qpBdOffset, baseQp + kDeltaQpAct[jointQp ? 3 : comp] );
-      }
-      const int qp = ts ? max( baseQp, pc.tsMinQp ) : baseQp;
-
-      // Whether the explicit scaling list applies, as Quant::dequant decides it
-      const bool lfnstApplied = cu.lfnst > 0 && ( isSepTree( cu ) || comp == 0 );
-      const bool scalingList  = sliceScalingList( jslice ) && !ts && !( lfnstApplied && ( pc.sps & kSpsNoSlLfnst ) != 0 )
-                               && !( ( pc.sps & kSpsNoSlAct ) != 0 && ( ( pc.sps & kSpsSlActSpace ) != 0 ) == cu.act );
-
-      // Quant::dequantParam
-      const int  log2W     = log2Of( block.z );
-      const int  log2H     = log2Of( block.w );
-      const bool bdpcm     = ( cu.bdpcmL != 0 && comp == 0 ) || ( cu.bdpcmC != 0 && comp != 0 );
-      const int  maxX      = bdpcm ? block.z - 1 : tu.maxX[comp];
-      const int  maxY      = bdpcm ? block.w - 1 : tu.maxY[comp];
-      const bool sqrtAdj   = !ts && ( ( log2W + log2H ) & 1 ) == 1;
-      const int  trShift   = 15 - pc.bitDepth - ( ( log2W + log2H ) >> 1 ) + ( sqrtAdj ? -1 : 0 );
-      const bool depQuant  = sliceDepQuant( jslice ) && !ts;
-      const int  qpPer     = depQuant ? ( qp + 1 ) / 6 : qp / 6;
-      const int  qpRem     = depQuant ? qp + 1 - 6 * qpPer : qp - 6 * qpPer;
-      const int  rightShift = 6 + ( depQuant ? 1 : 0 ) - ( ( ts ? 0 : trShift ) + qpPer ) + ( scalingList ? 4 : 0 );
-      const int  scale     = kInvQuantScales[sqrtAdj ? 1 : 0][qpRem];
-      const int  target    = min( 15 + 1, 32 + rightShift - 7 );
-      const int  inputMax  = ( 1 << ( target - 1 ) ) - 1;
+      const int4    block       = tu.blk[chOf( comp )];
+      const bool    ts          = tu.mts[comp] == 1;   // MTS_SKIP
+      const bool    scalingList = usesScalingList( cu, comp, ts, jslice );
+      const int     log2W       = log2Of( block.z );
+      const int     log2H       = log2Of( block.w );
+      const Dequant dq          = dequantOf( trafoQp( cu, tu, comp, ts ), log2W, log2H, ts, sliceDepQuant( jslice ) && !ts, scalingList );
+      const bool    bdpcm       = ( cu.bdpcmL != 0 && comp == 0 ) || ( cu.bdpcmC != 0 && comp != 0 );
+      const int     maxX        = bdpcm ? block.z - 1 : tu.maxX[comp];
+      const int     maxY        = bdpcm ? block.w - 1 : tu.maxY[comp];
 
       int  typeHor = DCT2, typeVer = DCT2;
       uint flags   = 0;
@@ -849,19 +885,12 @@ void trafoJobs( Cu cu, inout Out o )
 
       uint w[12];
       clearJob( w );
-      setTrafo( w, block.x, block.y, log2W, log2H, comp, typeHor, typeVer, flags, ict, maxX, maxY, scale, rightShift, inputMax );
+      setTrafo( w, block.x, block.y, log2W, log2H, comp, typeHor, typeVer, flags, ict, maxX, maxY, dq.scale, dq.rightShift, dq.inputMax );
       w[8] = tu.levelsAt[comp];   // the levels' place (the GPU's parse)
       w[9] = tu.levelsRow[comp];
-      // LFNST: the set and the orientation follow from the block's intra mode (TrQuant::xInvLfnst)
       if( cu.lfnst != 0 && ( pc.sps & kSpsLfnst ) != 0 && !ts && ( isSepTree( cu ) || comp == 0 ) )
       {
-        const int ch   = chOf( comp );
-        int       mode = isMip( cu, ch ) ? PLANAR_IDX : isLmcMode( cu.intraDir[ch] ) ? intraDirLuma( coLocatedLuma( cu ) ) : finalIntraMode( cu, ch );
-        const int wide = wideAngIntraMode( cu, tu, mode, comp );
-        mode           = wide < 0 ? wide + 14 + NUM_LUMA_MODE : wide >= NUM_LUMA_MODE ? wide + 14 : wide;
-        const bool tr  = ( mode >= NUM_LUMA_MODE && mode >= NUM_LUMA_MODE + 14 ) || ( mode < NUM_LUMA_MODE && mode > DIA_IDX );
-        w[6]           = uint( cu.lfnst ) | pc.tables[T_LFNST + mode] << 2 | uint( tr ) << 4 | uint( block.z >= 8 && block.w >= 8 ) << 5
-               | uint( ( block.z == 4 && block.w == 4 ) || ( block.z == 8 && block.w == 8 ) ) << 6;
+        w[6] = lfnstWord( cu, tu, comp, block );
       }
       if( scalingList )
       {
