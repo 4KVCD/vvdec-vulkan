@@ -501,19 +501,15 @@ size_t GpuRecon::alfParamSize( const CodingStructure& cs )
   return alignUp( kAlfCtus + size_t( cs.pcv->sizeInCtus ) * 8, 256 );
 }
 
-bool GpuRecon::prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alfFilter, uint8_t* base )
+// The filter tables at base: the fixed luma sets, then the luma, chroma and CC-ALF filters of the APSs the slices
+// use, each at its APS's place
+static void writeAlfFilterTables( const CodingStructure& cs, const AdaptiveLoopFilter& alfFilter, uint8_t* base )
 {
-  bool                 bounds = false;
-  const PreCalcValues& pcv    = *cs.pcv;
-
   int16_t* lumaCoeff   = reinterpret_cast<int16_t*>( base + kAlfLumaCoeff );
   int16_t* lumaClip    = reinterpret_cast<int16_t*>( base + kAlfLumaClip );
   int16_t* chromaCoeff = reinterpret_cast<int16_t*>( base + kAlfChromaCoeff );
   int16_t* chromaClip  = reinterpret_cast<int16_t*>( base + kAlfChromaClip );
   int16_t* ccCoeff     = reinterpret_cast<int16_t*>( base + kAlfCcCoeff );
-  uint8_t* ctus        = base + kAlfCtus;
-
-  // the filter tables: the fixed luma sets, then those of the APSs the slices use
   for( int set = 0; set < NUM_FIXED_FILTER_SETS; set++ )
   {
     memcpy( lumaCoeff + set * kAlfSetSize, alfFilter.getFixedFilterSetCoeff( set ), kAlfSetSize * sizeof( int16_t ) );
@@ -555,37 +551,47 @@ bool GpuRecon::prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& 
       }
     }
   }
+}
 
-  // Per CTU: the luma filter set (255: off), the chroma APS, each chroma component's alternative (255: off), each
-  // chroma component's CC-ALF filter (255: off), then the CTU's clipped sides
-  for( int ctuIdx = 0; ctuIdx < (int) pcv.sizeInCtus; ctuIdx++ )
+// CTU ctuIdx's 8 bytes at ctu: the luma filter set (255: off), the chroma APS, each chroma component's alternative
+// (255: off), each chroma component's CC-ALF filter (255: off), then the CTU's clipped sides (virtual boundaries on
+// them; slice, tile and subpicture boundaries without loop filtering across) and its raster-slice corners. Returns
+// whether such a boundary clips the CTU or virtual boundaries split it (the BOUNDS shaders are needed then).
+static bool writeAlfCtu( const CodingStructure& cs, int ctuIdx, uint8_t* ctu )
+{
+  const PreCalcValues& pcv     = *cs.pcv;
+  const CtuData&       ctuData = cs.getCtuData( ctuIdx );
+  const Slice*         slice   = ctuData.slice;
+  const CtuAlfData&    alf     = ctuData.alfParam;
+  ctu[0] = 255;
+  if( alf.alfCtuEnableFlag[COMPONENT_Y] )
   {
-    const CtuData&    ctuData = cs.getCtuData( ctuIdx );
-    const Slice*      slice   = ctuData.slice;
-    const CtuAlfData& alf     = ctuData.alfParam;
-    uint8_t*          ctu     = ctus + ctuIdx * 8;
+    const int index = alf.alfCtbFilterIndex;
+    ctu[0] = uint8_t( index < NUM_FIXED_FILTER_SETS ? index : NUM_FIXED_FILTER_SETS + slice->getAlfApsIdsLuma()[index - NUM_FIXED_FILTER_SETS] );
+  }
+  ctu[1] = uint8_t( slice->getAlfApsIdChroma() & ( ALF_CTB_MAX_NUM_APS - 1 ) );
+  ctu[2] = alf.alfCtuEnableFlag[COMPONENT_Cb] ? alf.alfCtuAlternative[0] : 255;
+  ctu[3] = alf.alfCtuEnableFlag[COMPONENT_Cr] ? alf.alfCtuAlternative[1] : 255;
+  ctu[4] = slice->getCcAlfEnabledFlag( 1 ) && alf.ccAlfFilterControl[0] ? uint8_t( slice->getCcAlfCbApsId() * 4 + alf.ccAlfFilterControl[0] - 1 ) : 255;
+  ctu[5] = slice->getCcAlfEnabledFlag( 2 ) && alf.ccAlfFilterControl[1] ? uint8_t( slice->getCcAlfCrApsId() * 4 + alf.ccAlfFilterControl[1] - 1 ) : 255;
+  const Position pos( ( ctuIdx % pcv.widthInCtus ) * pcv.maxCUWidth, ( ctuIdx / pcv.widthInCtus ) * pcv.maxCUHeight );
+  const Area     area( pos, Size( std::min( pcv.maxCUWidth, pcv.lumaWidth - pos.x ), std::min( pcv.maxCUHeight, pcv.lumaHeight - pos.y ) ) );
+  bool           clipTop, clipBottom, clipLeft, clipRight;
+  int            numHor, numVer, horPos[3], verPos[3], rasterPad;
+  const bool     bounds = AdaptiveLoopFilter::isClipOrCrossedByVirtualBoundaries( cs, area, clipTop, clipBottom, clipLeft, clipRight, numHor, numVer, horPos,
+                                                                                  verPos, rasterPad );
+  ctu[6] = uint8_t( int( clipTop ) | int( clipBottom ) << 1 | int( clipLeft ) << 2 | int( clipRight ) << 3 | rasterPad << 4 );
+  ctu[7] = 0;
+  return bounds;
+}
 
-    ctu[0] = 255;
-    if( alf.alfCtuEnableFlag[COMPONENT_Y] )
-    {
-      const int index = alf.alfCtbFilterIndex;
-      ctu[0] = uint8_t( index < NUM_FIXED_FILTER_SETS ? index : NUM_FIXED_FILTER_SETS + slice->getAlfApsIdsLuma()[index - NUM_FIXED_FILTER_SETS] );
-    }
-    ctu[1] = uint8_t( slice->getAlfApsIdChroma() & ( ALF_CTB_MAX_NUM_APS - 1 ) );
-    ctu[2] = alf.alfCtuEnableFlag[COMPONENT_Cb] ? alf.alfCtuAlternative[0] : 255;
-    ctu[3] = alf.alfCtuEnableFlag[COMPONENT_Cr] ? alf.alfCtuAlternative[1] : 255;
-    ctu[4] = slice->getCcAlfEnabledFlag( 1 ) && alf.ccAlfFilterControl[0] ? uint8_t( slice->getCcAlfCbApsId() * 4 + alf.ccAlfFilterControl[0] - 1 ) : 255;
-    ctu[5] = slice->getCcAlfEnabledFlag( 2 ) && alf.ccAlfFilterControl[1] ? uint8_t( slice->getCcAlfCrApsId() * 4 + alf.ccAlfFilterControl[1] - 1 ) : 255;
-    // The CTU's clipped sides (virtual boundaries on them; slice, tile and subpicture boundaries without loop
-    // filtering across), its raster-slice corners, and whether virtual boundaries split it
-    const Position pos( ( ctuIdx % pcv.widthInCtus ) * pcv.maxCUWidth, ( ctuIdx / pcv.widthInCtus ) * pcv.maxCUHeight );
-    const Area     area( pos, Size( std::min( pcv.maxCUWidth, pcv.lumaWidth - pos.x ), std::min( pcv.maxCUHeight, pcv.lumaHeight - pos.y ) ) );
-    bool           clipTop, clipBottom, clipLeft, clipRight;
-    int            numHor, numVer, horPos[3], verPos[3], rasterPad;
-    bounds |= AdaptiveLoopFilter::isClipOrCrossedByVirtualBoundaries( cs, area, clipTop, clipBottom, clipLeft, clipRight, numHor, numVer, horPos, verPos,
-                                                                      rasterPad );
-    ctu[6] = uint8_t( int( clipTop ) | int( clipBottom ) << 1 | int( clipLeft ) << 2 | int( clipRight ) << 3 | rasterPad << 4 );
-    ctu[7] = 0;
+bool GpuRecon::prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& alfFilter, uint8_t* base )
+{
+  writeAlfFilterTables( cs, alfFilter, base );
+  bool bounds = false;
+  for( int ctuIdx = 0; ctuIdx < (int) cs.pcv->sizeInCtus; ctuIdx++ )
+  {
+    bounds |= writeAlfCtu( cs, ctuIdx, base + kAlfCtus + ctuIdx * 8 );
   }
   return bounds;
 }
