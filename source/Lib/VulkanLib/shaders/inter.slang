@@ -416,33 +416,45 @@ int rprCoeff( int comp, int filter, int phase, bool hpel, int k )
   return kChroma[phase * 4 + k];
 }
 
-// xPredInterBlkRPR: predicts sample (col, row) of the block at (bx, by) (in
-// component comp's samples) from the scaled reference r (plane p) with motion
-// mv (1/16 luma sample, not clipped). The sample's position in the reference
-// follows from the scaling ratio and the scaling windows. The 2-D filter is
-// that of the filter index (2 for affine), or a stronger one past 1.25x and
-// 1.75x; each tap's sample is clamped into the reference (its border
-// extension), and the half-sample filter applies only at 1x. With bi, returns
-// the 14-bit intermediate, else the final value.
-int rprSample( RefPlanes r, int16_t* p, int comp, int bx, int by, int col, int row, int2 mv, bool bi, bool hpel, int filterIndex )
+// How a block is predicted from a scaled reference (xPredInterBlkRPR), worked out once for the block: where its first
+// sample lies in the reference and how far each next sample steps (both in 1/1024 reference samples), the filter
+// along each axis (rprCoeff's index), and the reference's size and stride in the component's samples
+struct RprGeometry
 {
-  const int sx     = comp == 0 ? 0 : chromaScaleX();
-  const int sy     = comp == 0 ? 0 : chromaScaleY();
-  const int refW   = int( r.size & 0xffffu ) >> sx;
-  const int refH   = int( r.size >> 16 ) >> sy;
-  const int stride = comp == 0 ? int( r.strides & 0xffffu ) : int( r.strides >> 16 );
-  const int one    = 1 << 14;   // SCALE_1X
-  const int thr1   = one * 5 / 4;
-  const int thr2   = one * 7 / 4;
-  int       xFilter = r.ratioX > thr2 ? 4 : ( r.ratioX > thr1 ? 3 : filterIndex );
-  int       yFilter = r.ratioY > thr2 ? 4 : ( r.ratioY > thr1 ? 3 : filterIndex );
+  int  x0, y0;
+  int  stepX, stepY;
+  int  xFilter, yFilter;
+  bool hpelX, hpelY;   // the half-sample filter applies (only without scaling)
+  int  sx, sy;         // the component's subsampling
+  int  refW, refH, stride;
+};
+
+// The geometry of the block at (bx, by) (in component comp's samples) predicted from the scaled reference r with
+// motion mv (1/16 luma sample, not clipped). The block's position in the reference follows from the scaling ratio and
+// the scaling windows. The filter is that of the filter index (2 for affine), or a stronger one past 1.25x and 1.75x.
+RprGeometry rprGeometry( RefPlanes r, int comp, int bx, int by, int2 mv, bool hpel, int filterIndex )
+{
+  RprGeometry g;
+  g.sx           = comp == 0 ? 0 : chromaScaleX();
+  g.sy           = comp == 0 ? 0 : chromaScaleY();
+  g.refW         = int( r.size & 0xffffu ) >> g.sx;
+  g.refH         = int( r.size >> 16 ) >> g.sy;
+  g.stride       = comp == 0 ? int( r.strides & 0xffffu ) : int( r.strides >> 16 );
+  const int one  = 1 << 14;   // SCALE_1X
+  const int thr1 = one * 5 / 4;
+  const int thr2 = one * 7 / 4;
+  g.xFilter      = r.ratioX > thr2 ? 4 : ( r.ratioX > thr1 ? 3 : filterIndex );
+  g.yFilter      = r.ratioY > thr2 ? 4 : ( r.ratioY > thr1 ? 3 : filterIndex );
   if( comp == 0 && filterIndex == 2 )
   {
-    xFilter += r.ratioX > thr1 ? 2 : 0;
-    yFilter += r.ratioY > thr1 ? 2 : 0;
+    g.xFilter += r.ratioX > thr1 ? 2 : 0;
+    g.yFilter += r.ratioY > thr1 ? 2 : 0;
   }
+  g.hpelX = hpel && r.ratioX == one;
+  g.hpelY = hpel && r.ratioY == one;
 
   // the block's position in the reference, in 1 / 1024 samples
+  const int sx   = g.sx, sy = g.sy;
   const int posX = ( ( bx << sx ) - pc.curWinLeft ) >> sx;
   const int posY = ( ( by << sy ) - pc.curWinTop ) >> sy;
   const int addX = comp == 0 ? 0 : ( 1 - pc.horColloc ) * 8 * ( r.ratioX - one );
@@ -451,57 +463,136 @@ int rprSample( RefPlanes r, int16_t* p, int comp, int bx, int by, int col, int r
   int64_t   y0   = ( ( int64_t( posY ) << ( 4 + sy ) ) + int64_t( mv.y ) ) * int64_t( r.ratioY ) + int64_t( addY );
   const int64_t rx = ( ( x0 < 0 ? -x0 : x0 ) + ( int64_t( 1 ) << ( 7 + sx ) ) ) >> ( 8 + sx );
   const int64_t ry = ( ( y0 < 0 ? -y0 : y0 ) + ( int64_t( 1 ) << ( 7 + sy ) ) ) >> ( 8 + sy );
-  x0 = ( x0 < 0 ? -rx : rx ) + ( int64_t( r.winLeft ) << ( 10 - sx ) );
-  y0 = ( y0 < 0 ? -ry : ry ) + ( int64_t( r.winTop ) << ( 10 - sy ) );
+  g.x0    = int( ( x0 < 0 ? -rx : rx ) + ( int64_t( r.winLeft ) << ( 10 - sx ) ) );
+  g.y0    = int( ( y0 < 0 ? -ry : ry ) + ( int64_t( r.winTop ) << ( 10 - sy ) ) );
+  g.stepX = ( r.ratioX + 8 ) >> 4;
+  g.stepY = ( r.ratioY + 8 ) >> 4;
+  return g;
+}
 
-  // The sample's integer position and phase
-  const int px    = int( x0 ) + col * ( ( r.ratioX + 8 ) >> 4 ) + ( 1 << ( 5 - sx ) );
-  const int py    = int( y0 ) + row * ( ( r.ratioY + 8 ) >> 4 ) + ( 1 << ( 5 - sy ) );
-  const int xInt  = px >> 10;
-  const int yInt  = py >> 10;
-  const int xFrac = ( px >> ( 6 - sx ) ) & ( ( 16 << sx ) - 1 );
-  const int yFrac = ( py >> ( 6 - sy ) ) & ( ( 16 << sy ) - 1 );
-  const int xPhase = comp == 0 ? xFrac : xFrac << ( 1 - sx );
-  const int yPhase = comp == 0 ? yFrac : yFrac << ( 1 - sy );
-  const bool hpelX = hpel && r.ratioX == one;
-  const bool hpelY = hpel && r.ratioY == one;
+// The reference position of sample i along one axis of a block (start and step from RprGeometry, s the axis's
+// subsampling): its integer sample, and its filter phase (in 16ths for luma, 32nds for chroma)
+int2 rprAxisPosition( int start, int step, int i, int s, int comp )
+{
+  const int p    = start + i * step + ( 1 << ( 5 - s ) );
+  const int frac = ( p >> ( 6 - s ) ) & ( ( 16 << s ) - 1 );
+  return int2( p >> 10, comp == 0 ? frac : frac << ( 1 - s ) );
+}
 
-  const int taps     = comp == 0 ? 8 : 4;
-  const int half     = taps / 2 - 1;
-  const int headRoom = max( 2, 14 - pc.bitDepth );
-  const int shift1   = 6 - headRoom;
-  const int offset1  = -IF_INTERNAL_OFFS * ( 1 << shift1 );
-  int       sum      = 0;
-  for( int t = 0; t < taps; t++ )
-  {
-    const int yy = clamp( yInt - half + t, 0, refH - 1 );
-    int       h  = 0;
-    for( int k = 0; k < taps; k++ )
-    {
-      h += rprCoeff( comp, xFilter, xPhase, hpelX, k ) * int( p[yy * stride + clamp( xInt - half + k, 0, refW - 1 )] );
-    }
-    sum += rprCoeff( comp, yFilter, yPhase, hpelY, t ) * ( ( h + offset1 ) >> shift1 );
-  }
+// The filter's first pass rounds to the 14-bit intermediate, its second to the result: with bi the intermediate, else
+// the final value
+int rprShift1( int headRoom ) { return 6 - headRoom; }
+int rprOffset1( int headRoom ) { return -IF_INTERNAL_OFFS * ( 1 << rprShift1( headRoom ) ); }
+int rprResult( int sum, bool bi, int headRoom )
+{
   const int maxVal = ( 1 << pc.bitDepth ) - 1;
   return bi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
 }
 
-// Predicts the thread's samples t = tid + THREADS k of a w x h tile from a
-// scaled reference (rprSample). The tile lies (ox, oy) into the block at
-// (bx, by) that xPredInterBlkRPR predicts as a whole (the CU, or SbTMVP's
-// joined sub-PUs), since the sample positions step from that block's origin.
+// xPredInterBlkRPR for sample (col, row) of the block of geometry g, read from plane p: the 2-D filter, each tap's
+// sample clamped into the reference (its border extension). rprBlock's fallback.
+int rprSample( RprGeometry g, int16_t* p, int comp, int col, int row, bool bi )
+{
+  const int2 x        = rprAxisPosition( g.x0, g.stepX, col, g.sx, comp );
+  const int2 y        = rprAxisPosition( g.y0, g.stepY, row, g.sy, comp );
+  const int  taps     = comp == 0 ? 8 : 4;
+  const int  half     = taps / 2 - 1;
+  const int  headRoom = max( 2, 14 - pc.bitDepth );
+  int        sum      = 0;
+  for( int t = 0; t < taps; t++ )
+  {
+    const int yy = clamp( y.x - half + t, 0, g.refH - 1 );
+    int       h  = 0;
+    for( int k = 0; k < taps; k++ )
+    {
+      h += rprCoeff( comp, g.xFilter, x.y, g.hpelX, k ) * int( p[yy * g.stride + clamp( x.x - half + k, 0, g.refW - 1 )] );
+    }
+    sum += rprCoeff( comp, g.yFilter, y.y, g.hpelY, t ) * ( ( h + rprOffset1( headRoom ) ) >> rprShift1( headRoom ) );
+  }
+  return rprResult( sum, bi, headRoom );
+}
+
+// The tile's output rows filtered together in rprBlock, so that the window of a reference up to twice as large fits the
+// shared pool
+static const int kRprBandRows = 8;
+
+// Predicts the thread's samples t = tid + THREADS k of a w x h tile from a scaled reference. The tile lies (ox, oy) into
+// the block at (bx, by) that xPredInterBlkRPR predicts as a whole (the CU, or SbTMVP's joined sub-PUs), since the
+// sample positions step from that block's origin. The threads filter the tile's rows a band at a time: they read the
+// band's window of the reference (each sample clamped into it, as its border extension) into the shared pool, then
+// the horizontal pass over its rows for the tile's columns, then the vertical pass of their samples in the band.
 void rprBlock( int tid, int slot, int comp, int bx, int by, int ox, int oy, int w, int h, int2 mv, bool bi, bool hpel, inout int out[PER_THREAD] )
 {
-  const RefPlanes r     = pc.refs[slot];
-  int16_t*        p     = comp == 0 ? r.y : ( comp == 1 ? r.cb : r.cr );
-  const int       log2W = firstbithigh( uint( w ) );
-  for( int k = 0; k < PER_THREAD; k++ )
+  const RefPlanes   r        = pc.refs[slot];
+  int16_t*          p        = comp == 0 ? r.y : ( comp == 1 ? r.cb : r.cr );
+  const RprGeometry g        = rprGeometry( r, comp, bx, by, mv, hpel, 0 );
+  const int         log2W    = firstbithigh( uint( w ) );
+  const int         taps     = comp == 0 ? 8 : 4;
+  const int         half     = taps / 2 - 1;
+  const int         headRoom = max( 2, 14 - pc.bitDepth );
+  const int         bandRows = min( h, kRprBandRows );
+  // The window's columns, from the first column's first tap to the last column's last; and a band's rows at most
+  // (the rows' positions step evenly, so any band spans as many reference rows as the first, give or take one)
+  const int xFirst  = rprAxisPosition( g.x0, g.stepX, ox, g.sx, comp ).x - half;
+  const int cols    = rprAxisPosition( g.x0, g.stepX, ox + w - 1, g.sx, comp ).x + taps - half - xFirst;
+  const int rowsMax = ( ( ( bandRows - 1 ) * g.stepY ) >> 10 ) + 2 + taps - 1;
+  if( cols * rowsMax + rowsMax * w > kPoolValues )
   {
-    const int t = tid + THREADS * k;
-    if( t < w * h )
+    // (a scaling past what the standard allows: the per-sample filter)
+    for( int k = 0; k < PER_THREAD; k++ )
     {
-      out[k] = rprSample( r, p, comp, bx, by, ox + ( t & ( w - 1 ) ), oy + ( t >> log2W ), mv, bi, hpel, 0 );
+      const int t = tid + THREADS * k;
+      if( t < w * h )
+      {
+        out[k] = rprSample( g, p, comp, ox + ( t & ( w - 1 ) ), oy + ( t >> log2W ), bi );
+      }
     }
+    return;
+  }
+  for( int band = 0; band < h; band += bandRows )
+  {
+    const int yFirst = rprAxisPosition( g.y0, g.stepY, oy + band, g.sy, comp ).x - half;
+    const int rows   = rprAxisPosition( g.y0, g.stepY, oy + band + bandRows - 1, g.sy, comp ).x + taps - half - yFirst;
+    const int tmpAt  = cols * rows;   // the horizontal pass, after the window
+    for( int s = tid; s < cols * rows; s += THREADS )
+    {
+      const int row = s / cols;
+      const int y   = clamp( yFirst + row, 0, g.refH - 1 );
+      const int x   = clamp( xFirst + s - row * cols, 0, g.refW - 1 );
+      s_pool[s]     = p[y * g.stride + x];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for( int s = tid; s < rows * w; s += THREADS )
+    {
+      const int  row = s >> log2W;
+      const int  col = s & ( w - 1 );
+      const int2 x   = rprAxisPosition( g.x0, g.stepX, ox + col, g.sx, comp );
+      const int  at  = row * cols + x.x - half - xFirst;
+      int        sum = 0;
+      for( int k = 0; k < taps; k++ )
+      {
+        sum += rprCoeff( comp, g.xFilter, x.y, g.hpelX, k ) * int( s_pool[at + k] );
+      }
+      s_pool[tmpAt + s] = int16_t( ( sum + rprOffset1( headRoom ) ) >> rprShift1( headRoom ) );
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for( int k = 0; k < PER_THREAD; k++ )
+    {
+      const int t   = tid + THREADS * k;
+      const int row = t >> log2W;
+      if( t < w * h && row >= band && row < band + bandRows )
+      {
+        const int2 y   = rprAxisPosition( g.y0, g.stepY, oy + row, g.sy, comp );
+        const int  at  = tmpAt + ( ( y.x - half - yFirst ) << log2W ) + ( t & ( w - 1 ) );
+        int        sum = 0;
+        for( int tap = 0; tap < taps; tap++ )
+        {
+          sum += rprCoeff( comp, g.yFilter, y.y, g.hpelY, tap ) * int( s_pool[at + ( tap << log2W )] );
+        }
+        out[k] = rprResult( sum, bi, headRoom );
+      }
+    }
+    GroupMemoryBarrierWithGroupSync();   // (the next band, or the next block, writes the pool)
   }
 }
 
@@ -535,11 +626,13 @@ void rprBlock( int tid, int slot, int comp, int bx, int by, int ox, int oy, int 
 // s_tmp: 897 values) and tile16's chroma (windows and horizontal passes: 880 values)
 #define BDOF_AT ( ( 16 + 7 ) * ( 16 + 7 ) + ( 16 + 7 ) * 16 )
 // (the affine variant holds the reference samples of up to 16 subblocks, 9 x 9 each)
+// The pool's 16-bit values (rprBlock checks that its window and horizontal pass fit)
 #if AFFINE
-groupshared int16_t s_pool[16 * 81];
+static const int kPoolValues = 16 * 81;
 #else
-groupshared int16_t s_pool[WORK_AT + 2 * DMVR_ROWS * 20];
+static const int kPoolValues = WORK_AT + 2 * DMVR_ROWS * 20;
 #endif
+groupshared int16_t s_pool[kPoolValues];
 #define s_ref( i ) int( s_pool[REF_AT + ( i )] )
 #define s_tmp( i ) int( s_pool[TMP_AT + ( i )] )
 #define s_bil0( i ) int( s_pool[BIL0_AT + ( i )] )
@@ -2569,7 +2662,7 @@ void affineLuma( int tid, uint job[24], int list, int x, int y, int w, int h, in
       [unroll]
       for( int o = 0; o < 4; o++ )
       {
-        pred[o] = rprSample( r, r.y, 0, cuX + 4 * sx, cuY + 4 * sy, o, v, mv, bi, false, 2 );
+        pred[o] = rprSample( rprGeometry( r, 0, cuX + 4 * sx, cuY + 4 * sy, mv, false, 2 ), r.y, 0, o, v, bi );
       }
     }
     return;
@@ -2705,7 +2798,8 @@ void affineChroma( int tid, uint job[24], int list, int comp, int x, int y, int 
           mv             = int2( roundAffine( sum.x, 1 ), roundAffine( sum.y, 1 ) );
         }
         mv      = affineClipScaled( mv, cuX, cuY );
-        pred[k] = rprSample( r, comp == 1 ? r.cb : r.cr, comp, ( cuX >> chromaScaleX() ) + 4 * csx, ( cuY >> chromaScaleY() ) + 4 * csy, i & 3, j & 3, mv, bi, false, 2 );
+        const RprGeometry g = rprGeometry( r, comp, ( cuX >> chromaScaleX() ) + 4 * csx, ( cuY >> chromaScaleY() ) + 4 * csy, mv, false, 2 );
+        pred[k]             = rprSample( g, comp == 1 ? r.cb : r.cr, comp, i & 3, j & 3, bi );
       }
     }
     return;
