@@ -1,4 +1,4 @@
-# fastcheck.py <vvdecapp exe> <name> [--tier smoke|wide|full] [--modes default,parse] [--lanes N] [--budget T]
+# fastcheck.py <vvdecapp exe> <name> [--tier smoke|wide|full] [--modes default,parse[,cpufe]] [--lanes N] [--budget T]
 #              [--only REGEX] [--batch <vvdecbatch exe>] [--refs]
 # The Vulkan decoder's check, with the decodes side by side. Every decode is checked frame by frame: each output
 # frame's per-plane MD5 against the JVET's per-frame list (<stream>.opl, conformance) or a list made once by upstream
@@ -19,7 +19,8 @@
 #   full  (milestones): everything whole (the long slower-preset streams: Beekeeper 600 frames, Top Gun 1200), plus
 #         check.sh's QA round (VideoQ 4800 / 1200 frames at 16 and 2 threads,
 #         The Beekeeper, the films, the stress streams; CRC-32C against crc_refs.txt) and the CPU path.
-# Modes: default (the CPU parses), parse (VVDEC_GPU_PARSE=2: the GPU parses); each mode has its own workers.
+# Modes: default (the CPU parses), parse (VVDEC_GPU_PARSE=2: the GPU parses), cpufe (VVDEC_GPU_FRONT=0: the CPU's front
+# end, for changes to it; only when asked for); each mode has its own workers.
 # Scheduling: longest first (times remembered in fastcheck_times.json), at most --lanes decodes at a time, within a
 # budget of GPU memory tokens (an 8K decode takes the whole budget). A decode that fails is decoded again alone with
 # vvdecapp afterwards, to tell a real failure from collateral damage (a GPU fault in one process resets the GPU work
@@ -61,7 +62,8 @@ lanes = int(opts['--lanes'])
 budget = int(opts['--budget'])
 only = re.compile(opts['--only']) if opts['--only'] else None
 batch_exe = opts['--batch'] or os.path.join(os.path.dirname(exe), os.path.basename(exe).replace('vvdecapp', 'vvdecbatch'))
-MODE_ENV = {'default': {}, 'parse': {'VVDEC_GPU_PARSE': '2'}}
+# The decoder's modes (see Modes above)
+MODE_ENV = {'default': {}, 'parse': {'VVDEC_GPU_PARSE': '2'}, 'cpufe': {'VVDEC_GPU_FRONT': '0'}}
 # The compiled pipelines' file of this program (ab_steady.py uses the same): the decoder starts its file anew when the
 # shaders differ, so programs sharing one would compile every shader again whenever another ran in between.
 CACHE = os.path.join(os.environ['LOCALAPPDATA'], 'vvdec', 'tools', name + '.bin')
