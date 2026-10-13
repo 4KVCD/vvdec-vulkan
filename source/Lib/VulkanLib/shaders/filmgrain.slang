@@ -108,18 +108,11 @@ int grainOf( Block b, int i, int intensity, int oc1, int oc2 )
   return p;
 }
 
-[shader( "compute" )]
-[numthreads( 256, 1, 1 )]
-void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
+// Loads the component's LUTs, and the segment's samples of the row (four a thread, up to end, the row's length rounded
+// up to whole blocks) with one sample of halo on each side. Past the frame's width these are the picture's samples,
+// and past the picture's width its last sample (the border extension).
+void loadSegment( int tid, int seg0, int row, int end )
 {
-  const int tid    = int( local.x );
-  const int seg0   = int( group.x ) * 1024;
-  const int row    = int( group.y );
-  const int nb     = 16 / pc.subx;   // block width in this plane's samples
-  const int blocks = ( pc.lumaWidth + 15 ) >> 4;
-  const int end    = blocks * nb;    // the row's length rounded up to whole blocks
-
-  // Load the component's LUTs.
   if( tid < 64 )
   {
     s_lut[tid] = pc.luts[( pc.comp * 256 ) / 4 + tid];
@@ -128,9 +121,6 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   {
     s_lut[tid] = pc.luts[( 768 + pc.comp * 256 ) / 4 + tid - 64];
   }
-  // Load the segment's samples and the halo. Past the frame's width these are
-  // the picture's samples, and past the picture's width its last sample (the
-  // border extension).
   int16_t*  src = pc.src + row * pc.srcStride;
   const int x0  = seg0 + 4 * tid;
   for( int k = 0; k < 4; k++ )
@@ -148,59 +138,63 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   {
     s_row[1025] = src[min( seg0 + 1024, pc.readWidth - 1 )];
   }
-  GroupMemoryBarrierWithGroupSync();
+}
 
-  const int lumaRow = row * pc.suby;
-  const int band    = lumaRow >> 4;
-  const int j       = lumaRow & 15;
-  int       oc1 = 0, oc2 = 0;
+// The weights that blend the grain of the band above into the first two luma rows of a band of 16 (0, 0 elsewhere)
+int2 overlapWeights( int lumaRow )
+{
+  const int j = lumaRow & 15;
   if( lumaRow > 15 && j == 0 )
   {
-    oc1 = pc.suby > 1 ? 20 : 12;
-    oc2 = pc.suby > 1 ? 20 : 24;
+    return pc.suby > 1 ? int2( 20, 20 ) : int2( 12, 24 );
   }
-  else if( lumaRow > 15 && j == 1 )
+  if( lumaRow > 15 && j == 1 )
   {
-    oc1 = 24;
-    oc2 = 12;
+    return int2( 24, 12 );
   }
-  const bool overlap = oc1 != 0;
-  const int  bxi     = x0 / nb;   // the thread's four samples all lie in this block
+  return int2( 0, 0 );
+}
 
-  // The raw grain of the thread's four samples (their pattern loads are issued
-  // together), and of the halo samples at the ends.
-  if( pc.present != 0 && x0 < end )
-  {
-    const Block b = blockAt( bxi, band, blocks, j, overlap );
-    const int   i = x0 - bxi * nb;
-    int         g[4];
-    for( int k = 0; k < 4; k++ )
-    {
-      g[k] = grainOf( b, i + k, int( s_row[1 + 4 * tid + k] ) >> pc.bs, oc1, oc2 );
-    }
-    for( int k = 0; k < 4; k++ )
-    {
-      s_grain[1 + 4 * tid + k] = int16_t( g[k] );
-    }
-    if( tid == 0 && seg0 > 0 )
-    {
-      const int   xl = seg0 - 1;
-      const Block l  = blockAt( xl / nb, band, blocks, j, overlap );
-      s_grain[0]     = int16_t( grainOf( l, xl - ( xl / nb ) * nb, int( s_row[0] ) >> pc.bs, oc1, oc2 ) );
-    }
-    if( tid == 255 && seg0 + 1024 < end )
-    {
-      const int   xr = seg0 + 1024;
-      const Block r  = blockAt( xr / nb, band, blocks, j, overlap );
-      s_grain[1025]  = int16_t( grainOf( r, xr - ( xr / nb ) * nb, int( s_row[1025] ) >> pc.bs, oc1, oc2 ) );
-    }
-  }
-  GroupMemoryBarrierWithGroupSync();
-
-  if( x0 >= pc.width )
+// The raw grain of the thread's four samples (their pattern loads are issued together) and of the halo samples at the
+// segment's ends, into s_grain; bxi: the block of the thread's samples
+void segmentGrain( int tid, int seg0, int x0, int bxi, int nb, int blocks, int end, int lumaRow, int2 oc )
+{
+  const int  band    = lumaRow >> 4;
+  const int  j       = lumaRow & 15;
+  const bool overlap = oc.x != 0;
+  if( pc.present == 0 || x0 >= end )
   {
     return;
   }
+  const Block b = blockAt( bxi, band, blocks, j, overlap );
+  const int   i = x0 - bxi * nb;
+  int         g[4];
+  for( int k = 0; k < 4; k++ )
+  {
+    g[k] = grainOf( b, i + k, int( s_row[1 + 4 * tid + k] ) >> pc.bs, oc.x, oc.y );
+  }
+  for( int k = 0; k < 4; k++ )
+  {
+    s_grain[1 + 4 * tid + k] = int16_t( g[k] );
+  }
+  if( tid == 0 && seg0 > 0 )
+  {
+    const int   xl = seg0 - 1;
+    const Block l  = blockAt( xl / nb, band, blocks, j, overlap );
+    s_grain[0]     = int16_t( grainOf( l, xl - ( xl / nb ) * nb, int( s_row[0] ) >> pc.bs, oc.x, oc.y ) );
+  }
+  if( tid == 255 && seg0 + 1024 < end )
+  {
+    const int   xr = seg0 + 1024;
+    const Block r  = blockAt( xr / nb, band, blocks, j, overlap );
+    s_grain[1025]  = int16_t( grainOf( r, xr - ( xr / nb ) * nb, int( s_row[1025] ) >> pc.bs, oc.x, oc.y ) );
+  }
+}
+
+// Writes the thread's four samples of the row (those inside the frame): each plus its grain, smoothed across the
+// boundaries between blocks and scaled as scale_and_output does it, at the output's sample size
+void writeSegment( int tid, int x0, int bxi, int nb, int blocks, int row )
+{
   const int maxVal = 255 << pc.bs;
   uint8_t*  dst    = pc.dst + row * pc.dstStride;
   for( int k = 0; k < 4; k++ )
@@ -217,7 +211,6 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       const int i = x - bxi * nb;
       int       g = int( s_grain[at] );
-      // Smooth the grain across the boundaries between blocks, as scale_and_output does.
       if( ( i == 0 && bxi > 0 ) || ( i == nb - 1 && bxi + 1 < blocks ) )
       {
         g = ( int( s_grain[at - 1] ) + 3 * g + int( s_grain[at + 1] ) + 2 ) >> 2;
@@ -233,5 +226,30 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       dst[x] = uint8_t( out );
     }
+  }
+}
+
+// One workgroup per segment of 1024 samples of a row (group.x the segment, group.y the row), four samples a thread:
+// the samples, then their grain, then the output
+[shader( "compute" )]
+[numthreads( 256, 1, 1 )]
+void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
+{
+  const int tid    = int( local.x );
+  const int seg0   = int( group.x ) * 1024;
+  const int row    = int( group.y );
+  const int nb     = 16 / pc.subx;   // block width in this plane's samples
+  const int blocks = ( pc.lumaWidth + 15 ) >> 4;
+  const int end    = blocks * nb;    // the row's length rounded up to whole blocks
+  const int x0     = seg0 + 4 * tid;
+  const int bxi    = x0 / nb;        // the thread's four samples all lie in this block
+  loadSegment( tid, seg0, row, end );
+  GroupMemoryBarrierWithGroupSync();
+  const int lumaRow = row * pc.suby;
+  segmentGrain( tid, seg0, x0, bxi, nb, blocks, end, lumaRow, overlapWeights( lumaRow ) );
+  GroupMemoryBarrierWithGroupSync();
+  if( x0 < pc.width )
+  {
+    writeSegment( tid, x0, bxi, nb, blocks, row );
   }
 }
