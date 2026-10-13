@@ -89,23 +89,19 @@ namespace gpu
 
 struct JobsPush;   // (GpuReconFrontEnd.cpp)
 
-// What a decoder's GpuRecon instances share:
-// - The GPU memory of the front end's buffers whose size changes with the picture (the job lists, the CUs' motion and
-//   job counts, the intra order, the edges), as ranges of a RangeArena: each picture takes ranges of its sizes as its
-//   front end is recorded and gives them back once its work is done (GpuRecon::takeFrontEnd, endCompute). So they
-//   hold what the pictures in flight need, not each instance the most any of its pictures needed (Beekeeper slower
-//   4K: 54 MB in the three instances, where three pictures in a row need at most 28 MB). The rest of the front end's
-//   buffers have a picture's size whatever its content; they stay each instance's own (shared, the front ends, which
-//   run side by side on the instances' async queues, would have to wait for each other).
-// - When the GPU parses the pictures (VVDEC_GPU_PARSE=2), the planes inter prediction keeps predictions aside in for
-//   intra jobs (GpuRecon::m_defer), which the instances take turns with. Inter prediction writes them in a picture's
-//   first part and intra prediction reads them in its rest, both on the compute queue, and each part begins with a
-//   barrier over the work submitted before it. So an instance needs them only from the start of a picture's recording
-//   until its rest is submitted (GpuRecon::SharedTurn): the next picture's work, submitted later, runs after the work
-//   that used them. Two instances recording at the same time is rare (Beekeeper slower 4K: 5 pictures of 600 began
-//   while another was recorded, a recording taking ~1.6 ms), while each instance's own planes held 19 MB at 4K. That
-//   order covers using them, not freeing them: planes grown for a larger picture (RPR) are freed only once the work
-//   queued before is done (Context::freeAfterQueued), as other instances' pictures may still be using them.
+// What a decoder's GpuRecon instances share.
+// - The front end's buffers whose size changes with the picture (the job lists, the CUs' motion and job counts, the
+//   intra order, the edges) are ranges of one RangeArena. A picture takes them when its front end is recorded and gives
+//   them back once its work is done (GpuRecon::takeFrontEnd, endCompute), so they hold only what the pictures in flight
+//   need. The front end's other buffers have a picture's size whatever its content, and each instance keeps its own:
+//   shared, the front ends that run side by side on the instances' async queues would have to wait for each other.
+// - With the GPU's parse (VVDEC_GPU_PARSE=2), the instances take turns with one set of deferred-prediction planes
+//   (GpuRecon::m_defer), in which inter prediction keeps predictions aside for intra jobs. Inter prediction writes them
+//   in a picture's first part and intra prediction reads them in its rest, both on the compute queue, and each part
+//   begins with a barrier over the work submitted before it. So an instance holds them only from the start of a
+//   picture's recording until its rest is submitted (GpuRecon::SharedDeferTurn). Free them only with
+//   Context::freeAfterQueued (planes grown for a larger picture, with RPR): another instance's queued work may still
+//   use them.
 struct SharedReconBuffers
 {
   explicit SharedReconBuffers( Context* context ) : ctx( context ), frontEnd( context, kIdlePictures ) {}
@@ -117,7 +113,7 @@ struct SharedReconBuffers
   static constexpr uint64_t kIdlePictures = 64;
 
   Context*   ctx;
-  std::mutex turn;   // held by the instance recording a picture with them
+  std::mutex deferMutex;   // held by the instance recording a picture with the deferred-prediction planes
   Buffer     defer;
   std::mutex frontEndMutex;   // (the instances take and give back ranges from their threads)
   RangeArena frontEnd;
@@ -230,15 +226,15 @@ private:
   // Where a picture's planes are, for copyPlanes: in host memory, in the twin, or in the scratch planes.
   enum { kHost, kTwin, kScratch };
 
-  // While it lives, the instance holds what the instances share (SharedReconBuffers) in place of its own (swapped in,
-  // and back at the end); with nothing to share, nothing changes.
-  class SharedTurn
+  // While it lives, the instance holds the shared deferred-prediction planes (SharedReconBuffers::defer) in place of its
+  // own: they are swapped in, and back when it ends. Without shared buffers it does nothing.
+  class SharedDeferTurn
   {
   public:
-    SharedTurn( GpuRecon& recon, SharedReconBuffers* shared );
-    ~SharedTurn();
-    SharedTurn( const SharedTurn& )            = delete;
-    SharedTurn& operator=( const SharedTurn& ) = delete;
+    SharedDeferTurn( GpuRecon& recon, SharedReconBuffers* shared );
+    ~SharedDeferTurn();
+    SharedDeferTurn( const SharedDeferTurn& )            = delete;
+    SharedDeferTurn& operator=( const SharedDeferTurn& ) = delete;
 
   private:
     void swapBuffers();
@@ -479,7 +475,7 @@ private:
   size_t m_lmcsCount = 0;   // the entries of a table
   Buffer m_lmcs;
   // The planes inter prediction keeps some predictions aside in, for intra jobs (LMCS's chroma scaling, CIIP): the
-  // instance's own, or the shared ones (SharedTurn). Whether the picture needs them (setPicture); bindDeferPlanes
+  // instance's own, or the shared ones (SharedDeferTurn). Whether the picture needs them (setPicture); bindDeferPlanes
   // gives them room for the picture and puts m_deferPlanes there, as its work is recorded.
   Buffer m_defer;
   bool   m_deferOn = false;

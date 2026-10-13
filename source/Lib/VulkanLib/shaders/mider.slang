@@ -8,13 +8,13 @@
 //   segment) in decoding order, one 32-thread workgroup per segment (the
 //   history-based candidates run along a row, starting at each tile's left
 //   edge). The segments of a tile run as a wavefront: a CTU starts once the
-//   segment above is past the CTU above-right, as vvdec's MIDER tasks wait.
-//   Tiles do not wait for each other: no CU is the neighbour of a CU in
-//   another tile. A CU's
-//   motion goes to its motion record (what vvdec keeps in the CodingUnit:
-//   control-point motion, reference indices, BCW, ...) and to the motion of
-//   its 4x4 luma blocks (vvdec's MotionInfo, CTU by CTU as vvdec keeps it),
-//   where its neighbours look it up.
+//   segment above is past the CTU above-right, as vvdec's MIDER tasks wait
+//   (with WPP, past the CTU above). Tiles do not wait for each other: no CU is
+//   the neighbour of a CU in another tile. A CU's motion goes to its motion
+//   record (what vvdec keeps in the CodingUnit: control-point motion,
+//   reference indices, BCW, ...) and to the motion of its 4x4 luma blocks
+//   (vvdec's MotionInfo, CTU by CTU as vvdec keeps it), where its neighbours
+//   look it up.
 //
 // It covers all of vvdec's motion tools: regular merge (spatial, temporal,
 // history-based, pairwise and zero candidates), MMVD, CIIP (regular merge),
@@ -2791,9 +2791,9 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   }
 }
 #else
-// One 32-thread workgroup per CTU row; the rows are taken in order (from a
-// counter), so a row waits only for rows whose workgroups already run.
-groupshared int s_row;
+// The segment this workgroup derives. The segments are taken in order from a counter, so that a segment waits only
+// for segments whose workgroups already run.
+groupshared int s_segment;
 
 // Tile column tc's CTU columns [x, y): the tile columns begin at the CTU columns whose records carry the flag of a
 // tile column's first CTU (row 0's records; every CTU row has the same tile columns).
@@ -2911,10 +2911,10 @@ void main( uint3 local : SV_GroupThreadID )
   const int segments = pc.heightInCtus * pc.tileCols;
   if( g_lane == 0 )
   {
-    s_row = int( pc.progress[segments].add( 1u ) );
+    s_segment = int( pc.progress[segments].add( 1u ) );
   }
   GroupMemoryBarrierWithGroupSync();
-  const int segment = s_row;
+  const int segment = s_segment;
   if( segment >= segments )
   {
     return;

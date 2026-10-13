@@ -59,6 +59,11 @@ POSSIBILITY OF SUCH DAMAGE.
 namespace vvdec
 {
 
+#if VVDEC_VULKAN
+// The reconstruction instances (DecLibRecon) the decoder takes turns with when the GPU reconstructs
+static constexpr size_t kGpuReconInstances = 3;
+#endif
+
 #ifdef TRACE_ENABLE_ITT
 std::vector<__itt_domain*> itt_domain_decInst;
 __itt_domain* itt_domain_dec           = __itt_domain_create( "Decode" );
@@ -196,15 +201,13 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
 #endif
 
 #if VVDEC_VULKAN
-  // with the GPU, more pictures in reconstruction at a time: the GPU finishes
-  // one while the CPU readies the next ones. Three: with the GPU's front end
-  // the slower-preset films decode as fast as with four (Top Gun 1080p 315.1
-  // vs 311.6 fps, Beekeeper 4K 142.3 vs 140.2; the CPU's parse 395.6 vs 397.2
-  // and 160.4 vs 161.3), and each instance holds a picture's GPU buffers (4K:
-  // device-local peak 750 -> 668 MB)
+  // With the GPU, more pictures are in reconstruction at a time: the GPU
+  // finishes one while the CPU readies the next ones. Three decode as fast as
+  // four, and each instance holds a picture's GPU buffers (4K: 82 MB less
+  // device-local memory with three).
   if( m_gpu )
   {
-    m_decLibRecon.resize( 3 );
+    m_decLibRecon.resize( kGpuReconInstances );
   }
 #endif
   bool upscalingEnabled = false;
@@ -941,15 +944,12 @@ void DecLib::reconPicture( Picture* pcPic )
   // last of those in turn
   size_t inTurn = m_decLibRecon.size();
 #if VVDEC_VULKAN
-  // with the GPU and the CPU's front end, the pictures up to 1080p take the
-  // first two only: as fast as with four instances (VideoQ 1080p 685 vs 675
-  // fps; two films' 1080p within 0.5%), with fewer pictures in reconstruction
-  // and the other instances' buffers not allocated (VideoQ 1080p: peak commit
-  // 580 -> 477 MB with four). Larger pictures take them all (3840x1608 and 4K
-  // with four: 1.3% and 2.0% faster than with two), and with the GPU's front
-  // end all pictures do: a picture's front end waits for its colocated
-  // picture's first part, more pictures in flight keep the GPU busy (VideoQ
-  // 1080p, four against two: +9%, peak commit +140 MB).
+  // With the GPU and the CPU's front end, pictures up to 1080p take the first
+  // two instances only: they decode as fast, and the other instances' buffers
+  // are not allocated. Larger pictures take them all, and so does every picture
+  // with the GPU's front end, because a picture's front end waits for its
+  // colocated picture's first part and more pictures in flight keep the GPU
+  // busy.
   const bool gpuFrontEnd = m_gpu && m_gpu->options().frontEnd && !m_gpu->options().frontEndCheck;
   if( m_gpu && pcPic->lumaSize().area() <= 1920 * 1088 && !gpuFrontEnd )
   {

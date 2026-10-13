@@ -113,14 +113,15 @@ public:
   // Records into cmd the clearing of the parse's counters (in GPU memory) when the parse starts from the beginning
   // (after prepare or restart). The steps after it need a barrier.
   void recordClear( VkCommandBuffer cmd );
-  // Records into cmd one dispatch of the parse: each substream parsed from where it stopped up to binBudget bins (a
-  // CU counts as 32): kStepBins, or more when ParseService has few substreams in parse
+  // Records into cmd one dispatch of the parse: each substream is parsed from where it stopped, up to binBudget bins
+  // (a CU counts as 32 bins). The budget is kStepBins, or more while ParseService has few substreams in parse and every
+  // picture in parse has a large substream.
   static constexpr int32_t kStepBins = 1 << 12;
   void recordStep( VkCommandBuffer cmd, int32_t binBudget = kStepBins ) const;
-  // Records into cmd the compaction's first pass, which does its work once every CTU is parsed: each CTU's record
-  // (its first CU and TU in raster order) and the totals. serial: the step's number (ParseService's, from 1): the
-  // totals go to the half of the totals of its parity, marked with it, so that the totals of a step stay as they are
-  // while the next step runs.
+  // Records into cmd the compaction's first pass, which does its work once every CTU is parsed: it writes each CTU's
+  // record (its first CU and TU in raster order) and the totals. serial is the step's number in ParseService (from 1).
+  // The totals go to the half of the totals buffer chosen by serial's parity and carry serial, so that one step's
+  // totals stay intact while the next step runs.
   void recordCompaction( VkCommandBuffer cmd, uint32_t serial = 0 ) const;
 
   // Where the parse is, after a submission of its steps and compaction
@@ -288,9 +289,9 @@ private:
     uint32_t                serial = 0;
     std::vector<ParseSlot*> slots;
   };
-  // One round: the steps kept in the parse queue, the parsed pictures' records copied, the oldest step's results
-  // taken (finishPictures), the copied pictures handed over, the slots whose parse is over freed or restarted
-  void           step();
+  // One round of the service: the steps kept in the parse queue, the parsed pictures' records copied, the oldest step's
+  // results taken (finishPictures), the copied pictures handed over, the slots whose parse is over freed or restarted
+  void           runRound();
   size_t         stepsAhead() const;                       // the steps to keep in the parse queue: 1 or 2
   void           submitSteps();                            // a step of the pictures in parse into a free frame
   void           finishPictures( const StepFrame& frame ); // after the step: the pictures done to be copied, others kept
@@ -328,9 +329,17 @@ private:
   // the most records and levels a picture had so far (startRoom): of the intra pictures, of the others, of the others
   // in each temporal layer
   Counts                  m_mostIntra, m_mostInter, m_mostLayer[MAX_TLAYER];
+  // The steps in flight, a ring of two frames: m_inFlight of them (0 to 2: stepsAhead), the oldest at m_firstFrame
   StepFrame               m_frames[2];
-  size_t                  m_firstFrame = 0;   // the oldest step in flight
-  size_t                  m_inFlight   = 0;   // the steps in flight (0 to 2: stepsAhead)
+  size_t                  m_firstFrame = 0;
+  size_t                  m_inFlight   = 0;
+  StepFrame&              oldestFrame() { return m_frames[m_firstFrame]; }
+  StepFrame&              nextFreeFrame() { return m_frames[( m_firstFrame + m_inFlight ) % 2]; }
+  void                    retireOldestFrame()   // after its step is done
+  {
+    m_firstFrame = ( m_firstFrame + 1 ) % 2;
+    m_inFlight--;
+  }
   uint32_t                m_serial     = 0;   // the last step's number
   uint64_t                m_doneValue  = 0;   // the parse timeline's value of the last step taken
   VkCommandPool           m_copyPool  = VK_NULL_HANDLE;   // the copy's submission

@@ -64,18 +64,14 @@ namespace gpu
 static constexpr size_t   kParseStateWords   = 1024;      // kStateWords
 static constexpr size_t   kParseStateNextCtu = 0;         // kStK: the substream's next CTU
 static constexpr size_t   kParseStateDone    = 1;         // kStDone: the substream is parsed (or given up)
-// The bins per substream and dispatch (a CU counts as 32). A step's workgroups hold their compute units' shared memory
-// (two of them fill a unit's) for as long as the step runs, and the steps run one after another, a submission each:
-// shorter steps cost more submissions, but decode faster, as if the reconstruction's passes on the other queues got
-// in between more often (15 W, 2^12 against 2^14: Beekeeper slower 4K +3.8%, Top Gun slower 1080p +4.5%, Conan
-// 1080p +39%, Top Gun 1080p +21%, the film grain stream fg_tg4k +0.6%; 2^13 about as fast on the slower streams but
-// +24% / +15% on Conan and Top Gun; 2^10 Conan -20% from 2^12; 2^15 -6%). With few substreams in parse (kFewStreams
-// at most: pictures without WPP or tiles parse as one substream each), all of them large (a substream of
-// kLargeStreamBytes or more each: ~15 bins a byte, so more than two steps of 2^16 bins), the steps take
-// kParseBinBudgetFew: a 4K all-intra picture has ~1.5M bins, and short steps left the GPU idle between the
-// submissions (isp_ai_4k: 2^14 21.4 fps, 2^16 25.1). Beside a small picture they don't: it would wait for the long
-// step's end to be handed over, and the pictures after it to start (VVenC random access without WPP: fg_videoq 1080p,
-// 2^16 109.0 fps, 2^14 207.4).
+// The bins each substream parses per dispatch (a CU counts as 32 bins). A step's workgroups hold their compute units'
+// shared memory for as long as the step runs, and the steps run one after another. Short steps let the
+// reconstruction's passes on the other queues run in between, which decodes faster although it costs more submissions
+// (2^12 against 2^14 bins at 15 W: Conan 1080p +39%, Beekeeper slower 4K +3.8%).
+// Long steps (kParseBinBudgetFew) are taken while at most kFewStreams substreams are in parse and every picture in parse
+// has a substream of at least kLargeStreamBytes, as all-intra pictures without WPP do: their short steps would leave
+// the GPU idle between submissions. Don't take long steps beside a small picture: it would wait for the long step to
+// end before it is handed over, and so would the pictures after it.
 static constexpr int32_t  kParseBinBudget    = ParseSlot::kStepBins;
 static constexpr int32_t  kParseBinBudgetFew = 1 << 16;
 static constexpr size_t   kFewStreams        = 32;
@@ -87,31 +83,26 @@ static constexpr size_t   kParseTotals       = 16;        // the CUs and TUs, th
 static constexpr size_t   kParseLevelChunk   = 4096;      // parse.slang's kLevelChunk: the levels a substream takes at a time
 static constexpr size_t   kGroupsPerRow      = 32768;     // the shaders take group.y as rows of 32768 workgroups
 
-// The service: each picture's dispatches in one submission (one, so that a picture is handed over as soon as it is
-// parsed), the pictures parsed at a time; the buffers of the parse results kept for reuse, in each size.
-// The pictures in parse: at least kMinParsing, and more while their substreams number fewer than kStreamsInParse (up
-// to kMaxParsing). Each step has a workgroup per substream, of which two fit a compute unit: fewer substreams leave
-// them idle (Top Gun slower 1080p, 18 substreams a picture: 8 pictures 299.3 fps, 10 314.1, 12 314.9, 14 314.1;
-// Beekeeper slower 4K, 26 a picture: 8 139.4, 12 139.6, 16 139.1). Each picture in parse holds its results' buffers
-// (1080p: 10 pictures 73 MB more commit than 8). With 16 at a time the intra picture that starts VideoQ 1080p parsed
-// in 800 ms (~190 ms alone) while the first frame waited for it.
+// How many pictures are in parse at a time. Each step runs one workgroup per substream, and two workgroups fill a
+// compute unit, so too few substreams leave units idle. At least kMinParsing pictures are in parse, and more start
+// while their substreams number fewer than kStreamsInParse, up to kMaxParsing. Each picture in parse holds the room
+// for its parse results, so more pictures cost memory. Each submission runs kStepsPerSubmission steps of every picture
+// in parse, so that a picture can be handed over as soon as its parse is done.
 static constexpr uint32_t kStepsPerSubmission = 1;
 static constexpr size_t   kMinParsing         = 8;
 static constexpr size_t   kMaxParsing         = 16;
 static constexpr size_t   kStreamsInParse     = 180;
-// The pictures in parse and the parse results not given back yet (their reconstruction still to read them) together:
-// no more start while this many are. With short steps the parse runs far ahead of the reconstruction (up to ~100
-// pictures as the decode starts), and its lead hides the long parses of intra pictures, but every picture parsed ahead
-// holds its records. 48 keeps most of the lead's speed for a little memory (15 W, Top Gun slower 1080p: no cap 394.7
-// fps and 221 MB of GPU memory at the peak, 48: 392.0 and 213 MB, 32: 382.6 and 205 MB, 24: 374.9; Beekeeper slower
-// 4K: 172.9 / 543, 48: 172.0 / 503, 32: 170.6 / 498).
+// The most pictures in parse or parsed and not yet given back (their reconstruction still has to read the results):
+// no more start while this many are. Short steps let the parse run far ahead of the reconstruction, and that lead hides
+// the long parses of intra pictures, but every picture parsed ahead holds its records. 48 keeps almost all of the
+// lead's speed for a little memory (Beekeeper slower 4K at 15 W: 172.0 fps and 503 MB of GPU memory, against 172.9 fps
+// and 543 MB without a cap).
 static constexpr size_t   kMaxAhead           = 48;
-// An intra picture of at most kSerialStreams substreams (no WPP, one tile) parses in one or two long chains (Conan
-// 1080p's: 60-260 ms, where a B picture's take ~40): started in turn, behind the ~50 pictures the CPU enqueues ahead
-// (kMaxAhead holds them back), it finished after the reconstruction had caught up with it, which waited ~100 ms each
-// time. So such a picture starts at once, ahead of the pictures enqueued before it (at most kSerialIntraInParse of them
-// in parse). The intra pictures of WPP parse their rows side by side, and started early they only held back the
-// pictures before them (Top Gun slower 1080p -1.4%).
+// An intra picture with at most kSerialStreams substreams (no WPP, one tile) parses in one or two long chains, several
+// times as long as a B picture's parse. Such a picture starts as soon as it is enqueued, ahead of the pictures
+// enqueued before it, so that its parse is done when the reconstruction reaches it; at most kSerialIntraInParse of
+// them are in parse at once. Don't start the intra pictures of WPP streams early: they parse their rows side by side,
+// and starting them early only holds back the pictures before them.
 static constexpr size_t   kSerialStreams      = 2;
 static constexpr size_t   kSerialIntraInParse = 2;
 // In an all-intra stream without WPP every picture's parse is one such long chain, and the parse holds the whole decode
@@ -121,7 +112,7 @@ static constexpr size_t   kSerialIntraInParse = 2;
 // without WPP gain nothing from more pictures in parse.)
 static constexpr size_t   kMaxSerialIntraParsing = 24;
 
-// The bytes of a picture's largest substream (its parse's longest)
+// Returns the size in bytes of the picture's largest substream, the one whose parse takes longest
 static uint32_t largestStreamBytes( const ParseInput& in )
 {
   uint32_t most = 0;
@@ -764,7 +755,7 @@ void ParseService::run()
       {
         startPicture( pic );
       }
-      step();
+      runRound();
     }
   }
   catch( ... )
@@ -899,18 +890,30 @@ static size_t sliceDataBytes( const Picture& pic )
   return bytes;
 }
 
-// The room a picture's parse starts with, for its staged records (CUs, TUs) and its levels. A picture with more is
-// parsed again (Overflow). The room is the most the pictures of its kind had so far (each count on its own), with
-// some to spare, and scaled up when the picture has more slice data than any of them had (by the ratio of the bytes,
-// at most 16):
-// - an intra picture: a quarter more than the intra pictures had;
-// - another picture: twice what the pictures of its temporal layer had, which are alike (Beekeeper slower 4K: layer 0
-//   up to 17,000 CUs, layer 5 up to 1,800); before its layer's first, a quarter more than any such picture had;
-// - before the first of its kind: 32 records a CTU for an intra picture (VideoQ's have up to 23 with the dual tree),
-//   8 for the others (VideoQ's have 2 to 4); half the samples' levels for an intra picture, a 32nd for the others.
-// The levels' room is at least a chunk a substream (each takes its levels in chunks), and at most twice the samples.
-// (The parse's counts replayed: Beekeeper slower 4K, a picture's room 2.75 MB with a quarter more than the most of its
-// kind, 1.27 MB with this, the pictures parsed again 14 and none; Top Gun slower 1080p, 2.14 and 0.88 MB, 6 and 1.)
+// How much room startRoom gives a picture's parse beyond what similar pictures needed
+static constexpr double kKindRoomScale  = 1.25;   // over the most any picture of its kind (intra or not) had
+static constexpr double kLayerRoomScale = 2.0;    // over the most the pictures of its temporal layer had
+static constexpr double kMaxBytesScale  = 16.0;   // the most the room grows with the picture's share of slice data
+static constexpr size_t kRecordsSpare   = 64;     // records added to every room
+// The room before any picture of the kind was parsed: records per CTU and levels per sample
+static constexpr size_t kFirstIntraRecordsPerCtu = 32;
+static constexpr size_t kFirstInterRecordsPerCtu = 8;
+static constexpr size_t kFirstIntraSamplesPerLevel = 2;
+static constexpr size_t kFirstInterSamplesPerLevel = 32;
+// The levels' room is at most twice the samples, plus slack for the substreams' last chunks of levels, which are
+// partly unused
+static constexpr size_t kLevelsChunkSlack = 16 * kParseLevelChunk;
+
+// Returns the room a picture's parse starts with, for its staged records (CUs, TUs) and its levels. A picture that
+// needs more is parsed again (Overflow). The room is the most that the pictures like it needed so far, each count on
+// its own, with some to spare:
+// - for an intra picture, kKindRoomScale times what the intra pictures needed;
+// - for another picture, kLayerRoomScale times what the pictures of its temporal layer needed, since the pictures of a
+//   layer are alike (Beekeeper slower 4K: layer 0 up to 17,000 CUs, layer 5 up to 1,800). Before its layer's first
+//   picture, kKindRoomScale times what any such picture needed;
+// - before the first picture of its kind, kFirstIntra... or kFirstInter... records a CTU and levels a sample.
+// The room grows with the ratio of the picture's slice data to the most those pictures had (at most kMaxBytesScale).
+// The levels' room is at least one chunk a substream, since each substream takes its levels a chunk at a time.
 ParseService::Counts ParseService::startRoom( const Picture& pic ) const
 {
   const PreCalcValues& pcv     = *pic.cs->pcv;
@@ -927,17 +930,19 @@ ParseService::Counts ParseService::startRoom( const Picture& pic ) const
   Counts               room;
   if( most )
   {
-    const double more  = std::min( std::max( 1.0, double( sliceDataBytes( pic ) ) / double( std::max<size_t>( most->bytes, 1 ) ) ), 16.0 );
-    const double scale = ( most == layer ? 2.0 : 1.25 ) * more;
-    room.cus           = size_t( double( most->cus ) * scale ) + 64;
-    room.tus           = size_t( double( most->tus ) * scale ) + 64;
-    room.levels        = size_t( double( most->levels ) * scale ) + kParseLevelChunk;
+    const double bytesRatio = double( sliceDataBytes( pic ) ) / double( std::max<size_t>( most->bytes, 1 ) );
+    const double more       = std::min( std::max( 1.0, bytesRatio ), kMaxBytesScale );
+    const double scale      = ( most == layer ? kLayerRoomScale : kKindRoomScale ) * more;
+    room.cus                = size_t( double( most->cus ) * scale ) + kRecordsSpare;
+    room.tus                = size_t( double( most->tus ) * scale ) + kRecordsSpare;
+    room.levels             = size_t( double( most->levels ) * scale ) + kParseLevelChunk;
   }
   else
   {
-    room = { ctus * ( intra ? 32 : 8 ), ctus * ( intra ? 32 : 8 ), intra ? samples / 2 : samples / 32 };
+    const size_t records = ctus * ( intra ? kFirstIntraRecordsPerCtu : kFirstInterRecordsPerCtu );
+    room                 = { records, records, samples / ( intra ? kFirstIntraSamplesPerLevel : kFirstInterSamplesPerLevel ) };
   }
-  room.levels = std::min( std::max( room.levels, substreamsOf( &pic ) * kParseLevelChunk ), 2 * samples + 65536 );
+  room.levels = std::min( std::max( room.levels, substreamsOf( &pic ) * kParseLevelChunk ), 2 * samples + kLevelsChunkSlack );
   return room;
 }
 
@@ -976,11 +981,10 @@ static void waitFor( Context* ctx, VkFence fence )
   }
 }
 
-// Two steps in the parse queue while a picture whose parse is one or two long chains is in parse (kSerialStreams): the
-// next step then runs while the thread takes the results of the one before (the thread's turn takes ~0.9 ms, a step
-// ~1.8 ms), and such a picture's parse, its steps one after another, takes that much less (15 W: Conan 1080p +7.2%,
-// Top Gun faster 1080p +2.5%, both without WPP). Else one: the pictures of WPP parse their rows side by side, and a
-// second step only weighed on the reconstruction (Top Gun slower 1080p -0.4% to -1.7%; Beekeeper slower 4K even).
+// Returns how many steps to keep in the parse queue: 2 while a picture whose parse is one or two long chains
+// (kSerialStreams) is in parse, else 1. With two steps queued, the GPU runs the next step while this thread takes the
+// results of the one before, which shortens such a picture's parse (Conan 1080p +7.2% at 15 W). Pictures with WPP parse
+// their rows side by side, and a second step would only weigh on the reconstruction.
 size_t ParseService::stepsAhead() const
 {
   for( const ParseSlot* slot: m_parsing )
@@ -993,17 +997,19 @@ size_t ParseService::stepsAhead() const
   return 1;
 }
 
-void ParseService::step()
+// Runs one round of the service: queues steps up to stepsAhead(), copies and hands over the pictures found parsed, and
+// takes the results of the oldest step in flight
+void ParseService::runRound()
 {
-  // the steps in the parse queue, as long as pictures are in parse (stepsAhead)
+  // Keep stepsAhead() steps in the parse queue while pictures are in parse.
   const size_t ahead = stepsAhead();
   while( m_inFlight < ahead && !m_parsing.empty() )
   {
     submitSteps();
   }
-  // the pictures parsed: their records copied, after the steps that step their slots (the oldest one, at most: the
-  // pictures were found parsed when the step before it was taken, and the steps since leave them out); handed over at
-  // once when those steps are done
+  // Copy the records of the pictures found parsed. On the GPU the copy waits for the steps that still step their slots:
+  // at most the oldest step in flight, since the steps after it leave those pictures out. When those steps are done
+  // already, hand the pictures over at once.
   if( !m_copying.empty() && m_copied.empty() )
   {
     submitCopies();
@@ -1012,19 +1018,18 @@ void ParseService::step()
   {
     handOverCopied();
   }
-  // the oldest step's results
+  // Take the results of the oldest step.
   if( m_inFlight > 0 )
   {
-    StepFrame& frame = m_frames[m_firstFrame];
-    // (a copy in flight waits for this step on the GPU: waiting for the copy waits for both, with one wake-up)
+    StepFrame& frame = oldestFrame();
+    // A copy in flight waits for this step on the GPU, so waiting for the copy covers both with one wake-up.
     if( !m_copied.empty() )
     {
       waitFor( m_ctx, m_copyFence );
     }
     waitFor( m_ctx, frame.fence );
-    m_doneValue  = frame.value;
-    m_firstFrame = 1 - m_firstFrame;
-    m_inFlight--;
+    m_doneValue = frame.value;
+    retireOldestFrame();
     {
       std::lock_guard<std::mutex> lock( m_mutex );
       m_stats.submissions++;
@@ -1032,7 +1037,7 @@ void ParseService::step()
     }
     finishPictures( frame );
   }
-  // the copy that waited for that step
+  // Hand over the pictures whose copy waited for that step.
   if( !m_copied.empty() )
   {
     handOverCopied();
@@ -1040,8 +1045,8 @@ void ParseService::step()
   endSlots();
 }
 
-// The pictures copied: to their reconstruction (whose front end waits for m_copyValue), their slots free (the copy
-// waited for the steps that stepped them, which are done: it is done soon)
+// Hands the copied pictures to their reconstruction, whose front ends wait for m_copyValue on the GPU, and frees their
+// slots. The copy waited for the steps that stepped those slots, which are done, so it ends soon.
 void ParseService::handOverCopied()
 {
   waitFor( m_ctx, m_copyFence );
@@ -1056,7 +1061,7 @@ void ParseService::handOverCopied()
 
 void ParseService::submitSteps()
 {
-  StepFrame& frame = m_frames[( m_firstFrame + m_inFlight ) % 2];
+  StepFrame& frame = nextFreeFrame();
   const Api& vk    = m_ctx->api();
   vk.vkResetCommandPool( m_ctx->device(), frame.pool, 0 );
   VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -1077,7 +1082,7 @@ void ParseService::submitSteps()
     allLarge = allLarge && largestStreamBytes( slot->input() ) >= kLargeStreamBytes;
   }
   const int32_t budget = streams <= kFewStreams && allLarge ? kParseBinBudgetFew : kParseBinBudget;
-  for( uint32_t step = 0; step < kStepsPerSubmission; step++ )
+  for( uint32_t s = 0; s < kStepsPerSubmission; s++ )
   {
     for( const ParseSlot* slot: m_parsing )
     {
@@ -1239,10 +1244,10 @@ void ParseService::endSlots()
 
 void ParseService::waitAll()
 {
-  for( ; m_inFlight > 0; m_inFlight-- )
+  while( m_inFlight > 0 )
   {
-    waitFor( m_ctx, m_frames[m_firstFrame].fence );
-    m_firstFrame = 1 - m_firstFrame;
+    waitFor( m_ctx, oldestFrame().fence );
+    retireOldestFrame();
   }
   if( !m_copied.empty() )
   {

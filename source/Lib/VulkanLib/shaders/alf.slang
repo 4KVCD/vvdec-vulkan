@@ -794,7 +794,8 @@ void filterPlane( int16_t* src, int16_t* dst, int bx, int by, int aps, int alt, 
   int out[16];
   if( alt == 255 && pc.aligned != 0 )
   {
-    // (the block's rows read whole, 8 bytes each: most chroma CTUs have no ALF, and their blocks are only copied)
+    // Without ALF on this component (the CTU has CC-ALF only), the block is copied before CC-ALF adds to it: its rows
+    // are read whole, 8 bytes each.
     [unroll]
     for( int j = 0; j < 4; j++ )
     {

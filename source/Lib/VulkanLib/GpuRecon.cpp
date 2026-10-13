@@ -804,16 +804,16 @@ void GpuRecon::bindDeferPlanes( const PelStorage& pic )
   }
 }
 
-GpuRecon::SharedTurn::SharedTurn( GpuRecon& recon, SharedReconBuffers* shared ) : m_recon( recon ), m_shared( shared )
+GpuRecon::SharedDeferTurn::SharedDeferTurn( GpuRecon& recon, SharedReconBuffers* shared ) : m_recon( recon ), m_shared( shared )
 {
   if( m_shared )
   {
-    m_lock = std::unique_lock<std::mutex>( m_shared->turn );
+    m_lock = std::unique_lock<std::mutex>( m_shared->deferMutex );
     swapBuffers();
   }
 }
 
-GpuRecon::SharedTurn::~SharedTurn()
+GpuRecon::SharedDeferTurn::~SharedDeferTurn()
 {
   if( m_shared )
   {
@@ -821,7 +821,7 @@ GpuRecon::SharedTurn::~SharedTurn()
   }
 }
 
-void GpuRecon::SharedTurn::swapBuffers()
+void GpuRecon::SharedDeferTurn::swapBuffers()
 {
   std::swap( m_recon.m_defer, m_shared->defer );
 }
@@ -905,8 +905,8 @@ void GpuRecon::startEarlyRows( CodingStructure& cs, const PictureJobs& jobs, siz
 int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
                             PelStorage& pic, bool waitFirst )
 {
-  // With the GPU's parse, what the instances share, held until the picture's rest is submitted (the return)
-  const SharedTurn turn( *this, jobs.shared );
+  // With the GPU's parse, the shared deferred-prediction planes, held until the picture's rest is submitted (the return)
+  const SharedDeferTurn deferTurn( *this, jobs.shared );
   if( m_prepared.picture != cs.picture )
   {
     prepareFilters( cs, deblock, sao, alf );
@@ -1042,12 +1042,10 @@ bool GpuRecon::recordInLoopFilters( const CodingStructure& cs, const PictureJobs
 {
   const bool deblock = m_prepared.deblock;
   const bool sao     = m_prepared.sao;
-  Planes     sets[2] = { planes, Planes{} };   // the twin, and for SAO and ALF the scratch planes
-  int        cur     = 0;                      // where the picture is
   if( deblock )
   {
     static const std::vector<EdgeLists> noEdges;
-    recordDeblock( cs, sets[cur], deblockParams(), jobs.useFrontEnd ? noEdges : *jobs.edges );   // in place
+    recordDeblock( cs, planes, deblockParams(), jobs.useFrontEnd ? noEdges : *jobs.edges );   // in place
   }
   if( sao )
   {
@@ -1055,19 +1053,17 @@ bool GpuRecon::recordInLoopFilters( const CodingStructure& cs, const PictureJobs
     {
       computeBarrier();
     }
-    recordSao( cs, sets[cur], saoParams() );   // in place
+    recordSao( cs, planes, saoParams() );   // in place
   }
   if( alf )
   {
-    sets[1] = scratchPlanes( pic );
     if( deblock || sao )
     {
       computeBarrier();
     }
-    recordAlf( cs, sets[cur], sets[1 - cur], alfParams() );
-    cur = 1 - cur;
+    recordAlf( cs, planes, scratchPlanes( pic ), alfParams() );
   }
-  return cur == 1;
+  return alf;
 }
 
 }   // namespace gpu

@@ -1135,14 +1135,14 @@ void bdofApply( int tid, int w, int h, out int result[PER_THREAD] )
 #endif
 
 // --------------------------------------------------------------------------------------------------------------------
-// tile: a tile whose reference samples all lie inside the picture (nearly every tile; with weighted prediction or
-// GPM's blend too): a 16x16 tile (tile16, with DMVR and BDOF), or a tile of 16x8, 8x16 or 8x8 without them (SbTMVP's
-// pairs of sub-PUs and its sub-PUs, small CUs). All its global reads are issued at once, in loads of 16 and 8 bytes
-// (from 4-byte aligned places), before the first wait for memory: each list's luma window of (w + 7) x (h + 7) samples
-// around its motion (with DMVR, around the merge motion; the search and the refined prediction both read inside it),
-// the chroma windows of (w / 2 + 3) x (h / 2 + 3), and the residuals. DMVR and the filters then work from shared
-// memory. (Reading and waiting one sample at a time, a tile waited for memory some 50 times; the shader is
-// latency-bound: with a third fewer waves per SIMD it ran a third slower.)
+// tile: a 16x16 tile (tile16, with DMVR and BDOF), or a tile of 16x8, 8x16 or 8x8 without them (SbTMVP's pairs of
+// sub-PUs and its sub-PUs, small CUs), with weighted prediction or GPM's blend too. Its reference samples lie inside
+// the picture, or for a 16x16 border tile (edges) near it: then its row reads are clamped into the picture. All its
+// global reads are issued at once, in loads of 16 and 8 bytes from 4-byte aligned places, before the first wait for
+// memory: each list's luma window of (w + 7) x (h + 7) samples around its motion (with DMVR around the merge motion,
+// since the search and the refined prediction both read inside it), the chroma windows of (w / 2 + 3) x (h / 2 + 3),
+// and the residuals. DMVR and the filters then work from shared memory. The shader is latency-bound, so all reads go
+// out before the first wait.
 // In the inter_bdof variant, tile16 also applies BDOF: its steps run in the phases between tile16's barriers, so
 // that a BDOF tile waits at no more barriers than another tile.
 // --------------------------------------------------------------------------------------------------------------------
@@ -3135,7 +3135,7 @@ void affineMain( int tid, int index )
     }
   }
   int pred0[PER_THREAD], pred1[PER_THREAD];
-  // The chroma, one component at a time (reusing luma's prediction arrays).
+  // The chroma, one component at a time.
   const int tw    = w >> chromaScaleX();   // the tile's chroma size
   const int th    = h >> chromaScaleY();
   const int log2C = log2Int( tw );

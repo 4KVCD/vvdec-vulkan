@@ -261,7 +261,7 @@ public:
   // clearColMotion: the colocated motion too, else the picture's first parse
   // task clears it (clearColMotion(), off the parser's thread)
   void initStructData( bool clearColMotion = true );
-  void initCtuData();   // each CTU's place, maps and offsets in m_ctuData (zeroed)
+  void initCtuData();   // sets each CTU's place, maps and offsets in m_ctuData, which must be zeroed before
   void clearColMotion();
 
   // cuMap: the CU map (a CodingUnit pointer a 4x4 block), which a picture the GPU parses never uses; colMotion: the
