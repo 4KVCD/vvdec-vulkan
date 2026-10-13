@@ -780,20 +780,138 @@ void captureSaoAlf( const CodingStructure& cs, int ctuRsAddr, uint32_t out[7] )
            | uint32_t( a.ccAlfFilterControl[0] ) << 16 | uint32_t( a.ccAlfFilterControl[1] ) << 20;
 }
 
+// The parse check's warnings: at most kMaxReports of them for a decoder (ParseStats::reported counts them)
+static constexpr int kMaxReports = 20;
+// The words of the records as the GPU's parse leaves them (GpuFrontEnd.h's layouts), and of a CTU's SAO and ALF
+// parameters (captureSaoAlf's)
+static constexpr size_t kCuWords     = sizeof( CuRecord ) / sizeof( uint32_t );
+static constexpr size_t kTuWords     = sizeof( TuRecord ) / sizeof( uint32_t );
+static constexpr size_t kCtuWords    = sizeof( CtuRecord ) / sizeof( uint32_t );
+static constexpr size_t kSaoAlfWords = 7;
+// A TU record's words from 9 on say where the GPU's parse put the levels, so only the words before are compared (the
+// levels' check compares the levels)
+static constexpr int kTuWordsCompared = 9;
+
+// Whether one more warning may be printed (and if so, it is counted)
+static bool mayReport( ParseStats& stats )
+{
+  if( stats.reported >= kMaxReports )
+  {
+    return false;
+  }
+  stats.reported++;
+  return true;
+}
+
+// The index of the first of the n words in which a and b differ (n when none does)
+static int firstDifference( const uint32_t* a, const uint32_t* b, int n )
+{
+  int w = 0;
+  while( w < n && a[w] == b[w] )
+  {
+    w++;
+  }
+  return w;
+}
+
+// Compares CTU ctu's record, and its SAO and ALF parameters when the CPU's were captured (cpuSaoAlf not null)
+static void compareCtu( int poc, int ctu, const CtuRecord& cpu, const uint32_t* gpu, const uint32_t* cpuSaoAlf, const uint32_t* gpuSaoAlf,
+                        ParseStats& stats )
+{
+  stats.ctusCompared++;
+  bool same = memcmp( cpu.w, gpu, kCtuWords * sizeof( uint32_t ) ) == 0;
+  if( cpuSaoAlf )
+  {
+    same = same && memcmp( cpuSaoAlf, gpuSaoAlf, kSaoAlfWords * sizeof( uint32_t ) ) == 0;
+  }
+  if( same )
+  {
+    return;
+  }
+  stats.ctusDiffer++;
+  if( mayReport( stats ) )
+  {
+    msg( WARNING, "GPU parse: POC %d CTU %d: CPU %08x %08x %08x %08x, GPU %08x %08x %08x %08x\n", poc, ctu, cpu.w[0], cpu.w[1], cpu.w[2], cpu.w[3],
+         gpu[0], gpu[1], gpu[2], gpu[3] );
+    if( cpuSaoAlf )
+    {
+      const uint32_t* c = cpuSaoAlf;
+      const uint32_t* o = gpuSaoAlf;
+      msg( WARNING, "  SAO/ALF CPU %08x %08x %08x %08x %08x %08x %08x, GPU %08x %08x %08x %08x %08x %08x %08x\n", c[0], c[1], c[2], c[3], c[4], c[5],
+           c[6], o[0], o[1], o[2], o[3], o[4], o[5], o[6] );
+    }
+  }
+}
+
+// Compares a CTU's CU records, the CPU's cus with the GPU's at gpu (as many)
+static void compareCus( int poc, int ctu, const std::vector<CuRecord>& cus, const uint32_t* gpu, ParseStats& stats )
+{
+  for( size_t i = 0; i < cus.size(); i++ )
+  {
+    const uint32_t* c = cus[i].w;
+    const uint32_t* g = gpu + kCuWords * i;
+    if( memcmp( c, g, sizeof( CuRecord ) ) == 0 )
+    {
+      continue;
+    }
+    stats.cusDiffer++;
+    if( mayReport( stats ) )
+    {
+      const int w = firstDifference( c, g, int( kCuWords ) );
+      msg( WARNING, "GPU parse: POC %d CTU %d CU %d (%d,%d %dx%d, chroma (%d,%d)): word %d CPU %08x GPU %08x\n", poc, ctu, int( i ), int( c[0] & 0xffff ),
+           int( c[0] >> 16 ), int( c[1] & 0xff ), int( ( c[1] >> 8 ) & 0xff ), int( c[19] & 0xffff ), int( c[19] >> 16 ), w, c[w], g[w] );
+    }
+  }
+}
+
+// Compares a CTU's TU records, the CPU's tus with the GPU's at gpu (as many), in their first kTuWordsCompared words
+static void compareTus( int poc, int ctu, const std::vector<TuRecord>& tus, const uint32_t* gpu, ParseStats& stats )
+{
+  for( size_t i = 0; i < tus.size(); i++ )
+  {
+    const uint32_t* c = tus[i].w;
+    const uint32_t* g = gpu + kTuWords * i;
+    if( memcmp( c, g, kTuWordsCompared * sizeof( uint32_t ) ) == 0 )
+    {
+      continue;
+    }
+    stats.tusDiffer++;
+    if( mayReport( stats ) )
+    {
+      const int w = firstDifference( c, g, kTuWordsCompared );
+      msg( WARNING, "GPU parse: POC %d CTU %d TU %d (%d,%d %dx%d) of CU %u: word %d CPU %08x GPU %08x\n", poc, ctu, int( i ), int( c[0] & 0xffff ),
+           int( c[0] >> 16 ), int( c[1] & 0xff ), int( ( c[1] >> 8 ) & 0xff ), c[8], w, c[w], g[w] );
+    }
+  }
+}
+
+// Adds the levels' check, as parsecompact.slang's CHECK counted it: levels[0] compared, levels[1] differing, the first
+// differing one in TU levels[2] - 1 of gpuTus, component levels[3]
+static void addLevels( int poc, const uint32_t* levels, const uint32_t* gpuTus, ParseStats& stats )
+{
+  stats.levelsCompared += levels[0];
+  stats.levelsDiffer += levels[1];
+  if( levels[1] != 0 && mayReport( stats ) )
+  {
+    const uint32_t  t = levels[2] - 1;
+    const uint32_t* g = gpuTus + kTuWords * t;
+    msg( WARNING, "GPU parse: POC %d levels: %u of %u differ, the first in TU %u (%d,%d %dx%d) component %u\n", poc, levels[1], levels[0], t,
+         int( g[0] & 0xffff ), int( g[0] >> 16 ), int( g[1] & 0xff ), int( ( g[1] >> 8 ) & 0xff ), levels[3] );
+  }
+}
+
 void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint32_t* gpuTus, const uint32_t* gpuCtus, const uint32_t* gpuCtuOut,
                    const std::vector<std::vector<CuRecord>>& cpuCus, const std::vector<std::vector<TuRecord>>& cpuTus,
                    const std::vector<uint32_t>& cpuSaoAlf, const uint32_t* levels, uint32_t errors, ParseStats& stats )
 {
-  const PreCalcValues& pcv  = *cs.pcv;
-  const int            ctus = int( pcv.sizeInCtus );
-  const int            poc  = cs.picture->poc;
+  const int ctus = int( cs.pcv->sizeInCtus );
+  const int poc  = cs.picture->poc;
   stats.pictures++;
   if( errors != 0 )
   {
     stats.errors++;
-    if( stats.reported < 20 )
+    if( mayReport( stats ) )
     {
-      stats.reported++;
       msg( WARNING, "GPU parse: POC %d: %u substreams gave up\n", poc, errors );
     }
   }
@@ -802,100 +920,26 @@ void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint
   writeCtuRecords( cs, cpuCus, cpuTus, cpuCtus.data() );
   for( int ctu = 0; ctu < ctus; ctu++ )
   {
-    // The CTU's record, and its SAO and ALF parameters when the CPU's were captured
-    stats.ctusCompared++;
-    bool same = memcmp( cpuCtus[ctu].w, gpuCtus + 4 * ctu, 4 * sizeof( uint32_t ) ) == 0;
-    if( !cpuSaoAlf.empty() )
-    {
-      same = same && memcmp( cpuSaoAlf.data() + 7 * ctu, gpuCtuOut + kParseCtuOutWords * ctu + 2, 7 * sizeof( uint32_t ) ) == 0;
-    }
-    if( !same )
-    {
-      stats.ctusDiffer++;
-      if( stats.reported < 20 )
-      {
-        stats.reported++;
-        const uint32_t* g = gpuCtus + 4 * ctu;
-        msg( WARNING, "GPU parse: POC %d CTU %d: CPU %08x %08x %08x %08x, GPU %08x %08x %08x %08x\n", poc, ctu, cpuCtus[ctu].w[0], cpuCtus[ctu].w[1],
-             cpuCtus[ctu].w[2], cpuCtus[ctu].w[3], g[0], g[1], g[2], g[3] );
-        if( !cpuSaoAlf.empty() )
-        {
-          const uint32_t* c = cpuSaoAlf.data() + 7 * ctu;
-          const uint32_t* o = gpuCtuOut + kParseCtuOutWords * ctu + 2;
-          msg( WARNING, "  SAO/ALF CPU %08x %08x %08x %08x %08x %08x %08x, GPU %08x %08x %08x %08x %08x %08x %08x\n", c[0], c[1], c[2], c[3], c[4], c[5],
-               c[6], o[0], o[1], o[2], o[3], o[4], o[5], o[6] );
-        }
-      }
-    }
+    const uint32_t* gpuCtu = gpuCtus + kCtuWords * ctu;
+    const uint32_t* out    = gpuCtuOut + kParseCtuOutWords * ctu;
+    compareCtu( poc, ctu, cpuCtus[ctu], gpuCtu, cpuSaoAlf.empty() ? nullptr : cpuSaoAlf.data() + kSaoAlfWords * ctu, out + 2, stats );
     // The CTU's CUs and TUs, record by record, when the GPU's parse found as many of each as the CPU's; otherwise all
-    // of them count as differing
-    const uint32_t first   = gpuCtus[4 * ctu];
-    const uint32_t count   = gpuCtus[4 * ctu + 1] & 0xffff;
-    const uint32_t firstTu = gpuCtus[4 * ctu + 3];
-    const auto&    cus     = cpuCus[ctu];
-    const auto&    tus     = cpuTus[ctu];
+    // of them count as differing. (The CTU record holds its first CU and their count, and its first TU; the CTU's
+    // output holds its TU count.)
+    const auto& cus = cpuCus[ctu];
+    const auto& tus = cpuTus[ctu];
     stats.cusCompared += int64_t( cus.size() );
     stats.tusCompared += int64_t( tus.size() );
-    if( count != cus.size() || uint32_t( gpuCtuOut[kParseCtuOutWords * ctu + 1] ) != tus.size() )
+    if( ( gpuCtu[1] & 0xffff ) != cus.size() || out[1] != tus.size() )
     {
       stats.cusDiffer += int64_t( cus.size() );
       stats.tusDiffer += int64_t( tus.size() );
       continue;
     }
-    for( size_t i = 0; i < cus.size(); i++ )
-    {
-      const uint32_t* g = gpuCus + 32 * ( first + i );
-      if( memcmp( cus[i].w, g, sizeof( CuRecord ) ) != 0 )
-      {
-        stats.cusDiffer++;
-        if( stats.reported < 20 )
-        {
-          stats.reported++;
-          int w = 0;
-          while( w < 32 && cus[i].w[w] == g[w] )
-          {
-            w++;
-          }
-          msg( WARNING, "GPU parse: POC %d CTU %d CU %d (%d,%d %dx%d, chroma (%d,%d)): word %d CPU %08x GPU %08x\n", poc, ctu, int( i ),
-               int( cus[i].w[0] & 0xffff ), int( cus[i].w[0] >> 16 ), int( cus[i].w[1] & 0xff ), int( ( cus[i].w[1] >> 8 ) & 0xff ),
-               int( cus[i].w[19] & 0xffff ), int( cus[i].w[19] >> 16 ), w, w < 32 ? cus[i].w[w] : 0u, w < 32 ? g[w] : 0u );
-        }
-      }
-    }
-    for( size_t i = 0; i < tus.size(); i++ )
-    {
-      // (the words from 9 on say where the GPU's parse put the levels: the levels' check compares those)
-      static constexpr int kTuWordsCompared = 9;
-      const uint32_t*      g                = gpuTus + 16 * ( firstTu + i );
-      if( memcmp( tus[i].w, g, kTuWordsCompared * sizeof( uint32_t ) ) != 0 )
-      {
-        stats.tusDiffer++;
-        if( stats.reported < 20 )
-        {
-          stats.reported++;
-          int w = 0;
-          while( w < kTuWordsCompared && tus[i].w[w] == g[w] )
-          {
-            w++;
-          }
-          msg( WARNING, "GPU parse: POC %d CTU %d TU %d (%d,%d %dx%d) of CU %u: word %d CPU %08x GPU %08x\n", poc, ctu, int( i ),
-               int( tus[i].w[0] & 0xffff ), int( tus[i].w[0] >> 16 ), int( tus[i].w[1] & 0xff ), int( ( tus[i].w[1] >> 8 ) & 0xff ), tus[i].w[8], w,
-               w < 16 ? tus[i].w[w] : 0u, w < 16 ? g[w] : 0u );
-        }
-      }
-    }
+    compareCus( poc, ctu, cus, gpuCus + kCuWords * gpuCtu[0], stats );
+    compareTus( poc, ctu, tus, gpuTus + kTuWords * gpuCtu[3], stats );
   }
-  // The levels, as parsecompact.slang's check counted them
-  stats.levelsCompared += levels[0];
-  stats.levelsDiffer += levels[1];
-  if( levels[1] != 0 && stats.reported < 20 )
-  {
-    stats.reported++;
-    const uint32_t  t = levels[2] - 1;
-    const uint32_t* g = gpuTus + 16 * t;
-    msg( WARNING, "GPU parse: POC %d levels: %u of %u differ, the first in TU %u (%d,%d %dx%d) component %u\n", poc, levels[1], levels[0], t,
-         int( g[0] & 0xffff ), int( g[0] >> 16 ), int( g[1] & 0xff ), int( ( g[1] >> 8 ) & 0xff ), levels[3] );
-  }
+  addLevels( poc, levels, gpuTus, stats );
 }
 
 }   // namespace gpu

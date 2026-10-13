@@ -130,7 +130,7 @@ struct ParseStats
   int64_t ctusDiffer     = 0;   // CTUs whose record or SAO / ALF parameters differ
   int64_t levelsCompared = 0;
   int64_t levelsDiffer   = 0;
-  int     reported       = 0;   // the differences printed so far (compareParse prints at most 20)
+  int     reported       = 0;   // the differences printed so far (compareParse prints at most 20: kMaxReports)
   int64_t substreams     = 0;
   int64_t runs           = 0;    // the substreams' runs: one per substream and dispatch until the substream is parsed
   int64_t submissions    = 0;    // the parse's submissions (GpuRecon::runParse)
