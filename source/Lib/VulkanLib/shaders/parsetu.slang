@@ -125,31 +125,29 @@ int addTu( int4 luma, bool lumaValid, int4 chroma, bool chromaValid )
   setTuWord( t, 2, chromaValid ? uint( chroma.x ) | uint( chroma.y ) << 16 : 0u );
   setTuWord( t, 3, chromaValid ? uint( chroma.z ) | uint( chroma.w ) << 8 | 1u << 16 : 0u );
   setTuWord( t, 4, uint( g_p.chType ) << 10 );
-  for( int w = 5; w < 16; w++ )
+  // Words 5 to 15 start at zero: threads 5 to 15 clear one each
+  if( g_lane >= 5 && g_lane < 16 )
   {
-    setTuWord( t, w, 0u );
+    s_tu[t * 16 + g_lane] = 0u;
   }
   setTuWord( t, 8, uint( g_cu.local ) );
   return t;
 }
 
 // Writes the CU's TU records as the staged records from at on (as far as there is room), each with its meta word: the
-// CTU << kLocalBits | the TU's index among the CTU's TUs
+// CTU << kLocalBits | the TU's index among the CTU's TUs. The threads store the records together, one word each: the
+// CU's records are 16 words a TU, one after another in s_tu and in pc.tus alike.
 void writeTuRecords( uint at )
 {
-  for( int t = 0; t < g_cu.numTus; t++ )
+  const uint room   = uint( pc.tuCap ) > at ? uint( pc.tuCap ) - at : 0u;
+  const int  stored = int( min( uint( g_cu.numTus ), room ) );   // the TUs there is room for
+  for( int w = g_lane; w < stored * 16; w += 32 )
   {
-    const uint i = at + uint( t );
-    if( i >= uint( pc.tuCap ) )
-    {
-      break;
-    }
-    uint* r = pc.tus + i * 16u;
-    for( int w = 0; w < 16; w++ )
-    {
-      r[w] = tuWord( t, w );
-    }
-    pc.tuMeta[i] = uint( g_ctu ) << kLocalBits | uint( g_cu.firstTu + t );
+    pc.tus[at * 16u + uint( w )] = s_tu[w];
+  }
+  if( g_lane < stored )
+  {
+    pc.tuMeta[at + uint( g_lane )] = uint( g_ctu ) << kLocalBits | uint( g_cu.firstTu + g_lane );
   }
 }
 
