@@ -2,9 +2,9 @@
 // LoopFilter::calcFilterStrengths does, from the parsed CUs and TUs
 // (GpuFrontEnd.h's records) and the motion the GPU derived
 // (shaders/mider.slang). The output is one LoopFilterParam per 4x4 luma block
-// and direction -- the edge's boundary strengths, QPs, filter lengths and
-// flags -- laid out as vvdec keeps them: CTU by CTU, first the vertical edges,
-// then the horizontal ones.
+// and direction, which holds the edge's boundary strengths, QPs, filter
+// lengths and flags. The parameters are laid out as vvdec keeps them: CTU by
+// CTU, first the vertical edges, then the horizontal ones.
 //
 // A CU writes only the parameters of the edges of its own blocks (the Q side
 // of each edge), reading its neighbours' records. There are three passes:

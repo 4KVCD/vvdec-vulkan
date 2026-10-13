@@ -65,11 +65,11 @@ namespace vvdec
 namespace gpu
 {
 
-// The job shaders find their job at workgroup x + kGroupsPerRow * workgroup y (dispatchJobs; common.slang's
-// workgroupIndex).
+// Dispatches of one workgroup per job lay their workgroups out in rows of kGroupsPerRow, so a job shader finds its job
+// at x + kGroupsPerRow * y of its workgroup (dispatchJobs; common.slang's workgroupIndex does the same).
 static constexpr size_t kGroupsPerRow = 32768;
-// The word of the front end's argument buffer where the passes' job counts begin (FrontPass; common.slang's
-// kFrontCounts)
+// The first word of the passes' job counts in the front end's argument buffer (see FrontPass; common.slang's
+// kFrontCounts must match it).
 static constexpr size_t kFrontCounts = 32;
 
 // ====================================================================================================================

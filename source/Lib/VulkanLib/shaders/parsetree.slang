@@ -861,8 +861,8 @@ bool ctuAboveAvailable()
 }
 
 // Parses the CTU's SAO parameters (CABACReader::sao) and writes 2 ctuOut words per component, from word 2: modeIdc |
-// typeIdc << 4 | typeAuxInfo << 8, then the 4 offsets as bytes -- a band offset's in band order from its first band
-// (typeAuxInfo), an edge offset's of the classes 0, 1, 3 and 4. A merge stays SAO_MODE_MERGE with typeIdc 0 (left)
+// typeIdc << 4 | typeAuxInfo << 8, then the 4 offsets as bytes. A band offset's are in band order from its first
+// band (typeAuxInfo); an edge offset's are those of the classes 0, 1, 3 and 4. A merge stays SAO_MODE_MERGE with typeIdc 0 (left)
 // or 1 (above), as vvdec's parse leaves it.
 void sao()
 {

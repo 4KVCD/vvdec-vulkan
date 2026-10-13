@@ -1236,8 +1236,8 @@ void mmvdMergeIdx()
   g_cu.mmvdIdx = var0 * 32 + var1 * 4 + var2;
 }
 
-// Parses a merge CU's merge data (CABACReader::merge_data): which merge mode it uses -- subblock (affine), regular,
-// MMVD, CIIP or GPM -- and its indices
+// Parses a merge CU's merge data (CABACReader::merge_data): the merge mode it uses (subblock, regular, MMVD, CIIP or
+// GPM) and its indices.
 void mergeData()
 {
   if( cuIsIbc() )

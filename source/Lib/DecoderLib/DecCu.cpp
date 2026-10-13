@@ -439,12 +439,13 @@ void DecCu::xGpuIntraJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu
         const int sx = getComponentScaleX( compID, cu.chromaFormat );
         const int sy = getComponentScaleY( compID, cu.chromaFormat );
         const int lx = area.x << sx, ly = area.y << sy, lw = area.width << sx, lh = area.height << sy;
-        // No further right than the CTU right of the block's, and no further
-        // down than the bottom of the block's CTU row: CCLM's luma is never
-        // there. On the GPU (jobs.slang's jobRects, which must match), the CTU
-        // after it in the row above may or may not have its waves yet, and so
-        // may the CTUs below (a row whose CTUs have no intra jobs waits for
-        // nothing): the waves would vary from run to run.
+        // The rectangle ends at the CTU to the right of the block's CTU and at
+        // the bottom of the block's CTU row, because CCLM never reads luma
+        // samples beyond those. Reading further would also make the waves
+        // depend on timing on the GPU (jobs.slang's jobRects must match this
+        // rectangle): there, the next CTU in the row above may not have its
+        // waves yet, and the rows below may already have theirs, since a row
+        // whose CTUs have no intra jobs never waits for the row above.
         const int ctuLog2 = getLog2( cu.cs->pcv->maxCUWidth );
         const int right   = ( ( lx >> ctuLog2 ) + 2 ) << ctuLog2;
         const int bottom  = ( ( ly >> ctuLog2 ) + 1 ) << ctuLog2;

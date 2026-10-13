@@ -55,8 +55,9 @@ static const int kBlock = 1024;
 static const int kArgsBlocks = 50;
 static const int kArgsSingle = 53;
 
-// An intra job's words (GpuJobs.h's IntraJob): word 1 holds its width and height in samples (bits 0-7 and 8-15), word
-// kWaveWord its wave (jobs.slang), which a band's copy replaces with the band's rows (first | count << 16)
+// The words of an intra job (GpuJobs.h's IntraJob) that this pass uses. Word 1 holds the block's width and height in
+// samples (bits 0-7 and 8-15). Word kWaveWord holds the job's wave, which jobs.slang sets; in a band's copy of the job,
+// that word holds the band's rows instead (first | count << 16).
 static const int kJobWords = 12;
 static const int kWaveWord = 7;
 
@@ -80,7 +81,7 @@ uint waveOf( uint index )
   return jobAt( index )[kWaveWord];
 }
 
-// The rows of the job's bands: as many as hold kBand samples, one at least
+// Returns how many of the job's rows each of its bands holds: as many as fit in kBand samples, and at least one.
 int bandRows( uint* job )
 {
   return max( 1, kBand / jobWidth( job ) );
@@ -143,8 +144,8 @@ void sort1024( int tid )
   }
 }
 
-// Writes job's bands into the sorted list from place first on: each band a copy of the job's words, with its rows in
-// word kWaveWord (the first | the count << 16). With withWaits, each band's wait (pc.waits) too.
+// Writes the job's bands into the sorted list, starting at place `first`. Each band is a copy of the job's words with
+// the band's rows in word kWaveWord (first | count << 16). With withWaits, it also writes each band's wait (pc.waits).
 void writeJobBands( uint* job, uint first, bool withWaits, uint wait )
 {
   const int rows = bandRows( job );
@@ -168,7 +169,7 @@ void writeJobBands( uint* job, uint first, bool withWaits, uint wait )
   }
 }
 
-// Stores the number of bands, and intra's indirect arguments (intra.slang runs a workgroup per band)
+// Stores the total number of bands and the indirect arguments of the intra pass, which runs one workgroup per band.
 void storeBandTotal( uint total )
 {
   pc.bandSums[pc.numBlocks] = total;
@@ -448,7 +449,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       pc.waveFirst[wave] = first;
     }
-    writeJobBands( job, first, false, 0u );   // (their waits: WAITS, once every wave's first band is known)
+    writeJobBands( job, first, false, 0u );   // (WAITS writes the waits once every wave's first band is known)
     return;
   }
   if( pc.pass == 4 )

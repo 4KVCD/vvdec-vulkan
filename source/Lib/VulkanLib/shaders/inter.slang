@@ -2927,7 +2927,8 @@ int2 affineVer( uint job[24], int list )
   return list == 0 ? int2( int( job[15] ), int( job[16] ) ) : int2( int( job[19] ), int( job[20] ) );
 }
 
-// An affine pair's tile and CU, from the pair's words: the tile at (x, y), w x h; its CU at (cuX, cuY), cw x ch
+// The tile and the CU of an affine pair, read from the pair's job words. The tile lies at (x, y) and is w x h; its CU
+// lies at (cuX, cuY) and is cw x ch.
 struct AffineArea
 {
   int x, y, w, h;
@@ -2948,8 +2949,9 @@ AffineArea affineArea( uint job[24] )
   return a;
 }
 
-// A list's flags in the pair's word 12: PROF, and the motion spread too far for subblocks (every subblock then takes
-// the motion of the CU's centre: isSubblockVectorSpreadOverLimit)
+// Two flags of each list in the pair's word 12. affineProfOf tells whether PROF refines the list's prediction.
+// affineSpreadOf tells whether the list's motion spreads too far for subblocks (isSubblockVectorSpreadOverLimit), in
+// which case every subblock takes the motion of the CU's centre.
 bool affineProfOf( uint job[24], int list )
 {
   return ( ( job[12] >> ( 16 + list ) ) & 1 ) != 0;
@@ -2960,7 +2962,7 @@ bool affineSpreadOf( uint job[24], int list )
   return ( ( job[12] >> ( 18 + list ) ) & 1 ) != 0;
 }
 
-// The motion of the CU's luma subblock (sx, sy) (a: the pair's tile and CU).
+// Returns the motion of luma subblock (sx, sy) of the pair's CU (a holds the pair's tile and CU).
 int2 affineMv( uint job[24], int list, AffineArea a, int sx, int sy )
 {
   const int2 base = affineBase( job, list );

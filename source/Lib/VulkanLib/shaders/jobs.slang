@@ -1303,8 +1303,8 @@ void wpJob( int bcw, uint* jslice, int refIdx0, int refIdx1, uint flags, inout u
   w[11] = ( uint( offset[1][0] ) & 255 ) | ( uint( offset[1][1] ) & 255 ) << 8 | ( uint( offset[1][2] ) & 255 ) << 16 | uint( n == 2 ) << 24;
 }
 
-// A block that motionCompensation predicts with one motion: a translational CU's (mcBlock), or a run of SbTMVP sub-PUs
-// (sbtmvpJobs)
+// A block that motionCompensation predicts with a single motion: a translational CU (mcBlock), or a run of SbTMVP
+// sub-PUs that share their motion (sbtmvpJobs).
 struct McBlock
 {
   uint flags;       // its jobs' flags: the CU's, the lists (setMcLists), DMVR and BDOF
@@ -1343,7 +1343,8 @@ void setMcLists( uint* slice, uint* jslice, bool dmvr, inout McBlock b )
   b.flags |= lists;
 }
 
-// The job of b's tile at (x, y), tileW x tileH; dmvrIndex: the tile's DMVR refinement's
+// Writes into w the job of block b's tile at (x, y), which is tileW x tileH. dmvrIndex is the index of the tile's DMVR
+// refinement.
 void mcTile( McBlock b, uint* jslice, int x, int y, int tileW, int tileH, int dmvrIndex, inout uint w[12] )
 {
   setInter( w, x, y, tileW, tileH, b.flags, b.mv[0], b.mv[1], b.pos.x, b.pos.y, b.ref[0], b.ref[1], dmvrIndex );
@@ -1356,8 +1357,7 @@ void mcTile( McBlock b, uint* jslice, int x, int y, int tileW, int tileH, int dm
   wpJob( b.bcw, jslice, b.refIdx[0], b.refIdx[1], b.flags, w );
 }
 
-// Emits the jobs of a translational CU, which motionCompensation predicts with the CU's motion, in tiles of up to
-// 16 x 16. flags: the CU's job flags.
+// Emits the jobs of a translational CU in tiles of up to 16 x 16. flags holds the CU's job flags.
 void mcBlock( Cu cu, Motion m, uint* slice, uint* jslice, uint flags, inout Out o )
 {
   const int4 area = cu.blk[0];
@@ -1728,9 +1728,9 @@ int waveShiftYOf( int c ) { return 2 - ( c == 0 ? 0 : pc.csy ); }
 int waveWidthOf( int c ) { return ( ( pc.width >> ( c == 0 ? 0 : pc.csx ) ) + ( 1 << waveShiftXOf( c ) ) - 1 ) >> waveShiftXOf( c ); }
 int waveHeightOf( int c ) { return ( ( pc.height >> ( c == 0 ? 0 : pc.csy ) ) + ( 1 << waveShiftYOf( c ) ) - 1 ) >> waveShiftYOf( c ); }
 
-// The map's layout (the names ending in 0 for luma, in 1 for chroma), its tag and its planes, which the WAVES pass
-// reads from the parameters into registers once (loadWaveLayout): in the per-job code, each read of a parameter was a
-// load from memory and a wait.
+// The wave map's layout (the names ending in 0 are luma's, those ending in 1 chroma's), its tag and its planes.
+// loadWaveLayout reads them from the parameters into registers once, because in the per-job code each read of a
+// parameter would be a load from memory and a wait.
 static int   g_shX0, g_shX1, g_shY0, g_shY1, g_mapW0, g_mapW1, g_mapH0, g_mapH1, g_planeSize;
 static int   g_ctuUnits;   // the units a CTU side has
 static uint  g_waveTag;
@@ -1755,8 +1755,9 @@ int waveShiftX( int c ) { return c == 0 ? g_shX0 : g_shX1; }
 int waveShiftY( int c ) { return c == 0 ? g_shY0 : g_shY1; }
 int waveWidth( int c ) { return c == 0 ? g_mapW0 : g_mapW1; }
 int waveHeight( int c ) { return c == 0 ? g_mapH0 : g_mapH1; }
-// A wave-map entry: the wave | the tag of the picture that wrote it << 16. An entry of another picture is wave 0,
-// as the map was zeroed for each picture before (GpuRecon zeroes it only when the tags wrap around).
+// Returns the wave in a wave-map entry, which holds the wave | the tag of the picture that wrote it << 16. An entry
+// written for another picture reads as wave 0, as if the map were zeroed for each picture (GpuRecon zeroes it only
+// when the tags wrap around).
 int mapWave( uint v )
 {
   return ( v >> 16 ) == g_waveTag ? int( v & 0xffffu ) : 0;
@@ -1767,14 +1768,15 @@ uint* waveRow( int c, int j )
   return g_waveMap + c * g_planeSize + j * waveWidth( c );
 }
 
-// A rectangle of component c's map in units (WaveMap::maxIn's): its first unit (x0, y0), its width, its number of
-// units (0: empty)
+// A rectangle of units in component c's wave map, as WaveMap::maxIn takes it: its first unit (x0, y0), its width in
+// units (cols) and its number of units (n, 0 for an empty rectangle).
 struct MapRect
 {
   int c, x0, y0, cols, n;
 };
 
-// The units of component c's map that the rectangle of samples (x, y, width, height) covers, cut at the map's edges
+// Returns the units of component c's map that the rectangle of samples (x, y, width, height) covers, clipped to the
+// map.
 MapRect mapRect( int c, int x, int y, int width, int height )
 {
   MapRect r;
@@ -1796,15 +1798,17 @@ MapRect noRect()
 }
 
 #if defined( WAVES )
-// The current CTU's units of the wave map, per component (CTU / 4 units a side, at most WAVE_U), each the wave | the
-// CTU's tag << 16: an entry of another CTU reads as wave 0, as an entry of another picture does in memory.
+// The wave-map units of the current CTU, per component (the CTU's size / 4 units a side, at most WAVE_U). Each entry
+// holds the wave | the CTU's tag << 16, so an entry left by another CTU reads as wave 0, as an entry of another
+// picture does in memory.
 #define WAVE_U 32
 groupshared uint s_ctuWaves[3 * WAVE_U * WAVE_U];
 static int  g_ctuUx, g_ctuUy;   // the current CTU's first unit (the same in all components' maps)
 static uint g_ctuTag;           // the current CTU's tag: its column + 1
 #endif
 
-// The map's entry of unit u of rectangle r (u < r.n): a unit of the current CTU from shared memory (WAVES)
+// Returns the map entry of unit u of rectangle r (u < r.n). In the WAVES pass, a unit of the current CTU comes from
+// shared memory.
 uint rectUnit( MapRect r, int u )
 {
   const int j = r.y0 + int( ( float( u ) + 0.5f ) / float( r.cols ) );   // (exactly u / cols, since u and cols are small)
@@ -1820,7 +1824,8 @@ uint rectUnit( MapRect r, int u )
   return waveRow( r.c, j )[x];
 }
 
-// The highest wave of the thread's units of rectangle r past its first 32 (most rectangles have no more)
+// Returns the highest wave among the calling thread's units of rectangle r beyond the first 32 (most rectangles have
+// no more).
 int restMax( MapRect r, int lane )
 {
   int wave = 0;
@@ -1831,8 +1836,9 @@ int restMax( MapRect r, int lane )
   return wave;
 }
 
-// The highest wave in five rectangles, worked out by the row's 32 threads (lane is the calling thread's): each
-// thread reads its unit of every rectangle's first 32 at once, then the rest of the larger rectangles
+// Returns the highest wave in five rectangles, worked out by the row's 32 threads together (lane is the calling
+// thread's). Each thread first reads its unit among the first 32 of every rectangle, all at once, then its units of
+// the rest of the larger rectangles.
 int gatherMax( MapRect r0, MapRect r1, MapRect r2, MapRect r3, MapRect r4, int lane )
 {
   const uint v0 = lane < r0.n ? rectUnit( r0, lane ) : 0u;
@@ -1849,8 +1855,8 @@ int gatherMax( MapRect r0, MapRect r1, MapRect r2, MapRect r3, MapRect r4, int l
   return WaveActiveMax( wave );
 }
 
-// WaveMap::set for the units of rectangle w (the current CTU's job's block) by the 32 threads of a row's workgroup,
-// each thread taking every 32nd unit: in the map in memory and in the CTU's units in shared memory.
+// WaveMap::set: writes `wave` into the units of rectangle w (the block of a job of the current CTU), in the map in
+// memory and in the CTU's units in shared memory. The row's 32 threads share the work, each taking every 32nd unit.
 void waveSetRect( MapRect w, int wave, int lane )
 {
   const float rcp = 1.0f / float( max( w.cols, 1 ) );   // (exactly u / cols, since u and cols are small)
@@ -1865,8 +1871,8 @@ void waveSetRect( MapRect w, int wave, int lane )
   }
 }
 
-// A rectangle in two words: x0 | y0 << 16, cols | n << 8 | c << 24 (a rectangle's cols are below 256 and its units
-// below 65536; when n is 0 the rest does not matter)
+// Packs a rectangle into two words: x0 | y0 << 16, and cols | n << 8 | c << 24. A rectangle's cols stay below 256 and
+// its units below 65536; when n is 0, the other fields do not matter.
 uint2 packRect( MapRect r )
 {
   return uint2( uint( r.x0 ) | uint( r.y0 ) << 16, ( uint( r.cols ) & 0xffu ) | uint( r.n ) << 8 | uint( r.c ) << 24 );
@@ -1883,8 +1889,9 @@ MapRect unpackRect( uint2 p )
   return r;
 }
 
-// The wave-map rectangles of an intra job (its 12 words), packed (packRect): the five it reads (IBC's block or the
-// reference lines above and left, LMCS's neighbours, CCLM's luma) and the one it writes (its own block)
+// Returns the wave-map rectangles of an intra job, given its 12 words, packed by packRect: the five it reads (IBC's
+// reference block or the reference lines above and left, LMCS's neighbours and CCLM's luma) and the one it writes
+// (its own block).
 void jobRects( uint job[12], out uint2 packed[6] )
 {
   const int  x     = int( job[0] & 0xffff );
@@ -1949,7 +1956,7 @@ void jobRects( uint job[12], out uint2 packed[6] )
   }
   if( kind == kIntraCclm )
   {
-    // (as DecCu's: up to the CTU right of the block's and down to the bottom of its CTU row)
+    // (The same rectangle as DecCu's, which explains its limits.)
     const int lx     = x << pc.csx, ly = y << pc.csy, lw = w << pc.csx, lh = h << pc.csy;
     const int right  = ( ( lx >> pc.log2Ctu ) + 2 ) << pc.log2Ctu;
     const int bottom = ( ( ly >> pc.log2Ctu ) + 1 ) << pc.log2Ctu;
@@ -1972,7 +1979,8 @@ groupshared int   s_row;
 groupshared int2  s_jobRange[32];   // the intra jobs of the 32 CTUs being walked: [first, end)
 groupshared uint4 s_rects[3 * 32];  // the packed rectangles (jobRects) of the 32 jobs at hand, 3 x 4 words each
 
-// The intra jobs of CTU ctu: from the first job of its first CU up to the first job of the next CTU's first CU
+// Returns the range of CTU ctu's intra jobs: from the first job of its first CU up to the first job of the next
+// CTU's first CU.
 int2 intraJobRange( int ctu )
 {
   const int first = int( pc.ctus[ctu * 4] );
@@ -1988,9 +1996,9 @@ int2 intraJobRange( int ctu )
   return int2( begin, min( end, pc.capIntra ) );
 }
 
-// WAVES: one workgroup of 32 threads per CTU row; the rows are taken in order (from a counter) and run as the
-// wavefront of vvdec's CTU tasks: a CTU with intra jobs waits until the row above is past the CTU above-right (its
-// jobs read samples up to there). A CTU without intra jobs reads and writes no wave, so it waits for nothing.
+// WAVES runs one workgroup of 32 threads per CTU row. The rows are taken in order from a counter and advance as the
+// wavefront of vvdec's CTU tasks: a CTU with intra jobs waits until the row above is past the CTU above-right, since
+// its jobs read samples up to there. A CTU without intra jobs reads and writes no waves, so it waits for nothing.
 [shader( "compute" )]
 [numthreads( 32, 1, 1 )]
 void main( uint3 local : SV_GroupThreadID )
@@ -2040,7 +2048,7 @@ void main( uint3 local : SV_GroupThreadID )
       }
       for( int base = range.x; base < range.y; base += 32 )
       {
-        // The next 32 jobs' rectangles, a job a thread
+        // The rectangles of the next 32 jobs, one job per thread
         const int count = min( 32, range.y - base );
         if( lane < count )
         {
@@ -2058,7 +2066,8 @@ void main( uint3 local : SV_GroupThreadID )
           s_rects[lane * 3 + 2] = uint4( packed[4], packed[5] );
         }
         GroupMemoryBarrierWithGroupSync();
-        // Then in order: each job's wave, one above the highest of what it reads, into its word 7 and its units
+        // Then, in order, each job's wave: one above the highest wave it reads. It goes into the job's word 7 and into
+        // its units.
         for( int k = 0; k < count; k++ )
         {
           const uint4 a    = WaveReadLaneFirst( s_rects[k * 3] );

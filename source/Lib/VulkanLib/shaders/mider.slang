@@ -896,13 +896,15 @@ int neighbourCu( Cur cur, int2 p, NeighbourWords n )
   return k >= 0 && ( g_nbAvail & ( 1u << k ) ) != 0 ? n.idx : -1;
 }
 
-// The kind of motion spanMotion and the others wrote into the block's word 4 (packBlockWord)
+// Returns the kind of motion that the CU's writer (spanMotion or another) stored in the block's word 4 (see
+// packBlockWord).
 int blockKind( NeighbourWords n )
 {
   return int( ( n.w >> 16 ) & 0xff );
 }
 
-// A translational CU's BCW index and AMVR's half-sample flag, from the block's word 4 (packBlockWord)
+// blockBcw and blockHpel return a translational CU's BCW index and AMVR half-sample flag from the block's word 4 (see
+// packBlockWord).
 int blockBcw( NeighbourWords n )
 {
   return int( ( n.w >> 24 ) & 7 );
@@ -1846,8 +1848,8 @@ void affineMergeCandidates( Cur cur, int last )
 
   // SbTMVP
   const bool subPu = ( pc.sps & 1 ) != 0 && !( slicePoc( cur.slice ) == refPoc( cur.slice, 0, 0 ) && sliceIrap( cur.slice ) );
-  // (With TMVP there is a colocated picture, unless its tables are missing --
-  // the comparison shows such cases -- and then its motion must not be read.)
+  // (With TMVP there is a colocated picture, unless its tables are missing, as
+  // the comparison shows can happen; then its motion must not be read.)
   if( subPu && tmvp( cur.slice ) && hasColPic( cur.slice ) )
   {
     int        pos = 0;
@@ -2423,8 +2425,9 @@ void spanGeo( Cur cur, int splitDir, Motion m0, Motion m1 )
 // A CU
 // --------------------------------------------------------------------------------------------------------------------
 
-// A motion block's word 4: its reference indices (a signed byte each), the kind of motion its CU wrote (kNotInter,
-// kTranslation, ...), and a translational CU's BCW index and AMVR's half-sample flag (which neighbourAt reads there)
+// Packs a motion block's word 4: both reference indices (a signed byte each), the kind of motion its CU stored
+// (kNotInter, kTranslation, ...), and for a translational CU its BCW index and AMVR half-sample flag, which neighbourAt
+// reads back.
 int packBlockWord( int refIdx0, int refIdx1, int kind, int bcw, bool hpel )
 {
   return int( ( uint( refIdx0 ) & 0xff ) | ( ( uint( refIdx1 ) & 0xff ) << 8 ) | ( uint( kind ) << 16 ) | ( ( uint( bcw ) & 7 ) << 24 )

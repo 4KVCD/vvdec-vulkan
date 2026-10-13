@@ -89,7 +89,7 @@ void releaseTwins( Picture& pic );
 // The planes of the pictures the GPU parses (VVDEC_GPU_PARSE=2): a picture has them only from when it is about to be
 // output (DecLib::prepareOutput: its download, below) until it is finished and may be reused
 // (PicListManager::markUnusedPicturesReusable). Before and after, the PelStorage of its planes holds stand-ins with the
-// same layout -- address space reserved without memory -- so that the sizes and strides are there for whatever reads
+// same layout (address space reserved without memory), so that the sizes and strides are there for whatever reads
 // them, and a stray access to the samples faults at once; its twins stay with the stand-ins meanwhile (planeTwin). The
 // pool keeps the planes given back for the next pictures.
 class PlanePool

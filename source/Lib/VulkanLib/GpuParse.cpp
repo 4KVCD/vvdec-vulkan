@@ -533,9 +533,10 @@ void writeParseScans( uint32_t* out )
   }
 }
 
-// Checks how parse.slang composes the grouped scan of a block -- the diagonal scan of its coefficient groups, then
-// the diagonal scan inside each group, both from the scan table -- against vvdec's g_scanOrder[SCAN_GROUPED_4x4], for
-// every block size and over the scan positions the parse can reach (the groups inside the zero-out's 32 x 32).
+// Checks how parse.slang composes the grouped scan of a block against vvdec's g_scanOrder[SCAN_GROUPED_4x4], for every
+// block size and over the scan positions the parse can reach (the groups inside the zero-out's 32 x 32). parse.slang
+// takes the diagonal scan of the block's coefficient groups, then the diagonal scan inside each group, both from the
+// scan table.
 // Prints the first 4 differences; returns whether there were none.
 static bool checkParseScans()
 {

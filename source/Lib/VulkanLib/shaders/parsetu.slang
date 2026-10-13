@@ -295,9 +295,10 @@ void transformLeaf( int4 luma, int4 chroma, bool chromaValid, int idx, int trDep
   }
 }
 
-// Parses the CU's transform tree (CABACReader::transform_tree): one TU for the CU, or one for each of its parts -- the
-// tiles of the largest transform size (getMaxTuTiling), ISP's parts (getTUIntraSubPartitions: the luma is split, the
-// chroma goes with the last part, and in the dual tree there is none) or SBT's two parts (getSbtTuTiling). The loop
+// Parses the CU's transform tree (CABACReader::transform_tree): one TU for the CU, or one for each of its parts. The
+// parts are the tiles of the largest transform size (getMaxTuTiling), ISP's parts (getTUIntraSubPartitions: the luma
+// is split, the chroma goes with the last part, and in the dual tree there is no chroma) or SBT's two parts
+// (getSbtTuTiling). The loop
 // keeps transformLeaf to one call site, as every call is inlined.
 void transformTree( inout CuCtx ctx )
 {
@@ -1643,9 +1644,9 @@ void residualCoding( int t, int comp, inout CuCtx ctx )
   PROF_COUNT( kProfLevelsN, g_outCount );
 }
 
-// Parses transform_skip_flag, then the block's residual coding: transform skip's, or the regular one -- the last
-// position, what it means for LFNST and MTS, the groups from the last one back to the first, and the levels over the
-// rectangle of the groups that have any (the whole block with BDPCM)
+// Parses transform_skip_flag, then the block's residual coding (transform skip's or the regular one). That covers the
+// last position and what it means for LFNST and MTS, the groups from the last one back to the first, and the levels
+// over the rectangle of the groups that have any (the whole block with BDPCM).
 void residualCodingBody( int t, int comp, inout CuCtx ctx )
 {
   if( comp == 2 && tuJoint( t ) == 3 )

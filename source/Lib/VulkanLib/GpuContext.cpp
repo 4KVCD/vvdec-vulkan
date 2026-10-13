@@ -588,9 +588,9 @@ bool Context::createPipelineLayout()
 // ====================================================================================================================
 // The compiled pipelines' binaries
 // ====================================================================================================================
-// The driver keeps the pipelines it compiled in a cache of its own, but per program: the first run of a program it has
-// not seen -- a new or updated one, or any after a driver update -- compiled every shader again on first use (VideoQ
-// 1080p: the first frame 12.3 s after the start instead of 0.85 s). A VkPipelineCache of the decoder's own does not
+// The driver keeps the pipelines it compiled in a cache of its own, but per program. So the first run of a program it
+// has not seen (a new or updated one, or any program after a driver update) compiled every shader again on first use,
+// and VideoQ 1080p showed its first frame 12.3 s after the start instead of 0.85 s. A VkPipelineCache of the decoder's own does not
 // help on AMD's driver (it compiles again, the cache's entries being per program too). With VK_KHR_pipeline_binary the
 // decoder keeps each pipeline's binaries itself and makes the pipeline from them, whatever the program: a set of
 // shaders is compiled once per driver. The binaries are kept in a file per device, with the driver's global key
