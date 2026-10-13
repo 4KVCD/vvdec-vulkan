@@ -1086,25 +1086,14 @@ int lastSigCoeff( int comp )
       break;
     }
   }
+  // the suffixes, ( prefix - 2 ) / 2 bypass bins each
   if( posLastX > 3 )
   {
-    uint      temp  = 0;
-    const int count = ( posLastX - 2 ) >> 1;
-    for( int i = count - 1; i >= 0; i-- )
-    {
-      temp += decodeBinEP() << uint( i );
-    }
-    posLastX = kMinInGroup[posLastX] + int( temp );
+    posLastX = kMinInGroup[posLastX] + int( decodeBinsEP( ( posLastX - 2 ) >> 1 ) );
   }
   if( posLastY > 3 )
   {
-    uint      temp  = 0;
-    const int count = ( posLastY - 2 ) >> 1;
-    for( int i = count - 1; i >= 0; i-- )
-    {
-      temp += decodeBinEP() << uint( i );
-    }
-    posLastY = kMinInGroup[posLastY] + int( temp );
+    posLastY = kMinInGroup[posLastY] + int( decodeBinsEP( ( posLastY - 2 ) >> 1 ) );
   }
   // The scan position from the inverse scans: the scan index of the position's group among the groups, times the
   // group size, plus the scan index of the position within its group

@@ -672,14 +672,43 @@ uint decodeBinEPBody()
   return bin;
 }
 
-// Decodes numBins bypass bins, the first into the highest bit. vvdec's decodeBinsEP and decodeAlignedBinsEP give the
-// same bins; this decodes them one at a time.
+// Decodes numBins bypass bins, the first into the highest bit (BinDecoder::decodeBinsEP; its decodeAlignedBinsEP gives
+// the same bins): while more than 8 are left, a byte is read and 8 bins come out of it; then the rest, after at most
+// one more byte read. Each bin compares the value with the range scaled to the bin's position, and a bin of 1 takes
+// that off the value.
 uint decodeBinsEP( int numBins )
 {
+  PROF_COUNT( kProfBinsEP, numBins );
+  g_binCount += uint( numBins );
   uint bins = 0;
-  for( int i = 0; i < numBins; i++ )
+  int  left = numBins;
+  while( left > 8 )
   {
-    bins = ( bins << 1 ) | decodeBinEP();
+    g_value          = ( g_value << 8 ) + ( readByte() << uint( 8 + g_bitsNeeded ) );
+    uint scaledRange = g_range << 15;
+    for( int i = 0; i < 8; i++ )
+    {
+      scaledRange >>= 1;
+      const bool one = g_value >= scaledRange;
+      bins           = ( bins << 1 ) | ( one ? 1u : 0u );
+      g_value       -= one ? scaledRange : 0u;
+    }
+    left -= 8;
+  }
+  g_bitsNeeded += left;
+  g_value <<= uint( left );
+  if( g_bitsNeeded >= 0 )
+  {
+    g_value += readByte() << uint( g_bitsNeeded );
+    g_bitsNeeded -= 8;
+  }
+  uint scaledRange = g_range << uint( left + 7 );
+  for( int i = 0; i < left; i++ )
+  {
+    scaledRange >>= 1;
+    const bool one = g_value >= scaledRange;
+    bins           = ( bins << 1 ) | ( one ? 1u : 0u );
+    g_value       -= one ? scaledRange : 0u;
   }
   return bins;
 }
