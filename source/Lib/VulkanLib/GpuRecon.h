@@ -89,6 +89,7 @@ namespace gpu
 
 struct JobsPush;       // (GpuReconFrontEnd.cpp)
 struct DbParamsPush;   // (GpuReconFrontEnd.cpp)
+struct InterPush;      // (GpuReconPrediction.cpp)
 
 // What a decoder's GpuRecon instances share.
 // - The front end's buffers whose size changes with the picture (the job lists, the CUs' motion and job counts, the
@@ -387,6 +388,7 @@ private:
     size_t regular = 0, bdof = 0, affine = 0;   // affine counts jobs: two per affine tile
   };
   InterCounts uploadInterJobs( const std::vector<std::vector<InterJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf );
+  void        interPush( const CodingStructure& cs, const Planes& planes, InterPush& push ) const;
   // Intra and IBC prediction in dependency waves, in place in planes: with the front end, its bands in wave order;
   // otherwise the CTU tasks' jobs, cut into bands and sorted by wave here.
   void   recordIntra( const CodingStructure& cs, const std::vector<std::vector<IntraJob>>& jobs, const Planes& planes );

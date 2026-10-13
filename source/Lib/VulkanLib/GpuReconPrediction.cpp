@@ -185,6 +185,16 @@ static_assert( sizeof( InterPush ) == 200, "InterPush: the layout of inter.slang
 static_assert( sizeof( ColocatedMotionInfo ) == 20 && offsetof( ColocatedMotionInfo, mv ) == 0 && sizeof( Mv ) == 8,
                "the colocated motion is not laid out as shaders/inter.slang writes it" );
 
+// The sets of inter tiles, each run by a shader variant of its own, in the order of the job lists and of the front end's
+// passes (kPassInter + set)
+enum InterSet
+{
+  kRegularTiles,
+  kBdofTiles,
+  kAffineTiles,   // two jobs per tile
+  kInterSets
+};
+
 GpuRecon::InterCounts GpuRecon::uploadInterJobs( const std::vector<std::vector<InterJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf )
 {
   size_t total = 0;
@@ -245,32 +255,65 @@ GpuRecon::InterCounts GpuRecon::uploadInterJobs( const std::vector<std::vector<I
   return counts;
 }
 
-void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
-                            const Planes& planes )
+// Whether a reference picture of the picture's slices is scaled (RPR)
+static bool anyReferenceScaled( const CodingStructure& cs )
 {
-  // Without the front end, the CTU tasks' jobs are uploaded.
-  InterCounts counts;
-  if( !m_useFrontEnd )
+  const PPS& pps = *cs.pps;
+  for( const Slice* slice: cs.picture->slices )
   {
-    counts = uploadInterJobs( jobs, ctuBegin, ctuEnd, buf );
-    if( counts.regular + counts.bdof + counts.affine == 0 )
+    for( int list = 0; list < 2; list++ )
     {
-      return;
+      for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ); refIdx++ )
+      {
+        if( slice->getRefPic( RefPicList( list ), refIdx )->isRefScaled( &pps ) )
+        {
+          return true;
+        }
+      }
     }
   }
+  return false;
+}
 
+// Whether the picture pic's planes, at addr on the GPU, suit the inter shader's tile paths (push.wide). The tile paths
+// load the planes' rows in aligned pieces of 16 and 8 bytes, up to 7 luma (3 chroma) samples before a window and 9 (5)
+// after it. So the rows must start 16-byte aligned and the margins be at least 16 samples wide (the reference pictures'
+// planes are laid out as this one's). The tile paths' own chroma code is 4:2:0's: 4:2:2 and 4:4:4 tiles use
+// chromaTile's, and monochrome pictures have no chroma. With RPR, subpictures treated as pictures or wraparound, the
+// shader takes the tile paths only for the jobs they suit (tileJob: no scaled reference; borderTiles: inside the
+// bounds).
+static bool planesSuitTiles( const PelStorage& pic, const VkDeviceAddress addr[MAX_NUM_COMPONENT] )
+{
+  for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
+  {
+    const VkDeviceSize left  = gpuLayout( pic, ComponentID( comp ) ).origin / sizeof( Pel );
+    const VkDeviceSize right = VkDeviceSize( pic.bufs[comp].stride ) - left - pic.bufs[comp].width;
+    if( addr[comp] % 16 != 0 || pic.bufs[comp].stride * sizeof( Pel ) % 16 != 0 || left < 16 || right < 16 )
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+// inter.slang's push constants for the picture, apart from its jobs, their count and the subpictures' rectangles (which
+// recordInter sets): the references, the planes it writes, where DMVR's refinements go, the picture's geometry and
+// chroma format, and its wraparound, subpicture and RPR settings
+void GpuRecon::interPush( const CodingStructure& cs, const Planes& planes, InterPush& push ) const
+{
   const PreCalcValues& pcv = *cs.pcv;
-  InterPush            push{};
-  push.jobs = m_useFrontEnd ? m_frontEnd.jobs[1].addr : buf.addr;
+  const PPS&           pps = *cs.pps;
+  push      = InterPush{};
   push.refs = m_refs.addr;
   push.dst0 = planes.addr[COMPONENT_Y];
   push.dst1 = planes.addr[COMPONENT_Cb];
   push.dst2 = planes.addr[COMPONENT_Cr];
-  // DMVR's refinements for vvdec's DMVR MV cache: with the GPU front end nothing reads them (the GPU stores the refined
-  // motion for TMVP itself, below), so the shader skips those writes to host memory (none: 0)
+  // DMVR's refinements for vvdec's DMVR MV cache. With the GPU front end nothing reads them, as the GPU stores the
+  // refined motion for TMVP itself (colMotion, below), so the address is 0 and the shader skips those writes to host
+  // memory.
   push.dmvr = m_useFrontEnd ? 0 : m_dmvr.addr;
-  // DMVR's refinements go into the picture's colocated motion (for TMVP), in memory from the GPU's picture
-  // allocator (Picture::gpuMemory)
+  // DMVR's refinements go into the picture's colocated motion (for TMVP), in memory from the GPU's picture allocator
+  // (Picture::gpuMemory).
   CHECK_FATAL( !cs.m_colMiAllocation, "Vulkan: the colocated motion out of the GPU's reach" );
   push.colMotion = static_cast<HostPlane*>( cs.m_colMiAllocation )->host.addr;
   if( m_lmcsOn )
@@ -286,7 +329,6 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   push.num8x8      = int32_t( pcv.num8x8CtuBlks );
   push.stride0     = planes.stride[COMPONENT_Y];
   push.stride12    = planes.stride[COMPONENT_Cb];
-  push.count       = int32_t( counts.regular );
   push.picWidth    = pcv.lumaWidth;
   push.picHeight   = pcv.lumaHeight;
   push.ctuSize     = pcv.maxCUWidth;
@@ -294,68 +336,56 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   push.numComp     = int32_t( getNumberValidComponents( pcv.chrFormat ) );
   push.scaleX      = push.numComp > 1 ? getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) : 0;
   push.scaleY      = push.numComp > 1 ? getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) : 0;
+  push.wide        = planesSuitTiles( cs.picture->m_bufs[PIC_RECONSTRUCTION], planes.addr ) ? 1 : 0;
   push.wrapSps     = cs.sps->getUseWrapAround() ? 1 : 0;
-  push.wrapPps     = cs.pps->getUseWrapAround() ? 1 : 0;
-  push.wrapOffset  = cs.pps->getUseWrapAround() ? cs.pps->getWrapAroundOffset() : 0;
-  // subpictures treated as pictures: each CTU's rectangle (its subpicture's or the picture's), written with the
-  // picture's first jobs
-  const PPS& pps = *cs.pps;
+  push.wrapPps     = pps.getUseWrapAround() ? 1 : 0;
+  push.wrapOffset  = pps.getUseWrapAround() ? pps.getWrapAroundOffset() : 0;
   for( int i = 0; pps.getNumSubPics() > 1 && i < pps.getNumSubPics(); i++ )
   {
     push.subpicOn |= pps.getSubPic( i ).getTreatedAsPicFlag() ? 1 : 0;
   }
-  if( push.subpicOn )
-  {
-    push.subpics = ctuBegin == 0 ? subpicRects( cs ) : m_subpics.addr;
-  }
-  // RPR: the picture's scaling window and its chroma's siting; whether any reference is scaled
+  // RPR: the picture's scaling window and its chroma's siting
   const Window& window = pps.getScalingWindow();
   push.curWinLeft      = window.getWindowLeftOffset() * SPS::getWinUnitX( cs.sps->getChromaFormatIdc() );
   push.curWinTop       = window.getWindowTopOffset() * SPS::getWinUnitY( cs.sps->getChromaFormatIdc() );
   push.horColloc       = cs.sps->getHorCollocatedChromaFlag() ? 1 : 0;
   push.verColloc       = cs.sps->getVerCollocatedChromaFlag() ? 1 : 0;
-  bool scaled          = false;
-  for( const Slice* slice: cs.picture->slices )
+}
+
+void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
+                            const Planes& planes )
+{
+  // Without the front end, the CTU tasks' jobs are uploaded.
+  InterCounts counts;
+  if( !m_useFrontEnd )
   {
-    for( int list = 0; list < 2; list++ )
+    counts = uploadInterJobs( jobs, ctuBegin, ctuEnd, buf );
+    if( counts.regular + counts.bdof + counts.affine == 0 )
     {
-      for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ); refIdx++ )
-      {
-        scaled |= slice->getRefPic( RefPicList( list ), refIdx )->isRefScaled( &pps );
-      }
+      return;
     }
   }
-  // The shader's tile paths (wide) load the planes' rows in aligned pieces of 16 and 8 bytes, up to 7 luma (3 chroma)
-  // samples before a window and 9 (5) after it. So the rows must start 16-byte aligned and the margins be wide enough
-  // (the reference pictures' planes are laid out as this one's). Their own chroma code is 4:2:0's: 4:2:2 and 4:4:4
-  // tiles have chromaTile's, and monochrome pictures none. With RPR,
-  // subpictures treated as pictures or wraparound, the shader takes them only for the jobs they suit (tileJob: no
-  // scaled reference; borderTiles: inside the bounds).
-  push.wide = 1;
-  for( int comp = 0; comp < (int) cs.picture->m_bufs[PIC_RECONSTRUCTION].bufs.size(); comp++ )
+  InterPush push;
+  interPush( cs, planes, push );
+  if( push.subpicOn )
   {
-    const PelStorage&  pic   = cs.picture->m_bufs[PIC_RECONSTRUCTION];
-    const VkDeviceSize left  = gpuLayout( pic, ComponentID( comp ) ).origin / sizeof( Pel );
-    const VkDeviceSize right = VkDeviceSize( pic.bufs[comp].stride ) - left - pic.bufs[comp].width;
-    if( planes.addr[comp] % 16 != 0 || pic.bufs[comp].stride * sizeof( Pel ) % 16 != 0 || left < 16 || right < 16 )
-    {
-      push.wide = 0;
-    }
+    // each CTU's rectangle (its subpicture's or the picture's), written with the picture's first jobs
+    push.subpics = ctuBegin == 0 ? subpicRects( cs ) : m_subpics.addr;
   }
 
-  // Each set of tiles has its own shader variant: the regular tiles, BDOF's, and the affine pairs, each also built for
-  // the pictures of push.wide without wraparound, subpictures treated as pictures or scaled references (WIDE=1: their
-  // layout values are constants, see inter.slang). The sets cover different tiles, so their dispatches need no
-  // barriers between them.
-  static const int kInterShaders[2][3] = { { kShader_inter, kShader_inter_bdof, kShader_inter_affine },
-                                           { kShader_inter_wide, kShader_inter_bdof_wide, kShader_inter_affine_wide } };
-  const bool constant = push.wide && pcv.chrFormat == CHROMA_420 && !push.wrapSps && !push.subpicOn && !scaled;
+  // Each set of tiles has its own shader variant, each also built for the pictures of push.wide without wraparound,
+  // subpictures treated as pictures or scaled references (WIDE=1: their layout values are constants, see inter.slang).
+  // The sets cover different tiles, so their dispatches need no barriers between them.
+  static const int kInterShaders[2][kInterSets] = { { kShader_inter, kShader_inter_bdof, kShader_inter_affine },
+                                                    { kShader_inter_wide, kShader_inter_bdof_wide, kShader_inter_affine_wide } };
+  const bool constant = push.wide && cs.pcv->chrFormat == CHROMA_420 && !push.wrapSps && !push.subpicOn && !anyReferenceScaled( cs );
   const int* shaders  = kInterShaders[constant ? 1 : 0];
   if( m_useFrontEnd )
   {
     // each set from its first job, with its count on the GPU
+    push.jobs  = m_frontEnd.jobs[1].addr;
     push.count = -1;
-    for( int set = 0; set < 3; set++ )
+    for( int set = 0; set < kInterSets; set++ )
     {
       const FrontPass pass = FrontPass( kPassInter + set );
       push.countAt         = frontEndCount( pass );
@@ -363,31 +393,24 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
       pushConstants( push );
       dispatchIndirect( pass );
     }
-    mark( "inter" );
-    return;
   }
-  // one workgroup per tile (an affine pair counts as one)
-  if( counts.regular > 0 )
+  else
   {
-    bind( shaders[0] );
-    pushConstants( push );
-    dispatchJobs( counts.regular );
-  }
-  if( counts.bdof > 0 )
-  {
-    push.jobs  = buf.addr + counts.regular * sizeof( InterJob );
-    push.count = int32_t( counts.bdof );
-    bind( shaders[1] );
-    pushConstants( push );
-    dispatchJobs( counts.bdof );
-  }
-  if( counts.affine > 0 )
-  {
-    push.jobs  = buf.addr + ( counts.regular + counts.bdof ) * sizeof( InterJob );
-    push.count = int32_t( counts.affine / 2 );
-    bind( shaders[2] );
-    pushConstants( push );
-    dispatchJobs( counts.affine / 2 );
+    // one workgroup per tile, the sets one after another in buf
+    const size_t setJobs[kInterSets] = { counts.regular, counts.bdof, counts.affine };
+    push.jobs                        = buf.addr;
+    for( int set = 0; set < kInterSets; set++ )
+    {
+      const size_t tiles = set == kAffineTiles ? setJobs[set] / 2 : setJobs[set];
+      if( tiles > 0 )
+      {
+        push.count = int32_t( tiles );
+        bind( shaders[set] );
+        pushConstants( push );
+        dispatchJobs( tiles );
+      }
+      push.jobs += setJobs[set] * sizeof( InterJob );
+    }
   }
   mark( "inter" );
 }
