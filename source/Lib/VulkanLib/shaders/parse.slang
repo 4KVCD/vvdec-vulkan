@@ -1028,6 +1028,60 @@ void saveState( uint* state, int k, int prevQp[2], bool done )
 
 // Workgroup i parses substream i: from where the previous dispatch left it, CTU by CTU, until the substream ends, its
 // share of bins for this dispatch is spent, or its next CTU has to wait for the CTU above.
+// Resumes the substream a previous dispatch paused: the slice's contexts for their rates, then the contexts' states,
+// the arithmetic decoder, the QPs and the column left of the next CTU as that dispatch saved them in state
+void resumeSubstream( uint* state, inout int prevQp[2] )
+{
+  initContexts();
+  for( int i = g_lane; i < CTX_COUNT; i += 32 )
+  {
+    s_ctx[i].x = state[kStCtx + i];
+  }
+  for( int i = g_lane; i < 2 * kMapRow; i += 32 )
+  {
+    s_left[i] = uint2( state[kStLeft + 2 * i], state[kStLeft + 2 * i + 1] );
+  }
+  GroupMemoryBarrierWithGroupSync();
+  g_range         = uni( state[kStRange] );
+  g_value         = uni( state[kStValue] );
+  g_bitsNeeded    = int( uni( state[kStBitsNeeded] ) );
+  g_pos           = uni( state[kStPos] );
+  g_winBase       = 0x80000000u;   // (far from every byte, so the next read loads the window)
+  prevQp[0]       = int( uni( state[kStQp0] ) );
+  prevQp[1]       = int( uni( state[kStQp1] ) );
+  g_csChromaQpAdj = int( uni( state[kStCqpAdj] ) );
+}
+
+// Gives the substream up after an error: counts the error, and marks its remaining CTUs (k to count - 1 of its list
+// from first) parsed all the same, so that the rows that wait for them do not wait in vain
+void giveUpSubstream( int first, int k, int count )
+{
+  AllMemoryBarrierWithGroupSync();
+  if( g_lane == 0 )
+  {
+    pc.sync[1].add( 1u );
+    for( int j = k; j < count; j++ )
+    {
+      pc.sync[2 + int( pc.ctuList[( first + j ) * 2] )].store( 1u, MemoryOrder.Release );
+    }
+  }
+}
+
+// Adds the room the job lists need for this dispatch's CUs (g_caps) to the picture's counters
+void addJobListRoom()
+{
+  if( g_lane == 0 )
+  {
+    for( int i = 0; i < 5; i++ )
+    {
+      if( g_caps[i] != 0 )
+      {
+        pc.counters[2 + i].add( g_caps[i] );
+      }
+    }
+  }
+}
+
 [shader( "compute" )]
 [numthreads( 32, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
@@ -1079,26 +1133,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   int k         = int( uni( state[kStK] ) );
   if( k > 0 )
   {
-    // Resuming: take the slice's contexts for their rates, then the states, the arithmetic decoder, the QPs and the
-    // column left of the next CTU as the previous dispatch saved them
-    initContexts();
-    for( int i = g_lane; i < CTX_COUNT; i += 32 )
-    {
-      s_ctx[i].x = state[kStCtx + i];
-    }
-    for( int i = g_lane; i < 2 * kMapRow; i += 32 )
-    {
-      s_left[i] = uint2( state[kStLeft + 2 * i], state[kStLeft + 2 * i + 1] );
-    }
-    GroupMemoryBarrierWithGroupSync();
-    g_range         = uni( state[kStRange] );
-    g_value         = uni( state[kStValue] );
-    g_bitsNeeded    = int( uni( state[kStBitsNeeded] ) );
-    g_pos           = uni( state[kStPos] );
-    g_winBase       = 0x80000000u;   // (far from every byte, so the next read loads the window)
-    prevQp[0]       = int( uni( state[kStQp0] ) );
-    prevQp[1]       = int( uni( state[kStQp1] ) );
-    g_csChromaQpAdj = int( uni( state[kStCqpAdj] ) );
+    resumeSubstream( state, prevQp );
   }
   // the substream's chunk of levels (none at its start: the host zeroes the state)
   g_levelsAt  = uni( state[kStLevelsAt] );
@@ -1184,28 +1219,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 #endif
   if( g_error )
   {
-    // Given up: count the error, and mark the substream's remaining CTUs parsed all the same, so that the rows that
-    // wait for them do not wait in vain
-    AllMemoryBarrierWithGroupSync();
-    if( g_lane == 0 )
-    {
-      pc.sync[1].add( 1u );
-      for( int j = k; j < count; j++ )
-      {
-        pc.sync[2 + int( pc.ctuList[( first + j ) * 2] )].store( 1u, MemoryOrder.Release );
-      }
-    }
+    giveUpSubstream( first, k, count );
   }
-  // the room the job lists need for this dispatch's CUs, added to the picture's
-  if( g_lane == 0 )
-  {
-    for( int i = 0; i < 5; i++ )
-    {
-      if( g_caps[i] != 0 )
-      {
-        pc.counters[2 + i].add( g_caps[i] );
-      }
-    }
-  }
+  addJobListRoom();
   saveState( state, k, prevQp, !paused || g_error );
 }
