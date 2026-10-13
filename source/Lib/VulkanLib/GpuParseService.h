@@ -185,6 +185,7 @@ private:
   Context*        m_ctx = nullptr;
   ParseInput      m_in;
   size_t          m_numCtus = 0;
+  bool            m_ctu64   = false;   // CTUs of 64 samples at most (prepare): the parse's _ctu64 variants
   VkDeviceAddress m_prof = 0;
   // the inputs (upload memory)
   Buffer m_bits, m_streams, m_ctuList, m_ctuInfo, m_slices, m_pic, m_scans;

@@ -227,6 +227,7 @@ bool ParseSlot::prepare( const CodingStructure& cs, StagedRecords staged, Buffer
   }
   CHECK( m_in.cuSlots >= ( 1u << kParseLocalBits ) || m_in.tuSlots >= ( 1u << kParseLocalBits ), "Vulkan: more records in a CTU than the parse's meta words hold" );
   m_numCtus = cs.pcv->sizeInCtus;
+  m_ctu64   = cs.pcv->maxCUWidth <= 64;
 
   // the inputs: the slice data (which the parse reads 128 bytes at a time: 256 zero bytes follow it), the
   // substreams, the CTUs in decoding order and their slices and tiles, the slices' parameters and contexts, the
@@ -350,10 +351,9 @@ void ParseSlot::recordStep( VkCommandBuffer cmd, int32_t binBudget ) const
   // (parse_prof for the profile; parse_shuffle where the device lacks what parse reads threads' values with; the
   // _ctu64 variants for CTUs of 64 samples at most, their maps a quarter of the shared memory; the _lite ones for
   // pictures that leave off the tools they leave out)
-  const bool ctu64  = picture->cs->pcv->maxCUWidth <= 64;
-  const bool lite   = ctu64 && m_in.lite;
-  const int  shader = m_prof                    ? ( lite ? kShader_parse_prof_ctu64_lite : ctu64 ? kShader_parse_prof_ctu64 : kShader_parse_prof )
-                      : m_ctx->subgroupBallot() ? ( lite ? kShader_parse_ctu64_lite : ctu64 ? kShader_parse_ctu64 : kShader_parse )
+  const bool lite   = m_ctu64 && m_in.lite;
+  const int  shader = m_prof                    ? ( lite ? kShader_parse_prof_ctu64_lite : m_ctu64 ? kShader_parse_prof_ctu64 : kShader_parse_prof )
+                      : m_ctx->subgroupBallot() ? ( lite ? kShader_parse_ctu64_lite : m_ctu64 ? kShader_parse_ctu64 : kShader_parse )
                                                 : kShader_parse_shuffle;
   dispatch( m_ctx, cmd, shader, push, m_in.numStreams );   // a workgroup per substream
 }
