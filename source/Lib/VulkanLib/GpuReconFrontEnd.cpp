@@ -426,16 +426,11 @@ void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
 // dbparams.slang's threads per CU in its per-CU passes (kThreadsPerCu)
 static constexpr size_t kDbParamsThreadsPerCu = 8;
 
-void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
+// Per CTU, its subpicture's index and whether loop filtering crosses the subpicture's boundaries (bit 16), uploaded
+// into m_frontEnd.ctuInfo
+void GpuRecon::uploadSubpicInfo( const CodingStructure& cs )
 {
-  const PreCalcValues& pcv    = *cs.pcv;
-  const bool           chroma = isChromaEnabled( pcv.chrFormat );
-  m_ctx->ensure( m_frontEnd.lfp, lfpBytes( pcv ), MemKind::Device );
-  if( !m_useFrontEnd )
-  {
-    m_ctx->ensure( m_check.lfp, lfpBytes( pcv ), MemKind::HostCached );
-  }
-  // per CTU, its subpicture's index and whether loop filtering crosses the subpicture's boundaries
+  const PreCalcValues& pcv = *cs.pcv;
   m_ctx->ensure( m_frontEnd.ctuInfo, pcv.sizeInCtus * sizeof( uint32_t ), MemKind::Upload );
   uint32_t* info = reinterpret_cast<uint32_t*>( m_frontEnd.ctuInfo.mapped );
   for( unsigned ctu = 0; ctu < pcv.sizeInCtus; ctu++ )
@@ -444,9 +439,13 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
     const SubPic&  sub = cs.pps->getSubPicFromPos( pos );
     info[ctu]          = sub.getSubPicIdx() | ( sub.getloopFilterAcrossSubPicEnabledFlag() ? 1u << 16 : 0u );
   }
-  // the parameters start zeroed, as the CTU tasks' LF_INIT leaves them: each entry carries the picture's tag, and an
-  // entry with another tag reads as zero, so the map is zeroed only when it is new and when the tags wrap around; in
-  // the check mode always (tag 0: the CPU compares the map)
+}
+
+// The picture's tag in the deblocking parameters. The parameters start zeroed, as the CTU tasks' LF_INIT leaves them:
+// each entry carries the picture's tag, and an entry with another tag reads as zero, so the map is zeroed (recorded
+// here) only when it is new and when the tags wrap around; in the check mode always (tag 0: the CPU compares the map).
+uint32_t GpuRecon::nextLfpTag()
+{
   FrontEndBuffers& fe = m_frontEnd;
   fe.lfpTag           = m_useFrontEnd ? fe.lfpTag % 65535 + 1 : 0;
   if( fe.lfpTag <= 1 || fe.lfp.buffer != fe.lfpZeroed )
@@ -455,8 +454,16 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
     transferToComputeBarrier();
     fe.lfpZeroed = fe.lfp.buffer;
   }
+  return fe.lfpTag;
+}
 
-  DbParamsPush push{};
+// dbparams.slang's push constants for the picture: the records, maps and motion it reads, the parameters it writes,
+// the picture's geometry, and its loop filter flags and virtual boundaries
+void GpuRecon::dbParamsPush( const CodingStructure& cs, size_t numCus, uint32_t lfpTag, DbParamsPush& push ) const
+{
+  const PreCalcValues& pcv    = *cs.pcv;
+  const bool           chroma = isChromaEnabled( pcv.chrFormat );
+  push              = DbParamsPush{};
   push.cus          = m_frontEnd.recordCus;
   push.tus          = m_frontEnd.recordTus;
   push.ctus         = m_frontEnd.recordCtus;
@@ -478,7 +485,7 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
   push.csy          = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
   push.chroma       = chroma ? 1 : 0;
   push.qpBdOffset   = cs.sps->getQpBDOffset();
-  push.lfpTag       = fe.lfpTag;
+  push.lfpTag       = lfpTag;
   push.flags        = ( cs.pps->getLoopFilterAcrossSlicesEnabledFlag() ? 1 : 0 ) | ( cs.pps->getLoopFilterAcrossTilesEnabledFlag() ? 2 : 0 )
                       | ( cs.sps->getSubPicInfoPresentFlag() ? 4 : 0 );
   const PicHeader& ph = *cs.picHeader;
@@ -495,6 +502,19 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
       push.vbPosVer[1 + i] = int32_t( ph.getVirtualBoundariesPosX( i ) );
     }
   }
+}
+
+void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
+{
+  const PreCalcValues& pcv = *cs.pcv;
+  m_ctx->ensure( m_frontEnd.lfp, lfpBytes( pcv ), MemKind::Device );
+  if( !m_useFrontEnd )
+  {
+    m_ctx->ensure( m_check.lfp, lfpBytes( pcv ), MemKind::HostCached );
+  }
+  uploadSubpicInfo( cs );
+  DbParamsPush push;
+  dbParamsPush( cs, numCus, nextLfpTag(), push );
   // Pass 0: the luma tree's CUs, kDbParamsThreadsPerCu threads per CU. Then, when the SPS allows sub-block motion or
   // ISP, the edges inside those CUs, one thread per 4x4 block (dbparams_sub). Pass 1: the chroma tree's CUs, as pass 0.
   // Threads in rows of 1024 workgroups.

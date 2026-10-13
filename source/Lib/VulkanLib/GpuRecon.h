@@ -87,7 +87,8 @@ struct LoopFilterParam;
 namespace gpu
 {
 
-struct JobsPush;   // (GpuReconFrontEnd.cpp)
+struct JobsPush;       // (GpuReconFrontEnd.cpp)
+struct DbParamsPush;   // (GpuReconFrontEnd.cpp)
 
 // What a decoder's GpuRecon instances share.
 // - The front end's buffers whose size changes with the picture (the job lists, the CUs' motion and job counts, the
@@ -349,6 +350,9 @@ private:
   void   giveFrontEnd();
   void   recordMotion( const CodingStructure& cs, size_t numCus );
   void   recordDeblockParams( const CodingStructure& cs, size_t numCus );
+  void   uploadSubpicInfo( const CodingStructure& cs );   // per CTU, its subpicture and loop filtering across it
+  uint32_t nextLfpTag();   // the picture's tag in the deblocking parameters (zeroing them when the tags wrap around)
+  void   dbParamsPush( const CodingStructure& cs, size_t numCus, uint32_t lfpTag, DbParamsPush& push ) const;
   void   recordJobs( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );       // passes 0 to 2
   void   recordJobWaves( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus );   // pass 3 (no barrier after)
   void   jobsPush( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus, JobsPush& push ) const;
