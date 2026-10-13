@@ -60,6 +60,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace vvdec
@@ -141,6 +142,7 @@ struct Options
   bool        frontEndCheck = false;   // VVDEC_GPU_MIDER=1: the CPU front end drives, the GPU front end is compared with it
   bool        parse         = false;   // VVDEC_GPU_PARSE=1: the GPU parses the slice data too, compared with the CPU's parse
   bool        parseDrives   = false;   // VVDEC_GPU_PARSE=2: the GPU parses the slice data instead of the CPU
+  bool        precompile    = true;    // VVDEC_GPU_PRECOMPILE=0: the pipelines are not compiled in the background at start-up
 
   static Options fromEnvironment();
 };
@@ -366,7 +368,17 @@ private:
   // the pipelines
   VkPipelineLayout                 m_layout    = VK_NULL_HANDLE;
   VkPipeline*                      m_pipelines = nullptr;
-  std::mutex                       m_pipelineMutex;
+  std::once_flag*                  m_pipelineOnce = nullptr;   // per shader: its pipeline created once (pipeline)
+  std::mutex                       m_pipelineMutex;            // guards the binaries map (PipelineBinaries::pipelines)
+  VkPipeline                       createPipelineOf( int shaderId );   // the shader's module and pipeline (compiled, or from its binaries)
+  // The pipelines this configuration is likely to use, compiled in the background from the end of init, biggest first
+  // (startPrecompile), by threads that stop taking shaders when the context ends (stopPrecompile)
+  void                             startPrecompile();
+  void                             stopPrecompile();
+  std::vector<std::thread>         m_precompileThreads;
+  std::vector<int>                 m_precompileOrder;
+  std::atomic<int>                 m_precompileNext{ 0 };
+  std::atomic<bool>                m_precompileStop{ false };
   // the compiled pipelines' binaries, kept in a file from one run to the next (VK_KHR_pipeline_binary: GpuContext.cpp's
   // PipelineBinaries; null without it)
   struct PipelineBinaries;

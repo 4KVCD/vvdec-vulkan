@@ -393,8 +393,9 @@ private:
   // --- Reconstruction (GpuReconPrediction.cpp) ---
   // The residuals: the coefficient levels from levels (the picture in host memory, where the parse left them), the
   // residuals into planes. Without the front end, the jobs of CTUs ctuBegin .. ctuEnd - 1 are uploaded into buf.
-  void recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
-                    const Planes& levels, const Planes& planes );
+  void   recordTrafo( const CodingStructure& cs, const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,
+                      const Planes& levels, const Planes& planes );
+  size_t uploadTrafoJobs( const std::vector<std::vector<TrafoJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf );   // returns their number
   // Inter prediction into planes. Without the front end, the jobs of CTUs ctuBegin .. ctuEnd - 1 are uploaded into
   // buf: the regular tiles, then BDOF's, then the affine pairs, each set run by its own shader variant.
   void recordInter( const CodingStructure& cs, const std::vector<std::vector<InterJob>>& jobs, size_t ctuBegin, size_t ctuEnd, Buffer& buf,

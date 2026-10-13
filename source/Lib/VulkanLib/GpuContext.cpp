@@ -50,6 +50,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "vvdec_gpu/GpuShaders.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -120,6 +121,7 @@ Options Options::fromEnvironment()
   options.frontEndCheck = value( "VVDEC_GPU_MIDER" ) && atoi( value( "VVDEC_GPU_MIDER" ) ) != 0;
   options.parse         = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 1;
   options.parseDrives   = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 2;
+  options.precompile    = !( value( "VVDEC_GPU_PRECOMPILE" ) && atoi( value( "VVDEC_GPU_PRECOMPILE" ) ) == 0 );
   return options;
 }
 
@@ -163,6 +165,10 @@ bool Context::init()
     return false;
   }
   msg( INFO, "Vulkan: %s\n", m_deviceName.c_str() );
+  if( m_options.precompile )
+  {
+    startPrecompile();
+  }
   return true;
 }
 
@@ -630,7 +636,8 @@ bool Context::createPipelineLayout()
   {
     return false;
   }
-  m_pipelines = new VkPipeline[kShaderCount];
+  m_pipelines    = new VkPipeline[kShaderCount];
+  m_pipelineOnce = new std::once_flag[kShaderCount];
   for( int i = 0; i < kShaderCount; i++ )
   {
     m_pipelines[i] = VK_NULL_HANDLE;
@@ -927,15 +934,20 @@ VkResult Context::createPipeline( int shaderId, bool wave32, VkComputePipelineCr
 // pipeline is then compiled).
 bool Context::createFromBinaries( const std::vector<uint8_t>& key, VkComputePipelineCreateInfo& info, VkPipeline& pipe )
 {
-  PipelineBinaries* b     = m_binaries;
-  const auto        found = b->pipelines.find( key );
-  if( found == b->pipelines.end() || found->second.empty() )
+  PipelineBinaries*                     b = m_binaries;
+  std::vector<PipelineBinaries::Binary> binaries;
   {
-    return false;
+    std::lock_guard<std::mutex> lock( m_pipelineMutex );
+    const auto                  found = b->pipelines.find( key );
+    if( found == b->pipelines.end() || found->second.empty() )
+    {
+      return false;
+    }
+    binaries = found->second;
   }
   std::vector<VkPipelineBinaryKeyKHR>  keys;
   std::vector<VkPipelineBinaryDataKHR> data;
-  for( const PipelineBinaries::Binary& binary: found->second )
+  for( const PipelineBinaries::Binary& binary: binaries )
   {
     VkPipelineBinaryKeyKHR k{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR };
     k.keySize = uint32_t( binary.key.size() );
@@ -970,7 +982,8 @@ bool Context::createFromBinaries( const std::vector<uint8_t>& key, VkComputePipe
   }
   if( result != VK_SUCCESS )
   {
-    b->pipelines.erase( found );
+    std::lock_guard<std::mutex> lock( m_pipelineMutex );
+    b->pipelines.erase( key );
   }
   return result == VK_SUCCESS;
 }
@@ -1011,6 +1024,7 @@ void Context::captureBinaries( const std::vector<uint8_t>& key, VkPipeline pipe 
       }
       if( binaries.size() == handles.size() )
       {
+        std::lock_guard<std::mutex> lock( m_pipelineMutex );
         b->pipelines[key] = std::move( binaries );
         b->added          = true;
       }
@@ -1094,6 +1108,7 @@ void Context::countMemory( MemKind kind, int64_t bytes )
 
 Context::~Context()
 {
+  stopPrecompile();
   if( m_profiling && !m_times.empty() )
   {
     msg( INFO, "GPU profile (milliseconds):\n" );
@@ -1147,6 +1162,7 @@ Context::~Context()
     m_api.vkDestroyDevice( m_device, nullptr );
   }
   delete[] m_pipelines;
+  delete[] m_pipelineOnce;
   // the instance and the Vulkan library stay (s_instance)
 }
 
@@ -1329,11 +1345,96 @@ static bool interShader( int shaderId )
 
 VkPipeline Context::pipeline( int shaderId )
 {
-  std::lock_guard<std::mutex> lock( m_pipelineMutex );
-  if( m_pipelines[shaderId] )
+  std::call_once( m_pipelineOnce[shaderId], [this, shaderId]() { m_pipelines[shaderId] = createPipelineOf( shaderId ); } );
+  return m_pipelines[shaderId];
+}
+
+// Which shaders the background compiles, and in what order: the two parse variants a stream may take first (they
+// compile longest), then the shaders of a picture's work in the order the first picture uses them, then the variants
+// other streams take. The profiling and shuffle variants of the parse and the parse check only when the configuration
+// is set up for them, last.
+static std::vector<int> precompileOrder( const Options& options, bool subgroupBallot )
+{
+  static const char* const kFirstUse[] = { "parse",           "parse_ctu64",     "mider",          "jobs",        "dbparams",        "inter_wide",
+                                           "inter_bdof_wide", "intra",           "jobs_count",     "dbparams_sub", "trafo",          "intrasort",
+                                           "deblock_luma_ver", "deblock_luma_hor", "deblock_chroma", "inter_affine_wide", "sao",     "alf_luma",
+                                           "alf_chroma",      "jobs_waves",      "edges",          "parsecompact", "mider_cumap",     "lmcs",
+                                           "parse_ctu64_lite", "mider_lite",     "inter",          "inter_bdof",   "inter_affine",   "alf_luma_bounds",
+                                           "alf_chroma_bounds", "filmgrain" };
+  std::vector<int>         order;
+  const auto               add = [&]( const std::string& name ) {
+    for( int i = 0; i < kShaderCount; i++ )
+    {
+      if( name == kShaders[i].name )
+      {
+        order.push_back( i );
+      }
+    }
+  };
+  for( const char* name: kFirstUse )
   {
-    return m_pipelines[shaderId];
+    add( name );
   }
+  for( int i = 0; i < kShaderCount; i++ )
+  {
+    const std::string name    = kShaders[i].name;
+    const bool        profile = name.find( "_prof" ) != std::string::npos;
+    const bool        shuffle = name == "parse_shuffle";
+    const bool        check   = name == "parsecheck";
+    const bool        wanted  = ( !profile || options.profile ) && ( !shuffle || !subgroupBallot ) && ( !check || options.parse );
+    if( wanted && std::find( order.begin(), order.end(), i ) == order.end() )
+    {
+      order.push_back( i );
+    }
+  }
+  return order;
+}
+
+void Context::startPrecompile()
+{
+  m_precompileOrder = precompileOrder( m_options, m_subgroupBallot );
+  // Compiles running side by side slow each other (the parse shader: 4.5 s alone, 7.1 s among 8), so a few threads
+  // serve better than many.
+  const unsigned cores   = std::thread::hardware_concurrency();
+  const int      threads = int( std::min( 4u, std::max( 2u, cores / 4 ) ) );
+  for( int t = 0; t < threads; t++ )
+  {
+    m_precompileThreads.emplace_back( [this]() {
+#ifdef _WIN32
+      SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL );   // (the decode's threads come first)
+#endif
+      while( !m_precompileStop.load( std::memory_order_relaxed ) )
+      {
+        const int k = m_precompileNext.fetch_add( 1 );
+        if( k >= int( m_precompileOrder.size() ) )
+        {
+          break;
+        }
+        try
+        {
+          pipeline( m_precompileOrder[k] );
+        }
+        catch( ... )
+        {
+          // (the decode thread that needs this pipeline will meet the failure itself)
+        }
+      }
+    } );
+  }
+}
+
+void Context::stopPrecompile()
+{
+  m_precompileStop.store( true );
+  for( std::thread& thread: m_precompileThreads )
+  {
+    thread.join();
+  }
+  m_precompileThreads.clear();
+}
+
+VkPipeline Context::createPipelineOf( int shaderId )
+{
 
   VkShaderModuleCreateInfo moduleInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
   moduleInfo.codeSize = kShaders[shaderId].size;
@@ -1365,7 +1466,6 @@ VkPipeline Context::pipeline( int shaderId )
   {
     THROW_FATAL( "Vulkan: the pipeline of " << kShaders[shaderId].name << " failed (" << result << ")" );
   }
-  m_pipelines[shaderId] = pipe;
   reportShader( shaderId, pipe );
   return pipe;
 }
