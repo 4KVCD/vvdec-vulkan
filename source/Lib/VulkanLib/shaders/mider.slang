@@ -2966,6 +2966,59 @@ void copyColMotion( int ctu )
   }
 }
 
+// Waits until the segment above, in the same tile, is past the CTU above-right of column col (or done, at the tile's
+// right edge: span is the tile's columns). With WPP the CTU above-right is out of the CUs' reach (cuAt): past the CTU
+// above is enough.
+void waitForSegmentAbove( int segment, int col, int2 span )
+{
+  if( g_lane == 0 )
+  {
+    const uint need = uint( min( col + 2 - pc.wpp, span.y ) - span.x );
+    while( pc.progress[segment - pc.tileCols].load( MemoryOrder.Relaxed ) < need )
+    {
+    }
+  }
+  AllMemoryBarrierWithGroupSync();
+}
+
+// The motion of CTU ctu's luma CUs (first to first + count - 1), CU by CU in decoding order: an intra CU has none,
+// an inter CU's comes from deriveCu
+void deriveCtuMotion( int ctu, int col, int row, int first, int count )
+{
+  Cur cur;
+  cur.ctu = ctu;
+  loadCurSlice( ctu );
+  cur.sliceIdx = independentIdx( cur.slice );
+  // (only with TMVP: the colocated picture has the picture's size then, and the CUs read it only then; without,
+  // hasColPic may name a reference picture of another size, whose slice table has other CTUs)
+  if( tmvp( cur.slice ) && hasColPic( cur.slice ) )
+  {
+    loadColSlices( ctu, col );
+  }
+  cur.tile = ctuTile( ctu );
+  cur.rect = ctuRect( ctu );
+  setNeighbourCtus( cur, col, row );
+  for( int i = first; i < first + count; i++ )
+  {
+    cur.cu = loadCu( i );
+    if( ( cur.cu.flags & kChroma ) != 0 )
+    {
+      continue;
+    }
+    if( cur.cu.predMode == MODE_INTRA )
+    {
+      storeCuMotion( i, noCuMotion() );
+      spanMotion( cur, noMotion(), kNotInter );
+    }
+    else
+    {
+      deriveCu( cur );
+    }
+    // (each thread's writes of the CU's blocks become visible to all before the next CU looks them up)
+    workgroupBarrierAll();
+  }
+}
+
 [shader( "compute" )]
 [numthreads( 32, 1, 1 )]
 void main( uint3 local : SV_GroupThreadID )
@@ -2996,18 +3049,9 @@ void main( uint3 local : SV_GroupThreadID )
     // A CTU whose luma CUs are all intra (an intra slice's, unless IBC) reads no neighbour's motion: it does not wait
     // for the segment above, and its CUs' motion, none, is written by all the threads at once rather than CU by CU.
     const bool allIntra = ctuAllIntra( first, count );
-    // Wait until the segment above, in the same tile, is past the CTU above-right (or done, at the tile's right
-    // edge). With WPP the CTU above-right is out of the CUs' reach (cuAt): past the CTU above is enough.
     if( waitAbove && !allIntra )
     {
-      if( g_lane == 0 )
-      {
-        const uint need = uint( min( col + 2 - pc.wpp, span.y ) - span.x );
-        while( pc.progress[segment - pc.tileCols].load( MemoryOrder.Relaxed ) < need )
-        {
-        }
-      }
-      AllMemoryBarrierWithGroupSync();
+      waitForSegmentAbove( segment, col, span );
     }
     if( ctuTileColStart( ctu ) )
     {
@@ -3020,38 +3064,7 @@ void main( uint3 local : SV_GroupThreadID )
     }
     else
     {
-      Cur cur;
-      cur.ctu = ctu;
-      loadCurSlice( ctu );
-      cur.sliceIdx = independentIdx( cur.slice );
-      // (only with TMVP: the colocated picture has the picture's size then, and the CUs read it only then; without,
-      // hasColPic may name a reference picture of another size, whose slice table has other CTUs)
-      if( tmvp( cur.slice ) && hasColPic( cur.slice ) )
-      {
-        loadColSlices( ctu, col );
-      }
-      cur.tile     = ctuTile( ctu );
-      cur.rect     = ctuRect( ctu );
-      setNeighbourCtus( cur, col, row );
-      for( int i = first; i < first + count; i++ )
-      {
-        cur.cu = loadCu( i );
-        if( ( cur.cu.flags & kChroma ) != 0 )
-        {
-          continue;
-        }
-        if( cur.cu.predMode == MODE_INTRA )
-        {
-          storeCuMotion( i, noCuMotion() );
-          spanMotion( cur, noMotion(), kNotInter );
-        }
-        else
-        {
-          deriveCu( cur );
-        }
-        // (each thread's writes of the CU's blocks become visible to all before the next CU looks them up)
-        workgroupBarrierAll();
-      }
+      deriveCtuMotion( ctu, col, row, first, count );
     }
     AllMemoryBarrierWithGroupSync();   // (makes the CTU's motion visible to the rows below)
     if( g_lane == 0 )
