@@ -2118,138 +2118,240 @@ struct TileChroma
   bool edges;      // a border tile (its windows reach past the picture's edges)
 };
 
-// The chroma of a tile at (x, y) in 4:2:2 or 4:4:4, with the job's flags; the whole workgroup calls it, after tile.
-void chromaTile( int tid, uint* job, int x, int y, int cuX, int cuY, int flags, TileChroma tile )
+// Where each list's chroma window starts (list slot s): a sample before its motion's integer position. With DMVR that
+// is the refined motion's, dI from the merge motion's: the window's rows are the merge motion's window's, clamped into
+// it, and its columns past that window are set by chromaFixRow (xPrefetchPad's padding). A row is read from x0, after a
+// lead sample when x0 is odd (the reads start 4-byte aligned). xFrac, yFrac: the refined motion's fractions.
+struct ChromaWindows
 {
-  const int2             mvs[2]   = tile.mvs;
-  const int2             mvR[2]   = tile.mvR;
-  const int              refs[2]  = tile.refs;
-  const int              lists    = tile.lists;
-  const bool             hi       = tile.hi;
-  const bool             edges    = tile.edges;
-  const ChromaTileLayout L        = chromaTileLayout( tile.tw, tile.th );
-  const int              maxVal   = ( 1 << pc.bitDepth ) - 1;
-  const int              headRoom = max( 2, 14 - pc.bitDepth );
-  const int              bcwW1    = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW's L1 weight
-  const bool             bi       = lists == 2;
-  const bool             geo      = ( flags & FLAG_GEO ) != 0;
-  const int              cHeight  = pc.picHeight >> L.sy;
-  // Each list's window starts a sample before its motion's integer position. With DMVR that is the refined motion's,
-  // dI from the merge motion's: the window's rows are the merge motion's window's, clamped into it, and its columns
-  // past that window are set by chromaFixRow (xPrefetchPad's padding). A row is read from x0, after a lead sample when
-  // x0 is odd (the reads start 4-byte aligned).
   int  x0[2], y0[2], lead[2];
   int2 dI[2];
   int  xFrac[2], yFrac[2];
+};
+
+ChromaWindows chromaWindowsOf( int x, int y, ChromaTileLayout L, TileChroma tile )
+{
+  ChromaWindows cw;
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    dI[s]    = int2( ( mvR[s].x >> ( 4 + L.sx ) ) - ( mvs[s].x >> ( 4 + L.sx ) ), ( mvR[s].y >> ( 4 + L.sy ) ) - ( mvs[s].y >> ( 4 + L.sy ) ) );
-    x0[s]    = ( x >> L.sx ) + ( mvs[s].x >> ( 4 + L.sx ) ) - 1 + dI[s].x;
-    y0[s]    = ( y >> L.sy ) + ( mvs[s].y >> ( 4 + L.sy ) ) - 1;
-    lead[s]  = x0[s] & 1;
-    xFrac[s] = mvR[s].x & ( ( 16 << L.sx ) - 1 );
-    yFrac[s] = mvR[s].y & ( ( 16 << L.sy ) - 1 );
+    const int2 mvs = tile.mvs[s];
+    const int2 mvR = tile.mvR[s];
+    cw.dI[s]       = int2( ( mvR.x >> ( 4 + L.sx ) ) - ( mvs.x >> ( 4 + L.sx ) ), ( mvR.y >> ( 4 + L.sy ) ) - ( mvs.y >> ( 4 + L.sy ) ) );
+    cw.x0[s]       = ( x >> L.sx ) + ( mvs.x >> ( 4 + L.sx ) ) - 1 + cw.dI[s].x;
+    cw.y0[s]       = ( y >> L.sy ) + ( mvs.y >> ( 4 + L.sy ) ) - 1;
+    cw.lead[s]     = cw.x0[s] & 1;
+    cw.xFrac[s]    = mvR.x & ( ( 16 << L.sx ) - 1 );
+    cw.yFrac[s]    = mvR.y & ( ( 16 << L.sy ) - 1 );
   }
-  const bool moved = ( dI[0].x | dI[1].x ) != 0;
+  return cw;
+}
+
+// Reads the round's windows (component k = w / lists, list slot s = w % lists of the round, from component first) in
+// chunks of 4 samples, two a thread at most; all the reads are issued before the first store. A thread past the last
+// chunk (or window) reads one that exists again and stores nothing. A border tile's rows are clamped into the picture,
+// and a chunk wholly beside it is read from its first column instead (chromaFixRow sets those samples); its reads
+// index from the margin's sample 16 left of the plane's first, as tile's border reads do.
+void readChromaWindows( int tid, ChromaTileLayout L, TileChroma tile, ChromaWindows cw, int first, out uint2 chunk[4][2] )
+{
+  const bool bi      = tile.lists == 2;
+  const int  windows = L.comps * tile.lists;
+  const int  chunks  = L.rows * L.rowChunks;
+  const int  cHeight = pc.picHeight >> L.sy;
+  if( tile.edges )
+  {
+    [unroll]
+    for( int w = 0; w < 4; w++ )
+    {
+      const int wc = min( w, windows - 1 );
+      const int s  = bi ? wc & 1 : 0;
+      int16_t*  p  = uniPtr( refPlane( tile.refs[s], 1 + first + ( bi ? wc >> 1 : wc ) ) );
+      [unroll]
+      for( int i = 0; i < 2; i++ )
+      {
+        const int task = min( tid + THREADS * i, chunks - 1 );
+        const int row  = smallQuotient( task, L.rowChunks );
+        const int col  = cw.x0[s] - cw.lead[s] + 4 * ( task - row * L.rowChunks );
+        const int c0   = col + 4 <= 0 || col >= ( pc.picWidth >> L.sx ) ? 0 : col;
+        const int src  = clamp( cw.y0[s] + clamp( row + cw.dI[s].y, 0, L.rows - 1 ), 0, cHeight - 1 );
+        chunk[w][i]    = load8( p - 16, uint( src * pc.stride12 + c0 + 16 ) );
+      }
+    }
+  }
+  else
+  {
+    [unroll]
+    for( int w = 0; w < 4; w++ )
+    {
+      const int wc = min( w, windows - 1 );
+      const int s  = bi ? wc & 1 : 0;
+      int16_t*  p  = uniPtr( refPlane( tile.refs[s], 1 + first + ( bi ? wc >> 1 : wc ) ) );
+      [unroll]
+      for( int i = 0; i < 2; i++ )
+      {
+        const int task = min( tid + THREADS * i, chunks - 1 );
+        const int row  = smallQuotient( task, L.rowChunks );
+        const int col  = cw.x0[s] - cw.lead[s] + 4 * ( task - row * L.rowChunks );
+        const int src  = cw.y0[s] + clamp( row + cw.dI[s].y, 0, L.rows - 1 );
+        chunk[w][i]    = load8( p, uint( src * pc.stride12 + col ) );
+      }
+    }
+  }
+}
+
+// Stores the chunks readChromaWindows read into the round's windows in the pool
+void storeChromaWindows( int tid, ChromaTileLayout L, TileChroma tile, uint2 chunk[4][2] )
+{
+  const bool bi      = tile.lists == 2;
+  const int  windows = L.comps * tile.lists;
+  const int  chunks  = L.rows * L.rowChunks;
+  [unroll]
+  for( int w = 0; w < 4; w++ )
+  {
+    const int kc = bi ? w >> 1 : w;
+    const int s  = bi ? w & 1 : 0;
+    [unroll]
+    for( int i = 0; i < 2; i++ )
+    {
+      const int task = tid + THREADS * i;
+      if( w < windows && task < chunks )
+      {
+        const int row = smallQuotient( task, L.rowChunks );
+        storeFour( chromaWindowAt( L, kc, s ) + row * L.rowLen + 4 * ( task - row * L.rowChunks ), chunk[w][i] );
+      }
+    }
+  }
+}
+
+// chromaFixRow for each row of the round's windows, a thread per window row
+void fixChromaRows( int tid, ChromaTileLayout L, TileChroma tile, ChromaWindows cw )
+{
+  const bool bi      = tile.lists == 2;
+  const int  windows = L.comps * tile.lists;
+  for( int r = tid; r < windows * L.rows; r += THREADS )
+  {
+    const int w  = smallQuotient( r, L.rows );
+    const int kc = bi ? w >> 1 : w;
+    const int s  = bi ? w & 1 : 0;
+    chromaFixRow( chromaWindowAt( L, kc, s ) + ( r - w * L.rows ) * L.rowLen + cw.lead[s], cw.x0[s], L.cols, cw.dI[s].x, tile.edges );
+  }
+}
+
+// The 2-D filters' horizontal passes over the round's windows (those with both fractions), in groups of 4 samples of
+// a window row, at 14 bits; cx holds each list's horizontal filter
+void chromaPasses( int tid, ChromaTileLayout L, TileChroma tile, ChromaWindows cw, int16_t cx[2][4] )
+{
+  const bool bi       = tile.lists == 2;
+  const int  windows  = L.comps * tile.lists;
+  const int  headRoom = max( 2, 14 - pc.bitDepth );
+  const int  shift1   = 6 - headRoom;
+  const int  offset1  = -IF_INTERNAL_OFFS * ( 1 << shift1 );
+  [unroll]
+  for( int w = 0; w < 4; w++ )
+  {
+    const int kc = bi ? w >> 1 : w;
+    const int s  = bi ? w & 1 : 0;
+    if( w < windows && cw.xFrac[s] != 0 && cw.yFrac[s] != 0 )
+    {
+      const int win  = chromaWindowAt( L, kc, s ) + cw.lead[s];
+      const int pass = chromaPassAt( L, kc, s );
+      for( int g = tid; g < L.rows << L.lgGroups; g += THREADS )
+      {
+        const int r  = g >> L.lgGroups;
+        const int gx = ( g & ( ( 1 << L.lgGroups ) - 1 ) ) << 2;
+        int       v[7];
+        [unroll]
+        for( int e = 0; e < 7; e++ )
+        {
+          v[e] = int( s_pool[win + r * L.rowLen + gx + e] );
+        }
+        [unroll]
+        for( int o = 0; o < 4; o++ )
+        {
+          int sum = 0;
+          [unroll]
+          for( int t = 0; t < 4; t++ )
+          {
+            sum += int( cx[s][t] ) * v[o + t];
+          }
+          s_pool[pass + r * L.cw + gx + o] = int16_t( ( sum + offset1 ) >> shift1 );
+        }
+      }
+    }
+  }
+}
+
+// The thread's group of 4 samples of component kc (k of the round), row j, from sample i0: each list's prediction,
+// combined (BCW's or weighted prediction's weights, or GPM's blend), plus the residual res, written at atC
+void writeChromaGroup( uint* job, int x, int y, int cuX, int cuY, int flags, ChromaTileLayout L, TileChroma tile, ChromaWindows cw,
+                       int16_t cx[2][4], int16_t cy[2][4], int k, int kc, int j, int i0, uint atC, uint2 res )
+{
+  const int  maxVal = ( 1 << pc.bitDepth ) - 1;
+  const int  bcwW1  = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW's L1 weight
+  const bool geo    = ( flags & FLAG_GEO ) != 0;
+  int4       pred[2];
+  [unroll]
+  for( int s = 0; s < 2; s++ )
+  {
+    pred[s] = int4( 0, 0, 0, 0 );
+    if( s < tile.lists )
+    {
+      pred[s] = chromaGroupPred( L, chromaWindowAt( L, k, s ) + cw.lead[s], chromaPassAt( L, k, s ), j, i0, cw.xFrac[s], cw.yFrac[s], cx[s], cy[s], tile.hi );
+    }
+  }
+  const int4 resV = unpackSamples( res );
+  int4       v;
+  [unroll]
+  for( int o = 0; o < 4; o++ )
+  {
+    // (GPM: the weight of the CU's luma sample under the chroma sample)
+    const int gpmWeight = geo ? geoWeight( job[9], ( ( x >> L.sx ) + i0 + o - ( cuX >> L.sx ) ) << L.sx, ( ( y >> L.sy ) + j - ( cuY >> L.sy ) ) << L.sy ) : 0;
+    v[o]                = combineLists( flags, 1 + kc, pred[0][o], pred[1][o], gpmWeight, job[9 + kc], job[11], bcwW1 );
+  }
+  if( ( flags & ( FLAG_RES_Y << ( 1 + kc ) ) ) != 0 )
+  {
+    v = clamp( v + resV, 0, maxVal );
+  }
+  int16_t* out = ( flags & ( FLAG_DEFER_CB << kc ) ) != 0 ? ( kc == 0 ? pc.defer1 : pc.defer2 ) : ( kc == 0 ? pc.dst1 : pc.dst2 );
+  *(uint2*)at( out, atC ) = packSamples( v );
+}
+
+// The chroma of a tile at (x, y) in 4:2:2 or 4:4:4, with the job's flags; the whole workgroup calls it, after tile.
+// Per round of components (both, or one when both do not fit the pool): the windows read, stored and fixed, the
+// horizontal passes, then the thread's group of samples.
+void chromaTile( int tid, uint* job, int x, int y, int cuX, int cuY, int flags, TileChroma tile )
+{
+  const ChromaTileLayout L     = chromaTileLayout( tile.tw, tile.th );
+  const ChromaWindows    cw    = chromaWindowsOf( x, y, L, tile );
+  const bool             moved = ( cw.dI[0].x | cw.dI[1].x ) != 0;
   // The thread's group of 4 samples: component k of the round, row j, samples i0 .. i0 + 3
-  const int  k     = tid >> L.lgComp;
-  const int  j     = ( tid >> L.lgGroups ) & ( L.ch - 1 );
-  const int  i0    = ( tid & ( ( 1 << L.lgGroups ) - 1 ) ) << 2;
-  const bool mine  = k < L.comps;
-  const uint atC   = uint( ( ( y >> L.sy ) + j ) * pc.stride12 + ( x >> L.sx ) + i0 );
+  const int  k    = tid >> L.lgComp;
+  const int  j    = ( tid >> L.lgGroups ) & ( L.ch - 1 );
+  const int  i0   = ( tid & ( ( 1 << L.lgGroups ) - 1 ) ) << 2;
+  const bool mine = k < L.comps;
+  const uint atC  = uint( ( ( y >> L.sy ) + j ) * pc.stride12 + ( x >> L.sx ) + i0 );
 
   GroupMemoryBarrierWithGroupSync();   // (the luma is done with the pool)
   [loop]
   for( int first = 0; first < 2; first += L.comps )
   {
-    // The windows (component k = w / lists, list slot s = w % lists of the round's), each read in chunks of 4 samples,
-    // two a thread at most; all the reads are issued before the first store. A thread past the last chunk (or window)
-    // reads one that exists again and stores nothing.
-    const int windows = L.comps * lists;
-    const int chunks  = L.rows * L.rowChunks;
-    uint2     chunk[4][2];
-    if( edges )
-    {
-      // A border tile: rows clamped into the picture, and a chunk wholly beside it read from its first column instead
-      // (chromaFixRow sets those samples); the reads index from the margin's sample 16 left of the plane's first, as
-      // tile's border reads do.
-      [unroll]
-      for( int w = 0; w < 4; w++ )
-      {
-        const int wc = min( w, windows - 1 );
-        const int s  = bi ? wc & 1 : 0;
-        int16_t*  p  = uniPtr( refPlane( refs[s], 1 + first + ( bi ? wc >> 1 : wc ) ) );
-        [unroll]
-        for( int i = 0; i < 2; i++ )
-        {
-          const int task = min( tid + THREADS * i, chunks - 1 );
-          const int row  = smallQuotient( task, L.rowChunks );
-          const int col  = x0[s] - lead[s] + 4 * ( task - row * L.rowChunks );
-          const int c0   = col + 4 <= 0 || col >= ( pc.picWidth >> L.sx ) ? 0 : col;
-          const int src  = clamp( y0[s] + clamp( row + dI[s].y, 0, L.rows - 1 ), 0, cHeight - 1 );
-          chunk[w][i]    = load8( p - 16, uint( src * pc.stride12 + c0 + 16 ) );
-        }
-      }
-    }
-    else
-    {
-      [unroll]
-      for( int w = 0; w < 4; w++ )
-      {
-        const int wc = min( w, windows - 1 );
-        const int s  = bi ? wc & 1 : 0;
-        int16_t*  p  = uniPtr( refPlane( refs[s], 1 + first + ( bi ? wc >> 1 : wc ) ) );
-        [unroll]
-        for( int i = 0; i < 2; i++ )
-        {
-          const int task = min( tid + THREADS * i, chunks - 1 );
-          const int row  = smallQuotient( task, L.rowChunks );
-          const int col  = x0[s] - lead[s] + 4 * ( task - row * L.rowChunks );
-          const int src  = y0[s] + clamp( row + dI[s].y, 0, L.rows - 1 );
-          chunk[w][i]    = load8( p, uint( src * pc.stride12 + col ) );
-        }
-      }
-    }
-    // The residuals where the thread's samples go: both planes read when either has one (the branch is the same for all
-    // the threads), the thread's component's picked after
+    uint2 chunk[4][2];
+    readChromaWindows( tid, L, tile, cw, first, chunk );
+    // The residuals where the thread's samples go: both planes read when either has one (the branch is the same for
+    // all the threads), the thread's component's picked after
     uint2 resCb = uint2( 0, 0 ), resCr = uint2( 0, 0 );
     if( ( flags & ( ( FLAG_RES_Y << 1 ) | ( FLAG_RES_Y << 2 ) ) ) != 0 )
     {
       resCb = *(uint2*)at( pc.dst1, atC );
       resCr = *(uint2*)at( pc.dst2, atC );
     }
-    [unroll]
-    for( int w = 0; w < 4; w++ )
-    {
-      const int kc = bi ? w >> 1 : w;
-      const int s  = bi ? w & 1 : 0;
-      [unroll]
-      for( int i = 0; i < 2; i++ )
-      {
-        const int task = tid + THREADS * i;
-        if( w < windows && task < chunks )
-        {
-          const int row = smallQuotient( task, L.rowChunks );
-          storeFour( chromaWindowAt( L, kc, s ) + row * L.rowLen + 4 * ( task - row * L.rowChunks ), chunk[w][i] );
-        }
-      }
-    }
+    storeChromaWindows( tid, L, tile, chunk );
     GroupMemoryBarrierWithGroupSync();
-    if( edges || moved )
+    if( tile.edges || moved )
     {
-      // a thread per window row
-      for( int r = tid; r < windows * L.rows; r += THREADS )
-      {
-        const int w  = smallQuotient( r, L.rows );
-        const int kc = bi ? w >> 1 : w;
-        const int s  = bi ? w & 1 : 0;
-        chromaFixRow( chromaWindowAt( L, kc, s ) + ( r - w * L.rows ) * L.rowLen + lead[s], x0[s], L.cols, dI[s].x, edges );
-      }
+      fixChromaRows( tid, L, tile, cw );
       GroupMemoryBarrierWithGroupSync();
     }
-
-    // The 2-D filters' horizontal passes, in groups of 4 samples of a window row
     int16_t cx[2][4], cy[2][4];
     [unroll]
     for( int s = 0; s < 2; s++ )
@@ -2257,77 +2359,16 @@ void chromaTile( int tid, uint* job, int x, int y, int cuX, int cuY, int flags, 
       [unroll]
       for( int t = 0; t < 4; t++ )
       {
-        cx[s][t] = int16_t( kChroma[( xFrac[s] << ( 1 - L.sx ) ) * 4 + t] );
-        cy[s][t] = int16_t( kChroma[( yFrac[s] << ( 1 - L.sy ) ) * 4 + t] );
+        cx[s][t] = int16_t( kChroma[( cw.xFrac[s] << ( 1 - L.sx ) ) * 4 + t] );
+        cy[s][t] = int16_t( kChroma[( cw.yFrac[s] << ( 1 - L.sy ) ) * 4 + t] );
       }
     }
-    const int shift1  = 6 - headRoom;
-    const int offset1 = -IF_INTERNAL_OFFS * ( 1 << shift1 );
-    [unroll]
-    for( int w = 0; w < 4; w++ )
-    {
-      const int kc = bi ? w >> 1 : w;
-      const int s  = bi ? w & 1 : 0;
-      if( w < windows && xFrac[s] != 0 && yFrac[s] != 0 )
-      {
-        const int win  = chromaWindowAt( L, kc, s ) + lead[s];
-        const int pass = chromaPassAt( L, kc, s );
-        for( int g = tid; g < L.rows << L.lgGroups; g += THREADS )
-        {
-          const int r  = g >> L.lgGroups;
-          const int gx = ( g & ( ( 1 << L.lgGroups ) - 1 ) ) << 2;
-          int       v[7];
-          [unroll]
-          for( int e = 0; e < 7; e++ )
-          {
-            v[e] = int( s_pool[win + r * L.rowLen + gx + e] );
-          }
-          [unroll]
-          for( int o = 0; o < 4; o++ )
-          {
-            int sum = 0;
-            [unroll]
-            for( int t = 0; t < 4; t++ )
-            {
-              sum += int( cx[s][t] ) * v[o + t];
-            }
-            s_pool[pass + r * L.cw + gx + o] = int16_t( ( sum + offset1 ) >> shift1 );
-          }
-        }
-      }
-    }
+    chromaPasses( tid, L, tile, cw, cx );
     GroupMemoryBarrierWithGroupSync();
-
-    // The thread's group: each list's prediction, combined, the residual added, written
     if( mine )
     {
       const int kc = first + k;   // (0: Cb, 1: Cr)
-      int4      pred[2];
-      [unroll]
-      for( int s = 0; s < 2; s++ )
-      {
-        pred[s] = int4( 0, 0, 0, 0 );
-        if( s < lists )
-        {
-          pred[s] = chromaGroupPred( L, chromaWindowAt( L, k, s ) + lead[s], chromaPassAt( L, k, s ), j, i0, xFrac[s], yFrac[s], cx[s], cy[s], hi );
-        }
-      }
-      const uint2 res  = kc == 0 ? resCb : resCr;
-      const int4  resV = unpackSamples( res );
-      int4        v;
-      [unroll]
-      for( int o = 0; o < 4; o++ )
-      {
-        // (GPM: the weight of the CU's luma sample under the chroma sample)
-        const int gpmWeight = geo ? geoWeight( job[9], ( ( x >> L.sx ) + i0 + o - ( cuX >> L.sx ) ) << L.sx, ( ( y >> L.sy ) + j - ( cuY >> L.sy ) ) << L.sy ) : 0;
-        v[o]                = combineLists( flags, 1 + kc, pred[0][o], pred[1][o], gpmWeight, job[9 + kc], job[11], bcwW1 );
-      }
-      if( ( flags & ( FLAG_RES_Y << ( 1 + kc ) ) ) != 0 )
-      {
-        v = clamp( v + resV, 0, maxVal );
-      }
-      int16_t* out = ( flags & ( FLAG_DEFER_CB << kc ) ) != 0 ? ( kc == 0 ? pc.defer1 : pc.defer2 ) : ( kc == 0 ? pc.dst1 : pc.dst2 );
-      *(uint2*)at( out, atC ) = packSamples( v );
+      writeChromaGroup( job, x, y, cuX, cuY, flags, L, tile, cw, cx, cy, k, kc, j, i0, atC, kc == 0 ? resCb : resCr );
     }
     GroupMemoryBarrierWithGroupSync();   // (the next round's windows replace these)
   }
