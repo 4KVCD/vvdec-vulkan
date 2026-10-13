@@ -966,165 +966,207 @@ int lmcsResidual( int r, int scale )
   return clip3( -32768, 32767, c < 0 ? -v : v );
 }
 
-// Makes one job (a block of a component, or a band of its rows): the
-// workgroup's threads first read together what the block needs from the
-// picture, then share out the block's samples.
-void make( int tid, uint job[12] )
+// An intra job's block, decoded from the job's words for make() and its stages
+struct IntraBlock
 {
-  const int   x0     = int( job[0] & 0xffff );
-  const int   y0     = int( job[0] >> 16 );
-  const int   w      = int( job[1] & 255 );
-  const int   h      = int( ( job[1] >> 8 ) & 255 );
-  const int   comp   = int( ( job[1] >> 16 ) & 255 );
-  const int   kind   = int( job[1] >> 24 );
-  const int   mode   = int( job[2] & 255 );
-  const uint  flags  = ( job[2] >> 8 ) & 255;
-  const int   refLine = int( ( job[2] >> 24 ) & 3 );   // MRL
-  const int   maxVal = ( 1 << pc.bitDepth ) - 1;
-  const bool  filtered = ( flags & kIntraFiltered ) != 0;
-  const bool  residual = ( flags & kIntraResidual ) != 0;
-  const int   log2W  = log2Int( w );
-  // The workgroup makes the block's rows first to first + count - 1: m samples
-  // (at most 256, four per thread); its sample i is the block's sample s0 + i.
-  const int   s0     = int( job[7] & 0xffff ) * w;
-  const int   m      = int( job[7] >> 16 ) * w;
+  int  x0, y0, w, h, log2W;   // the block, in samples of its component
+  int  comp, kind, mode;
+  uint flags;
+  int  refLine;               // MRL's reference line
+  bool filtered, residual;
+  int  s0, m;                 // the samples the workgroup makes: the block's s0 to s0 + m - 1, a band of its rows
+  uint lmcsInfo;              // LMCS: whether (bit 0) and how to scale the chroma residual
+  bool lmcs;
+  int  maxVal;
+};
 
-  int16_t*  dst    = planeOf( comp );
-  const int stride = strideOf( comp );
-  // LMCS: whether to scale the chroma residual
-  const uint lmcsInfo = job[9];
-  const bool lmcs     = ( lmcsInfo & 1 ) != 0;
+IntraBlock intraBlockOf( uint job[12] )
+{
+  IntraBlock b;
+  b.x0       = int( job[0] & 0xffff );
+  b.y0       = int( job[0] >> 16 );
+  b.w        = int( job[1] & 255 );
+  b.h        = int( ( job[1] >> 8 ) & 255 );
+  b.log2W    = log2Int( b.w );
+  b.comp     = int( ( job[1] >> 16 ) & 255 );
+  b.kind     = int( job[1] >> 24 );
+  b.mode     = int( job[2] & 255 );
+  b.flags    = ( job[2] >> 8 ) & 255;
+  b.refLine  = int( ( job[2] >> 24 ) & 3 );
+  b.filtered = ( b.flags & kIntraFiltered ) != 0;
+  b.residual = ( b.flags & kIntraResidual ) != 0;
+  // The workgroup makes the block's rows first to first + count - 1: m samples (at most 256, four per thread); its
+  // sample i is the block's sample s0 + i.
+  b.s0       = int( job[7] & 0xffff ) * b.w;
+  b.m        = int( job[7] >> 16 ) * b.w;
+  b.lmcsInfo = job[9];
+  b.lmcs     = ( b.lmcsInfo & 1 ) != 0;
+  b.maxVal   = ( 1 << pc.bitDepth ) - 1;
+  return b;
+}
 
-  if( kind == kIntraIbc || kind == kIntraLmcs )
+// Makes an IBC job, which copies the block from elsewhere in the picture and adds the residual, or an LMCS job (the
+// chroma of an inter CU), which adds the scaled residual to the prediction kept aside. All the reads are issued
+// together, then the writes.
+void copyJob( int tid, uint job[12], IntraBlock b )
+{
+  int16_t*  dst    = planeOf( b.comp );
+  const int stride = strideOf( b.comp );
+  const int bvx    = int( int16_t( job[6] & 0xffff ) );
+  const int bvy    = int( int16_t( job[6] >> 16 ) );
+  int16_t*  src    = b.kind == kIntraLmcs ? ( b.comp == 1 ? pc.defer1 : pc.defer2 ) : dst;
+  int       pred[4];
+  int       res[4];
+  [unroll]
+  for( int k = 0; k < 4; k++ )
   {
-    // IBC: copy the block from elsewhere in the picture and add the residual.
-    // The chroma of an inter CU under LMCS: add the residual to the prediction
-    // kept aside. All the reads are issued together, then the writes.
-    const int bvx = int( int16_t( job[6] & 0xffff ) );
-    const int bvy = int( int16_t( job[6] >> 16 ) );
-    int16_t*  src = kind == kIntraLmcs ? ( comp == 1 ? pc.defer1 : pc.defer2 ) : dst;
-    int       pred[4];
-    int       res[4];
-    [unroll]
-    for( int k = 0; k < 4; k++ )
-    {
-      const int i = tid + 64 * k;
-      const int x = ( s0 + i ) & ( w - 1 );
-      const int y = ( s0 + i ) >> log2W;
-      pred[k]     = i < m ? ( kind == kIntraLmcs ? int( src[( y0 + y ) * stride + x0 + x] ) : sampleAt( comp, x0 + x + bvx, y0 + y + bvy ) ) : 0;
-      res[k]      = i < m && residual ? int( dst[( y0 + y ) * stride + x0 + x] ) : 0;
-    }
-    int scale = 0;
-    if( lmcs )
-    {
-      lmcsShare( tid, lmcsLuma( tid, job[8], lmcsInfo ) );
-      GroupMemoryBarrierWithGroupSync();
-      scale = lmcsScale( lmcsInfo );
-    }
-    [unroll]
-    for( int k = 0; k < 4; k++ )
-    {
-      const int i = tid + 64 * k;
-      if( i < m )
-      {
-        const int at = ( y0 + ( ( s0 + i ) >> log2W ) ) * stride + x0 + ( ( s0 + i ) & ( w - 1 ) );
-        dst[at]      = int16_t( residual ? clip3( 0, maxVal, pred[k] + ( lmcs ? lmcsResidual( res[k], scale ) : res[k] ) ) : pred[k] );
-      }
-    }
-    return;   // (the whole workgroup returns here)
+    const int i = tid + 64 * k;
+    const int x = ( b.s0 + i ) & ( b.w - 1 );
+    const int y = ( b.s0 + i ) >> b.log2W;
+    pred[k]     = i < b.m ? ( b.kind == kIntraLmcs ? int( src[( b.y0 + y ) * stride + b.x0 + x] ) : sampleAt( b.comp, b.x0 + x + bvx, b.y0 + y + bvy ) ) : 0;
+    res[k]      = i < b.m && b.residual ? int( dst[( b.y0 + y ) * stride + b.x0 + x] ) : 0;
   }
+  int scale = 0;
+  if( b.lmcs )
+  {
+    lmcsShare( tid, lmcsLuma( tid, job[8], b.lmcsInfo ) );
+    GroupMemoryBarrierWithGroupSync();
+    scale = lmcsScale( b.lmcsInfo );
+  }
+  [unroll]
+  for( int k = 0; k < 4; k++ )
+  {
+    const int i = tid + 64 * k;
+    if( i < b.m )
+    {
+      const int at = ( b.y0 + ( ( b.s0 + i ) >> b.log2W ) ) * stride + b.x0 + ( ( b.s0 + i ) & ( b.w - 1 ) );
+      dst[at]      = int16_t( b.residual ? clip3( 0, b.maxVal, pred[k] + ( b.lmcs ? lmcsResidual( res[k], scale ) : res[k] ) ) : pred[k] );
+    }
+  }
+}
 
-  // The block that the prediction covers (pw x ph; the job's block starts xoff
-  // samples into it), the size that decides the wide-angle modes, and the
-  // references' lengths. All are the job's block's own, except for ISP
-  // sub-partitions (kIntraIsp): the size is the CU's, the top (left) length is
-  // the CU's width (height) plus the block's, and the sub-partitions of a
-  // vertical split that are 1 or 2 samples wide share one prediction block 4
-  // samples wide (CU::isPredRegDiffFromTB).
-  const bool isp   = ( flags & kIntraIsp ) != 0;
-  const IspCu cu    = ispCuOf( job );   // (meaningful with isp only)
-  const bool region = isp && cu.ver && ( cu.w == 4 || ( cu.w == 8 && cu.h > 4 ) );
-  const int  pw    = region ? 4 : w;
-  const int  ph    = h;
-  const int  xoff  = region ? ( x0 - cu.x ) & 3 : 0;
-  const int  sizeW = isp ? cu.w : pw;
-  const int  sizeH = isp ? cu.h : ph;
-  const int  topLength  = isp ? cu.w + pw : pw << 1;
-  const int  leftLength = isp ? cu.h + ph : ph << 1;
+// The block that the prediction covers (pw x ph; the job's block starts xoff samples into it), the size that decides
+// the wide-angle modes, and the references' lengths. All are the job's block's own, except for ISP sub-partitions
+// (kIntraIsp): the size is the CU's, the top (left) length is the CU's width (height) plus the block's, and the
+// sub-partitions of a vertical split that are 1 or 2 samples wide share one prediction block 4 samples wide
+// (CU::isPredRegDiffFromTB).
+struct PredBlock
+{
+  bool  isp;
+  IspCu cu;   // (meaningful with isp only)
+  int   pw, ph, xoff;
+  int   sizeW, sizeH;
+  int   topLength, leftLength;
+};
 
-  // The reads: first the references, then, while those are in flight, the
-  // residual, CCLM's luma, and kCubic for luma's angular modes.
-  const uint       nb   = job[3];
-  References       refs;
-  if( isp )
+PredBlock predBlockOf( uint job[12], IntraBlock b )
+{
+  PredBlock p;
+  p.isp             = ( b.flags & kIntraIsp ) != 0;
+  p.cu              = ispCuOf( job );
+  const bool region = p.isp && p.cu.ver && ( p.cu.w == 4 || ( p.cu.w == 8 && p.cu.h > 4 ) );
+  p.pw              = region ? 4 : b.w;
+  p.ph              = b.h;
+  p.xoff            = region ? ( b.x0 - p.cu.x ) & 3 : 0;
+  p.sizeW           = p.isp ? p.cu.w : p.pw;
+  p.sizeH           = p.isp ? p.cu.h : p.ph;
+  p.topLength       = p.isp ? p.cu.w + p.pw : p.pw << 1;
+  p.leftLength      = p.isp ? p.cu.h + p.ph : p.ph << 1;
+  return p;
+}
+
+// Reads what the block needs into shared memory: first the references, then, while those are in flight, the
+// residual, CCLM's luma (or CIIP's inter prediction), kCubic for luma's angular modes and LMCS's luma; then waits at a
+// barrier for all of them.
+void loadInputs( int tid, uint job[12], IntraBlock b, PredBlock p )
+{
+  int16_t*   dst    = planeOf( b.comp );
+  const int  stride = strideOf( b.comp );
+  const uint nb     = job[3];
+  References refs;
+  if( p.isp )
   {
     // the CU's fill, as for a block of the CU's size
-    const RefFill f = refFill( comp, cu.x, cu.y, cu.w << 1, cu.h << 1, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), 0 );
-    refs = loadReferencesIsp( tid, f, x0 - xoff, y0, pw, ph, cu );
+    const RefFill f = refFill( b.comp, p.cu.x, p.cu.y, p.cu.w << 1, p.cu.h << 1, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), 0 );
+    refs = loadReferencesIsp( tid, f, b.x0 - p.xoff, b.y0, p.pw, p.ph, p.cu );
   }
   else
   {
-    refs = loadReferences( tid, refFill( comp, x0, y0, w << 1, h << 1, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), refLine ) );
+    refs = loadReferences( tid, refFill( b.comp, b.x0, b.y0, b.w << 1, b.h << 1, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), b.refLine ) );
   }
-  const bool       lmAbove = ( ( job[4] >> 16 ) & 1 ) != 0;
-  const bool       lmLeft  = ( ( job[4] >> 17 ) & 1 ) != 0;
-  if( kind == kIntraCclm )
+  const bool lmAbove = ( ( job[4] >> 16 ) & 1 ) != 0;
+  const bool lmLeft  = ( ( job[4] >> 17 ) & 1 ) != 0;
+  if( b.kind == kIntraCclm )
   {
     // CCLM: the downsampled luma of the template samples, one thread each (the block's samples follow below)
     const CclmPicks picks = cclmPicks( job[4], job[5] );
     if( tid < picks.cntT + picks.cntL )
     {
-      s_tmpl[tid] = cclmTemplateLuma( x0, y0, job[4], picks, tid );
+      s_tmpl[tid] = cclmTemplateLuma( b.x0, b.y0, job[4], picks, tid );
     }
   }
-  if( kind == kIntraCclm || kind == kIntraCiip || residual )
+  if( b.kind == kIntraCclm || b.kind == kIntraCiip || b.residual )
   {
     // (CIIP keeps inter's prediction where CCLM keeps its luma, in s_luma)
-    int16_t* inter = comp == 0 ? pc.defer0 : ( comp == 1 ? pc.defer1 : pc.defer2 );
+    int16_t* inter = b.comp == 0 ? pc.defer0 : ( b.comp == 1 ? pc.defer1 : pc.defer2 );
     int      luma[4];
     int      res[4];
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
       const int i = tid + 64 * k;
-      const int x = ( s0 + i ) & ( w - 1 );
-      const int y = ( s0 + i ) >> log2W;
-      luma[k]     = i < m && kind == kIntraCclm ? lumaDown( x0 << pc.scaleX, y0 << pc.scaleY, x, y, lmAbove, lmLeft )
-                    : ( i < m && kind == kIntraCiip ? int( inter[( y0 + y ) * stride + x0 + x] ) : 0 );
-      res[k]      = i < m && residual ? int( dst[( y0 + y ) * stride + x0 + x] ) : 0;
+      const int x = ( b.s0 + i ) & ( b.w - 1 );
+      const int y = ( b.s0 + i ) >> b.log2W;
+      luma[k]     = i < b.m && b.kind == kIntraCclm ? lumaDown( b.x0 << pc.scaleX, b.y0 << pc.scaleY, x, y, lmAbove, lmLeft )
+                    : ( i < b.m && b.kind == kIntraCiip ? int( inter[( b.y0 + y ) * stride + b.x0 + x] ) : 0 );
+      res[k]      = i < b.m && b.residual ? int( dst[( b.y0 + y ) * stride + b.x0 + x] ) : 0;
     }
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
       const int i = tid + 64 * k;
-      if( i < m )
+      if( i < b.m )
       {
         s_luma[i] = int16_t( luma[k] );
         s_res[i]  = int16_t( res[k] );
       }
     }
   }
-  if( kind == kIntraAngular && comp == 0 )
+  if( b.kind == kIntraAngular && b.comp == 0 )
   {
     s_cubic[tid]      = kCubic[tid];
     s_cubic[tid + 64] = kCubic[tid + 64];
   }
-  if( lmcs )
+  if( b.lmcs )
   {
-    lmcsShare( tid, lmcsLuma( tid, job[8], lmcsInfo ) );
+    lmcsShare( tid, lmcsLuma( tid, job[8], b.lmcsInfo ) );
   }
-  storeReferences( tid, topLength + refLine, leftLength + refLine, refs );
+  storeReferences( tid, p.topLength + b.refLine, p.leftLength + b.refLine, refs );
   GroupMemoryBarrierWithGroupSync();
-  const int lmcsScaling = lmcs ? lmcsScale( lmcsInfo ) : 0;
+}
+
+// Makes one job (a block of a component, or a band of its rows): the workgroup's threads first read together what the
+// block needs from the picture, then share out the block's samples.
+void make( int tid, uint job[12] )
+{
+  const IntraBlock b = intraBlockOf( job );
+  if( b.kind == kIntraIbc || b.kind == kIntraLmcs )
+  {
+    copyJob( tid, job, b );
+    return;   // (the whole workgroup returns here)
+  }
+  const PredBlock p = predBlockOf( job, b );
+  loadInputs( tid, job, b, p );
+  const int lmcsScaling = b.lmcs ? lmcsScale( b.lmcsInfo ) : 0;
 
   // Per block, derive what the predictor needs from the references.
-  if( filtered )
+  if( b.filtered )
   {
-    filterReferences( tid, w, h );
+    filterReferences( tid, b.w, b.h );
     GroupMemoryBarrierWithGroupSync();
   }
   Angular ang;
-  if( kind == kIntraCclm )
+  if( b.kind == kIntraCclm )
   {
     if( tid == 0 )
     {
@@ -1132,79 +1174,82 @@ void make( int tid, uint job[12] )
     }
     GroupMemoryBarrierWithGroupSync();
   }
-  else if( kind == kIntraAngular && mode == DC_IDX )
+  else if( b.kind == kIntraAngular && b.mode == DC_IDX )
   {
     if( tid == 0 )
     {
-      s_dc = dcValue( filtered, pw, ph, refLine );
+      s_dc = dcValue( b.filtered, p.pw, p.ph, b.refLine );
     }
     GroupMemoryBarrierWithGroupSync();
   }
-  else if( kind == kIntraAngular && mode != PLANAR_IDX )
+  else if( b.kind == kIntraAngular && b.mode != PLANAR_IDX )
   {
-    ang = setupAngular( comp, pw, ph, mode, refLine, sizeW, sizeH, topLength, leftLength, isp );
+    ang = setupAngular( b.comp, p.pw, p.ph, b.mode, b.refLine, p.sizeW, p.sizeH, p.topLength, p.leftLength, p.isp );
   }
-  const int mipPred = mipSizeId( w, h ) < 2 ? 4 : 8;
-  if( kind == kIntraMip )
+  const int mipPred = mipSizeId( b.w, b.h ) < 2 ? 4 : 8;
+  if( b.kind == kIntraMip )
   {
     // MIP: the reduced boundary, then the reduced prediction (one thread per element)
-    const int sizeId = mipSizeId( w, h );
+    const int sizeId = mipSizeId( b.w, b.h );
     const int bdry   = sizeId == 0 ? 2 : 4;
     if( tid < 2 * bdry )
     {
-      s_luma[MIP_BDRY + tid] = int16_t( mipBoundary( tid, bdry, w, h ) );
+      s_luma[MIP_BDRY + tid] = int16_t( mipBoundary( tid, bdry, b.w, b.h ) );
     }
     GroupMemoryBarrierWithGroupSync();
     if( tid < mipPred * mipPred )
     {
-      mipReducedPred( tid, sizeId, mode, ( flags & kIntraMipTransposed ) != 0 );
+      mipReducedPred( tid, sizeId, b.mode, ( b.flags & kIntraMipTransposed ) != 0 );
     }
     GroupMemoryBarrierWithGroupSync();
   }
   const int  dc    = s_dc;
   const int3 model = s_model;
 
-  const int  bdpcmDir = int( ( job[2] >> 16 ) & 255 );
-  const bool doPdpcPlanarDc = ( kind == kIntraAngular || kind == kIntraCiip ) && ( mode == PLANAR_IDX || mode == DC_IDX ) && pw >= 4 && ph >= 4 && refLine == 0;
+  const int  bdpcmDir       = int( ( job[2] >> 16 ) & 255 );
+  const bool doPdpcPlanarDc = ( b.kind == kIntraAngular || b.kind == kIntraCiip ) && ( b.mode == PLANAR_IDX || b.mode == DC_IDX ) && p.pw >= 4
+                              && p.ph >= 4 && b.refLine == 0;
   const int  ciipIntra      = int( job[6] );   // CIIP: planar's weight
 
   // Compute the samples, from shared memory only.
-  for( int i = tid; i < m; i += 64 )
+  int16_t*  dst    = planeOf( b.comp );
+  const int stride = strideOf( b.comp );
+  for( int i = tid; i < b.m; i += 64 )
   {
-    const int x = ( s0 + i ) & ( w - 1 );
-    const int y = ( s0 + i ) >> log2W;
+    const int x = ( b.s0 + i ) & ( b.w - 1 );
+    const int y = ( b.s0 + i ) >> b.log2W;
     int       v;
-    if( kind == kIntraCclm )
+    if( b.kind == kIntraCclm )
     {
-      v = clip3( 0, maxVal, ( ( model.x * int( s_luma[i] ) ) >> model.z ) + model.y );
+      v = clip3( 0, b.maxVal, ( ( model.x * int( s_luma[i] ) ) >> model.z ) + model.y );
     }
-    else if( kind == kIntraBdpcm )
+    else if( b.kind == kIntraBdpcm )
     {
       v = bdpcmDir == 1 ? refL( false, y + 1 ) : refT( false, x + 1 );
     }
-    else if( kind == kIntraMip )
+    else if( b.kind == kIntraMip )
     {
-      v = mipSample( x, y, w, h, mipPred );
+      v = mipSample( x, y, b.w, b.h, mipPred );
     }
-    else if( mode == PLANAR_IDX || mode == DC_IDX )
+    else if( b.mode == PLANAR_IDX || b.mode == DC_IDX )
     {
-      v = mode == PLANAR_IDX ? predictPlanar( filtered, pw, ph, x + xoff, y ) : dc;
+      v = b.mode == PLANAR_IDX ? predictPlanar( b.filtered, p.pw, p.ph, x + p.xoff, y ) : dc;
       if( doPdpcPlanarDc )
       {
-        v = pdpcPlanarDc( filtered, pw, ph, x + xoff, y, v );
+        v = pdpcPlanarDc( b.filtered, p.pw, p.ph, x + p.xoff, y, v );
       }
     }
     else
     {
-      v = ang.isVer ? predictAngular( ang, comp, filtered, x + xoff, y, maxVal ) : predictAngular( ang, comp, filtered, y, x + xoff, maxVal );
+      v = ang.isVer ? predictAngular( ang, b.comp, b.filtered, x + p.xoff, y, b.maxVal ) : predictAngular( ang, b.comp, b.filtered, y, x + p.xoff, b.maxVal );
     }
-    if( kind == kIntraCiip )
+    if( b.kind == kIntraCiip )
     {
       // predBlendIntraCiip
       v = ( ( 4 - ciipIntra ) * int( s_luma[i] ) + ciipIntra * v + 2 ) >> 2;
     }
-    const int at = ( y0 + y ) * stride + x0 + x;
-    dst[at]      = int16_t( residual ? clip3( 0, maxVal, v + ( lmcs ? lmcsResidual( int( s_res[i] ), lmcsScaling ) : int( s_res[i] ) ) ) : v );
+    const int at = ( b.y0 + y ) * stride + b.x0 + x;
+    dst[at]      = int16_t( b.residual ? clip3( 0, b.maxVal, v + ( b.lmcs ? lmcsResidual( int( s_res[i] ), lmcsScaling ) : int( s_res[i] ) ) ) : v );
   }
 }
 
