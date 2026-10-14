@@ -76,9 +76,11 @@ static constexpr vvdecComponentType kColMotion = vvdecComponentType( VVDEC_MAX_N
 
 static void* createHostPlane( void* opaque, vvdecComponentType comp, uint32_t size, uint32_t, void** allocator )
 {
+  // (a picture's planes from the context's cache when it has some that fit: Context::allocHost; the colocated motion in
+  // the scarce memory the CPU maps on the GPU's side is never cached)
   Context*   context = static_cast<Context*>( opaque );
   HostPlane* plane   = new HostPlane;
-  plane->host        = context->alloc( size, comp == kColMotion ? MemKind::Upload : MemKind::HostCached );
+  plane->host        = comp == kColMotion ? context->alloc( size, MemKind::Upload ) : context->allocHost( size, MemKind::HostCached );
   plane->bytes       = size;
   if( !plane->host.mapped )
   {
@@ -92,9 +94,17 @@ static void* createHostPlane( void* opaque, vvdecComponentType comp, uint32_t si
 
 static void unrefHostPlane( void* opaque, void* allocator )
 {
-  HostPlane* plane = static_cast<HostPlane*>( allocator );
-  static_cast<Context*>( opaque )->free( plane->host );
-  static_cast<Context*>( opaque )->free( plane->twin );
+  HostPlane* plane   = static_cast<HostPlane*>( allocator );
+  Context*   context = static_cast<Context*>( opaque );
+  if( plane->host.kind == MemKind::HostCached )
+  {
+    context->keepHost( plane->host );   // (for the next picture created: Context::allocHost)
+  }
+  else
+  {
+    context->free( plane->host );
+  }
+  context->free( plane->twin );
   delete plane;
 }
 

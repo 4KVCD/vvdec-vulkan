@@ -1096,6 +1096,56 @@ void Context::recycle( Buffer& buf )
   buf = Buffer();
 }
 
+Buffer Context::allocHost( size_t size, MemKind kind )
+{
+  {
+    std::lock_guard<std::mutex> lock( m_hostCacheMutex );
+    // the smallest that fits, so that a larger one stays for a larger picture
+    auto best = m_hostCache.end();
+    for( auto it = m_hostCache.begin(); it != m_hostCache.end(); ++it )
+    {
+      const bool fits = it->kind == kind && it->size >= size && it->size <= 2 * size;
+      if( fits && ( best == m_hostCache.end() || it->size < best->size ) )
+      {
+        best = it;
+      }
+    }
+    if( best != m_hostCache.end() )
+    {
+      const Buffer buf = *best;
+      m_hostCacheBytes -= size_t( buf.size );
+      m_hostCache.erase( best );
+      return buf;
+    }
+  }
+  return alloc( size, kind );
+}
+
+void Context::keepHost( Buffer& buf )
+{
+  if( !buf.valid() )
+  {
+    return;
+  }
+  std::vector<Buffer> evicted;
+  {
+    std::lock_guard<std::mutex> lock( m_hostCacheMutex );
+    m_hostCache.push_back( buf );
+    m_hostCacheBytes += size_t( buf.size );
+    while( m_hostCacheBytes > kHostCacheBytes )
+    {
+      m_hostCacheBytes -= size_t( m_hostCache.front().size );
+      evicted.push_back( m_hostCache.front() );
+      m_hostCache.pop_front();
+    }
+  }
+  for( Buffer& old: evicted )
+  {
+    free( old );   // (outside the lock: freeing memory takes time)
+  }
+  buf = Buffer();
+}
+
 void Context::countMemory( MemKind kind, int64_t bytes )
 {
   const int     heap = kind == MemKind::Device ? 0 : 1;
@@ -1127,6 +1177,11 @@ Context::~Context()
       free( buf );
     }
     m_pool.clear();
+    for( Buffer& buf: m_hostCache )
+    {
+      free( buf );
+    }
+    m_hostCache.clear();
     closePipelineBinaries();
     if( m_profiling )
     {

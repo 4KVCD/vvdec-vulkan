@@ -57,6 +57,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <set>
 #include <string>
@@ -178,6 +179,15 @@ public:
   // may be returned while queued work still uses it, as long as whatever takes it next is queued after that work.
   Buffer allocPooled( size_t size );
   void   recycle( Buffer& buf );
+
+  // A cache for the host-memory buffers of the pictures' planes (hostPictureAllocator). A picture whose size differs
+  // from that of the picture whose buffers it reuses is created anew, and allocating host memory the GPU can reach
+  // takes ~0.3 ms a plane (BOUNDARY_A_3, whose pictures change size one after the other, spent half its decode there;
+  // the CPU's malloc takes microseconds). allocHost() returns a buffer given back earlier, of kind and of at least size
+  // bytes but at most twice that, or a new one; keepHost() gives one back. The cache holds kHostCacheBytes at most, and
+  // frees the buffers given back longest ago beyond that.
+  Buffer allocHost( size_t size, MemKind kind );
+  void   keepHost( Buffer& buf );
 
   // The compute pipeline of a shader (kShader_...), created on first use, and the layout they all share.
   VkPipeline       pipeline( int shaderId );
@@ -396,6 +406,12 @@ private:
   std::mutex                       m_poolMutex;
   std::vector<Buffer>              m_pool;
   std::set<VkDeviceSize>           m_poolSizes;   // the sizes requested since the size last changed
+
+  // the host buffers' cache (allocHost, keepHost): the buffers given back, the oldest first, and their bytes
+  static constexpr size_t          kHostCacheBytes = size_t( 128 ) << 20;
+  std::mutex                       m_hostCacheMutex;
+  std::deque<Buffer>               m_hostCache;
+  size_t                           m_hostCacheBytes = 0;
 
   // profiling
   struct Time
