@@ -50,9 +50,11 @@ POSSIBILITY OF SUCH DAMAGE.
     Each line of the list: <bitstream> <frames> <threads> <gpu> <film grain>
       frames:     stop once that many frames are output, without flushing the rest (0: all frames);
       threads:    vvdecParams::threads; gpu: vvdecParams::gpu (0 or 1); film grain: vvdecParams::filmGrainSynthesis.
-    The decoder's own environment variables (VVDEC_GPU_PARSE, ...) apply to every job.
+    The decoder's own environment variables (VVDEC_GPU_PARSE, ...) apply to every job; VVDECBATCH_NOHASH=1 leaves the
+    hashes out (a frame's line ends after its number), for timing.
     Out, for job i (counted from 0): "job i frame k [MD5:y,u,v]" for each output frame, as vvdecapp -dph 11 prints
-    it, then "job i end OK <seconds>", or "job i end ERROR <message>", or "job i end FIELDS" for a stream of field
+    it, then "job i end OK <seconds> open <s> first <s> close <s>" (the seconds of the whole job, of opening the
+    decoder, until its first frame, of closing it), or "job i end ERROR <message>", or "job i end FIELDS" for a stream of field
     pictures (whose frames this does not hash).
     From the first job on the GPU to the end, one more decoder holds the GPU's context, so that the jobs share it.
 */
@@ -64,6 +66,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -107,6 +110,20 @@ std::string lastError( vvdecDecoder* dec )
   return error;
 }
 
+// Whether the environment variable is set (MSVC refuses getenv)
+static bool environmentSet( const char* name )
+{
+#ifdef _MSC_VER
+  char*      value = nullptr;
+  size_t     size  = 0;
+  const bool set   = _dupenv_s( &value, &size, name ) == 0 && value != nullptr;
+  free( value );
+  return set;
+#else
+  return getenv( name ) != nullptr;
+#endif
+}
+
 // Prints an output frame's per-plane MD5 and gives it back to the decoder. Returns false for a field picture.
 bool handleFrame( vvdecDecoder* dec, vvdecFrame* frame, int index, unsigned& frames )
 {
@@ -115,9 +132,18 @@ bool handleFrame( vvdecDecoder* dec, vvdecFrame* frame, int index, unsigned& fra
     vvdec_frame_unref( dec, frame );
     return false;
   }
-  std::vector<uint8_t> hash;
-  const int            chars = calc_md5( frame, hash );
-  std::cout << "job " << index << " frame " << frames << " [MD5:" << hashToString( hash, chars ) << "]\n";
+  // (VVDECBATCH_NOHASH: no hash, for timing: a 4K frame's MD5 takes some 37 ms, more than decoding it)
+  static const bool noHash = environmentSet( "VVDECBATCH_NOHASH" );
+  if( noHash )
+  {
+    std::cout << "job " << index << " frame " << frames << "\n";
+  }
+  else
+  {
+    std::vector<uint8_t> hash;
+    const int            chars = calc_md5( frame, hash );
+    std::cout << "job " << index << " frame " << frames << " [MD5:" << hashToString( hash, chars ) << "]\n";
+  }
   frames++;
   vvdec_frame_unref( dec, frame );
   return true;
@@ -139,7 +165,8 @@ void decodeJob( int index, const Job& job )
     std::cout << "job " << index << " end ERROR cannot open " << job.bitstream << std::endl;
     return;
   }
-  vvdecDecoder* dec = vvdec_decoder_open( &params );
+  vvdecDecoder* dec    = vvdec_decoder_open( &params );
+  const auto    opened = std::chrono::steady_clock::now();
   if( !dec )
   {
     std::cout << "job " << index << " end ERROR cannot open the decoder" << std::endl;
@@ -156,6 +183,7 @@ void decodeJob( int index, const Job& job )
   // vvdecapp's input loop: the access units' time stamps count the pictures (a picture's first slice), so that the
   // frames come out with valid time stamps
   unsigned     frames          = 0;
+  double       firstFrame      = -1;   // seconds from the start to the first frame
   bool         fields          = false;
   bool         stop            = false;
   std::string  error;
@@ -198,8 +226,9 @@ void decodeJob( int index, const Job& job )
     }
     if( frame && frame->ctsValid )
     {
-      fields = !handleFrame( dec, frame, index, frames ) || fields;
-      stop   = job.frames && frames >= job.frames;
+      firstFrame = firstFrame < 0 ? std::chrono::duration<double>( std::chrono::steady_clock::now() - start ).count() : firstFrame;
+      fields     = !handleFrame( dec, frame, index, frames ) || fields;
+      stop       = job.frames && frames >= job.frames;
     }
     if( ret == VVDEC_EOF )
     {
@@ -226,6 +255,7 @@ void decodeJob( int index, const Job& job )
     stop   = job.frames && frames >= job.frames;
   }
   vvdec_accessUnit_free( au );
+  const auto closing = std::chrono::steady_clock::now();
   vvdec_decoder_close( dec );
 
   const double seconds = std::chrono::duration<double>( std::chrono::steady_clock::now() - start ).count();
@@ -240,7 +270,9 @@ void decodeJob( int index, const Job& job )
   }
   else
   {
-    std::cout << "OK " << seconds;
+    // the seconds, then where they went: opening the decoder, until the first frame, closing it
+    std::cout << "OK " << seconds << " open " << std::chrono::duration<double>( opened - start ).count() << " first " << firstFrame << " close "
+              << std::chrono::duration<double>( std::chrono::steady_clock::now() - closing ).count();
   }
   std::cout << std::endl;
 }
