@@ -271,6 +271,8 @@ public:
   bool               transferTimestamps() const { return m_transferTimestamps; }
   double             timestampPeriod() const { return m_timestampPeriod; }
   const std::string& deviceName()      const { return m_deviceName; }
+  // A discrete GPU: its shaders reach host memory across the bus, slowly (GpuFilmGrain copies its frames instead)
+  bool               discrete()        const { return m_discrete; }
 
   // --- Profiling (VVDEC_GPU_PROFILE=1) ---
   // The decoder instances add up the GPU time of their passes (addTime); the totals are printed when the context
@@ -297,6 +299,7 @@ private:
   VkPhysicalDeviceMemoryProperties m_memProps{};
   double                           m_timestampPeriod = 1.0;
   std::string                      m_deviceName;
+  bool                             m_discrete = false;   // VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
   bool                             m_wave32 = false;   // the shaders may ask for waves of 32 threads
   bool                             m_splitStores      = false;   // the shaders' kSplitStores is set (NVIDIA's GPUs)
   bool                             m_integerAddresses = false;   // their kIntegerAddresses is set (Intel's GPUs)

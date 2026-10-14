@@ -57,8 +57,11 @@ namespace gpu
 
 // Adds film grain to output frames on the GPU (filmgrain.slang), bit-exact with vvdec's FilmGrain on the CPU
 // (VVDecImpl::xAddGrain). The frames are in host memory the GPU can reach: the pictures' planes, or the output's
-// copies of them. The grain of a frame is under way while the decoder goes on (up to kSlots frames at a time); each
-// frame has a ticket to wait for (VVDecImpl hands a frame out once its grain is done).
+// copies of them. On a discrete GPU the shader works on copies of them in GPU memory (the copies in and out are in
+// the frame's commands): there its own reads and writes of host memory cross the bus one by one (RTX 5090, a 4K
+// frame's samples read and written: 1.6 s in host memory, 0.1 ms in its own). The grain of a frame is under way while
+// the decoder goes on (up to kSlots frames at a time); each frame has a ticket to wait for (VVDecImpl hands a frame
+// out once its grain is done).
 class GpuFilmGrain
 {
 public:
@@ -69,12 +72,15 @@ public:
   GpuFilmGrain( const GpuFilmGrain& )            = delete;
   GpuFilmGrain& operator=( const GpuFilmGrain& ) = delete;
 
-  // A plane of a frame: the address of its sample (0, 0) and its stride.
+  // A plane of a frame: the address of its sample (0, 0) and its stride; and the buffer it is in, with that sample's
+  // offset in it (for the copies on a discrete GPU).
   struct Plane
   {
     VkDeviceAddress addr      = 0;
     int             stride    = 0;   // source: in samples (16 bits each); destination: in bytes
     int             readWidth = 0;   // source: the samples a row has from x = 0 on (can be wider than the frame: the picture's)
+    VkBuffer        buffer    = VK_NULL_HANDLE;
+    VkDeviceSize    offset    = 0;
   };
 
   // Where the next frame's block seeds go (FilmGrain::prepareBlockSeeds): room for count seeds, in the next frame's
@@ -91,11 +97,14 @@ public:
 
 private:
   // The work of a frame: its tables (the grain patterns, then per component the scale table (sLUT), then the
-  // pattern tables (pLUT)), its block seeds, its commands; and the ticket of its frame while the GPU may be at it.
+  // pattern tables (pLUT)), its block seeds, on a discrete GPU the frame's copies in GPU memory (before and after the
+  // grain), its commands; and the ticket of its frame while the GPU may be at it.
   struct Slot
   {
     Buffer          tables;
     Buffer          seeds;
+    Buffer          before, after;
+    std::vector<VkBufferCopy> rows;   // (the copies of the output's rows: kept for the next frame's)
     VkCommandPool   pool   = VK_NULL_HANDLE;
     VkCommandBuffer cmd    = VK_NULL_HANDLE;
     VkFence         fence  = VK_NULL_HANDLE;

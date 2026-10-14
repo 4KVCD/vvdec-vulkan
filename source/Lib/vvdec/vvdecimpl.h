@@ -129,6 +129,7 @@ public:
       return 0;
     }
     VkDeviceAddress gpuAddress() const { return m_gpuBuf.addr; }
+    VkBuffer        gpuBuffer() const { return m_gpuBuf.buffer; }
 #endif
 
     int freeStorage()

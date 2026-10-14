@@ -90,6 +90,8 @@ GpuFilmGrain::~GpuFilmGrain()
     m_ctx->destroyCommandPool( slot.pool );
     m_ctx->free( slot.tables );
     m_ctx->free( slot.seeds );
+    m_ctx->free( slot.before );
+    m_ctx->free( slot.after );
   }
 }
 
@@ -178,12 +180,47 @@ int64_t GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane 
   VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vk.vkBeginCommandBuffer( slot.cmd, &begin );
+
+  // On a discrete GPU, the planes' rows that the shader reads are copied into slot.before (whole, from the first row's
+  // sample 0 to the last row's last sample read), and it writes into slot.after, with the same layouts.
+  const bool      copies = m_ctx->discrete();
+  VkDeviceAddress srcAt[3], dstAt[3];
+  if( copies )
+  {
+    VkDeviceSize srcSpan[3], dstSpan[3], srcTotal = 0, dstTotal = 0;
+    for( int c = 0; c < numPlanes; c++ )
+    {
+      const int rows = lumaHeight / ( c ? impl.subY() : 1 );
+      const int cols = lumaWidth / ( c ? impl.subX() : 1 );
+      srcSpan[c]     = ( VkDeviceSize( rows - 1 ) * src[c].stride + src[c].readWidth ) * sizeof( int16_t );
+      dstSpan[c]     = VkDeviceSize( rows - 1 ) * dst[c].stride + VkDeviceSize( cols ) * dstBytes;
+      srcAt[c]       = srcTotal;
+      dstAt[c]       = dstTotal;
+      srcTotal      += ( srcSpan[c] + 255 ) & ~VkDeviceSize( 255 );
+      dstTotal      += ( dstSpan[c] + 255 ) & ~VkDeviceSize( 255 );
+    }
+    m_ctx->ensure( slot.before, size_t( srcTotal ), MemKind::Device );
+    m_ctx->ensure( slot.after, size_t( dstTotal ), MemKind::Device );
+    for( int c = 0; c < numPlanes; c++ )
+    {
+      const VkBufferCopy region{ src[c].offset, srcAt[c], srcSpan[c] };
+      vk.vkCmdCopyBuffer( slot.cmd, src[c].buffer, slot.before.buffer, 1, &region );
+      srcAt[c] += slot.before.addr;
+      dstAt[c] += slot.after.addr;
+    }
+    VkMemoryBarrier copied{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vk.vkCmdPipelineBarrier( slot.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &copied, 0, nullptr, 0,
+                             nullptr );
+  }
+
   vk.vkCmdBindPipeline( slot.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_filmgrain ) );
   for( int c = 0; c < numPlanes; c++ )
   {
     FilmGrainPush push{};
-    push.src        = src[c].addr;
-    push.dst        = dst[c].addr;
+    push.src        = copies ? srcAt[c] : src[c].addr;
+    push.dst        = copies ? dstAt[c] : dst[c].addr;
     push.pattern    = slot.tables.addr;
     push.luts       = slot.tables.addr + kPatternBytes;
     push.seeds      = slot.seeds.addr;
@@ -203,11 +240,33 @@ int64_t GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane 
     // a workgroup 1024 samples of a row
     vk.vkCmdDispatch( slot.cmd, uint32_t( ( push.width + 1023 ) / 1024 ), uint32_t( lumaHeight / push.suby ), 1 );
   }
+  if( copies )
+  {
+    // slot.after's rows into the output, row by row: the bytes between the rows (dst may be the picture) stay as they are
+    VkMemoryBarrier written{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    written.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    written.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vk.vkCmdPipelineBarrier( slot.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &written, 0, nullptr, 0,
+                             nullptr );
+    for( int c = 0; c < numPlanes; c++ )
+    {
+      const int          rows     = lumaHeight / ( c ? impl.subY() : 1 );
+      const VkDeviceSize rowBytes = VkDeviceSize( lumaWidth / ( c ? impl.subX() : 1 ) ) * dstBytes;
+      slot.rows.resize( size_t( rows ) );
+      for( int y = 0; y < rows; y++ )
+      {
+        const VkDeviceSize at = VkDeviceSize( y ) * dst[c].stride;
+        slot.rows[y]          = { dstAt[c] - slot.after.addr + at, dst[c].offset + at, rowBytes };
+      }
+      vk.vkCmdCopyBuffer( slot.cmd, slot.after.buffer, dst[c].buffer, uint32_t( rows ), slot.rows.data() );
+    }
+  }
   // the host reads the frame after the fence
   VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.srcAccessMask = copies ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_WRITE_BIT;
   barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  vk.vkCmdPipelineBarrier( slot.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+  vk.vkCmdPipelineBarrier( slot.cmd, copies ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                           1, &barrier, 0, nullptr, 0, nullptr );
   vk.vkEndCommandBuffer( slot.cmd );
 
   vk.vkResetFences( m_ctx->device(), 1, &slot.fence );

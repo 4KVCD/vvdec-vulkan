@@ -289,6 +289,7 @@ bool Context::chooseDevice( VkPhysicalDeviceProperties& props )
   m_api.vkGetPhysicalDeviceProperties( m_physical, &props );
   m_deviceName      = props.deviceName;
   m_timestampPeriod = props.limits.timestampPeriod;
+  m_discrete         = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
   m_splitStores      = props.vendorID == kVendorNvidia;
   m_integerAddresses = props.vendorID == kVendorIntel;
   m_coherentReads    = props.vendorID == kVendorNvidia;

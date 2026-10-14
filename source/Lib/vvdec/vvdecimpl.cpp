@@ -1009,18 +1009,25 @@ int64_t VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft
     const ComponentID compID = ComponentID( c );
     const int         csx    = getComponentScaleX( compID, pic.chromaFormat );
     const int         csy    = getComponentScaleY( compID, pic.chromaFormat );
+    const gpu::Buffer& plane = gpu::hostPlane( pic, compID )->host;
     src[c].addr      = addr[c] + ( VkDeviceAddress( confTop >> csy ) * stride[c] + ( confLeft >> csx ) ) * sizeof( Pel );
     src[c].stride    = stride[c];
     src[c].readWidth = int( pic.bufs[c].width ) - ( confLeft >> csx );
+    src[c].buffer    = plane.buffer;
+    src[c].offset    = src[c].addr - plane.addr;
     if( storage )
     {
       dst[c].addr   = storage->gpuAddress() + VkDeviceAddress( frame->planes[c].ptr - storage->getStorage() );
       dst[c].stride = int( frame->planes[c].stride );
+      dst[c].buffer = storage->gpuBuffer();
+      dst[c].offset = dst[c].addr - storage->gpuAddress();
     }
     else
     {
       dst[c].addr   = src[c].addr;
       dst[c].stride = stride[c] * int( sizeof( Pel ) );
+      dst[c].buffer = src[c].buffer;
+      dst[c].offset = src[c].offset;
     }
   }
   const int64_t ticket = m_gpuFilmGrain->apply( *m_filmGrainSynth, int( frame->numPlanes ), src, dst, int( frame->planes[0].bytesPerSample ), width, height );
