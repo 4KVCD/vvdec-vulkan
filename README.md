@@ -101,8 +101,6 @@ vvdecapp -b input.266 -o output.yuv --gpu 1
 
 - [`source/Lib/VulkanLib/README.md`](source/Lib/VulkanLib/README.md): the design (the paths, the queues, a
   picture's journey through the tasks and passes). Each source file and shader begins with a description of its part.
-- [`VULKAN_HANDOFF.md`](VULKAN_HANDOFF.md): development notes written for continuing the work; parts are out of
-  date.
 - [`tools/gpu-dev/`](tools/gpu-dev/): the checks and benchmarks used during development. `fastcheck.py` decodes the
   conformance and tool streams and compares every frame; `speedsweep.py` times every video against the CPU decoder.
   The test streams are not in the repository.
