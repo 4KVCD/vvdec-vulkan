@@ -2586,7 +2586,7 @@ void tileStoreChromaWindows( int tid, TileSetup t, uint2 cChunk[4] )
 // DMVR (xProcessDMVR) of a 16x16 tile, from its luma windows: the centre's SAD first. When it is small enough (83% of
 // VideoQ's subblocks) there is no refinement, and neither the other 24 SADs nor most bilinear predictions are needed.
 // Gives the refined motion (mvR, in the lists' slots) and, for BDOF, the best cost (cost). s_sad starts zeroed.
-void tileDmvr( int tid, uint* job, TileSetup t, int2 mv0, int2 mv1, out int2 mvR[2], out int cost )
+void tileDmvr( int tid, uint slot, TileSetup t, int2 mv0, int2 mv1, out int2 mvR[2], out int cost )
 {
   const int shift = 4 - ( 10 - pc.bitDepth );
   // Rows 2, 4 .. 16 and columns 2 .. 17 of the bilinear predictions (the windows' samples from (3, 3)), 2 per thread
@@ -2657,7 +2657,7 @@ void tileDmvr( int tid, uint* job, TileSetup t, int2 mv0, int2 mv1, out int2 mvR
   }
   else if( tid < 18 && pc.dmvr != nullptr )
   {
-    pc.dmvr[int( job[8] ) * 2 + tid - 16] = tid == 16 ? delta.x : delta.y;
+    pc.dmvr[int( slot ) * 2 + tid - 16] = tid == 16 ? delta.x : delta.y;
   }
   mvR[0] = clipStorage( mv0 + delta );
   mvR[1] = clipStorage( mv1 - delta );
@@ -2683,6 +2683,9 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
 {
   const TileSetup t        = tileSetup<FULL>( tid, x, y, w, h, flags, mv0, mv1, ref0, ref1, bi, border );
   const int       bcwW1    = int( ( job[7] >> 16 ) & 15 ) - 2;   // BCW's L1 weight
+  // The job's words 8 .. 11 (DMVR's slot, GPM's and weighted prediction's parameters), read now, with the windows: read
+  // where they are used, after the filters, each pair of them cost the tile a round trip of its own.
+  const uint4     late     = uint4( job[8], job[9], job[10], job[11] );
   const int       maxVal   = ( 1 << pc.bitDepth ) - 1;
   const int       headRoom = max( 2, 14 - pc.bitDepth );
 
@@ -2709,7 +2712,7 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   int  dmvrCost  = 2 * 16 * 16;
   if( FULL != 0 && dmvr )
   {
-    tileDmvr( tid, job, t, mv0, mv1, mvR, dmvrCost );
+    tileDmvr( tid, late.x, t, mv0, mv1, mvR, dmvrCost );
   }
 #if BDOF
   const bool bdof = ( flags & FLAG_BDOF ) != 0 && dmvrCost >= 2 * 16 * 16;
@@ -2832,14 +2835,14 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
-      geoY[o] = geoWeight( job[9], x - cuX + t.i0 + o, y - cuY + t.j );
+      geoY[o] = geoWeight( late.y, x - cuX + t.i0 + o, y - cuY + t.j );
     }
     [unroll]
     for( int o = 0; o < 2; o++ )
     {
       if( chroma420() )
       {
-        geoC[o] = geoWeight( job[9], ( ( x >> 1 ) + t.ci0 + o - ( cuX >> 1 ) ) << 1, ( ( y >> 1 ) + t.cj - ( cuY >> 1 ) ) << 1 );
+        geoC[o] = geoWeight( late.y, ( ( x >> 1 ) + t.ci0 + o - ( cuX >> 1 ) ) << 1, ( ( y >> 1 ) + t.cj - ( cuY >> 1 ) ) << 1 );
       }
     }
   }
@@ -2859,7 +2862,7 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   [unroll]
   for( int o = 0; o < 4; o++ )
   {
-    vy[o] = combineLists( flags, 0, predY[0][o], predY[1][o], geoY[o], job[8], job[11], bcwW1 );
+    vy[o] = combineLists( flags, 0, predY[0][o], predY[1][o], geoY[o], late.x, late.w, bcwW1 );
   }
 #if BDOF
   if( bdof )
@@ -2889,15 +2892,15 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   [unroll]
   for( int o = 0; o < 2; o++ )
   {
-    vc[o] = combineLists( flags, 1 + t.cc, predC[0][o], predC[1][o], geoC[o], job[9 + t.cc], job[11], bcwW1 );
+    vc[o] = combineLists( flags, 1 + t.cc, predC[0][o], predC[1][o], geoC[o], t.cc == 0 ? late.y : late.z, late.w, bcwW1 );
   }
   if( ( flags & ( FLAG_RES_Y << ( 1 + t.cc ) ) ) != 0 )
   {
     vc = clamp( vc + int2( lo16( resC ), hi16( resC ) ), 0, maxVal );
   }
-  // (each component's plane first, then the thread's: see the residuals)
-  int16_t* outCb = ( flags & FLAG_DEFER_CB ) != 0 ? pc.defer1 : pc.dst1;
-  int16_t* outCr = ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2;
+  // (each component's plane first, as a scalar, then the thread's: see the residuals)
+  int16_t* outCb = uniPtr( ( flags & FLAG_DEFER_CB ) != 0 ? pc.defer1 : pc.dst1 );
+  int16_t* outCr = uniPtr( ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2 );
   if( chroma420() && t.mineC )
   {
     *(uint*)at( t.cc == 0 ? outCb : outCr, t.atC ) = packPair( vc );
@@ -3720,8 +3723,9 @@ void affineTileChroma( int tid, uint job[24], int w, int flags, bool hi, int bcw
   }
   if( p.mineC )
   {
-    int16_t* outCb = ( flags & FLAG_DEFER_CB ) != 0 ? pc.defer1 : pc.dst1;
-    int16_t* outCr = ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2;
+    // (each component's plane first, as a scalar, then the thread's: see tileResiduals)
+    int16_t* outCb = uniPtr( ( flags & FLAG_DEFER_CB ) != 0 ? pc.defer1 : pc.dst1 );
+    int16_t* outCr = uniPtr( ( flags & ( FLAG_DEFER_CB << 1 ) ) != 0 ? pc.defer2 : pc.dst2 );
     *(uint*)at( p.cc == 0 ? outCb : outCr, p.atC ) = packPair( vc );
   }
 }
