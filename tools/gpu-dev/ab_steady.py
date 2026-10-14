@@ -85,11 +85,14 @@ for r in range(rounds):
                   'stopped', flush=True)
             sys.exit(2)
         seconds = (kv['mark2_ms'] - kv['mark1_ms']) / 1000
-        fps     = (frames - 1) / seconds
+        # the frames vvdecapp decoded, which may be fewer than asked for (a stream's skipped leading pictures)
+        decoded = re.search(r'(\d+) frames decoded @', out)
+        count   = int(decoded.group(1)) if decoded else frames
+        fps     = (count - 1) / seconds
         # the package's (RAPL) power and energy per frame over the same steady-state span
         joules  = kv.get('mark2_pkg_j', -1) - kv.get('mark1_pkg_j', -1)
         watts   = joules / seconds if kv.get('mark1_pkg_j', -1) >= 0 else float('nan')
-        mj      = 1000 * joules / (frames - 1) if kv.get('mark1_pkg_j', -1) >= 0 else float('nan')
+        mj      = 1000 * joules / (count - 1) if kv.get('mark1_pkg_j', -1) >= 0 else float('nan')
         runs.setdefault(spec, []).append((fps, kv['peak_commit_mb'], kv['peak_ws_mb'], kv['mark1_ms'] / 1000, watts, mj))
         print(f'{spec} run {r + 1}: {fps:.1f} fps, package {watts:.1f} W ({mj:.0f} mJ a frame), commit {kv["peak_commit_mb"]:.0f} MB, '
               f'ws {kv["peak_ws_mb"]:.0f} MB, first frame {kv["mark1_ms"] / 1000:.2f} s', flush=True)
