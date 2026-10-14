@@ -179,8 +179,8 @@ int  refIdxOf( Cu cu, int list ) { return int( int8_t( ( cu.w3 >> ( 8 * list ) )
 bool affine6Of( Cu cu ) { return ( cu.flags & kAffine6 ) != 0; }
 int2 mvdOf( Cu cu, int list, int k )
 {
-  int* r = (int*) ( pc.cus + cu.index * 32 + 4 + list * 6 + k * 2 );
-  return int2( r[0], r[1] );
+  uint* r = pc.cus + cu.index * 32 + 4 + list * 6 + k * 2;   // (no cast to int*: see copyColMotion)
+  return int2( int( r[0] ), int( r[1] ) );
 }
 
 // CtuRecord fields: the first CU, the CU count, the slice and the tile
@@ -416,9 +416,9 @@ Motion motionAt( int x, int y )
 {
   int*       mi = motionPtr( x, y );
   Motion     m  = noMotion();
-  m.mv[0]       = int2( mi[0], mi[1] );
-  m.mv[1]       = int2( mi[2], mi[3] );
-  const uint w  = uint( mi[4] );
+  m.mv[0]       = int2( coherentWord( mi ), coherentWord( mi + 1 ) );   // (the segment above's too: see coherentWord)
+  m.mv[1]       = int2( coherentWord( mi + 2 ), coherentWord( mi + 3 ) );
+  const uint w  = uint( coherentWord( mi + 4 ) );
   m.refIdx[0]   = int( int8_t( w & 0xff ) );
   m.refIdx[1]   = int( int8_t( ( w >> 8 ) & 0xff ) );
   return m;
@@ -494,10 +494,10 @@ CuMotion loadCuMotion( int cuIdx )
   {
     for( int k = 0; k < 3; k++ )
     {
-      c.mv[l][k] = int2( r[6 * l + 2 * k], r[6 * l + 2 * k + 1] );
+      c.mv[l][k] = int2( coherentWord( r + 6 * l + 2 * k ), coherentWord( r + 6 * l + 2 * k + 1 ) );
     }
   }
-  const uint w = uint( r[12] );
+  const uint w = uint( coherentWord( r + 12 ) );
   c.refIdx[0]  = int( int8_t( w & 0xff ) );
   c.refIdx[1]  = int( int8_t( ( w >> 8 ) & 0xff ) );
   c.interDir   = int( ( w >> 16 ) & 3 );
@@ -848,8 +848,8 @@ NeighbourWords fetchNeighbour( int x, int y )
   int*           mi = motionPtr( cx, cy );
   NeighbourWords n;
   n.idx = int( pc.cuMap[( cy >> 2 ) * pc.widthIn4 + ( cx >> 2 )] );
-  n.mv  = int4( mi[0], mi[1], mi[2], mi[3] );
-  n.w   = uint( mi[4] );
+  n.mv  = int4( coherentWord( mi ), coherentWord( mi + 1 ), coherentWord( mi + 2 ), coherentWord( mi + 3 ) );   // (see motionAt)
+  n.w   = uint( coherentWord( mi + 4 ) );
   return n;
 }
 
@@ -1690,8 +1690,26 @@ void affineControlPointCand( Cur cur, Motion mi[4], bool avail[4], int4 verIdx, 
     }
     for( int i = 0; i < verNum; i++ )
     {
-      const int v = i == 0 ? verIdx.x : i == 1 ? verIdx.y : verIdx.z;
-      cMv[l][v]   = mi[v].mv[l];
+      // (corner v's motion, with v spelled out: NVIDIA's compiler (driver 616.92) lost corner 2's with cMv[l][v] =
+      // mi[v].mv[l], and the candidates built from the bottom-left corner came out wrong)
+      const int  v  = i == 0 ? verIdx.x : i == 1 ? verIdx.y : verIdx.z;
+      const int2 mv = v == 0 ? mi[0].mv[l] : v == 1 ? mi[1].mv[l] : v == 2 ? mi[2].mv[l] : mi[3].mv[l];
+      if( v == 0 )
+      {
+        cMv[l][0] = mv;
+      }
+      else if( v == 1 )
+      {
+        cMv[l][1] = mv;
+      }
+      else if( v == 2 )
+      {
+        cMv[l][2] = mv;
+      }
+      else
+      {
+        cMv[l][3] = mv;
+      }
     }
     if( modelIdx == 1 )
     {
@@ -2928,25 +2946,27 @@ static const int kColPerThread = 8;
 // Copies the colocated motion of the CTU's 8x8 blocks (their top-left 4x4 block's motion) into pc.colMotion. Each
 // thread reads all its blocks' motion before it writes any: the compiler cannot move a read of pc.motion past a write
 // to pc.colMotion (they might overlap), so reading and writing word by word would wait for memory 40 times.
+// (The words are read and written as the pointers' own int: NVIDIA's compiler (driver 616.92) crashes on a pointer
+// cast between int* and uint* after an offset, (uint*)( p + n ), that is then read or written more than once.)
 void copyColMotion( int ctu )
 {
   const int across8  = 1 << ( pc.log2Ctu - 3 );
   const int num8x8   = across8 * across8;
   const int ctuSize4 = 1 << ( pc.log2Ctu - 2 );
-  uint4     head[kColPerThread];   // words 0-3 of each block's motion
-  uint      tail[kColPerThread];   // word 4
+  int4      head[kColPerThread];   // words 0-3 of each block's motion
+  int       tail[kColPerThread];   // word 4
   [unroll]
   for( int j = 0; j < kColPerThread; j++ )
   {
     const int e = g_lane + 32 * j;
-    head[j]     = uint4( 0, 0, 0, 0 );
+    head[j]     = int4( 0, 0, 0, 0 );
     tail[j]     = 0;
     if( e < num8x8 )
     {
       const int x4  = ( e & ( across8 - 1 ) ) * 2;
       const int y4  = ( e >> ( pc.log2Ctu - 3 ) ) * 2;
-      uint*     src = (uint*) ( pc.motion + ( ctu * ctuSize4 * ctuSize4 + y4 * ctuSize4 + x4 ) * 5 );
-      head[j]       = uint4( src[0], src[1], src[2], src[3] );
+      int*      src = pc.motion + ( ctu * ctuSize4 * ctuSize4 + y4 * ctuSize4 + x4 ) * 5;
+      head[j]       = int4( src[0], src[1], src[2], src[3] );
       tail[j]       = src[4];
     }
   }
@@ -2956,12 +2976,12 @@ void copyColMotion( int ctu )
     const int e = g_lane + 32 * j;
     if( e < num8x8 )
     {
-      uint* dst = (uint*) ( pc.colMotion + ( ctu * num8x8 + e ) * 5 );
-      dst[0]    = head[j].x;
-      dst[1]    = head[j].y;
-      dst[2]    = head[j].z;
-      dst[3]    = head[j].w;
-      dst[4]    = tail[j];
+      int* dst = pc.colMotion + ( ctu * num8x8 + e ) * 5;
+      dst[0]   = head[j].x;
+      dst[1]   = head[j].y;
+      dst[2]   = head[j].z;
+      dst[3]   = head[j].w;
+      dst[4]   = tail[j];
     }
   }
 }
@@ -2974,7 +2994,7 @@ void waitForSegmentAbove( int segment, int col, int2 span )
   if( g_lane == 0 )
   {
     const uint need = uint( min( col + 2 - pc.wpp, span.y ) - span.x );
-    while( pc.progress[segment - pc.tileCols].load( MemoryOrder.Relaxed ) < need )
+    while( pollCounter( pc.progress + ( segment - pc.tileCols ) ) < need )
     {
     }
   }
@@ -3069,7 +3089,7 @@ void main( uint3 local : SV_GroupThreadID )
     AllMemoryBarrierWithGroupSync();   // (makes the CTU's motion visible to the rows below)
     if( g_lane == 0 )
     {
-      pc.progress[segment].store( uint( col + 1 - span.x ), MemoryOrder.Release );
+      pc.progress[segment].add( 1u, MemoryOrder.Release );   // (col + 1 - span.x now: see jobs.slang's WAVES)
     }
     // The CTU's colocated motion, from its now final motion. After the progress, as the rows below do not read it,
     // and in this pass rather than one of its own: the front end's first part waits for every pass in it.

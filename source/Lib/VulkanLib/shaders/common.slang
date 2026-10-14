@@ -10,9 +10,76 @@ int clip3( int lo, int hi, int v )
 // offset below 2 GB, as every buffer of the decoder's is. So written, AMD's compiler adds the 32-bit offset to the
 // pointer in the load or store instruction itself (scalar-base addressing); p + index makes each thread work out a
 // 64-bit address instead (a sign extension, a shift and two adds with carry).
+// With kIntegerAddresses (set on Intel's GPUs, Context::createPipelineOf) the address is worked out as an integer:
+// their compiler (driver 101.8860) scales a pointer's offset by the wrong element size when the pointer is a cast of
+// one that was itself offset, (T*)( (uint8_t*)( q + n ) + offset ), and every sample of a plane went elsewhere.
+[vk::constant_id( 1 )] const bool kIntegerAddresses = false;
+
 T* at<T>( T* p, uint index )
 {
-  return (T*)( (uint8_t*)p + ( ( index * uint( sizeof( T ) ) ) & 0x7fffffffu ) );
+  const uint offset = ( index * uint( sizeof( T ) ) ) & 0x7fffffffu;
+  if( kIntegerAddresses )
+  {
+    return (T*)( (uint64_t)p + uint64_t( offset ) );
+  }
+  return (T*)( (uint8_t*)p + offset );
+}
+
+// p moved back n samples, the address worked out as an integer: NVIDIA's compiler (driver 616.92) adds a negative
+// offset to a pointer that was itself offset 4 GB too high, ( q + m ) - n, and inter.slang's border tiles read there.
+int16_t* samplesBefore( int16_t* p, int n )
+{
+  return (int16_t*)( (uint64_t)p - uint64_t( n * 2 ) );
+}
+
+// p + index for an index that may be negative, the address worked out as an integer, for a pointer offset again
+// afterwards: NVIDIA's compiler (driver 616.92) also puts ( p + m ) + n 4 GB too high when m is negative, even where
+// m + n is not (deblock.slang's edges at the picture's top and left; tested with a buffer of 4 GB + 4 MB, whose
+// marker samples 4 GB in came back).
+int16_t* samplesAt( int16_t* p, int index )
+{
+  return (int16_t*)( (uint64_t)p + uint64_t( int64_t( index ) * 2 ) );
+}
+
+// Reads of what other workgroups of the same dispatch wrote, after waiting for them (intra.slang's neighbours,
+// mider.slang's segment above, jobs.slang's wave map). With kCoherentReads (set on NVIDIA's GPUs,
+// Context::createPipelineOf) they are device-scope atomic loads: there (driver 616.92) a plain load, or a Volatile one,
+// could still read the value from before the other workgroup wrote it, and an intra picture came out wrong.
+[vk::constant_id( 2 )] const bool kCoherentReads = false;
+
+uint coherentLoad( uint64_t address )   // (address: 4-byte aligned)
+{
+  return ( (Atomic<uint>*)address )[0].load( MemoryOrder.Relaxed );
+}
+
+uint coherentWord( uint* p )
+{
+  return kCoherentReads ? coherentLoad( (uint64_t)p ) : *p;
+}
+
+int coherentWord( int* p )
+{
+  return kCoherentReads ? int( coherentLoad( (uint64_t)p ) ) : *p;
+}
+
+// A counter that a workgroup waits on while another advances it (jobs.slang's and mider.slang's rows' progress). With
+// kCoherentReads it is polled with an atomic add of 0: there (driver 616.92) the wait on an atomic load of it did not
+// end, and the GPU was reset.
+uint pollCounter( Atomic<uint>* p )
+{
+  return kCoherentReads ? p[0].add( 0u ) : p[0].load( MemoryOrder.Relaxed );
+}
+
+// p[index], a 16-bit sample
+int coherentSample( int16_t* p, int index )
+{
+  if( kCoherentReads )
+  {
+    const uint64_t address = (uint64_t)p + uint64_t( int64_t( index ) * 2 );
+    const uint     word    = coherentLoad( address & ~3ull );
+    return int( int16_t( uint16_t( word >> ( ( uint( address ) & 2u ) * 8u ) ) ) );
+  }
+  return int( p[index] );
 }
 
 // A pointer the same in all the threads, made one the compiler keeps in scalar registers: for a pointer read from

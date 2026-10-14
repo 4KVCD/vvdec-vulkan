@@ -80,6 +80,8 @@ void*      Context::s_library  = nullptr;
 VkInstance Context::s_instance = VK_NULL_HANDLE;
 
 static constexpr uint32_t kPushConstantSize = 256;
+static constexpr uint32_t kVendorNvidia     = 0x10de;   // VkPhysicalDeviceProperties::vendorID
+static constexpr uint32_t kVendorIntel      = 0x8086;
 
 Context* Context::acquire()
 {
@@ -144,6 +146,14 @@ bool Context::init()
   if( !chooseDevice( props ) || !checkFeatures( props, timelineSemaphore, subgroupSizeControl ) )
   {
     return false;
+  }
+  if( m_coherentReads && ( m_options.parse || m_options.parseDrives ) )
+  {
+    // The parse's substreams hand each other CTUs with a release store and plain loads (parse.slang's ctuParsed), which
+    // NVIDIA's GPUs do not make visible in order (see common.slang's kCoherentReads): the CPU parses there.
+    msg( WARNING, "Vulkan: the GPU parse (VVDEC_GPU_PARSE) is off on %s; the CPU parses\n", props.deviceName );
+    m_options.parse       = false;
+    m_options.parseDrives = false;
   }
   uint32_t count = 0;
   m_api.vkGetPhysicalDeviceQueueFamilyProperties( m_physical, &count, nullptr );
@@ -279,6 +289,9 @@ bool Context::chooseDevice( VkPhysicalDeviceProperties& props )
   m_api.vkGetPhysicalDeviceProperties( m_physical, &props );
   m_deviceName      = props.deviceName;
   m_timestampPeriod = props.limits.timestampPeriod;
+  m_splitStores      = props.vendorID == kVendorNvidia;
+  m_integerAddresses = props.vendorID == kVendorIntel;
+  m_coherentReads    = props.vendorID == kVendorNvidia;
   if( props.apiVersion < VK_API_VERSION_1_2 || props.limits.maxPushConstantsSize < kPushConstantSize )
   {
     msg( WARNING, "Vulkan: %s lacks Vulkan 1.2 or 256 bytes of push constants\n", props.deviceName );
@@ -707,15 +720,16 @@ static uint64_t shadersHash()
   return h;
 }
 
-// A pipeline's key in the binaries' file: its shader (its name and its SPIR-V's hash) and whether it asks for waves of
-// 32 threads. (Not the driver's pipeline key, vkGetPipelineKeyKHR: AMD's makes it per program, as its shader cache.)
-static std::vector<uint8_t> pipelineKeyOf( int shaderId, bool wave32 )
+// A pipeline's key in the binaries' file: its shader (its name and its SPIR-V's hash), whether it asks for waves of
+// 32 threads and the work-arounds set (kSplitStores, kIntegerAddresses, kCoherentReads). (Not the driver's pipeline
+// key, vkGetPipelineKeyKHR: AMD's makes it per program, as its shader cache.)
+static std::vector<uint8_t> pipelineKeyOf( int shaderId, bool wave32, bool splitStores, bool integerAddresses, bool coherentReads )
 {
   const char*          name = kShaders[shaderId].name;
   std::vector<uint8_t> key( name, name + strlen( name ) );
   const uint64_t       h = hashShader( kHashSeed, shaderId );
   key.insert( key.end(), reinterpret_cast<const uint8_t*>( &h ), reinterpret_cast<const uint8_t*>( &h ) + sizeof( h ) );
-  key.push_back( wave32 ? 32 : 0 );
+  key.push_back( uint8_t( ( wave32 ? 32 : 0 ) | ( splitStores ? 1 : 0 ) | ( integerAddresses ? 2 : 0 ) | ( coherentReads ? 4 : 0 ) ) );
   return key;
 }
 
@@ -911,7 +925,7 @@ VkResult Context::createPipeline( int shaderId, bool wave32, VkComputePipelineCr
   {
     return m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
   }
-  const std::vector<uint8_t> key = pipelineKeyOf( shaderId, wave32 );
+  const std::vector<uint8_t> key = pipelineKeyOf( shaderId, wave32, m_splitStores, m_integerAddresses, m_coherentReads );
   if( createFromBinaries( key, info, pipe ) )
   {
     return VK_SUCCESS;
@@ -1513,6 +1527,16 @@ VkPipeline Context::createPipelineOf( int shaderId )
   if( wave32 )
   {
     info.stage.pNext = &size;
+  }
+  // The work-arounds of drivers' bugs, for the shaders that have them: kSplitStores (constant 0), kIntegerAddresses (1)
+  // and kCoherentReads (2), 32-bit bools
+  const uint32_t                 values[3]  = { m_splitStores ? 1u : 0u, m_integerAddresses ? 1u : 0u, m_coherentReads ? 1u : 0u };
+  const VkSpecializationMapEntry entries[3] = { { 0, 0, sizeof( uint32_t ) }, { 1, sizeof( uint32_t ), sizeof( uint32_t ) },
+                                                { 2, 2 * sizeof( uint32_t ), sizeof( uint32_t ) } };
+  const VkSpecializationInfo     specialization{ 3, entries, sizeof( values ), values };
+  if( m_splitStores || m_integerAddresses || m_coherentReads )
+  {
+    info.stage.pSpecializationInfo = &specialization;
   }
   VkPipeline     pipe   = VK_NULL_HANDLE;
   const VkResult result = createPipeline( shaderId, wave32, info, pipe );

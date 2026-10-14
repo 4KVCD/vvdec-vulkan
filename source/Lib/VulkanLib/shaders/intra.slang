@@ -117,7 +117,7 @@ int strideOf( int comp )
 
 int sampleAt( int comp, int x, int y )
 {
-  return int( planeOf( comp )[y * strideOf( comp ) + x] );
+  return coherentSample( planeOf( comp ), y * strideOf( comp ) + x );
 }
 
 // The reference samples, shared by the block's threads and laid out as vvdec's
@@ -697,7 +697,7 @@ int mipSample( int x, int y, int w, int h, int pred )
 
 int lumaAt( int x, int y )
 {
-  return int( pc.plane0[y * pc.stride0 + x] );
+  return coherentSample( pc.plane0, y * pc.stride0 + x );
 }
 
 // 4:2:2: the [1 2 1] filter around the luma sample (x, y); with noLeft, the

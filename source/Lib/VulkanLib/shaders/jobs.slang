@@ -1871,7 +1871,7 @@ uint rectUnit( MapRect r, int u )
     return ( v >> 16 ) == g_ctuTag ? ( v & 0xffffu ) | g_waveTag << 16 : 0u;
   }
 #endif
-  return waveRow( r.c, j )[x];
+  return coherentWord( waveRow( r.c, j ) + x );   // (another row's units too: see coherentWord)
 }
 
 // Returns the highest wave among the calling thread's units of rectangle r beyond the first 32 (most rectangles have
@@ -2090,7 +2090,7 @@ void main( uint3 local : SV_GroupThreadID )
         if( lane == 0 )
         {
           const uint need = uint( min( col + 2, pc.widthInCtus ) );
-          while( pc.progress[row - 1].load( MemoryOrder.Relaxed ) < need )
+          while( pollCounter( pc.progress + ( row - 1 ) ) < need )
           {
           }
         }
@@ -2138,7 +2138,9 @@ void main( uint3 local : SV_GroupThreadID )
     }
     if( lane == 0 )
     {
-      pc.progress[row].store( uint( col + 1 ), MemoryOrder.Release );
+      // (col + 1 now; an atomic add, not a store: on NVIDIA's GPUs, driver 616.92, a release store did not make the
+      // writes before it visible to the workgroup that saw it, in a test of this hand-over)
+      pc.progress[row].add( 1u, MemoryOrder.Release );
     }
   }
 }

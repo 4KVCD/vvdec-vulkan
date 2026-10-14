@@ -355,7 +355,7 @@ int16_t* loadEdge( int x, int y, bool largeP, bool largeQ, out uint2 v[16] )
     v[a] = uint2( 0, 0 );
   }
 #if DIR == 0
-  int16_t* at = pc.pic0 + y * pc.stride + x - 8;
+  int16_t* at = samplesAt( pc.pic0, y * pc.stride + x - 8 );   // (negative for an edge at x 4 in row 0: see samplesAt)
   [unroll]
   for( int i = 0; i < 4; i++ )
   {
@@ -371,7 +371,7 @@ int16_t* loadEdge( int x, int y, bool largeP, bool largeQ, out uint2 v[16] )
     }
   }
 #else
-  int16_t* at = pc.pic0 + ( y - 8 ) * pc.stride + x;
+  int16_t* at = samplesAt( pc.pic0, ( y - 8 ) * pc.stride + x );   // (negative for an edge at y 4: see samplesAt)
   [unroll]
   for( int r = 4; r < 12; r++ )
   {

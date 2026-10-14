@@ -298,6 +298,9 @@ private:
   double                           m_timestampPeriod = 1.0;
   std::string                      m_deviceName;
   bool                             m_wave32 = false;   // the shaders may ask for waves of 32 threads
+  bool                             m_splitStores      = false;   // the shaders' kSplitStores is set (NVIDIA's GPUs)
+  bool                             m_integerAddresses = false;   // their kIntegerAddresses is set (Intel's GPUs)
+  bool                             m_coherentReads    = false;   // their kCoherentReads is set (NVIDIA's GPUs)
   bool                             m_subgroupBallot = false;   // VK_EXT_shader_subgroup_ballot is on
 
   // the compute queue

@@ -827,7 +827,8 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
   {
     // Inside the picture (most blocks): copy the samples without clamping.
     const int stride = comp == 0 ? pc.stride0 : pc.stride12;
-    int16_t*  src    = ref + ( baseY - oy ) * stride + baseX - ox;
+    // (one offset, never negative: see common.slang's samplesBefore)
+    int16_t*  src    = ref + ( ( baseY - oy ) * stride + baseX - ox );
     // The thread's sample (c, r) is src[at]; each step advances THREADS samples.
     const int stepR  = THREADS / rw;
     const int stepC  = THREADS - stepR * rw;
@@ -1279,10 +1280,28 @@ uint2 load8( int16_t* p, uint i )
   return uint2( w[0], w[1] );
 }
 
+// Whether storeEight stores its samples as two halves with a fence between them (set on NVIDIA's GPUs,
+// Context::createPipelineOf): their compiler (driver 616.92) crashed on the inter shaders' tile paths with the eight
+// 16-bit stores together, and does not with them apart.
+[vk::constant_id( 0 )] const bool kSplitStores = false;
+
 // Stores the 8 (4) samples packed in pairs in v at s_pool[at], 16 (8) bytes aligned: the compiler stores them with one
-// store.
+// store (with kSplitStores, two).
 void storeEight( int at, uint4 v )
 {
+  if( kSplitStores )
+  {
+    s_pool[at]     = int16_t( v.x );
+    s_pool[at + 1] = int16_t( v.x >> 16 );
+    s_pool[at + 2] = int16_t( v.y );
+    s_pool[at + 3] = int16_t( v.y >> 16 );
+    GroupMemoryBarrier();
+    s_pool[at + 4] = int16_t( v.z );
+    s_pool[at + 5] = int16_t( v.z >> 16 );
+    s_pool[at + 6] = int16_t( v.w );
+    s_pool[at + 7] = int16_t( v.w >> 16 );
+    return;
+  }
   const uint w[4] = { v.x, v.y, v.z, v.w };
   [unroll]
   for( int m = 0; m < 8; m++ )
@@ -2178,7 +2197,7 @@ void readChromaWindows( int tid, ChromaTileLayout L, TileChroma tile, ChromaWind
         const int col  = cw.x0[s] - cw.lead[s] + 4 * ( task - row * L.rowChunks );
         const int c0   = col + 4 <= 0 || col >= ( pc.picWidth >> L.sx ) ? 0 : col;
         const int src  = clamp( cw.y0[s] + clamp( row + cw.dI[s].y, 0, L.rows - 1 ), 0, cHeight - 1 );
-        chunk[w][i]    = load8( p - 16, uint( src * pc.stride12 + c0 + 16 ) );
+        chunk[w][i]    = load8( samplesBefore( p, 16 ), uint( src * pc.stride12 + c0 + 16 ) );
       }
     }
   }
@@ -2502,6 +2521,7 @@ void tileIssueReads<let FULL : int>( int tid, TileSetup t, out uint4 yChunk[4], 
     // row's start instead (tileBorderLuma sets its samples); a chunk across an edge reaches 7 samples past it at most,
     // into the margin. (Chroma alike, with chunks of 4 samples.) The reads index from the margin's sample 16 left of the
     // plane's first sample: at() takes no negative index (as an offset of 2 GB, a chunk left of the first row faulted).
+    // That sample's address is worked out as an integer (samplesBefore).
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
@@ -2510,7 +2530,8 @@ void tileIssueReads<let FULL : int>( int tid, TileSetup t, out uint4 yChunk[4], 
       const int row = rem / 3;
       const int col = t.wx[s] - t.leadY[s] + 8 * ( rem - 3 * row );
       const int c0  = col + 8 <= 0 || col >= pc.picWidth ? 0 : col;
-      yChunk[k]     = load16( planeY[s] - 16, uint( clamp( t.wy[s] + row, 0, pc.picHeight - 1 ) * pc.stride0 + c0 + 16 ) );
+      yChunk[k]     = load16( samplesBefore( planeY[s], 16 ),
+                              uint( clamp( t.wy[s] + row, 0, pc.picHeight - 1 ) * pc.stride0 + c0 + 16 ) );
     }
     [unroll]
     for( int k = 0; k < 4; k++ )
@@ -2520,7 +2541,7 @@ void tileIssueReads<let FULL : int>( int tid, TileSetup t, out uint4 yChunk[4], 
         const int s   = k < 2 || !t.two ? 0 : 1;
         const int col = t.cxs[s] - t.leadC[s] + 4 * ( cRem - 3 * cRow );
         const int c0  = col + 4 <= 0 || col >= ( pc.picWidth >> 1 ) ? 0 : col;
-        cChunk[k]     = load8( ( ( k & 1 ) == 0 ? planeCb[s] : planeCr[s] ) - 16,
+        cChunk[k]     = load8( samplesBefore( ( k & 1 ) == 0 ? planeCb[s] : planeCr[s], 16 ),
                                uint( clamp( t.cys[s] + cRow, 0, ( pc.picHeight >> 1 ) - 1 ) * pc.stride12 + c0 + 16 ) );
       }
     }
