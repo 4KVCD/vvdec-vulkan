@@ -6,8 +6,9 @@ decodes on the GPU with Vulkan compute shaders. It is not an official Fraunhofer
 - **Bit-exact.** Every output frame is identical to upstream VVdeC's. The check decodes, in both GPU modes, the 250
   JVET conformance streams that upstream VVdeC decodes correctly, 34 streams made to exercise particular coding
   tools, and long film encodes, and compares every frame: 609 of 609 decodes pass.
-- **Faster than the CPU decoder at 4K, slower at 1080p and below**, on the one laptop it was tested on: 1.10 to
-  1.85 times the CPU decoder's speed on 4K films, 0.81 to 0.96 times on 1080p films (see Speed).
+- **Faster than the CPU decoder on 4K films, about as fast or slower at 1080p, much slower on small pictures.** With
+  `--gpu 1`, 1.23 to 1.71 times the CPU decoder's speed on four 4K films and 0.76 to 1.04 times on four 1080p films
+  (see Speed).
 - **Tested on one GPU only:** the AMD Radeon 780M integrated in a Ryzen 7 8845HS, on Windows 11 with driver
   32.0.31041.1004. NVIDIA and Intel GPUs have not been tried.
 
@@ -25,60 +26,73 @@ In both modes the CPU reads the parameter sets, the picture and slice headers an
 records and submits the GPU's work. The decoded frames are copied back to host memory and come out of the usual
 vvdec API.
 
-Every coding tool that upstream VVdeC supports runs on the GPU, among them affine motion with PROF, SbTMVP, GPM,
+The GPU path covers every coding tool that upstream VVdeC supports, among them affine motion with PROF, SbTMVP, GPM,
 MMVD, DMVR, BDOF, CIIP, BCW, weighted prediction, IBC, reference picture resampling, wraparound, MIP, ISP, MRL,
 CCLM, LFNST, MTS, SBT, dependent quantization, joint chroma coding, transform skip and BDPCM, in 4:0:0, 4:2:0, 4:2:2
-and 4:4:4 at 8 and 10 bits. The one exception is adaptive colour transform, which upstream VVdeC does not decode
-correctly either: streams that use it are decoded on the CPU.
+and 4:4:4 at 8 and 10 bits. Streams that use adaptive colour transform, which upstream VVdeC does not decode
+correctly either, are decoded on the CPU.
 
 ## Speed
 
-Measured on the laptop above with 16 decoder threads: one decode at a time, the whole decode including start-up,
-one run each. Power was not controlled: this laptop runs anywhere between about 15 and 38 W, which by itself moves
-the fps by up to about 25%, so compare the columns of a row rather than the rows.
+Measured on the laptop above with 16 decoder threads. The fps leave start-up out: they count from the first output
+frame to the end of decoding. Each number is the median of 3 runs, with the three configurations run in turn.
 
-| Video | Size | Frames | GPU parse (`VVDEC_GPU_PARSE=2`) | CPU parse (`--gpu 1`) | CPU decoder (`--gpu 0`) |
-|---|---|---|---|---|---|
-| Film, VVenC slower preset, WPP | 3840x1608 | 300 | 113.6 fps | 135.0 fps | 102.5 fps |
-| Film with film grain synthesis | 3840x2160 | 300 | 88.6 fps | 125.0 fps | 67.7 fps |
-| Film, VVenC medium preset | 3840x2160 | 300 | 75.6 fps | 105.7 fps | 81.1 fps |
-| Film, VVenC slower preset, no WPP | 3840x1608 | 300 | 82.9 fps | 141.3 fps | 127.9 fps |
-| Film, VVenC slower preset | 1920x1080 | 600 | 242.3 fps | 295.5 fps | 317.0 fps |
-| Film, VVenC medium preset | 1920x1080 | 600 | 258.4 fps | 312.4 fps | 324.2 fps |
-| Film, one substream a picture | 1920x1080 | 600 | 209.6 fps | 319.6 fps | 396.3 fps |
+| Video | Size | Substreams a picture | GPU parse (`VVDEC_GPU_PARSE=2`) | `--gpu 1` | CPU decoder (`--gpu 0`) | `--gpu 1` against the CPU |
+|---|---|---|---|---|---|---|
+| 4K film, VVenC slower preset | 3840x1608 | 26 | 202.1 fps | 202.1 fps | 141.7 fps | 1.43x |
+| 4K film | 3840x2160 | 34 | 123.9 fps | 156.6 fps | 110.4 fps | 1.42x |
+| 4K film | 3840x1608 | 1 | 182.8 fps | 223.2 fps | 180.8 fps | 1.23x |
+| 4K film with film grain synthesis | 3840x2160 | 2 | 166.3 fps | 170.0 fps | 99.6 fps | 1.71x |
+| 1080p film, VVenC slower preset | 1920x1080 | 18 | 457.4 fps | 505.1 fps | 487.2 fps | 1.04x |
+| 1080p film | 1920x1080 | 18 | 468.3 fps | 522.5 fps | 502.2 fps | 1.04x |
+| 1080p film | 1920x1080 | 2 | 343.1 fps | 526.0 fps | 525.0 fps | 1.00x |
+| 1080p film | 1920x1080 | 1 | 296.4 fps | 363.6 fps | 480.8 fps | 0.76x |
 
-On every film, `--gpu 1` (the CPU parses) is the faster of the two GPU modes.
+All eight films are 10-bit. On each of them `--gpu 1` is at least as fast as the GPU parse.
 
 Where it is slow:
 
-- **Small pictures.** The GPU spends about 0.8 to 2.5 ms on each picture in passes that wait on one another, so at
-  832x480 and below `--gpu 1` decodes about 400 to 1,250 fps where the CPU decoder does 900 to 4,800.
-- **All-intra 1080p.** Intra blocks are predicted in waves, each of which depends on the one before, so much of the
-  work runs in sequence: 77 fps against the CPU decoder's 123 on the LFNST_D_3 conformance stream.
-- **The GPU parse when a picture has few substreams.** Arithmetic decoding is serial within a substream, and one GPU
-  wave does it roughly 25 times slower than a CPU core. WPP or many tiles give a picture enough substreams to keep
-  the GPU busy. With one substream a picture, or at very high bitrates, `VVDEC_GPU_PARSE=2` decodes 2 to 17 times
-  slower than `--gpu 1`.
-- **Start-up.** With the Vulkan device already running, the first frame came after a median of 0.1 s with
-  `--gpu 1` and 0.5 s with the GPU parse (the CPU decoder: 0.04 s). The first run of a new build also compiles the
-  shaders, about 7 s; the compiled pipelines are kept on disk for later runs.
+| Conformance stream | Size | GPU parse | `--gpu 1` | CPU decoder |
+|---|---|---|---|---|
+| LFNST_D_3 (all intra) | 1920x1080 | 54.7 fps | 98.0 fps | 172.2 fps |
+| TEMPSCAL_A_4 | 832x480 | 250.4 fps | 464.2 fps | 1,317.9 fps |
+| TREE_A_3 (all intra) | 768x384 | 183.6 fps | 475.9 fps | 1,199.5 fps |
+| BOUNDARY_A_3 (the picture size changes) | up to 376x376 | 534.8 fps | 1,294.1 fps | 4,406.5 fps |
+
+- **Small pictures.** Each picture goes through a chain of GPU passes that run one after another. On a small
+  picture each pass has little work, so the time goes into the passes waiting on one another while the GPU stays
+  mostly idle.
+- **Intra pictures.** Intra blocks are predicted in waves, each depending on the one before, and the GPU works out
+  those waves one block after another along each row of CTUs. Pictures that are mostly intra therefore run largely
+  in sequence.
+- **The GPU parse.** Arithmetic decoding is serial within a substream (a slice, a tile, or a row of CTUs with
+  WPP), and each substream is parsed by one GPU workgroup, so a picture's parse can spread over only as many
+  workgroups as it has substreams. In the tests above the GPU parse is never faster than `--gpu 1`: it is up to 35%
+  slower on the films and 44 to 61% slower on the four conformance streams.
+- **Start-up** (left out of the fps above) takes longer than the CPU decoder's: creating the Vulkan device, loading
+  the compiled pipelines and filling the GPU's pipeline of pictures. The first run of a new build also compiles the
+  shaders, about 7 s on this laptop.
 
 ## Building (Windows)
 
-You need Visual Studio 2022 with the C++ tools, CMake, Ninja, Python 3, the
-[Slang](https://github.com/shader-slang/slang) compiler 2026.10.2 (`slangc.exe`) and the Khronos
-[Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers), 1.4.3xx or newer. Then run:
+You need Visual Studio 2022 with the C++ tools, CMake, Ninja, the [Slang](https://github.com/shader-slang/slang)
+compiler 2026.10.2 (`slangc.exe`) and the Khronos [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers)
+(version 1.4.364 was used). Then run:
 
 ```bat
 scripts\build_vulkan.bat path\to\slangc.exe path\to\Vulkan-Headers\include
 ```
 
-This builds Release with Ninja into `build\vulkan` and puts `vvdecapp.exe` in `bin\release-static`. The script runs
-CMake with `-DVVDEC_ENABLE_VULKAN=ON -DVVDEC_SLANGC=<slangc> -DVVDEC_VULKAN_HEADERS=<include dir>`; the shaders are
-compiled to SPIR-V and embedded in the program. Other platforms have not been built.
+This builds Release with Ninja into `build\vulkan`; the programs (`vvdecapp.exe`, `vvdecbatch.exe`) land in
+`bin\release-static`. The script runs CMake with `-DVVDEC_ENABLE_VULKAN=ON -DVVDEC_SLANGC=<slangc>
+-DVVDEC_VULKAN_HEADERS=<include dir>`; the shaders are compiled to SPIR-V and embedded in the program. Other
+platforms have not been built.
 
 At run time the decoder loads the Vulkan loader (`vulkan-1.dll`). It needs a Vulkan 1.2 device with buffer device
-addresses and 8-, 16- and 64-bit integers in shaders.
+addresses, 8-, 16- and 64-bit integers in shaders, and 8- and 16-bit storage buffer access. The GPU parse and the
+front end's own queue also need timeline semaphores and an asynchronous compute queue; without them the CPU parses
+and the front end runs on the main queue. Keeping the compiled pipelines between runs needs Vulkan 1.3 with
+`VK_KHR_pipeline_binary`.
 
 ## Running
 
@@ -89,8 +103,8 @@ vvdecapp -b input.266 -o output.yuv --gpu 1
 | Environment variable | Effect |
 |---|---|
 | `VVDEC_GPU_PARSE=2` | the GPU parses the slice data too |
-| `VVDEC_GPU_DEVICE=<n>` | use Vulkan device number `n` (default: the first discrete GPU, else the first integrated one) |
-| `VVDEC_GPU_CACHE=<file>` | where the compiled pipelines are kept (default: under `%LOCALAPPDATA%\vvdec`); `0` keeps none |
+| `VVDEC_GPU_DEVICE=<n>` | use Vulkan device number `n` (default: the first discrete GPU, else the first integrated one, else the first device) |
+| `VVDEC_GPU_CACHE=<file>` | where the compiled pipelines are kept (default: `%LOCALAPPDATA%\vvdec` on Windows); `0` keeps none |
 | `VVDEC_GPU_PRECOMPILE=0` | compile each shader when it is first used instead of in the background at start |
 | `VVDEC_GPU_FRONT=0` | the CPU derives the motion and the deblocking parameters and builds the job lists |
 | `VVDEC_GPU_PROFILE=1` | at exit, print the GPU time of each pass, each shader's registers and the GPU memory peaks |
@@ -101,9 +115,9 @@ vvdecapp -b input.266 -o output.yuv --gpu 1
 
 - [`source/Lib/VulkanLib/README.md`](source/Lib/VulkanLib/README.md): the design (the paths, the queues, a
   picture's journey through the tasks and passes). Each source file and shader begins with a description of its part.
-- [`tools/gpu-dev/`](tools/gpu-dev/): the checks and benchmarks used during development. `fastcheck.py` decodes the
-  conformance and tool streams and compares every frame; `speedsweep.py` times every video against the CPU decoder.
-  The test streams are not in the repository.
+- [`tools/gpu-dev/`](tools/gpu-dev/): the checks and benchmarks used during development (Python 3). `fastcheck.py`
+  decodes the conformance and tool streams and compares every frame; `ab_steady.py` measures steady-state speed;
+  `speedsweep.py` times every video against the CPU decoder. The test streams are not in the repository.
 
 ## License
 
@@ -113,7 +127,8 @@ Fraunhofer.
 
 ---
 
-*The upstream VVdeC README follows.*
+*The upstream VVdeC README follows. Its list of supported platforms is upstream's, for the CPU decoder; the GPU
+decoder has only been built on Windows x64.*
 
 # Upstream VVdeC
 
