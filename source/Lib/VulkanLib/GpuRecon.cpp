@@ -50,6 +50,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "CommonLib/AdaptiveLoopFilter.h"
 #include "CommonLib/CodingStructure.h"
+#include "CommonLib/InterpolationFilter.h"
 #include "CommonLib/MipData.h"
 #include "CommonLib/Picture.h"
 #include "CommonLib/Rom.h"
@@ -125,13 +126,46 @@ static Buffer uploadMipMatrices( Context* ctx )
   return buf;
 }
 
-// GPM's prestored weight masks (g_globalGeoWeights), for inter.slang.
+// inter.slang's tables: GPM's prestored weight masks (g_globalGeoWeights), then the interpolation filters' taps in the
+// order of inter.slang's Taps (kTapsLuma ...). The shader reads the taps from memory: as its own constant arrays, read
+// with a run-time index, Intel's compiler copied each array into the thread's scratch memory at each use.
 static Buffer uploadGeoWeights( Context* ctx )
 {
   static_assert( sizeof( g_globalGeoWeights ) == GEO_NUM_PRESTORED_MASK * GEO_WEIGHT_MASK_SIZE * GEO_WEIGHT_MASK_SIZE * sizeof( int16_t ) && GEO_WEIGHT_MASK_SIZE == 112,
                  "GPM's masks are not those of shaders/inter.slang" );
-  Buffer buf = ctx->alloc( sizeof( g_globalGeoWeights ), MemKind::Upload );
-  memcpy( buf.mapped, g_globalGeoWeights, sizeof( g_globalGeoWeights ) );
+  using IF = InterpolationFilter;
+  static_assert( sizeof( TFilterCoeff ) == sizeof( int16_t ) && sizeof( IF::m_lumaFilter ) == 128 * sizeof( int16_t )
+                   && sizeof( IF::m_chromaFilter ) == 128 * sizeof( int16_t ) && sizeof( IF::m_lumaAltHpelIFilter ) == 8 * sizeof( int16_t )
+                   && sizeof( IF::m_bilinearFilterPrec4 ) == 32 * sizeof( int16_t ),
+                 "the interpolation filters are not those of shaders/inter.slang" );
+  // (the order of inter.slang's kTaps* offsets)
+  const std::pair<const void*, size_t> taps[] = {
+    { IF::m_lumaFilter, sizeof( IF::m_lumaFilter ) },
+    { IF::m_lumaFilter4x4, sizeof( IF::m_lumaFilter4x4 ) },
+    { IF::m_lumaFilterRPR1, sizeof( IF::m_lumaFilterRPR1 ) },
+    { IF::m_lumaFilterRPR2, sizeof( IF::m_lumaFilterRPR2 ) },
+    { IF::m_affineLumaFilterRPR1, sizeof( IF::m_affineLumaFilterRPR1 ) },
+    { IF::m_affineLumaFilterRPR2, sizeof( IF::m_affineLumaFilterRPR2 ) },
+    { IF::m_chromaFilter, sizeof( IF::m_chromaFilter ) },
+    { IF::m_chromaFilterRPR1, sizeof( IF::m_chromaFilterRPR1 ) },
+    { IF::m_chromaFilterRPR2, sizeof( IF::m_chromaFilterRPR2 ) },
+    { IF::m_lumaAltHpelIFilter, sizeof( IF::m_lumaAltHpelIFilter ) },
+    { IF::m_bilinearFilterPrec4, sizeof( IF::m_bilinearFilterPrec4 ) },
+  };
+  size_t size = sizeof( g_globalGeoWeights );
+  for( const auto& t: taps )
+  {
+    size += t.second;
+  }
+  Buffer   buf = ctx->alloc( size, MemKind::Upload );
+  uint8_t* at  = static_cast<uint8_t*>( buf.mapped );
+  memcpy( at, g_globalGeoWeights, sizeof( g_globalGeoWeights ) );
+  at += sizeof( g_globalGeoWeights );
+  for( const auto& t: taps )
+  {
+    memcpy( at, t.first, t.second );
+    at += t.second;
+  }
   return buf;
 }
 

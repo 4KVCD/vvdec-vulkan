@@ -120,10 +120,13 @@ Options Options::fromEnvironment()
   options.pipelineCache = value( "VVDEC_GPU_CACHE" ) ? value( "VVDEC_GPU_CACHE" ) : "";
   options.async         = !( value( "VVDEC_GPU_ASYNC" ) && atoi( value( "VVDEC_GPU_ASYNC" ) ) == 0 );
   options.frontEnd      = !( value( "VVDEC_GPU_FRONT" ) && atoi( value( "VVDEC_GPU_FRONT" ) ) == 0 );
+  options.frontEndSet   = value( "VVDEC_GPU_FRONT" ) != nullptr;
   options.frontEndCheck = value( "VVDEC_GPU_MIDER" ) && atoi( value( "VVDEC_GPU_MIDER" ) ) != 0;
   options.parse         = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 1;
   options.parseDrives   = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 2;
   options.precompile    = !( value( "VVDEC_GPU_PRECOMPILE" ) && atoi( value( "VVDEC_GPU_PRECOMPILE" ) ) == 0 );
+  options.waveSize      = value( "VVDEC_GPU_WAVE" ) ? atoi( value( "VVDEC_GPU_WAVE" ) ) : -1;
+  options.waveSizeInter = value( "VVDEC_GPU_WAVE_INTER" ) ? atoi( value( "VVDEC_GPU_WAVE_INTER" ) ) : -1;
   options.lowPriority   = !( value( "VVDEC_GPU_PRIORITY" ) && strcmp( value( "VVDEC_GPU_PRIORITY" ), "normal" ) == 0 );
   options.engine        = value( "VVDEC_GPU_ENGINE" ) ? value( "VVDEC_GPU_ENGINE" ) : "";
   return options;
@@ -148,6 +151,14 @@ bool Context::init()
   if( !chooseDevice( props ) || !checkFeatures( props, timelineSemaphore, subgroupSizeControl ) )
   {
     return false;
+  }
+  if( m_intel && !m_options.frontEndSet && !m_options.parseDrives )
+  {
+    // Intel's GPUs: the CPU front end (VVDEC_GPU_FRONT=1: the GPU's). The GPU front end's motion derivation runs a
+    // CTU row per 32-thread workgroup as a wavefront, a chain of CTUs that leaves most of an integrated GPU idle
+    // (mider: 7.9 ms of a VideoQ 4K picture's 27 on the 285K's Intel Graphics). VideoQ 4K 35.4 -> 55.3 fps, 1080p
+    // 90.2 -> 206.5 fps. The GPU parse (VVDEC_GPU_PARSE=2) needs the GPU front end: with it, the front end stays there.
+    m_options.frontEnd = false;
   }
   if( m_coherentReads && ( m_options.parse || m_options.parseDrives ) )
   {
@@ -295,6 +306,7 @@ bool Context::chooseDevice( VkPhysicalDeviceProperties& props )
   m_splitStores      = props.vendorID == kVendorNvidia;
   m_integerAddresses = props.vendorID == kVendorIntel;
   m_coherentReads    = props.vendorID == kVendorNvidia;
+  m_intel            = props.vendorID == kVendorIntel;
   // The compute queue on the GPU's compute engine (a compute-only family) instead of the graphics engine, where the
   // desktop's compositor runs, on Intel's GPUs (VVDEC_GPU_ENGINE=compute or 3d chooses). Intel Graphics (285K, driver
   // 101.8991), VideoQ 4K beside a 60 Hz probe of the graphics queue: its submissions late for a frame 16.3% -> 0.1%;
@@ -456,12 +468,17 @@ uint32_t Context::queueCreateInfos( const AsyncQueueLayout& async, VkDeviceQueue
 
 // Whether the shaders may ask for waves of 32 threads, on GPUs that run both sizes (AMD's), where the shaders run
 // better so: it takes Vulkan 1.3's subgroup size control for compute shaders, with 32 among the sizes
-bool Context::wave32Possible( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl ) const
+bool Context::wave32Possible( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl )
 {
   VkPhysicalDeviceSubgroupSizeControlProperties sizes{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES };
   VkPhysicalDeviceProperties2                   props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
   props2.pNext = &sizes;
   m_api.vkGetPhysicalDeviceProperties2( m_physical, &props2 );
+  if( props.apiVersion >= VK_API_VERSION_1_3 && subgroupSizeControl && ( sizes.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT ) )
+  {
+    m_minWave = sizes.minSubgroupSize;
+    m_maxWave = sizes.maxSubgroupSize;
+  }
   return props.apiVersion >= VK_API_VERSION_1_3 && subgroupSizeControl && sizes.minSubgroupSize <= 32 && sizes.maxSubgroupSize >= 32
          && ( sizes.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT );
 }
@@ -773,16 +790,17 @@ static uint64_t shadersHash()
   return h;
 }
 
-// A pipeline's key in the binaries' file: its shader (its name and its SPIR-V's hash), whether it asks for waves of
-// 32 threads and the work-arounds set (kSplitStores, kIntegerAddresses, kCoherentReads). (Not the driver's pipeline
+// A pipeline's key in the binaries' file: its shader (its name and its SPIR-V's hash), the wave size it asks for (0:
+// none) and the work-arounds set (kSplitStores, kIntegerAddresses, kCoherentReads). (Not the driver's pipeline
 // key, vkGetPipelineKeyKHR: AMD's makes it per program, as its shader cache.)
-static std::vector<uint8_t> pipelineKeyOf( int shaderId, bool wave32, bool splitStores, bool integerAddresses, bool coherentReads )
+static std::vector<uint8_t> pipelineKeyOf( int shaderId, uint32_t waveSize, bool splitStores, bool integerAddresses, bool coherentReads )
 {
   const char*          name = kShaders[shaderId].name;
   std::vector<uint8_t> key( name, name + strlen( name ) );
   const uint64_t       h = hashShader( kHashSeed, shaderId );
   key.insert( key.end(), reinterpret_cast<const uint8_t*>( &h ), reinterpret_cast<const uint8_t*>( &h ) + sizeof( h ) );
-  key.push_back( uint8_t( ( wave32 ? 32 : 0 ) | ( splitStores ? 1 : 0 ) | ( integerAddresses ? 2 : 0 ) | ( coherentReads ? 4 : 0 ) ) );
+  key.push_back( uint8_t( ( splitStores ? 1 : 0 ) | ( integerAddresses ? 2 : 0 ) | ( coherentReads ? 4 : 0 ) ) );
+  key.push_back( uint8_t( waveSize ) );
   return key;
 }
 
@@ -972,13 +990,13 @@ void Context::closePipelineBinaries()
   m_binaries = nullptr;
 }
 
-VkResult Context::createPipeline( int shaderId, bool wave32, VkComputePipelineCreateInfo& info, VkPipeline& pipe )
+VkResult Context::createPipeline( int shaderId, uint32_t waveSize, VkComputePipelineCreateInfo& info, VkPipeline& pipe )
 {
   if( !m_binaries )
   {
     return m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
   }
-  const std::vector<uint8_t> key = pipelineKeyOf( shaderId, wave32, m_splitStores, m_integerAddresses, m_coherentReads );
+  const std::vector<uint8_t> key = pipelineKeyOf( shaderId, waveSize, m_splitStores, m_integerAddresses, m_coherentReads );
   if( createFromBinaries( key, info, pipe ) )
   {
     return VK_SUCCESS;
@@ -1465,6 +1483,42 @@ static bool interShader( int shaderId )
          || shaderId == kShader_inter_bdof_wide || shaderId == kShader_inter_affine_wide;
 }
 
+// The shaders that work with waves of any size from 16 up (no ballots or lane reads that take 32 threads): they may
+// run in the size VVDEC_GPU_WAVE (VVDEC_GPU_WAVE_INTER: inter's variants) asks for
+static bool anyWaveSize( int shaderId )
+{
+  switch( shaderId )
+  {
+  case kShader_alf_luma: case kShader_alf_chroma: case kShader_alf_luma_bounds: case kShader_alf_chroma_bounds:
+  case kShader_sao: case kShader_deblock_luma_ver: case kShader_deblock_luma_hor: case kShader_deblock_chroma:
+  case kShader_intra: case kShader_trafo: case kShader_lmcs: case kShader_filmgrain: case kShader_dbparams:
+  case kShader_dbparams_sub: case kShader_edges:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// The wave size a shader's pipeline asks for (0: the driver's choice): 32, but for inter's variants (interShader), and
+// on Intel's GPUs 16 for the shaders that work with any (anyWaveSize), unless VVDEC_GPU_WAVE or VVDEC_GPU_WAVE_INTER asks
+// for another. Intel's compiler gives a thread of a 32-wide wave half the registers of a 16-wide one's; at 32 the
+// heavy shaders spill. Intel Graphics (285K, driver 101.8991), VideoQ 4K, ms a picture at 32 -> 16: ALF luma 5.66 ->
+// 0.90, deblocking 1.31 -> 0.86, dbparams 1.61 -> 0.82, edges 1.79 -> 1.41; 29.3 -> 35.4 fps (GPU front end). Inter's
+// variants keep the driver's choice there (16: the same; 32: 3.4 -> 4.7 ms at 1080p).
+uint32_t Context::waveSizeOf( int shaderId ) const
+{
+  int asked = interShader( shaderId ) ? m_options.waveSizeInter : anyWaveSize( shaderId ) ? m_options.waveSize : -1;
+  if( asked < 0 && m_intel && anyWaveSize( shaderId ) )
+  {
+    asked = 16;
+  }
+  if( asked >= 0 && ( asked == 0 || ( m_minWave <= uint32_t( asked ) && uint32_t( asked ) <= m_maxWave ) ) )
+  {
+    return uint32_t( asked );
+  }
+  return m_wave32 && !interShader( shaderId ) ? 32u : 0u;
+}
+
 VkPipeline Context::pipeline( int shaderId )
 {
   std::call_once( m_pipelineOnce[shaderId], [this, shaderId]() { m_pipelines[shaderId] = createPipelineOf( shaderId ); } );
@@ -1573,11 +1627,9 @@ VkPipeline Context::createPipelineOf( int shaderId )
   info.stage.module = module;
   info.stage.pName  = "main";
   info.layout       = m_layout;
-  // waves of 32 threads, but for inter's variants (interShader)
   VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
-  size.requiredSubgroupSize = 32;
-  const bool wave32         = m_wave32 && !interShader( shaderId );
-  if( wave32 )
+  size.requiredSubgroupSize = waveSizeOf( shaderId );
+  if( size.requiredSubgroupSize != 0 )
   {
     info.stage.pNext = &size;
   }
@@ -1592,7 +1644,7 @@ VkPipeline Context::createPipelineOf( int shaderId )
     info.stage.pSpecializationInfo = &specialization;
   }
   VkPipeline     pipe   = VK_NULL_HANDLE;
-  const VkResult result = createPipeline( shaderId, wave32, info, pipe );
+  const VkResult result = createPipeline( shaderId, size.requiredSubgroupSize, info, pipe );
   m_api.vkDestroyShaderModule( m_device, module, nullptr );
   if( result != VK_SUCCESS )
   {
