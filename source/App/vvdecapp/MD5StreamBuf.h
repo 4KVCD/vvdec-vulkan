@@ -50,7 +50,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#if defined( _M_X64 ) || defined( __SSE4_2__ )
+#if ( defined( _MSC_VER ) && defined( _M_X64 ) ) || defined( __SSE4_2__ )   // (MinGW defines _M_X64 too)
 #  include <nmmintrin.h>
 #  define VVDECAPP_CRC32C_INSTRUCTION 1
 #endif
