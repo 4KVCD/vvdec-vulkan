@@ -76,7 +76,7 @@ struct DbParamsPush
 {
   VkDeviceAddress cus, tus, ctus, slices, cuMapL, cuMapC, cuMotion, motion, lfp, ctuInfo;
   int32_t         numCus, widthInCtus, heightInCtus, log2Ctu, width, height, widthIn4, csx, csy, chroma, qpBdOffset, pass, flags;
-  int32_t         vbPosHor[4], vbPosVer[4];   // the count, then the positions
+  int32_t         vbPosHor[4], vbPosVer[4];   // the count, then the positions (in the shader, scalars: numVbHor, vbHor0..2...)
   uint32_t        lfpTag;
 };
 static_assert( sizeof( DbParamsPush ) == 168, "DbParamsPush: the layout of dbparams.slang's Params" );   // (the tag in the padding)

@@ -216,193 +216,56 @@ int combineLists( int flags, int comp, int p0, int p1, int gpmWeight, uint wpPar
 #define THREADS 64
 #define PER_THREAD 4   // a 16x16 tile's luma samples per thread
 
-static const int kLuma[128] = {
-   0, 0,   0, 64,  0,   0,  0,  0,
-   0, 1,  -3, 63,  4,  -2,  1,  0,
-  -1, 2,  -5, 62,  8,  -3,  1,  0,
-  -1, 3,  -8, 60, 13,  -4,  1,  0,
-  -1, 4, -10, 58, 17,  -5,  1,  0,
-  -1, 4, -11, 52, 26,  -8,  3, -1,
-  -1, 3,  -9, 47, 31, -10,  4, -1,
-  -1, 4, -11, 45, 34, -10,  4, -1,
-  -1, 4, -11, 40, 40, -11,  4, -1,
-  -1, 4, -10, 34, 45, -11,  4, -1,
-  -1, 4, -10, 31, 47,  -9,  3, -1,
-  -1, 3,  -8, 26, 52, -11,  4, -1,
-   0, 1,  -5, 17, 58, -10,  4, -1,
-   0, 1,  -4, 13, 60,  -8,  3, -1,
-   0, 1,  -3,  8, 62,  -5,  2, -1,
-   0, 1,  -2,  4, 63,  -3,  1,  0
+// The interpolation filters' taps (vvdec's InterpolationFilter tables), in pc.geo after GPM's masks
+// (GpuRecon.cpp's uploadGeoWeights, in this order): kLuma, then the 6-tap luma filter vvdec uses for 4x4 blocks
+// (affine), RPR's filters (m_lumaFilterRPR1 and 2, used past 1.25x and 1.75x), their affine variants, then the chroma
+// ones, the half-sample luma filter and the bilinear one (m_bilinearFilterPrec4). Read from memory: as the shader's
+// own constant arrays, read with a run-time index, Intel's compiler copied each array into the thread's scratch
+// memory at each use (VideoQ 4K on the 285K's Intel Graphics: inter 14.7 ms a picture).
+static const uint kGeoValues = 6 * 112 * 112;   // GEO_NUM_PRESTORED_MASK masks of 112 x 112
+struct Taps
+{
+  uint base;
+  __subscript( int i )->int
+  {
+    get { return int( *at( pc.geo, kGeoValues + base + uint( i ) ) ); }
+  }
 };
-static const int kLumaHpel[8] = { 0, 3, 9, 20, 20, 9, 3, 0 };
-static const int kChroma[128] = {
-   0, 64,  0,  0,  -1, 63,  2,  0,  -2, 62,  4,  0,  -2, 60,  7, -1,  -2, 58, 10, -2,  -3, 57, 12, -2,  -4, 56, 14, -2,  -4, 55, 15, -2,
-  -4, 54, 16, -2,  -5, 53, 18, -2,  -6, 52, 20, -2,  -6, 49, 24, -3,  -6, 46, 28, -4,  -5, 44, 29, -4,  -4, 42, 30, -4,  -4, 39, 33, -4,
-  -4, 36, 36, -4,  -4, 33, 39, -4,  -4, 30, 42, -4,  -4, 29, 44, -5,  -4, 28, 46, -6,  -3, 24, 49, -6,  -2, 20, 52, -6,  -2, 18, 53, -5,
-  -2, 16, 54, -4,  -2, 15, 55, -4,  -2, 14, 56, -4,  -2, 12, 57, -3,  -2, 10, 58, -2,  -1,  7, 60, -2,   0,  4, 62, -2,   0,  2, 63, -1
-};
-static const int16_t kBilinear[32] = { 16, 0, 15, 1, 14, 2, 13, 3, 12, 4, 11, 5, 10, 6, 9, 7, 8, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
-// The 6-tap luma filter vvdec uses for 4x4 blocks (affine), then RPR's filters
-// (InterpolationFilter's m_lumaFilterRPR1 and 2, used past 1.25x and 1.75x;
-// then the affine variants; then the chroma ones).
-static const int kLuma4x4[128] = {
-   0, 0,   0, 64,  0,   0,  0,  0,
-   0, 1,  -3, 63,  4,  -2,  1,  0,
-   0, 1,  -5, 62,  8,  -3,  1,  0,
-   0, 2,  -8, 60, 13,  -4,  1,  0,
-   0, 3, -10, 58, 17,  -5,  1,  0,
-   0, 3, -11, 52, 26,  -8,  2,  0,
-   0, 2,  -9, 47, 31, -10,  3,  0,
-   0, 3, -11, 45, 34, -10,  3,  0,
-   0, 3, -11, 40, 40, -11,  3,  0,
-   0, 3, -10, 34, 45, -11,  3,  0,
-   0, 3, -10, 31, 47,  -9,  2,  0,
-   0, 2,  -8, 26, 52, -11,  3,  0,
-   0, 1,  -5, 17, 58, -10,  3,  0,
-   0, 1,  -4, 13, 60,  -8,  2,  0,
-   0, 1,  -3,  8, 62,  -5,  1,  0,
-   0, 1,  -2,  4, 63,  -3,  1,  0
-};
-static const int kLumaRPR1[128] = {
-   -1,  -5,  17,  42,  17,  -5,  -1,   0,
-    0,  -5,  15,  41,  19,  -5,  -1,   0,
-    0,  -5,  13,  40,  21,  -4,  -1,   0,
-    0,  -5,  11,  39,  24,  -4,  -2,   1,
-    0,  -5,   9,  38,  26,  -3,  -2,   1,
-    0,  -5,   7,  38,  28,  -2,  -3,   1,
-    1,  -5,   5,  36,  30,  -1,  -3,   1,
-    1,  -4,   3,  35,  32,   0,  -4,   1,
-    1,  -4,   2,  33,  33,   2,  -4,   1,
-    1,  -4,   0,  32,  35,   3,  -4,   1,
-    1,  -3,  -1,  30,  36,   5,  -5,   1,
-    1,  -3,  -2,  28,  38,   7,  -5,   0,
-    1,  -2,  -3,  26,  38,   9,  -5,   0,
-    1,  -2,  -4,  24,  39,  11,  -5,   0,
-    0,  -1,  -4,  21,  40,  13,  -5,   0,
-    0,  -1,  -5,  19,  41,  15,  -5,   0
-};
-static const int kLumaRPR2[128] = {
-   -4,   2,  20,  28,  20,   2,  -4,   0,
-   -4,   0,  19,  29,  21,   5,  -4,  -2,
-   -4,  -1,  18,  29,  22,   6,  -4,  -2,
-   -4,  -1,  16,  29,  23,   7,  -4,  -2,
-   -4,  -1,  16,  28,  24,   7,  -4,  -2,
-   -4,  -1,  14,  28,  25,   8,  -4,  -2,
-   -3,  -3,  14,  27,  26,   9,  -3,  -3,
-   -3,  -1,  12,  28,  25,  10,  -4,  -3,
-   -3,  -3,  11,  27,  27,  11,  -3,  -3,
-   -3,  -4,  10,  25,  28,  12,  -1,  -3,
-   -3,  -3,   9,  26,  27,  14,  -3,  -3,
-   -2,  -4,   8,  25,  28,  14,  -1,  -4,
-   -2,  -4,   7,  24,  28,  16,  -1,  -4,
-   -2,  -4,   7,  23,  29,  16,  -1,  -4,
-   -2,  -4,   6,  22,  29,  18,  -1,  -4,
-   -2,  -4,   5,  21,  29,  19,   0,  -4
-};
-static const int kAffineLumaRPR1[128] = {
-    0,  -6,  17,  42,  17,  -5,  -1,   0,
-    0,  -5,  15,  41,  19,  -5,  -1,   0,
-    0,  -5,  13,  40,  21,  -4,  -1,   0,
-    0,  -5,  11,  39,  24,  -4,  -1,   0,
-    0,  -5,   9,  38,  26,  -3,  -1,   0,
-    0,  -5,   7,  38,  28,  -2,  -2,   0,
-    0,  -4,   5,  36,  30,  -1,  -2,   0,
-    0,  -3,   3,  35,  32,   0,  -3,   0,
-    0,  -3,   2,  33,  33,   2,  -3,   0,
-    0,  -3,   0,  32,  35,   3,  -3,   0,
-    0,  -2,  -1,  30,  36,   5,  -4,   0,
-    0,  -2,  -2,  28,  38,   7,  -5,   0,
-    0,  -1,  -3,  26,  38,   9,  -5,   0,
-    0,  -1,  -4,  24,  39,  11,  -5,   0,
-    0,  -1,  -4,  21,  40,  13,  -5,   0,
-    0,  -1,  -5,  19,  41,  15,  -5,   0
-};
-static const int kAffineLumaRPR2[128] = {
-    0,  -2,  20,  28,  20,   2,  -4,   0,
-    0,  -4,  19,  29,  21,   5,  -6,   0,
-    0,  -5,  18,  29,  22,   6,  -6,   0,
-    0,  -5,  16,  29,  23,   7,  -6,   0,
-    0,  -5,  16,  28,  24,   7,  -6,   0,
-    0,  -5,  14,  28,  25,   8,  -6,   0,
-    0,  -6,  14,  27,  26,   9,  -6,   0,
-    0,  -4,  12,  28,  25,  10,  -7,   0,
-    0,  -6,  11,  27,  27,  11,  -6,   0,
-    0,  -7,  10,  25,  28,  12,  -4,   0,
-    0,  -6,   9,  26,  27,  14,  -6,   0,
-    0,  -6,   8,  25,  28,  14,  -5,   0,
-    0,  -6,   7,  24,  28,  16,  -5,   0,
-    0,  -6,   7,  23,  29,  16,  -5,   0,
-    0,  -6,   6,  22,  29,  18,  -5,   0,
-    0,  -6,   5,  21,  29,  19,  -4,   0
-};
-static const int kChromaRPR1[128] = {
-   12,  40,  12,   0,
-   11,  40,  13,   0,
-   10,  40,  15,  -1,
-    9,  40,  16,  -1,
-    8,  40,  17,  -1,
-    8,  39,  18,  -1,
-    7,  39,  19,  -1,
-    6,  38,  21,  -1,
-    5,  38,  22,  -1,
-    4,  38,  23,  -1,
-    4,  37,  24,  -1,
-    3,  36,  25,   0,
-    3,  35,  26,   0,
-    2,  34,  28,   0,
-    2,  33,  29,   0,
-    1,  33,  30,   0,
-    1,  31,  31,   1,
-    0,  30,  33,   1,
-    0,  29,  33,   2,
-    0,  28,  34,   2,
-    0,  26,  35,   3,
-    0,  25,  36,   3,
-   -1,  24,  37,   4,
-   -1,  23,  38,   4,
-   -1,  22,  38,   5,
-   -1,  21,  38,   6,
-   -1,  19,  39,   7,
-   -1,  18,  39,   8,
-   -1,  17,  40,   8,
-   -1,  16,  40,   9,
-   -1,  15,  40,  10,
-    0,  13,  40,  11
-};
-static const int kChromaRPR2[128] = {
-   17,  30,  17,   0,
-   17,  30,  18,  -1,
-   16,  30,  18,   0,
-   16,  30,  18,   0,
-   15,  30,  18,   1,
-   14,  30,  18,   2,
-   13,  29,  19,   3,
-   13,  29,  19,   3,
-   12,  29,  20,   3,
-   11,  28,  21,   4,
-   10,  28,  22,   4,
-   10,  27,  22,   5,
-    9,  27,  23,   5,
-    9,  26,  24,   5,
-    8,  26,  24,   6,
-    7,  26,  25,   6,
-    7,  25,  25,   7,
-    6,  25,  26,   7,
-    6,  24,  26,   8,
-    5,  24,  26,   9,
-    5,  23,  27,   9,
-    5,  22,  27,  10,
-    4,  22,  28,  10,
-    4,  21,  28,  11,
-    3,  20,  29,  12,
-    3,  19,  29,  13,
-    3,  19,  29,  13,
-    2,  18,  30,  14,
-    1,  18,  30,  15,
-    0,  18,  30,  16,
-    0,  18,  30,  16,
-   -1,  18,  30,  17
-};
+static const Taps kLuma           = { 0 };
+static const Taps kLuma4x4        = { 128 };
+static const Taps kLumaRPR1       = { 256 };
+static const Taps kLumaRPR2       = { 384 };
+static const Taps kAffineLumaRPR1 = { 512 };
+static const Taps kAffineLumaRPR2 = { 640 };
+static const Taps kChroma         = { 768 };
+static const Taps kChromaRPR1     = { 896 };
+static const Taps kChromaRPR2     = { 1024 };
+static const Taps kLumaHpel       = { 1152 };
+static const Taps kBilinear       = { 1160 };
+
+// A phase's taps at once, a row of a luma table (8 taps, one 16-byte load) or of a chroma table (4 taps, 8 bytes): the
+// rows lie aligned in pc.geo. Tap k is lumaTap( row, k ).
+uint4 lumaRow( Taps table, int phase )
+{
+  return *at( (uint4*)pc.geo, ( kGeoValues + table.base ) / 8 + uint( phase ) );
+}
+
+uint2 chromaRow( Taps table, int phase )
+{
+  return *at( (uint2*)pc.geo, ( kGeoValues + table.base ) / 4 + uint( phase ) );
+}
+
+int16_t lumaTap( uint4 row, int k )
+{
+  const uint w = row[k >> 1];
+  return int16_t( ( k & 1 ) != 0 ? w >> 16 : w );
+}
+
+int16_t chromaTap( uint2 row, int k )
+{
+  const uint w = row[k >> 1];
+  return int16_t( ( k & 1 ) != 0 ? w >> 16 : w );
+}
 
 // RPR's filter taps by filter index (InterpolationFilter::filterHor, filterVer).
 // Luma: 0 the regular filter (its half-sample variant with hpel), 2 the 4x4
@@ -585,7 +448,7 @@ void rprBlock( int tid, int slot, int comp, int bx, int by, int ox, int oy, int 
       const int row = s / cols;
       const int y   = clamp( yFirst + row, 0, g.refH - 1 );
       const int x   = clamp( xFirst + s - row * cols, 0, g.refW - 1 );
-      s_pool[s]     = p[y * g.stride + x];
+      poolSet( s, p[y * g.stride + x] );
     }
     GroupMemoryBarrierWithGroupSync();
     for( int s = tid; s < rows * w; s += THREADS )
@@ -597,9 +460,9 @@ void rprBlock( int tid, int slot, int comp, int bx, int by, int ox, int oy, int 
       int        sum = 0;
       for( int k = 0; k < taps; k++ )
       {
-        sum += rprCoeff( comp, g.xFilter, x.y, g.hpelX, k ) * int( s_pool[at + k] );
+        sum += rprCoeff( comp, g.xFilter, x.y, g.hpelX, k ) * int( poolGet( at + k ) );
       }
-      s_pool[tmpAt + s] = int16_t( ( sum + rprOffset1( headRoom ) ) >> rprShift1( headRoom ) );
+      poolSet( tmpAt + s, int16_t( ( sum + rprOffset1( headRoom ) ) >> rprShift1( headRoom ) ) );
     }
     GroupMemoryBarrierWithGroupSync();
     for( int k = 0; k < PER_THREAD; k++ )
@@ -613,7 +476,7 @@ void rprBlock( int tid, int slot, int comp, int bx, int by, int ox, int oy, int 
         int        sum = 0;
         for( int tap = 0; tap < taps; tap++ )
         {
-          sum += rprCoeff( comp, g.yFilter, y.y, g.hpelY, tap ) * int( s_pool[at + ( tap << log2W )] );
+          sum += rprCoeff( comp, g.yFilter, y.y, g.hpelY, tap ) * int( poolGet( at + ( tap << log2W ) ) );
         }
         out[k] = rprResult( sum, bi, headRoom );
       }
@@ -654,15 +517,45 @@ void rprBlock( int tid, int slot, int comp, int bx, int by, int ox, int oy, int 
 // (the affine variant holds the reference samples of up to 16 subblocks, 9 x 9 each)
 // The pool's 16-bit values (rprBlock checks that its window and horizontal pass fit)
 #if AFFINE
-static const int kPoolValues = 16 * 81;
+static const int kPoolValues = 16 * 90;   // (16 subblocks' windows of 9 x 9, rows of 10: AFFINE_STRIDE)
 #else
 static const int kPoolValues = WORK_AT + 2 * DMVR_ROWS * 20;
 #endif
-groupshared int16_t s_pool[kPoolValues];
-#define s_ref( i ) int( s_pool[REF_AT + ( i )] )
-#define s_tmp( i ) int( s_pool[TMP_AT + ( i )] )
-#define s_bil0( i ) int( s_pool[BIL0_AT + ( i )] )
-#define s_bil1( i ) int( s_pool[BIL1_AT + ( i )] )
+groupshared uint s_pool32[( kPoolValues + 1 ) / 2 + 1];   // the pool's 16-bit values, two a word (the first in the low half), and a
+                                                         // word for poolRun, which may read one past the last value
+
+// Value i of the pool
+int16_t poolGet( int i )
+{
+  const uint w = s_pool32[uint( i ) >> 1];
+  return int16_t( ( i & 1 ) != 0 ? w >> 16 : w );
+}
+
+// Stores value i of the pool: one half of a word, atomically (another thread may store the word's other half
+// meanwhile). The hot paths store whole words (poolSetPair, storeEight, storeFour).
+void poolSet( int i, int16_t v )
+{
+  const uint a     = uint( i ) >> 1;
+  const uint shift = uint( i & 1 ) * 16u;
+  InterlockedAnd( s_pool32[a], ~( 0xffffu << shift ) );
+  InterlockedOr( s_pool32[a], uint( uint16_t( v ) ) << shift );
+}
+
+// Stores values i and i + 1 of the pool (i even) with one store
+void poolSetPair( int i, int lo, int hi )
+{
+  s_pool32[uint( i ) >> 1] = ( uint( lo ) & 0xffffu ) | ( uint( hi ) << 16 );
+}
+
+// The word of values i and i + 1 (i even)
+uint poolPair( int i )
+{
+  return s_pool32[uint( i ) >> 1];
+}
+#define s_ref( i ) int( poolGet( REF_AT + ( i ) ) )
+#define s_tmp( i ) int( poolGet( TMP_AT + ( i ) ) )
+#define s_bil0( i ) int( poolGet( BIL0_AT + ( i ) ) )
+#define s_bil1( i ) int( poolGet( BIL1_AT + ( i ) ) )
 // DMVR's SADs, and BDOF's sums (s_bsum) once DMVR is done with them
 #if BDOF
 groupshared int  s_ints[16 * 5];
@@ -838,7 +731,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
     int       at     = r * stride + c;
     for( int s = tid; s < rw * rh; s += THREADS )
     {
-      s_pool[REF_AT + s] = src[at];
+      poolSet( REF_AT + s, src[at] );
       c  += stepC;
       at += stepAt;
       if( c >= rw )
@@ -854,7 +747,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
     {
       const int r = s / rw;
       const int c = s - r * rw;
-      s_pool[REF_AT + s] = int16_t( refSample( ref, comp, baseX - ox + c, baseY - oy + r, windowed, window, wrap ) );
+      poolSet( REF_AT + s, int16_t( refSample( ref, comp, baseX - ox + c, baseY - oy + r, windowed, window, wrap ) ) );
     }
   }
   GroupMemoryBarrierWithGroupSync();
@@ -875,7 +768,7 @@ void predictBlock<let N : int>( int tid, int slot, int comp, int bx, int by, int
       {
         sum += int( cx[k] ) * s_ref( at + k );
       }
-      s_pool[TMP_AT + s] = int16_t( ( sum + offset1 ) >> shift1 );
+      poolSet( TMP_AT + s, int16_t( ( sum + offset1 ) >> shift1 ) );
     }
     GroupMemoryBarrierWithGroupSync();
     for( int k = 0; k < PER_THREAD; k++ )
@@ -1096,7 +989,7 @@ int2 clipStorage( int2 mv )
 // inside the tile stand in). The two predictions are then averaged with the offset's correction.
 // --------------------------------------------------------------------------------------------------------------------
 #define BS 18                                     // a list's row length in s_bdof: the tile (16 at most) plus border
-#define s_bdof( i ) s_pool[BDOF_AT + ( i )]       // (2 * BS * BS values)
+#define s_bdof( i ) poolGet( BDOF_AT + ( i ) )       // (2 * BS * BS values)
 #define s_bsum s_ints                             // per 4x4: sums of |gx|, |gy|, di*sgn(gx), di*sgn(gy), gx*sgn(gy)
 groupshared int     s_minCost;                    // DMVR's best cost (BDOF applies only where it is 2 w h or more)
 
@@ -1146,7 +1039,7 @@ void bdofStore( int tid, int list, int w, int h, int pred[PER_THREAD], int slot,
     const int t = tid + THREADS * k;
     if( t < w * h )
     {
-      s_bdof( list * BS * BS + ( ( t >> log2W ) + 1 ) * BS + ( t & ( w - 1 ) ) + 1 ) = int16_t( pred[k] );
+      poolSet( BDOF_AT + ( list * BS * BS + ( ( t >> log2W ) + 1 ) * BS + ( t & ( w - 1 ) ) + 1 ), int16_t( pred[k] ) );
     }
   }
   const int ring = 2 * ( w + 2 ) + 2 * h;
@@ -1157,7 +1050,7 @@ void bdofStore( int tid, int list, int w, int h, int pred[PER_THREAD], int slot,
   {
     const int2 b = bdofBorderAt( r, w, h );
     const int  v = refSample( ref, 0, baseX + b.x + 1 - xOff, baseY + b.y + 1 - yOff, windowed, window, wrap );
-    s_bdof( list * BS * BS + ( b.y + 1 ) * BS + b.x + 1 ) = bdofBorderValue( v );
+    poolSet( BDOF_AT + ( list * BS * BS + ( b.y + 1 ) * BS + b.x + 1 ), bdofBorderValue( v ) );
   }
 }
 
@@ -1285,48 +1178,66 @@ uint2 load8( int16_t* p, uint i )
 // 16-bit stores together, and does not with them apart.
 [vk::constant_id( 0 )] const bool kSplitStores = false;
 
-// Stores the 8 (4) samples packed in pairs in v at s_pool[at], 16 (8) bytes aligned: the compiler stores them with one
+// Stores the 8 (4) samples packed in pairs in v at poolGet( at ), 16 (8) bytes aligned: the compiler stores them with one
 // store (with kSplitStores, two).
 void storeEight( int at, uint4 v )
 {
+  const uint a = uint( at ) >> 1;
+  s_pool32[a]     = v.x;
+  s_pool32[a + 1] = v.y;
   if( kSplitStores )
   {
-    s_pool[at]     = int16_t( v.x );
-    s_pool[at + 1] = int16_t( v.x >> 16 );
-    s_pool[at + 2] = int16_t( v.y );
-    s_pool[at + 3] = int16_t( v.y >> 16 );
     GroupMemoryBarrier();
-    s_pool[at + 4] = int16_t( v.z );
-    s_pool[at + 5] = int16_t( v.z >> 16 );
-    s_pool[at + 6] = int16_t( v.w );
-    s_pool[at + 7] = int16_t( v.w >> 16 );
-    return;
   }
-  const uint w[4] = { v.x, v.y, v.z, v.w };
-  [unroll]
-  for( int m = 0; m < 8; m++ )
-  {
-    s_pool[at + m] = int16_t( w[m >> 1] >> ( 16 * ( m & 1 ) ) );
-  }
+  s_pool32[a + 2] = v.z;
+  s_pool32[a + 3] = v.w;
 }
 
 void storeFour( int at, uint2 v )
 {
-  s_pool[at]     = int16_t( v.x );
-  s_pool[at + 1] = int16_t( v.x >> 16 );
-  s_pool[at + 2] = int16_t( v.y );
-  s_pool[at + 3] = int16_t( v.y >> 16 );
+  const uint a    = uint( at ) >> 1;
+  s_pool32[a]     = v.x;
+  s_pool32[a + 1] = v.y;
 }
 
 // Sample (r, c) of the window whose sample (0, 0) is at index at.
 int winY( int at, int r, int c )
 {
-  return int( s_pool[at + r * YS + c] );
+  return int( poolGet( at + r * YS + c ) );
 }
 
 int winC( int at, int r, int c )
 {
-  return int( s_pool[at + r * CS + c] );
+  return int( poolGet( at + r * CS + c ) );
+}
+
+// The signed 16-bit half k (0 low, 1 high) of a word
+int halfOf( uint w, int k )
+{
+  return int( int16_t( k != 0 ? w >> 16 : w ) );
+}
+
+// N consecutive values of the pool from index at, read as words: (N + 2) / 2 words from the even index at or before
+// it. Each read of the pool is an instruction of its own and they limit inter's speed on Intel's GPUs, where reading the
+// pool's values one at a time took more of the tile paths' time than their filters' arithmetic (VideoQ 4K: 11 more
+// values read a row of tileLumaH 8.28 -> 9.03 ms, 8 more multiply-adds an output 8.28 -> 8.45 ms).
+void poolRun<let N : int>( int at, out int v[N] )
+{
+  const bool odd = ( at & 1 ) != 0;
+  uint       w[( N + 2 ) / 2];
+  [unroll]
+  for( int k = 0; k < ( N + 2 ) / 2; k++ )
+  {
+    w[k] = poolPair( ( at & ~1 ) + 2 * k );
+  }
+  [unroll]
+  for( int e = 0; e < N; e++ )
+  {
+    // (e and e + 1 are constants: the picks fold into shifts, odd selects between them)
+    const int lo = halfOf( w[e >> 1], e & 1 );
+    const int hi = halfOf( w[( e + 1 ) >> 1], ( e + 1 ) & 1 );
+    v[e]         = odd ? hi : lo;
+  }
 }
 
 // When DMVR's refinement moves a list's integer position (by dI, the refined motion's minus the merge motion's), the
@@ -1359,8 +1270,8 @@ void tile16ShiftLuma( int tid, int at[2], int2 dI[2] )
     if( i < YW * YW )
     {
       const int r = i / YW, c = i - r * YW;
-      s_pool[at[0] + r * YS + c] = int16_t( pairs[k] );
-      s_pool[at[1] + r * YS + c] = int16_t( pairs[k] >> 16 );
+      poolSet( at[0] + r * YS + c, int16_t( pairs[k] ) );
+      poolSet( at[1] + r * YS + c, int16_t( pairs[k] >> 16 ) );
     }
   }
   GroupMemoryBarrierWithGroupSync();
@@ -1394,8 +1305,8 @@ void tile16ShiftChroma( int tid, int at[4], int2 dI[2] )
       [unroll]
       for( int s = 0; s < 2; s++ )
       {
-        s_pool[at[2 * s] + r * CS + c]     = int16_t( pairs[k][s] );
-        s_pool[at[2 * s + 1] + r * CS + c] = int16_t( pairs[k][s] >> 16 );
+        poolSet( at[2 * s] + r * CS + c, int16_t( pairs[k][s] ) );
+        poolSet( at[2 * s + 1] + r * CS + c, int16_t( pairs[k][s] >> 16 ) );
       }
     }
   }
@@ -1417,11 +1328,8 @@ void tileLumaH( int tid, int at, int tmp, int16_t cx[8], int shift1, int offset1
     if( r < rows )
     {
       int w[11];
-      [unroll]
-      for( int e = 0; e < 11; e++ )
-      {
-        w[e] = winY( at, r, gi + e );
-      }
+      poolRun<11>( at + r * YS + gi, w );
+      int out[4];
       [unroll]
       for( int o = 0; o < 4; o++ )
       {
@@ -1431,8 +1339,11 @@ void tileLumaH( int tid, int at, int tmp, int16_t cx[8], int shift1, int offset1
         {
           sum += int( cx[t] ) * w[o + t];
         }
-        s_pool[tmp + r * 16 + gi + o] = int16_t( ( sum + offset1 ) >> shift1 );
+        out[o] = ( sum + offset1 ) >> shift1;
       }
+      // (tmp is even and gi a multiple of 4: two whole words)
+      poolSetPair( tmp + r * 16 + gi, out[0], out[1] );
+      poolSetPair( tmp + r * 16 + gi + 2, out[2], out[3] );
     }
   }
 }
@@ -1451,11 +1362,8 @@ void tileChromaH( int tid, int at, int tmp, int16_t cx[4], int shift1, int offse
     if( r < CWD + rows && ( r < rows || r >= CWD ) )
     {
       int w[5];
-      [unroll]
-      for( int e = 0; e < 5; e++ )
-      {
-        w[e] = winC( at, r, gi + e );
-      }
+      poolRun<5>( at + r * CS + gi, w );
+      int out[2];
       [unroll]
       for( int o = 0; o < 2; o++ )
       {
@@ -1465,8 +1373,9 @@ void tileChromaH( int tid, int at, int tmp, int16_t cx[4], int shift1, int offse
         {
           sum += int( cx[t] ) * w[o + t];
         }
-        s_pool[tmp + r * 8 + gi + o] = int16_t( ( sum + offset1 ) >> shift1 );
+        out[o] = ( sum + offset1 ) >> shift1;
       }
+      poolSetPair( tmp + r * 8 + gi, out[0], out[1] );   // (tmp and gi are even)
     }
   }
 }
@@ -1492,8 +1401,9 @@ uint sadRow( int b0, int b1, int j, int pos )
   for( int m = 0; m < 9; m++ )
   {
     const int  at = 2 * ( m == 8 && !odd ? 7 : m );
-    const Pair a  = Pair( uint16_t( s_pool[a0 + at] ), uint16_t( s_pool[a0 + at + 1] ) );
-    const Pair b  = Pair( uint16_t( s_pool[a1 + at] ), uint16_t( s_pool[a1 + at + 1] ) );
+    const uint wa = poolPair( a0 + at ), wb = poolPair( a1 + at );   // (even: one word each)
+    const Pair a  = Pair( uint16_t( wa ), uint16_t( wa >> 16 ) );
+    const Pair b  = Pair( uint16_t( wb ), uint16_t( wb >> 16 ) );
     const Pair d  = max( a, b ) - min( a, b );
     sum += d;
     if( m == 0 )
@@ -1517,16 +1427,19 @@ int4 lumaPred( int at, int tmp, int j, int i0, int rx0, int ry0, int xFrac, int 
   int4      out;
   if( xFrac != 0 && yFrac != 0 )
   {
+    // (tmp is even and i0 a multiple of 4: a row's 4 values are two whole words)
+    int4 sum = int4( 0 );
+    [unroll]
+    for( int t = 0; t < 8; t++ )
+    {
+      const uint a = poolPair( tmp + ( j + t ) * 16 + i0 );
+      const uint b = poolPair( tmp + ( j + t ) * 16 + i0 + 2 );
+      sum += int( cy[t] ) * int4( halfOf( a, 0 ), halfOf( a, 1 ), halfOf( b, 0 ), halfOf( b, 1 ) );
+    }
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
-      int sum = 0;
-      [unroll]
-      for( int t = 0; t < 8; t++ )
-      {
-        sum += int( cy[t] ) * int( s_pool[tmp + ( j + t ) * 16 + i0 + o] );
-      }
-      out[o] = bi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
+      out[o] = bi ? sum[o] >> 6 : clip3( 0, maxVal, ( sum[o] + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
     }
     return out;
   }
@@ -1535,11 +1448,7 @@ int4 lumaPred( int at, int tmp, int j, int i0, int rx0, int ry0, int xFrac, int 
   if( xFrac != 0 )
   {
     int w[11];
-    [unroll]
-    for( int e = 0; e < 11; e++ )
-    {
-      w[e] = winY( at, ry0 + j, rx0 + i0 + e );
-    }
+    poolRun<11>( at + ( ry0 + j ) * YS + rx0 + i0, w );
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
@@ -1556,24 +1465,28 @@ int4 lumaPred( int at, int tmp, int j, int i0, int rx0, int ry0, int xFrac, int 
   }
   if( yFrac != 0 )
   {
+    int4 sum = int4( 0 );
+    [unroll]
+    for( int t = 0; t < 8; t++ )
+    {
+      int row[4];
+      poolRun<4>( at + ( ry0 + j + t ) * YS + rx0 + i0, row );
+      sum += int( cy[t] ) * int4( row[0], row[1], row[2], row[3] );
+    }
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
-      int sum = 0;
-      [unroll]
-      for( int t = 0; t < 8; t++ )
-      {
-        sum += int( cy[t] ) * winY( at, ry0 + j + t, rx0 + i0 + o );
-      }
-      const int v = ( sum + offset ) >> shiftV;
+      const int v = ( sum[o] + offset ) >> shiftV;
       out[o]      = bi ? v : clip3( 0, maxVal, v );
     }
     return out;
   }
+  int row[4];
+  poolRun<4>( at + ( ry0 + j ) * YS + rx0 + i0, row );
   [unroll]
   for( int o = 0; o < 4; o++ )
   {
-    const int v = winY( at, ry0 + j, rx0 + i0 + o );
+    const int v = row[o];
     out[o]      = bi ? v * ( 1 << headRoom ) - IF_INTERNAL_OFFS : v;
   }
   return out;
@@ -1588,16 +1501,18 @@ int2 chromaPred( int at, int tmp, int j, int i0, int rx0, int ry0, int xFrac, in
   int2      out;
   if( xFrac != 0 && yFrac != 0 )
   {
+    // (tmp and i0 are even: a row's 2 values are one word)
+    int2 sum = int2( 0 );
+    [unroll]
+    for( int t = 0; t < 4; t++ )
+    {
+      const uint a = poolPair( tmp + ( j + t ) * 8 + i0 );
+      sum += int( cy[t] ) * int2( halfOf( a, 0 ), halfOf( a, 1 ) );
+    }
     [unroll]
     for( int o = 0; o < 2; o++ )
     {
-      int sum = 0;
-      [unroll]
-      for( int t = 0; t < 4; t++ )
-      {
-        sum += int( cy[t] ) * int( s_pool[tmp + ( j + t ) * 8 + i0 + o] );
-      }
-      out[o] = bi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
+      out[o] = bi ? sum[o] >> 6 : clip3( 0, maxVal, ( sum[o] + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
     }
     return out;
   }
@@ -1606,11 +1521,7 @@ int2 chromaPred( int at, int tmp, int j, int i0, int rx0, int ry0, int xFrac, in
   if( xFrac != 0 )
   {
     int w[5];
-    [unroll]
-    for( int e = 0; e < 5; e++ )
-    {
-      w[e] = winC( at, ry0 + j, rx0 + i0 + e );
-    }
+    poolRun<5>( at + ( ry0 + j ) * CS + rx0 + i0, w );
     [unroll]
     for( int o = 0; o < 2; o++ )
     {
@@ -1679,25 +1590,52 @@ int2 dmvrDeltaFrom( int centre )
   return delta;
 }
 
-// DMVR's bilinear prediction (xinitMC, as bilinearInside) of the window sample at s_pool[p] (rows of YS samples)
+// DMVR's bilinear prediction (xinitMC, as bilinearInside) of the window sample at poolGet( p ) (rows of YS samples)
 int bilinearW( int p, int xFrac, int yFrac, int shift )
 {
   const int16_t c0x = int16_t( 16 - xFrac ), c1x = int16_t( xFrac ), c0y = int16_t( 16 - yFrac ), c1y = int16_t( yFrac );
   if( xFrac == 0 && yFrac == 0 )
   {
-    return int( s_pool[p] ) * ( 1 << ( 10 - pc.bitDepth ) );
+    return int( poolGet( p ) ) * ( 1 << ( 10 - pc.bitDepth ) );
   }
   if( yFrac == 0 )
   {
-    return ( int( c0x ) * int( s_pool[p] ) + int( c1x ) * int( s_pool[p + 1] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
+    return ( int( c0x ) * int( poolGet( p ) ) + int( c1x ) * int( poolGet( p + 1 ) ) + ( 1 << ( shift - 1 ) ) ) >> shift;
   }
   if( xFrac == 0 )
   {
-    return ( int( c0y ) * int( s_pool[p] ) + int( c1y ) * int( s_pool[p + YS] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
+    return ( int( c0y ) * int( poolGet( p ) ) + int( c1y ) * int( poolGet( p + YS ) ) + ( 1 << ( shift - 1 ) ) ) >> shift;
   }
-  const int16_t t0 = int16_t( ( int( c0x ) * int( s_pool[p] ) + int( c1x ) * int( s_pool[p + 1] ) + ( 1 << ( shift - 1 ) ) ) >> shift );
-  const int16_t t1 = int16_t( ( int( c0x ) * int( s_pool[p + YS] ) + int( c1x ) * int( s_pool[p + YS + 1] ) + ( 1 << ( shift - 1 ) ) ) >> shift );
+  const int16_t t0 = int16_t( ( int( c0x ) * int( poolGet( p ) ) + int( c1x ) * int( poolGet( p + 1 ) ) + ( 1 << ( shift - 1 ) ) ) >> shift );
+  const int16_t t1 = int16_t( ( int( c0x ) * int( poolGet( p + YS ) ) + int( c1x ) * int( poolGet( p + YS + 1 ) ) + ( 1 << ( shift - 1 ) ) ) >> shift );
   return ( int( c0y ) * int( t0 ) + int( c1y ) * int( t1 ) + 8 ) >> 4;
+}
+
+// bilinearW for the samples at p and p + 1: their rows' 3 values read as words (poolRun)
+int2 bilinearPair( int p, int xFrac, int yFrac, int shift )
+{
+  const int c0x = 16 - xFrac, c1x = xFrac, c0y = 16 - yFrac, c1y = yFrac;
+  int       r0[3];
+  poolRun<3>( p, r0 );
+  if( xFrac == 0 && yFrac == 0 )
+  {
+    return int2( r0[0], r0[1] ) * ( 1 << ( 10 - pc.bitDepth ) );
+  }
+  const int2 h0 = ( c0x * int2( r0[0], r0[1] ) + c1x * int2( r0[1], r0[2] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
+  if( yFrac == 0 )
+  {
+    return h0;
+  }
+  int r1[3];
+  poolRun<3>( p + YS, r1 );
+  if( xFrac == 0 )
+  {
+    return ( c0y * int2( r0[0], r0[1] ) + c1y * int2( r1[0], r1[1] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
+  }
+  const int2 h1 = ( c0x * int2( r1[0], r1[1] ) + c1x * int2( r1[1], r1[2] ) + ( 1 << ( shift - 1 ) ) ) >> shift;
+  // (as bilinearW, the horizontal passes' results as 16-bit values)
+  const int2 t0 = int2( int16_t( h0.x ), int16_t( h0.y ) ), t1 = int2( int16_t( h1.x ), int16_t( h1.y ) );
+  return ( c0y * t0 + c1y * t1 + 8 ) >> 4;
 }
 
 #if BDOF
@@ -1726,14 +1664,14 @@ void tile16BdofBorder( int tid, int at[2], int2 mvR[2], out int16_t border[3] )
 // the border (tile16BdofBorder)
 void tile16BdofStore( int tid, int j, int i0, int4 predY[2], int16_t border[3] )
 {
+  // (BDOF_AT is odd and BS even: a row's columns 1 .. 16, the predictions, are whole words, which the border's
+  // columns 0 and 17 do not share)
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    [unroll]
-    for( int o = 0; o < 4; o++ )
-    {
-      s_bdof( s * BS * BS + ( j + 1 ) * BS + i0 + o + 1 ) = int16_t( predY[s][o] );
-    }
+    const int at = BDOF_AT + s * BS * BS + ( j + 1 ) * BS + i0 + 1;
+    poolSetPair( at, predY[s][0], predY[s][1] );
+    poolSetPair( at + 2, predY[s][2], predY[s][3] );
   }
   [unroll]
   for( int k = 0; k < 3; k++ )
@@ -1743,7 +1681,7 @@ void tile16BdofStore( int tid, int j, int i0, int4 predY[2], int16_t border[3] )
     {
       const int  s = r >= kTileRing ? 1 : 0;
       const int2 b = bdofBorderAt( r - kTileRing * s, 16, 16 );
-      s_bdof( s * BS * BS + ( b.y + 1 ) * BS + b.x + 1 ) = border[k];
+      poolSet( BDOF_AT + ( s * BS * BS + ( b.y + 1 ) * BS + b.x + 1 ), border[k] );
     }
   }
 }
@@ -1899,7 +1837,7 @@ bool tileNear( int x, int y, int flags, int2 mv0, int2 mv1 )
   return near;
 }
 
-// Fixes a border tile's window row of n samples at s_pool[at], whose first sample is at column x0 of the picture. The
+// Fixes a border tile's window row of n samples at poolGet( at ), whose first sample is at column x0 of the picture. The
 // reads took the samples beside the picture from the planes' margins, which hold no border extension on the GPU. So the
 // samples left of column 0 are set to column 0's value, and those right of the last column to the last column's value,
 // which is what vvdec's border extension of the reference picture holds there. (tileNear leaves both columns in the
@@ -1910,18 +1848,18 @@ void tileBorderRow( int at, int x0, int n, int width )
   const int last  = width - 1 - x0;   // at the picture's last column
   if( first > 0 )
   {
-    const int16_t v = s_pool[at + first];
+    const int16_t v = poolGet( at + first );
     for( int c = 0; c < first; c++ )
     {
-      s_pool[at + c] = v;
+      poolSet( at + c, v );
     }
   }
   if( last < n - 1 )
   {
-    const int16_t v = s_pool[at + last];
+    const int16_t v = poolGet( at + last );
     for( int c = last + 1; c < n; c++ )
     {
-      s_pool[at + c] = v;
+      poolSet( at + c, v );
     }
   }
 }
@@ -2042,7 +1980,7 @@ int4 chromaGroupPred( ChromaTileLayout L, int win, int pass, int j, int i0, int 
       [unroll]
       for( int t = 0; t < 4; t++ )
       {
-        sum += int( cy[t] ) * int( s_pool[pass + ( j + t ) * L.cw + i0 + o] );
+        sum += int( cy[t] ) * int( poolGet( pass + ( j + t ) * L.cw + i0 + o ) );
       }
       out[o] = hi ? sum >> 6 : clip3( 0, maxVal, ( sum + ( 1 << ( 5 + headRoom ) ) + ( IF_INTERNAL_OFFS << 6 ) ) >> ( 6 + headRoom ) );
     }
@@ -2058,7 +1996,7 @@ int4 chromaGroupPred( ChromaTileLayout L, int win, int pass, int j, int i0, int 
     [unroll]
     for( int e = 0; e < 7; e++ )
     {
-      w[e] = int( s_pool[win + ( j + 1 ) * L.rowLen + i0 + e] );
+      w[e] = int( poolGet( win + ( j + 1 ) * L.rowLen + i0 + e ) );
     }
     [unroll]
     for( int o = 0; o < 4; o++ )
@@ -2083,7 +2021,7 @@ int4 chromaGroupPred( ChromaTileLayout L, int win, int pass, int j, int i0, int 
       [unroll]
       for( int t = 0; t < 4; t++ )
       {
-        sum += int( cy[t] ) * int( s_pool[win + ( j + t ) * L.rowLen + i0 + 1 + o] );
+        sum += int( cy[t] ) * int( poolGet( win + ( j + t ) * L.rowLen + i0 + 1 + o ) );
       }
       const int v = ( sum + offset ) >> shiftV;
       out[o]      = hi ? v : clip3( 0, maxVal, v );
@@ -2093,13 +2031,13 @@ int4 chromaGroupPred( ChromaTileLayout L, int win, int pass, int j, int i0, int 
   [unroll]
   for( int o = 0; o < 4; o++ )
   {
-    const int v = int( s_pool[win + ( j + 1 ) * L.rowLen + i0 + 1 + o] );
+    const int v = int( poolGet( win + ( j + 1 ) * L.rowLen + i0 + 1 + o ) );
     out[o]      = hi ? v * ( 1 << headRoom ) - IF_INTERNAL_OFFS : v;
   }
   return out;
 }
 
-// Once a window's rows are stored, makes one of them hold what the filters read: the row's cols samples at s_pool[at],
+// Once a window's rows are stored, makes one of them hold what the filters read: the row's cols samples at poolGet( at ),
 // read from the picture's column x0 on, dIx columns right of the merge motion's window. In a border tile, the samples
 // beside the picture take its edge's (tileBorderRow); where DMVR moved the integer position sideways, the samples past
 // the merge motion's window take its edge column's (xPrefetchPad's padding).
@@ -2111,18 +2049,18 @@ void chromaFixRow( int at, int x0, int cols, int dIx, bool edges )
   }
   if( dIx > 0 )
   {
-    const int16_t v = s_pool[at + cols - 1 - dIx];
+    const int16_t v = poolGet( at + cols - 1 - dIx );
     for( int c = cols - dIx; c < cols; c++ )
     {
-      s_pool[at + c] = v;
+      poolSet( at + c, v );
     }
   }
   if( dIx < 0 )
   {
-    const int16_t v = s_pool[at - dIx];
+    const int16_t v = poolGet( at - dIx );
     for( int c = 0; c < -dIx; c++ )
     {
-      s_pool[at + c] = v;
+      poolSet( at + c, v );
     }
   }
 }
@@ -2286,7 +2224,7 @@ void chromaPasses( int tid, ChromaTileLayout L, TileChroma tile, ChromaWindows c
         [unroll]
         for( int e = 0; e < 7; e++ )
         {
-          v[e] = int( s_pool[win + r * L.rowLen + gx + e] );
+          v[e] = int( poolGet( win + r * L.rowLen + gx + e ) );
         }
         [unroll]
         for( int o = 0; o < 4; o++ )
@@ -2297,7 +2235,7 @@ void chromaPasses( int tid, ChromaTileLayout L, TileChroma tile, ChromaWindows c
           {
             sum += int( cx[s][t] ) * v[o + t];
           }
-          s_pool[pass + r * L.cw + gx + o] = int16_t( ( sum + offset1 ) >> shift1 );
+          poolSet( pass + r * L.cw + gx + o, int16_t( ( sum + offset1 ) >> shift1 ) );
         }
       }
     }
@@ -2611,15 +2549,13 @@ void tileDmvr( int tid, uint slot, TileSetup t, int2 mv0, int2 mv1, out int2 mvR
 {
   const int shift = 4 - ( 10 - pc.bitDepth );
   // Rows 2, 4 .. 16 and columns 2 .. 17 of the bilinear predictions (the windows' samples from (3, 3)), 2 per thread
-  int part = 0;
-  [unroll]
-  for( int k = 0; k < 2; k++ )
-  {
-    const int e  = tid + THREADS * k;
-    const int rc = ( 3 + 2 * ( e >> 4 ) ) * YS + 3 + ( e & 15 );
-    part += abs( bilinearW( t.wyAt[0] + rc, t.mvs[0].x & 15, t.mvs[0].y & 15, shift )
-                 - bilinearW( t.wyAt[1] + rc, t.mvs[1].x & 15, t.mvs[1].y & 15, shift ) );
-  }
+  // (a pair of neighbouring samples a thread: row 2 + 2 (tid >> 3), columns 2 + 2 (tid & 7) and the next; the same 128
+  // samples, their rows' values read as words)
+  int        part = 0;
+  const int  rc   = ( 3 + 2 * ( tid >> 3 ) ) * YS + 3 + 2 * ( tid & 7 );
+  const int2 d    = bilinearPair( t.wyAt[0] + rc, t.mvs[0].x & 15, t.mvs[0].y & 15, shift )
+                 - bilinearPair( t.wyAt[1] + rc, t.mvs[1].x & 15, t.mvs[1].y & 15, shift );
+  part += abs( d.x ) + abs( d.y );
   const int waveSum = WaveActiveSum( part );
   if( WaveIsFirstLane() )
   {
@@ -2636,10 +2572,13 @@ void tileDmvr( int tid, uint slot, TileSetup t, int2 mv0, int2 mv1, out int2 mvR
     for( int s = 0; s < 2; s++ )
     {
       const int at = t.wyAt[s] + YS + 1;
-      for( int o = tid; o < DMVR_ROWS * 20; o += THREADS )
+      // (a pair of neighbouring samples a step, stored as one word: rows of 20 values, all pairs whole)
+      for( int q = tid; q < DMVR_ROWS * 10; q += THREADS )
       {
-        const int v = o / 20;
-        s_pool[WORK_AT + DMVR_ROWS * 20 * s + o] = int16_t( bilinearW( at + v * YS + o - 20 * v, t.mvs[s].x & 15, t.mvs[s].y & 15, shift ) );
+        const int  v  = q / 10;
+        const int  o  = 2 * q;
+        const int2 bp = bilinearPair( at + v * YS + o - 20 * v, t.mvs[s].x & 15, t.mvs[s].y & 15, shift );
+        poolSetPair( WORK_AT + DMVR_ROWS * 20 * s + o, bp.x, bp.y );
       }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -2752,12 +2691,14 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    const int xFrac = mvR[s].x & 15, yFrac = mvR[s].y & 15;
+    const int   xFrac = mvR[s].x & 15, yFrac = mvR[s].y & 15;
+    const uint4 rowX  = hpel && xFrac == 8 ? lumaRow( kLumaHpel, 0 ) : lumaRow( kLuma, xFrac );   // (coeff's taps)
+    const uint4 rowY  = hpel && yFrac == 8 ? lumaRow( kLumaHpel, 0 ) : lumaRow( kLuma, yFrac );
     [unroll]
     for( int k = 0; k < 8; k++ )
     {
-      cxY[s][k] = int16_t( coeff( 0, xFrac, hpel, k ) );
-      cyY[s][k] = int16_t( coeff( 0, yFrac, hpel, k ) );
+      cxY[s][k] = lumaTap( rowX, k );
+      cyY[s][k] = lumaTap( rowY, k );
     }
     // (a filter's taps start at the window's first column or row; unfiltered, the samples start at the motion's integer
     // position, the window's sample 3)
@@ -2831,12 +2772,14 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    const int xFrac = mvR[s].x & 31, yFrac = mvR[s].y & 31;
+    const int   xFrac = mvR[s].x & 31, yFrac = mvR[s].y & 31;
+    const uint2 rowX  = chromaRow( kChroma, xFrac );
+    const uint2 rowY  = chromaRow( kChroma, yFrac );
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
-      cxC[s][k] = int16_t( kChroma[xFrac * 4 + k] );
-      cyC[s][k] = int16_t( kChroma[yFrac * 4 + k] );
+      cxC[s][k] = chromaTap( rowX, k );
+      cyC[s][k] = chromaTap( rowY, k );
     }
     crx0[s] = xFrac != 0 ? 0 : 1;
     cry0[s] = yFrac != 0 ? 0 : 1;
@@ -3062,13 +3005,16 @@ groupshared int2 s_cbMv[2][16];
 groupshared int  s_cbWrap[2][16];
 
 // A list's luma prediction of the thread's four samples (row v of its 4x4 subblock sb), at 14 bits for a bi-prediction
-// or PROF (hi), else final, from the subblock's 9 x 9 window at s_pool[at], rows stride apart (its (r, c) is the
+// or PROF (hi), else final, from the subblock's 9 x 9 window at poolGet( at ), rows stride apart (its (r, c) is the
 // reference sample (r - 2, c - 2) from the subblock's integer position): the 6-tap filter vvdec uses for 4x4 blocks
 // (kLuma4x4's first and last taps are zero). The 2-D filter is separable: the subblock's four threads filter the
 // window's nine rows across together (thread v the rows v, v + 4 and, the first, 8) into s_ext (nine rows of four a
 // subblock), and then each filters its row's four samples down from the six rows they need. (Each thread filtering its
 // six rows itself filtered most rows four times.) All the threads call it, as it waits at barriers; a thread past the
 // tile's subblocks takes the last one's (sb, the same values).
+// The affine windows' row length in the pool: 9 samples and one value unused, so that each row starts a word (its
+// stores are whole words, and its reads read words)
+#define AFFINE_STRIDE 10
 int4 affineLumaFilter( int at, int stride, int sb, int v, int xFrac, int yFrac, bool hi )
 {
   const int  headRoom = max( 2, 14 - pc.bitDepth );
@@ -3085,11 +3031,7 @@ int4 affineLumaFilter( int at, int stride, int sb, int v, int xFrac, int yFrac, 
       if( r < 9 )
       {
         int row[9];
-        [unroll]
-        for( int c = 0; c < 9; c++ )
-        {
-          row[c] = int( s_pool[at + r * stride + c] );
-        }
+        poolRun<9>( at + r * stride, row );
         [unroll]
         for( int o = 0; o < 4; o++ )
         {
@@ -3126,7 +3068,7 @@ int4 affineLumaFilter( int at, int stride, int sb, int v, int xFrac, int yFrac, 
     [unroll]
     for( int o = 0; o < 4; o++ )
     {
-      const int s0 = int( s_pool[at + ( v + 2 ) * stride + o + 2] );
+      const int s0 = int( poolGet( at + ( v + 2 ) * stride + o + 2 ) );
       pred[o]      = hi ? s0 * ( 1 << headRoom ) - IF_INTERNAL_OFFS : s0;
     }
   }
@@ -3141,8 +3083,8 @@ int4 affineLumaFilter( int at, int stride, int sb, int v, int xFrac, int yFrac, 
       [unroll]
       for( int c = 1; c < 7; c++ )
       {
-        sum += yFrac != 0 ? kLuma4x4[yFrac * 8 + c] * int( s_pool[at + ( v + c - 1 ) * stride + o + 2] )
-                          : kLuma4x4[xFrac * 8 + c] * int( s_pool[at + ( v + 2 ) * stride + o + c - 1] );
+        sum += yFrac != 0 ? kLuma4x4[yFrac * 8 + c] * int( poolGet( at + ( v + c - 1 ) * stride + o + 2 ) )
+                          : kLuma4x4[xFrac * 8 + c] * int( poolGet( at + ( v + 2 ) * stride + o + c - 1 ) );
       }
       const int r = ( sum + offset ) >> shiftV;
       pred[o]     = hi ? r : clip3( 0, maxVal, r );
@@ -3153,7 +3095,7 @@ int4 affineLumaFilter( int at, int stride, int sb, int v, int xFrac, int yFrac, 
 }
 
 // PROF, which refines a list's luma prediction (pred, from affineLumaFilter with hi): each 4x4 block gets a border from
-// the reference samples nearest its motion (in its window at s_pool[at], rows stride apart); then the gradients inside,
+// the reference samples nearest its motion (in its window at poolGet( at ), rows stride apart); then the gradients inside,
 // and each sample moves along them by its offset from the subblock's motion (dMvScaleHor / Ver), at 14 bits for a
 // bi-prediction, else final. All the threads call it (it waits at a barrier); mine: whether the thread has a subblock
 // (sb, its row v).
@@ -3192,7 +3134,7 @@ void affineProf( uint job[24], int list, int sb, int v, bool mine, int at, int s
         bx = 4;
         by = q - 16;
       }
-      const int sm = int( s_pool[at + ( by + ( yFrac >> 3 ) + 2 ) * stride + bx + ( xFrac >> 3 ) + 2] );
+      const int sm = int( poolGet( at + ( by + ( yFrac >> 3 ) + 2 ) * stride + bx + ( xFrac >> 3 ) + 2 ) );
       s_ext[sb * 36 + ( by + 1 ) * 6 + bx + 1] = int16_t( sm * ( 1 << headRoom ) - IF_INTERNAL_OFFS );
     }
   }
@@ -3259,7 +3201,7 @@ void affineLuma( int tid, uint job[24], int list, AffineArea a, bool bi, out int
     return;
   }
   int16_t*   ref      = refPlane( slot, 0 );
-  const int  at       = sb * 81;   // the subblock's window: (r, c) is the reference sample (r - 2, c - 2) from its position
+  const int  at       = sb * 9 * AFFINE_STRIDE;   // the subblock's window: (r, c) is the reference sample (r - 2, c - 2) from its position
 
   // The windows: the subblock's rows v, v + 4 (and 8) from the thread
   if( mine )
@@ -3270,10 +3212,11 @@ void affineLuma( int tid, uint job[24], int list, AffineArea a, bool bi, out int
     const int  by   = a.cuY + 4 * sy + ( mv.y >> 4 ) - 2;
     for( int r = v; r < 9; r += 4 )
     {
+      // (a row is 5 whole words: its 9 samples and the row's tenth value, unused)
       [unroll]
-      for( int c = 0; c < 9; c++ )
+      for( int c = 0; c < 10; c += 2 )
       {
-        s_pool[at + r * 9 + c] = int16_t( refAt( ref, 0, bx + c, by + r, wrap ) );
+        poolSetPair( at + r * AFFINE_STRIDE + c, refAt( ref, 0, bx + c, by + r, wrap ), c + 1 < 9 ? refAt( ref, 0, bx + c + 1, by + r, wrap ) : 0 );
       }
     }
   }
@@ -3283,14 +3226,14 @@ void affineLuma( int tid, uint job[24], int list, AffineArea a, bool bi, out int
   const int  xFrac = mv.x & 15;
   const int  yFrac = mv.y & 15;
   const bool prof  = affineProfOf( job, list );
-  pred             = affineLumaFilter( sbf * 81, 9, sbf, v, xFrac, yFrac, bi || prof );
+  pred             = affineLumaFilter( sbf * 9 * AFFINE_STRIDE, AFFINE_STRIDE, sbf, v, xFrac, yFrac, bi || prof );
   if( !mine )
   {
     pred = int4( 0, 0, 0, 0 );
   }
   if( prof )
   {
-    affineProf( job, list, sb, v, mine, at, 9, xFrac, yFrac, bi, pred );
+    affineProf( job, list, sb, v, mine, at, AFFINE_STRIDE, xFrac, yFrac, bi, pred );
   }
   GroupMemoryBarrierWithGroupSync();   // before the next writes to the shared memory
 }
@@ -3313,7 +3256,7 @@ int2 affineChromaMv( uint job[24], int list, AffineArea a, int csx, int csy, out
 }
 
 // A list's chroma prediction of the sample (u, v) of a 4x4 chroma subblock, at 14 bits for a bi-prediction, else final,
-// from the subblock's 7 x 7 window at s_pool[at], rows stride apart (its (r, c) is the reference sample (r - 1, c - 1)
+// from the subblock's 7 x 7 window at poolGet( at ), rows stride apart (its (r, c) is the reference sample (r - 1, c - 1)
 // from the subblock's integer position), with the filter's phases xFrac, yFrac (in 32nds).
 int affineChromaSample( int at, int stride, int u, int v, int xFrac, int yFrac, bool bi )
 {
@@ -3321,7 +3264,7 @@ int affineChromaSample( int at, int stride, int u, int v, int xFrac, int yFrac, 
   const int maxVal   = ( 1 << pc.bitDepth ) - 1;
   if( xFrac == 0 && yFrac == 0 )
   {
-    const int s0 = int( s_pool[at + ( v + 1 ) * stride + u + 1] );
+    const int s0 = int( poolGet( at + ( v + 1 ) * stride + u + 1 ) );
     return bi ? s0 * ( 1 << headRoom ) - IF_INTERNAL_OFFS : s0;
   }
   if( xFrac != 0 && yFrac != 0 )
@@ -3336,7 +3279,7 @@ int affineChromaSample( int at, int stride, int u, int v, int xFrac, int yFrac, 
       [unroll]
       for( int c = 0; c < 4; c++ )
       {
-        hs += kChroma[xFrac * 4 + c] * int( s_pool[at + ( v + r ) * stride + u + c] );
+        hs += kChroma[xFrac * 4 + c] * int( poolGet( at + ( v + r ) * stride + u + c ) );
       }
       sum2 += kChroma[yFrac * 4 + r] * ( ( hs + offset1 ) >> shift1 );
     }
@@ -3348,8 +3291,8 @@ int affineChromaSample( int at, int stride, int u, int v, int xFrac, int yFrac, 
   [unroll]
   for( int c = 0; c < 4; c++ )
   {
-    sum2 += yFrac != 0 ? kChroma[yFrac * 4 + c] * int( s_pool[at + ( v + c ) * stride + u + 1] )
-                       : kChroma[xFrac * 4 + c] * int( s_pool[at + ( v + 1 ) * stride + u + c] );
+    sum2 += yFrac != 0 ? kChroma[yFrac * 4 + c] * int( poolGet( at + ( v + c ) * stride + u + 1 ) )
+                       : kChroma[xFrac * 4 + c] * int( poolGet( at + ( v + 1 ) * stride + u + c ) );
   }
   const int r = ( sum2 + offset ) >> shiftV;
   return bi ? r : clip3( 0, maxVal, r );
@@ -3416,7 +3359,7 @@ void affineChroma( int tid, uint job[24], int list, int comp, AffineArea a, bool
     const int  csy  = ocy + cb / ncx;
     const int2 mv   = s_cbMv[list][cb];
     const bool wrap = wrapPps() && s_cbWrap[list][cb] != 0;   // (wrapPps(): constant in the WIDE variants)
-    s_pool[s]       = int16_t( refAt( ref, comp, ( a.cuX >> sx ) + 4 * csx + ( mv.x >> ( 4 + sx ) ) - 1 + c, ( a.cuY >> sy ) + 4 * csy + ( mv.y >> ( 4 + sy ) ) - 1 + r, wrap ) );
+    poolSet( s, int16_t( refAt( ref, comp, ( a.cuX >> sx ) + 4 * csx + ( mv.x >> ( 4 + sx ) ) - 1 + c, ( a.cuY >> sy ) + 4 * csy + ( mv.y >> ( 4 + sy ) ) - 1 + r, wrap ) ) );
   }
   GroupMemoryBarrierWithGroupSync();
   for( int k = 0; k < PER_THREAD; k++ )
@@ -4038,8 +3981,8 @@ void dmvrBilinear( int tid, InterJob j, int2 start0, int2 start1 )
     int       out     = v * 20 + u;
     for( int s = tid; s < bw * ( j.h + 4 ); s += THREADS )
     {
-      s_pool[BIL0_AT + out] = int16_t( bilinearInside( src0 + at, start0.x & 15, start0.y & 15 ) );
-      s_pool[BIL1_AT + out] = int16_t( bilinearInside( src1 + at, start1.x & 15, start1.y & 15 ) );
+      poolSet( BIL0_AT + out, int16_t( bilinearInside( src0 + at, start0.x & 15, start0.y & 15 ) ) );
+      poolSet( BIL1_AT + out, int16_t( bilinearInside( src1 + at, start1.x & 15, start1.y & 15 ) ) );
       u   += stepU;
       at  += stepAt;
       out += stepOut;
@@ -4058,8 +4001,8 @@ void dmvrBilinear( int tid, InterJob j, int2 start0, int2 start1 )
     {
       const int v = s / bw;
       const int u = s - v * bw;
-      s_pool[BIL0_AT + v * 20 + u] = int16_t( bilinearAt( j.ref0, j.cuX, j.cuY, start0, j.x - j.cuX + u, j.y - j.cuY + v, wrapB ) );
-      s_pool[BIL1_AT + v * 20 + u] = int16_t( bilinearAt( j.ref1, j.cuX, j.cuY, start1, j.x - j.cuX + u, j.y - j.cuY + v, wrapB ) );
+      poolSet( BIL0_AT + v * 20 + u, int16_t( bilinearAt( j.ref0, j.cuX, j.cuY, start0, j.x - j.cuX + u, j.y - j.cuY + v, wrapB ) ) );
+      poolSet( BIL1_AT + v * 20 + u, int16_t( bilinearAt( j.ref1, j.cuX, j.cuY, start1, j.x - j.cuX + u, j.y - j.cuY + v, wrapB ) ) );
     }
   }
 }

@@ -511,6 +511,11 @@ if( VVDEC_FUZZING_BUILD )
   add_subdirectory( "tests/fuzzing" )
 endif()
 
+# the GPU shaders' push constants hold no arrays (see the script); reads the sources only, no GPU needed
+add_test( NAME vvdec_gpu_push_constants
+          COMMAND ${CMAKE_COMMAND} -DSHADER_DIR=${CMAKE_CURRENT_SOURCE_DIR}/source/Lib/VulkanLib/shaders
+                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules/vvdecCheckPushConstants.cmake )
+
 # create a list of all test bitstreams in variable BITSTREAM_FILES
 # also defines BITSTREAM_URL_BASE
 include( define_bitstream_files )

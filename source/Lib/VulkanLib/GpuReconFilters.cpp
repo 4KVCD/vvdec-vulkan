@@ -106,8 +106,9 @@ struct DeblockPush
   int32_t         stride, width, height, ctuLog2, widthInCtus, bitDepth, dir, scaleX, scaleY, count;
   int32_t         ladfNum, ladfOffset[5], ladfBound[4];
   VkDeviceAddress countAt;
+  VkDeviceAddress tables;   // the tc and beta tables (kDeblockTablesAt in the tables' buffer)
 };
-static_assert( sizeof( DeblockPush ) == 120, "DeblockPush: the layout of deblock.slang's Params" );
+static_assert( sizeof( DeblockPush ) == 128, "DeblockPush: the layout of deblock.slang's Params" );
 // deblock.slang's workgroups: a thread per edge, 64 threads each
 static constexpr int kDeblockEdgesPerGroup = 64;
 
@@ -241,13 +242,14 @@ void GpuRecon::uploadCpuEdges( const std::vector<EdgeLists>& edges, size_t first
 
 // deblock.slang's push constants for the picture: the CTUs' parameters, the picture's geometry and bit depth, and LADF's
 // intervals. The planes, the direction and the edge list are set per dispatch.
-static void deblockPush( const CodingStructure& cs, VkDeviceAddress params, DeblockPush& push )
+static void deblockPush( const CodingStructure& cs, VkDeviceAddress params, VkDeviceAddress tables, DeblockPush& push )
 {
   const PreCalcValues& pcv    = *cs.pcv;
   const SPS&           sps    = *cs.sps;
   const bool           chroma = isChromaEnabled( pcv.chrFormat );
   push             = DeblockPush{};
   push.ctus        = params;
+  push.tables      = tables;
   push.ctuLog2     = getLog2( pcv.maxCUWidth );
   push.widthInCtus = pcv.widthInCtus;
   push.bitDepth    = sps.getBitDepth();
@@ -306,7 +308,7 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
     uploadCpuEdges( edges, first );
   }
   DeblockPush push;
-  deblockPush( cs, params, push );
+  deblockPush( cs, params, m_tables.geoWeights.addr + kDeblockTablesAt, push );
   // The lists: luma's vertical and horizontal edges (lists 0 and 1), then chroma's (lists 2 and 3).
   for( int dir = 0; dir < 2; dir++ )
   {

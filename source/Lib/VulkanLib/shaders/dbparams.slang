@@ -50,8 +50,10 @@ struct Params
   int   qpBdOffset; // the SPS's QpBDOffset
   int   pass;       // 0: the CUs of the luma tree (or single tree), 1: the CUs of the chroma tree (unused with SUBBLOCKS)
   int   flags;      // bits: 1 loop filter across slices, 2 across tiles (PPS); 4 subpicture info present (SPS)
-  int   vbPosHor[4];   // virtual boundaries: their count, then up to 3 positions in luma samples
-  int   vbPosVer[4];
+  int   numVbHor;    // virtual boundaries: the number of horizontal ones, then up to 3 positions in luma samples;
+  int   vbHor0, vbHor1, vbHor2;
+  int   numVbVer;    // the same for the vertical ones (scalars, not arrays: see vbPosHor)
+  int   vbVer0, vbVer1, vbVer2;
   uint  lfpTag;      // the picture's tag in the parameters (see loadLfp)
 };
 
@@ -695,13 +697,26 @@ bool transformEdge( int dir, int2 g )
   return ( loadLfp( lfpPtr( dir, g.x, g.y ) ).sideMaxFiltLength & 128 ) != 0;
 }
 
+// The i-th (0 to 2) horizontal or vertical virtual boundary's position. The push constants hold them as scalars: as an
+// array read with a run-time index (pc.vbPosVer[1 + i], at offset 148), Intel's compiler (driver 101.8991) read wrong
+// positions, the GDR streams' vertical virtual boundaries were deblocked, and every picture after differed.
+int vbPosHor( int i )
+{
+  return i == 0 ? pc.vbHor0 : i == 1 ? pc.vbHor1 : pc.vbHor2;
+}
+
+int vbPosVer( int i )
+{
+  return i == 0 ? pc.vbVer0 : i == 1 ? pc.vbVer1 : pc.vbVer2;
+}
+
 // Whether a vertical (dir EDGE_VER) or horizontal edge at the luma position pos lies on a virtual boundary.
 bool onVirtualBoundary( int dir, int2 pos )
 {
-  const int count = dir == EDGE_VER ? pc.vbPosVer[0] : pc.vbPosHor[0];
+  const int count = dir == EDGE_VER ? pc.numVbVer : pc.numVbHor;
   for( int i = 0; i < count; i++ )
   {
-    if( ( dir == EDGE_VER ? pc.vbPosVer[1 + i] : pc.vbPosHor[1 + i] ) == perp( dir, pos ) )
+    if( ( dir == EDGE_VER ? vbPosVer( i ) : vbPosHor( i ) ) == perp( dir, pos ) )
     {
       return true;
     }
@@ -818,18 +833,18 @@ void virtualBoundaries( int4 a, out int numHor, out int numVer, out int3 hor, ou
   numVer = 0;
   hor    = int3( 0 );
   ver    = int3( 0 );
-  for( int i = 0; i < pc.vbPosHor[0]; i++ )
+  for( int i = 0; i < pc.numVbHor; i++ )
   {
-    const int p = pc.vbPosHor[1 + i];
+    const int p = vbPosHor( i );
     if( a.y <= p && p <= a.y + a.w )
     {
       if( numHor == 0 ) hor.x = p; else if( numHor == 1 ) hor.y = p; else hor.z = p;
       numHor++;
     }
   }
-  for( int i = 0; i < pc.vbPosVer[0]; i++ )
+  for( int i = 0; i < pc.numVbVer; i++ )
   {
-    const int p = pc.vbPosVer[1 + i];
+    const int p = vbPosVer( i );
     if( a.x <= p && p <= a.x + a.z )
     {
       if( numVer == 0 ) ver.x = p; else if( numVer == 1 ) ver.y = p; else ver.z = p;

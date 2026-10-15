@@ -120,10 +120,15 @@ Options Options::fromEnvironment()
   options.pipelineCache = value( "VVDEC_GPU_CACHE" ) ? value( "VVDEC_GPU_CACHE" ) : "";
   options.async         = !( value( "VVDEC_GPU_ASYNC" ) && atoi( value( "VVDEC_GPU_ASYNC" ) ) == 0 );
   options.frontEnd      = !( value( "VVDEC_GPU_FRONT" ) && atoi( value( "VVDEC_GPU_FRONT" ) ) == 0 );
+  options.frontEndSet   = value( "VVDEC_GPU_FRONT" ) != nullptr;
   options.frontEndCheck = value( "VVDEC_GPU_MIDER" ) && atoi( value( "VVDEC_GPU_MIDER" ) ) != 0;
   options.parse         = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 1;
   options.parseDrives   = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 2;
   options.precompile    = !( value( "VVDEC_GPU_PRECOMPILE" ) && atoi( value( "VVDEC_GPU_PRECOMPILE" ) ) == 0 );
+  options.waveSize      = value( "VVDEC_GPU_WAVE" ) ? atoi( value( "VVDEC_GPU_WAVE" ) ) : -1;
+  options.waveSizeInter = value( "VVDEC_GPU_WAVE_INTER" ) ? atoi( value( "VVDEC_GPU_WAVE_INTER" ) ) : -1;
+  options.lowPriority   = !( value( "VVDEC_GPU_PRIORITY" ) && strcmp( value( "VVDEC_GPU_PRIORITY" ), "normal" ) == 0 );
+  options.engine        = value( "VVDEC_GPU_ENGINE" ) ? value( "VVDEC_GPU_ENGINE" ) : "";
   return options;
 }
 
@@ -133,6 +138,7 @@ static constexpr const char* kExtShaderClock    = "VK_KHR_shader_clock";        
 static constexpr const char* kExtSubgroupBallot = "VK_EXT_shader_subgroup_ballot";   // the parse's OpSubgroupReadInvocationKHR
 static constexpr const char* kExtMaintenance5   = "VK_KHR_maintenance5";             // (the pipelines' binaries need it)
 static constexpr const char* kExtPipelineBinary = "VK_KHR_pipeline_binary";          // the pipelines' binaries kept in a file
+static constexpr const char* kExtExecutables    = "VK_KHR_pipeline_executable_properties";   // the shaders' statistics
 
 bool Context::init()
 {
@@ -146,6 +152,14 @@ bool Context::init()
   if( !chooseDevice( props ) || !checkFeatures( props, timelineSemaphore, subgroupSizeControl ) )
   {
     return false;
+  }
+  if( m_intel && !m_options.frontEndSet && !m_options.parseDrives )
+  {
+    // Intel's GPUs: the CPU front end (VVDEC_GPU_FRONT=1: the GPU's). The GPU front end's motion derivation runs a
+    // CTU row per 32-thread workgroup as a wavefront, a chain of CTUs that leaves most of an integrated GPU idle
+    // (mider: 7.9 ms of a VideoQ 4K picture's 27 on the 285K's Intel Graphics). VideoQ 4K 35.4 -> 55.3 fps, 1080p
+    // 90.2 -> 206.5 fps. The GPU parse (VVDEC_GPU_PARSE=2) needs the GPU front end: with it, the front end stays there.
+    m_options.frontEnd = false;
   }
   if( m_coherentReads && ( m_options.parse || m_options.parseDrives ) )
   {
@@ -293,6 +307,13 @@ bool Context::chooseDevice( VkPhysicalDeviceProperties& props )
   m_splitStores      = props.vendorID == kVendorNvidia;
   m_integerAddresses = props.vendorID == kVendorIntel;
   m_coherentReads    = props.vendorID == kVendorNvidia;
+  m_intel            = props.vendorID == kVendorIntel;
+  // The compute queue on the GPU's compute engine (a compute-only family) instead of the graphics engine, where the
+  // desktop's compositor runs, on Intel's GPUs (VVDEC_GPU_ENGINE=compute or 3d chooses). Intel Graphics (285K, driver
+  // 101.8991), VideoQ 4K beside a 60 Hz probe of the graphics queue: its submissions late for a frame 16.3% -> 0.1%;
+  // VideoQ 1080p 94.4 -> 89.5 fps (the front end then shares the compute queue: on another queue of the compute
+  // family, 85.8 fps)
+  m_computeEngine = m_options.engine == "compute" || ( m_options.engine != "3d" && props.vendorID == kVendorIntel );
   if( props.apiVersion < VK_API_VERSION_1_2 || props.limits.maxPushConstantsSize < kPushConstantSize )
   {
     msg( WARNING, "Vulkan: %s lacks Vulkan 1.2 or 256 bytes of push constants\n", props.deviceName );
@@ -324,9 +345,16 @@ bool Context::checkFeatures( const VkPhysicalDeviceProperties& props, bool& time
 
 bool Context::chooseQueueFamilies( const std::vector<VkQueueFamilyProperties>& families, bool timelineSemaphore, const char* deviceName )
 {
-  // a queue with compute: the first family that has it
+  // a queue with compute: the first family that has it; with m_computeEngine the first without graphics, if any
   const uint32_t count = uint32_t( families.size() );
   m_queueFamily        = UINT32_MAX;
+  for( uint32_t i = 0; i < count && m_queueFamily == UINT32_MAX && m_computeEngine; i++ )
+  {
+    if( ( families[i].queueFlags & VK_QUEUE_COMPUTE_BIT ) && !( families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT ) && families[i].timestampValidBits )
+    {
+      m_queueFamily = i;
+    }
+  }
   for( uint32_t i = 0; i < count && m_queueFamily == UINT32_MAX; i++ )
   {
     if( ( families[i].queueFlags & VK_QUEUE_COMPUTE_BIT ) && families[i].timestampValidBits )
@@ -406,6 +434,15 @@ Context::DeviceExtensions Context::findExtensions() const
     found.subgroupBallot |= strcmp( extension.extensionName, kExtSubgroupBallot ) == 0;
     found.maintenance5 |= strcmp( extension.extensionName, kExtMaintenance5 ) == 0;
     found.pipelineBinary |= strcmp( extension.extensionName, kExtPipelineBinary ) == 0;
+    found.executables |= m_options.profile && strcmp( extension.extensionName, kExtExecutables ) == 0;
+    if( strcmp( extension.extensionName, "VK_KHR_global_priority" ) == 0 )
+    {
+      found.globalPriority = "VK_KHR_global_priority";
+    }
+    else if( !found.globalPriority && strcmp( extension.extensionName, "VK_EXT_global_priority" ) == 0 )
+    {
+      found.globalPriority = "VK_EXT_global_priority";
+    }
   }
   return found;
 }
@@ -433,12 +470,17 @@ uint32_t Context::queueCreateInfos( const AsyncQueueLayout& async, VkDeviceQueue
 
 // Whether the shaders may ask for waves of 32 threads, on GPUs that run both sizes (AMD's), where the shaders run
 // better so: it takes Vulkan 1.3's subgroup size control for compute shaders, with 32 among the sizes
-bool Context::wave32Possible( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl ) const
+bool Context::wave32Possible( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl )
 {
   VkPhysicalDeviceSubgroupSizeControlProperties sizes{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES };
   VkPhysicalDeviceProperties2                   props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
   props2.pNext = &sizes;
   m_api.vkGetPhysicalDeviceProperties2( m_physical, &props2 );
+  if( props.apiVersion >= VK_API_VERSION_1_3 && subgroupSizeControl && ( sizes.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT ) )
+  {
+    m_minWave = sizes.minSubgroupSize;
+    m_maxWave = sizes.maxSubgroupSize;
+  }
   return props.apiVersion >= VK_API_VERSION_1_3 && subgroupSizeControl && sizes.minSubgroupSize <= 32 && sizes.maxSubgroupSize >= 32
          && ( sizes.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT );
 }
@@ -478,6 +520,7 @@ struct DeviceFeatures
   VkPhysicalDeviceShaderClockFeaturesKHR      clock{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR };
   VkPhysicalDeviceMaintenance5FeaturesKHR     maintenance5{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR };
   VkPhysicalDevicePipelineBinaryFeaturesKHR   binaries{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
+  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executables{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
   std::vector<const char*>                    extensions;
 
   // The features the decoder needs (Context::checkFeatures): timeline semaphores for the async queues, and subgroup size
@@ -509,6 +552,14 @@ struct DeviceFeatures
     clock.shaderDeviceClock   = VK_TRUE;
     chain( clock );
     extensions.push_back( kExtShaderClock );
+  }
+
+  // VK_KHR_pipeline_executable_properties' statistics of the pipelines
+  void enableExecutableStatistics()
+  {
+    executables.pipelineExecutableInfo = VK_TRUE;
+    chain( executables );
+    extensions.push_back( kExtExecutables );
   }
 
   // VK_KHR_pipeline_binary, with the VK_KHR_maintenance5 it needs
@@ -551,6 +602,12 @@ bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgro
   {
     features.extensions.push_back( kExtShaderInfo );
   }
+  // (VVDEC_GPU_PROFILE=1 without VK_AMD_shader_info: the shaders' statistics, VK_KHR_pipeline_executable_properties)
+  const bool executables = found.executables && !found.shaderInfo;
+  if( executables )
+  {
+    features.enableExecutableStatistics();
+  }
   if( m_shaderClock )
   {
     features.enableShaderClock();
@@ -564,13 +621,42 @@ bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgro
     features.enablePipelineBinaries();
   }
 
+  // Every queue at low global priority (VVDEC_GPU_PRIORITY=normal: not), so that other programs' GPU work, the
+  // desktop's, goes first; a device that refuses it is made without. Intel Graphics, VideoQ 4K beside a 60 Hz probe
+  // of the graphics queue, the compute queue on the graphics engine: probe submissions late for a frame 16.3% -> 7.6%,
+  // the decode's speed unchanged
+  VkDeviceQueueGlobalPriorityCreateInfoKHR lowPriority{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR };
+  lowPriority.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR;
+  const bool priority        = m_options.lowPriority && found.globalPriority;
+  if( priority )
+  {
+    for( uint32_t i = 0; i < numQueueInfos; i++ )
+    {
+      queueInfos[i].pNext = &lowPriority;
+    }
+    features.extensions.push_back( found.globalPriority );
+  }
+
   VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
   deviceInfo.pNext                   = &features.enable;
   deviceInfo.queueCreateInfoCount    = numQueueInfos;
   deviceInfo.pQueueCreateInfos       = queueInfos;
   deviceInfo.enabledExtensionCount   = uint32_t( features.extensions.size() );
   deviceInfo.ppEnabledExtensionNames = features.extensions.empty() ? nullptr : features.extensions.data();
-  if( m_api.vkCreateDevice( m_physical, &deviceInfo, nullptr, &m_device ) != VK_SUCCESS )
+  VkResult created                   = m_api.vkCreateDevice( m_physical, &deviceInfo, nullptr, &m_device );
+  if( created != VK_SUCCESS && priority )
+  {
+    for( uint32_t i = 0; i < numQueueInfos; i++ )
+    {
+      queueInfos[i].pNext = nullptr;
+    }
+    features.extensions.pop_back();
+    deviceInfo.enabledExtensionCount   = uint32_t( features.extensions.size() );
+    deviceInfo.ppEnabledExtensionNames = features.extensions.empty() ? nullptr : features.extensions.data();
+    created                            = m_api.vkCreateDevice( m_physical, &deviceInfo, nullptr, &m_device );
+    msg( WARNING, "Vulkan: %s refused low queue priorities\n", props.deviceName );
+  }
+  if( created != VK_SUCCESS )
   {
     msg( WARNING, "Vulkan: creating the device on %s failed\n", props.deviceName );
     return false;
@@ -582,6 +668,12 @@ bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgro
   if( found.shaderInfo )
   {
     m_getShaderInfo = (PFN_vkGetShaderInfoAMD) m_api.vkGetDeviceProcAddr( m_device, "vkGetShaderInfoAMD" );
+  }
+  if( executables )
+  {
+    m_getExecutables = (PFN_vkGetPipelineExecutablePropertiesKHR) m_api.vkGetDeviceProcAddr( m_device, "vkGetPipelineExecutablePropertiesKHR" );
+    m_getExecutableStatistics
+      = (PFN_vkGetPipelineExecutableStatisticsKHR) m_api.vkGetDeviceProcAddr( m_device, "vkGetPipelineExecutableStatisticsKHR" );
   }
   if( binaries )
   {
@@ -721,16 +813,17 @@ static uint64_t shadersHash()
   return h;
 }
 
-// A pipeline's key in the binaries' file: its shader (its name and its SPIR-V's hash), whether it asks for waves of
-// 32 threads and the work-arounds set (kSplitStores, kIntegerAddresses, kCoherentReads). (Not the driver's pipeline
+// A pipeline's key in the binaries' file: its shader (its name and its SPIR-V's hash), the wave size it asks for (0:
+// none) and the work-arounds set (kSplitStores, kIntegerAddresses, kCoherentReads). (Not the driver's pipeline
 // key, vkGetPipelineKeyKHR: AMD's makes it per program, as its shader cache.)
-static std::vector<uint8_t> pipelineKeyOf( int shaderId, bool wave32, bool splitStores, bool integerAddresses, bool coherentReads )
+static std::vector<uint8_t> pipelineKeyOf( int shaderId, uint32_t waveSize, bool splitStores, bool integerAddresses, bool coherentReads )
 {
   const char*          name = kShaders[shaderId].name;
   std::vector<uint8_t> key( name, name + strlen( name ) );
   const uint64_t       h = hashShader( kHashSeed, shaderId );
   key.insert( key.end(), reinterpret_cast<const uint8_t*>( &h ), reinterpret_cast<const uint8_t*>( &h ) + sizeof( h ) );
-  key.push_back( uint8_t( ( wave32 ? 32 : 0 ) | ( splitStores ? 1 : 0 ) | ( integerAddresses ? 2 : 0 ) | ( coherentReads ? 4 : 0 ) ) );
+  key.push_back( uint8_t( ( splitStores ? 1 : 0 ) | ( integerAddresses ? 2 : 0 ) | ( coherentReads ? 4 : 0 ) ) );
+  key.push_back( uint8_t( waveSize ) );
   return key;
 }
 
@@ -920,13 +1013,13 @@ void Context::closePipelineBinaries()
   m_binaries = nullptr;
 }
 
-VkResult Context::createPipeline( int shaderId, bool wave32, VkComputePipelineCreateInfo& info, VkPipeline& pipe )
+VkResult Context::createPipeline( int shaderId, uint32_t waveSize, VkComputePipelineCreateInfo& info, VkPipeline& pipe )
 {
   if( !m_binaries )
   {
     return m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
   }
-  const std::vector<uint8_t> key = pipelineKeyOf( shaderId, wave32, m_splitStores, m_integerAddresses, m_coherentReads );
+  const std::vector<uint8_t> key = pipelineKeyOf( shaderId, waveSize, m_splitStores, m_integerAddresses, m_coherentReads );
   if( createFromBinaries( key, info, pipe ) )
   {
     return VK_SUCCESS;
@@ -1413,6 +1506,42 @@ static bool interShader( int shaderId )
          || shaderId == kShader_inter_bdof_wide || shaderId == kShader_inter_affine_wide;
 }
 
+// The shaders that work with waves of any size from 16 up (no ballots or lane reads that take 32 threads): they may
+// run in the size VVDEC_GPU_WAVE (VVDEC_GPU_WAVE_INTER: inter's variants) asks for
+static bool anyWaveSize( int shaderId )
+{
+  switch( shaderId )
+  {
+  case kShader_alf_luma: case kShader_alf_chroma: case kShader_alf_luma_bounds: case kShader_alf_chroma_bounds:
+  case kShader_sao: case kShader_deblock_luma_ver: case kShader_deblock_luma_hor: case kShader_deblock_chroma:
+  case kShader_intra: case kShader_trafo: case kShader_lmcs: case kShader_filmgrain: case kShader_dbparams:
+  case kShader_dbparams_sub: case kShader_edges:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// The wave size a shader's pipeline asks for (0: the driver's choice): 32, but for inter's variants (interShader), and
+// on Intel's GPUs 16 for the shaders that work with any (anyWaveSize), unless VVDEC_GPU_WAVE or VVDEC_GPU_WAVE_INTER asks
+// for another. Intel's compiler gives a thread of a 32-wide wave half the registers of a 16-wide one's; at 32 the
+// heavy shaders spill. Intel Graphics (285K, driver 101.8991), VideoQ 4K, ms a picture at 32 -> 16: ALF luma 5.66 ->
+// 0.90, deblocking 1.31 -> 0.86, dbparams 1.61 -> 0.82, edges 1.79 -> 1.41; 29.3 -> 35.4 fps (GPU front end). Inter's
+// variants keep the driver's choice there (16: the same; 32: 3.4 -> 4.7 ms at 1080p).
+uint32_t Context::waveSizeOf( int shaderId ) const
+{
+  int asked = interShader( shaderId ) ? m_options.waveSizeInter : anyWaveSize( shaderId ) ? m_options.waveSize : -1;
+  if( asked < 0 && m_intel && anyWaveSize( shaderId ) )
+  {
+    asked = 16;
+  }
+  if( asked >= 0 && ( asked == 0 || ( m_minWave <= uint32_t( asked ) && uint32_t( asked ) <= m_maxWave ) ) )
+  {
+    return uint32_t( asked );
+  }
+  return m_wave32 && !interShader( shaderId ) ? 32u : 0u;
+}
+
 VkPipeline Context::pipeline( int shaderId )
 {
   std::call_once( m_pipelineOnce[shaderId], [this, shaderId]() { m_pipelines[shaderId] = createPipelineOf( shaderId ); } );
@@ -1521,11 +1650,13 @@ VkPipeline Context::createPipelineOf( int shaderId )
   info.stage.module = module;
   info.stage.pName  = "main";
   info.layout       = m_layout;
-  // waves of 32 threads, but for inter's variants (interShader)
+  if( m_getExecutableStatistics )
+  {
+    info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+  }
   VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
-  size.requiredSubgroupSize = 32;
-  const bool wave32         = m_wave32 && !interShader( shaderId );
-  if( wave32 )
+  size.requiredSubgroupSize = waveSizeOf( shaderId );
+  if( size.requiredSubgroupSize != 0 )
   {
     info.stage.pNext = &size;
   }
@@ -1540,7 +1671,7 @@ VkPipeline Context::createPipelineOf( int shaderId )
     info.stage.pSpecializationInfo = &specialization;
   }
   VkPipeline     pipe   = VK_NULL_HANDLE;
-  const VkResult result = createPipeline( shaderId, wave32, info, pipe );
+  const VkResult result = createPipeline( shaderId, size.requiredSubgroupSize, info, pipe );
   m_api.vkDestroyShaderModule( m_device, module, nullptr );
   if( result != VK_SUCCESS )
   {
@@ -1554,6 +1685,40 @@ VkPipeline Context::createPipelineOf( int shaderId )
 // VVDEC_GPU_ISA=<directory> its machine code into <directory>/<name>.isa
 void Context::reportShader( int shaderId, VkPipeline pipe ) const
 {
+  if( m_getExecutables && m_getExecutableStatistics )
+  {
+    // each executable's statistics (Intel's: its SIMD width, registers, spills and fills, scratch, instructions)
+    VkPipelineInfoKHR pipeInfo{ VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
+    pipeInfo.pipeline = pipe;
+    uint32_t count    = 0;
+    m_getExecutables( m_device, &pipeInfo, &count, nullptr );
+    std::vector<VkPipelineExecutablePropertiesKHR> props( count, VkPipelineExecutablePropertiesKHR{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR } );
+    m_getExecutables( m_device, &pipeInfo, &count, props.data() );
+    for( uint32_t e = 0; e < count; e++ )
+    {
+      VkPipelineExecutableInfoKHR exe{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
+      exe.pipeline        = pipe;
+      exe.executableIndex = e;
+      uint32_t n          = 0;
+      m_getExecutableStatistics( m_device, &exe, &n, nullptr );
+      std::vector<VkPipelineExecutableStatisticKHR> stats( n, VkPipelineExecutableStatisticKHR{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR } );
+      m_getExecutableStatistics( m_device, &exe, &n, stats.data() );
+      std::string line;
+      for( const VkPipelineExecutableStatisticKHR& st: stats )
+      {
+        char value[64];
+        switch( st.format )
+        {
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: snprintf( value, sizeof( value ), "%s", st.value.b32 ? "yes" : "no" ); break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: snprintf( value, sizeof( value ), "%lld", (long long) st.value.i64 ); break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: snprintf( value, sizeof( value ), "%llu", (unsigned long long) st.value.u64 ); break;
+        default: snprintf( value, sizeof( value ), "%g", st.value.f64 ); break;
+        }
+        line += std::string( "  " ) + st.name + " " + value;
+      }
+      msg( INFO, "GPU shader %-16s %s (subgroup %u):%s\n", kShaders[shaderId].name, props[e].name, props[e].subgroupSize, line.c_str() );
+    }
+  }
   if( !m_getShaderInfo )
   {
     return;

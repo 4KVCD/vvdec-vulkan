@@ -139,11 +139,19 @@ struct Options
   std::string pipelineCache;           // VVDEC_GPU_CACHE: the file of the compiled pipelines' binaries (Context's
                                        // PipelineBinaries; empty: in the user's cache directory, "0": none)
   bool        async         = true;    // VVDEC_GPU_ASYNC=0: the front end on the compute queue, not an async queue
-  bool        frontEnd      = true;    // VVDEC_GPU_FRONT=0: the CPU front end drives the pictures
+  bool        frontEnd      = true;    // VVDEC_GPU_FRONT=0: the CPU front end drives the pictures (on Intel's GPUs the
+                                       // default; VVDEC_GPU_FRONT=1: the GPU front end)
+  bool        frontEndSet   = false;   // VVDEC_GPU_FRONT is set
   bool        frontEndCheck = false;   // VVDEC_GPU_MIDER=1: the CPU front end drives, the GPU front end is compared with it
   bool        parse         = false;   // VVDEC_GPU_PARSE=1: the GPU parses the slice data too, compared with the CPU's parse
   bool        parseDrives   = false;   // VVDEC_GPU_PARSE=2: the GPU parses the slice data instead of the CPU
   bool        precompile    = true;    // VVDEC_GPU_PRECOMPILE=0: the pipelines are not compiled in the background at start-up
+  int         waveSize      = -1;      // VVDEC_GPU_WAVE=<n>: the wave size of the shaders that work with any (0: the
+                                       // driver's choice; -1: the default)
+  int         waveSizeInter = -1;      // VVDEC_GPU_WAVE_INTER=<n>: the same for inter's variants
+  bool        lowPriority   = true;    // VVDEC_GPU_PRIORITY=normal: the queues not at low global priority
+  std::string engine;                  // VVDEC_GPU_ENGINE=compute or 3d: the compute queue in a compute-only family (the
+                                       // GPU's compute engine) or in the graphics family (empty: per GPU, m_computeEngine)
 
   static Options fromEnvironment();
 };
@@ -301,6 +309,9 @@ private:
   std::string                      m_deviceName;
   bool                             m_discrete = false;   // VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
   bool                             m_wave32 = false;   // the shaders may ask for waves of 32 threads
+  bool                             m_computeEngine = false;   // the compute queue in a compute-only family (chooseDevice)
+  bool                             m_intel         = false;   // an Intel GPU
+  uint32_t                         m_minWave = 0, m_maxWave = 0;   // the wave sizes a shader may ask for (subgroup size control)
   bool                             m_splitStores      = false;   // the shaders' kSplitStores is set (NVIDIA's GPUs)
   bool                             m_integerAddresses = false;   // their kIntegerAddresses is set (Intel's GPUs)
   bool                             m_coherentReads    = false;   // their kCoherentReads is set (NVIDIA's GPUs)
@@ -355,13 +366,15 @@ private:
   // The extensions the device has, of those the decoder uses
   struct DeviceExtensions
   {
-    bool shaderInfo = false, shaderClock = false, subgroupBallot = false, maintenance5 = false, pipelineBinary = false;
+    bool        shaderInfo = false, shaderClock = false, subgroupBallot = false, maintenance5 = false, pipelineBinary = false;
+    const char* globalPriority = nullptr;   // VK_KHR_global_priority, else VK_EXT_global_priority, if the device has one
+    bool        executables    = false;     // VK_KHR_pipeline_executable_properties (when profiling)
   };
   DeviceExtensions findExtensions() const;
   // createDevice's steps: the queues to create (returns their number), whether the shaders may run in waves of 32
   // threads, and whether the device has the optional features the decoder uses
   uint32_t queueCreateInfos( const AsyncQueueLayout& async, VkDeviceQueueCreateInfo infos[3] ) const;
-  bool     wave32Possible( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl ) const;
+  bool     wave32Possible( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl );
   bool     hasShaderClocks() const;
   bool     hasPipelineBinaries() const;
   bool createDevice( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl, const AsyncQueueLayout& async );
@@ -399,9 +412,10 @@ private:
   // PipelineBinaries; null without it)
   struct PipelineBinaries;
   PipelineBinaries*                m_binaries = nullptr;
-  // Creates the compute pipeline of info (wave32: it asks for waves of 32 threads): from its binaries when the file has
+  // Creates the compute pipeline of info (waveSize: the wave size it asks for, 0: none): from its binaries when the file has
   // them, else compiled, its binaries kept for the file
-  VkResult                         createPipeline( int shaderId, bool wave32, VkComputePipelineCreateInfo& info, VkPipeline& pipe );
+  VkResult                         createPipeline( int shaderId, uint32_t waveSize, VkComputePipelineCreateInfo& info, VkPipeline& pipe );
+  uint32_t                         waveSizeOf( int shaderId ) const;
   bool                             createFromBinaries( const std::vector<uint8_t>& key, VkComputePipelineCreateInfo& info, VkPipeline& pipe );
   void                             captureBinaries( const std::vector<uint8_t>& key, VkPipeline pipe );   // (pipe compiled to capture them)
   void                             reportShader( int shaderId, VkPipeline pipe ) const;   // its registers, its machine code (VVDEC_GPU_ISA)
@@ -433,6 +447,9 @@ private:
   std::atomic<int64_t>             m_memoryNow[2]  = { { 0 }, { 0 } };
   std::atomic<int64_t>             m_memoryPeak[2] = { { 0 }, { 0 } };
   PFN_vkGetShaderInfoAMD           m_getShaderInfo = nullptr;   // VK_AMD_shader_info, on AMD when profiling or writing machine code
+  // VK_KHR_pipeline_executable_properties, when profiling without VK_AMD_shader_info: the shaders' statistics
+  PFN_vkGetPipelineExecutablePropertiesKHR m_getExecutables          = nullptr;
+  PFN_vkGetPipelineExecutableStatisticsKHR m_getExecutableStatistics = nullptr;
 
   static std::mutex s_mutex;
   static Context*   s_context;
