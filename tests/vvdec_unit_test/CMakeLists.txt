@@ -37,6 +37,11 @@ target_include_directories( ${EXE_NAME}
 
 target_link_libraries( ${EXE_NAME} Threads::Threads vvdec )
 
+# the library's internal headers (Picture, CodingStructure) have GPU members: the same layout as the library's
+if( VVDEC_ENABLE_VULKAN )
+  target_compile_definitions( ${EXE_NAME} PRIVATE VVDEC_VULKAN=1 )
+endif()
+
 target_compile_options( ${EXE_NAME} PRIVATE $<$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:-Wall>
                                             $<$<CXX_COMPILER_ID:GNU>:-Wall -fdiagnostics-show-option -Wno-ignored-attributes -Wno-sign-compare>
                                             $<$<CXX_COMPILER_ID:MSVC>:/W4 /WX /wd4244 /wd4251 /wd4996 /wd4189>)
