@@ -435,12 +435,18 @@ void main( uint3 id : SV_DispatchThreadID )
 #define TILE_H ( TILE + 2 * MARGIN )
 groupshared uint2 s_tile[TILE_H * GROUPS];
 static int        s_x0, s_y0;
-// The classification's Laplacians, computed once per cell of 2x2 samples: a
-// block's window has 4x4 cells, and each cell lies in the windows of up to 4
-// blocks. Entry (cx, cy) holds V | H << 16 and D0 | D1 << 16 of the cell at
-// ( s_x0 - 2 + 2 * cx, s_y0 - 2 + 2 * cy ).
-#define CELLS 18
-groupshared uint2 s_cls[CELLS * CELLS];
+// The classification's Laplacians, computed per cell of 2x2 samples, the
+// cell at ( s_x0 - 2 + 2 * cx, s_y0 - 2 + 2 * cy ) for cx, cy 0 .. 17. A
+// block's window has 4x4 cells, the 4 of a row from an even cell: entry
+// ( q, r ) holds the sums over cells 2 q .. 2 q + 3 of cell row 8 h + r,
+// V | H << 16 and D0 | D1 << 16 (a cell's at most 4092 at 10 bits, 4 cells'
+// below 2^16), for the half h of the tile's block rows being classified
+// (classifyHalf). So kept, the workgroup's shared memory is 3680 bytes, not
+// 5632 with the whole tile's cells: Intel's GPUs allocate it in blocks of 4
+// and 8 KB, and a workgroup of 8 KB let half as many run at a time.
+#define CELL_ROWS 10   // a half's cell rows: its 4 block rows' windows
+#define QUADS 8        // a row's sums: one per block column
+groupshared uint2 s_cls[CELL_ROWS * QUADS];
 
 // The samples ( bx - 4 .. bx + 7, y ) around the 4x4 block at bx: the tile's
 // group G, which holds the block, and the groups before and after it.
@@ -515,68 +521,73 @@ void loadTile( int tid )
   }
 }
 
-// Computes the cells' Laplacians into s_cls (see above), two neighbouring cells per iteration (their samples lie in 2
-// groups of each tile row), by the workgroup's 64 threads. The rows next to the virtual boundary (vbPos in each CTU of
-// vbH rows) read their own row instead of the one past the boundary.
-void cellLaplacians( int tid, int vbH, int vbPos )
+// The Laplacians of cells 2 m and 2 m + 1 of cell row cy, added up (their samples lie in 2 groups of each tile row).
+// The rows next to the virtual boundary (vbPos in each CTU of vbH rows) read their own row instead of the one past the
+// boundary.
+uint2 cellPair( int cy, int m, int vbH, int vbPos )
 {
-  for( int t = tid; t < CELLS * CELLS / 2; t += 64 )
+  const int y0  = s_y0 - 2 + 2 * cy;
+  int       ym1 = y0 - 1;
+  int       yp2 = y0 + 2;
+  if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos - 2 )
   {
-    const int cy  = t / ( CELLS / 2 );
-    const int m   = t - cy * ( CELLS / 2 );   // this iteration's cells: 2 * m and 2 * m + 1 of row cy
-    const int y0  = s_y0 - 2 + 2 * cy;
-    int       ym1 = y0 - 1;
-    int       yp2 = y0 + 2;
-    if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos - 2 )
-    {
-      yp2 = y0 + 1;
-    }
-    else if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos )
-    {
-      ym1 = y0;
-    }
-    const Row2 am = tileRow2( ym1, m );
-    const Row2 a0 = tileRow2( y0, m );
-    const Row2 a1 = tileRow2( y0 + 1, m );
-    const Row2 ap = tileRow2( yp2, m );
-    [unroll]
-    for( int e = 0; e < 2; e++ )
-    {
-      const int j0 = 2 + 2 * e;   // x0 = s_x0 - 2 + 2 * ( 2 * m + e )
-      const int a  = a0.at( j0 ) << 1;       // ( x0, y0 )
-      const int b  = a1.at( j0 + 1 ) << 1;   // ( x0 + 1, y0 + 1 )
-      const int v  = abs( a - am.at( j0 ) - a1.at( j0 ) ) + abs( b - a0.at( j0 + 1 ) - ap.at( j0 + 1 ) );
-      const int h  = abs( a - a0.at( j0 + 1 ) - a0.at( j0 - 1 ) ) + abs( b - a1.at( j0 + 2 ) - a1.at( j0 ) );
-      const int d0 = abs( a - am.at( j0 - 1 ) - a1.at( j0 + 1 ) ) + abs( b - a0.at( j0 ) - ap.at( j0 + 2 ) );
-      const int d1 = abs( a - a1.at( j0 - 1 ) - am.at( j0 + 1 ) ) + abs( b - ap.at( j0 ) - a0.at( j0 + 2 ) );
-      s_cls[cy * CELLS + 2 * m + e] = uint2( uint( v ) | uint( h ) << 16, uint( d0 ) | uint( d1 ) << 16 );
-    }
+    yp2 = y0 + 1;
+  }
+  else if( y0 > 0 && ( y0 & ( vbH - 1 ) ) == vbPos )
+  {
+    ym1 = y0;
+  }
+  const Row2 am = tileRow2( ym1, m );
+  const Row2 a0 = tileRow2( y0, m );
+  const Row2 a1 = tileRow2( y0 + 1, m );
+  const Row2 ap = tileRow2( yp2, m );
+  uint2      sum = uint2( 0, 0 );
+  [unroll]
+  for( int e = 0; e < 2; e++ )
+  {
+    const int j0 = 2 + 2 * e;   // x0 = s_x0 - 2 + 2 * ( 2 * m + e )
+    const int a  = a0.at( j0 ) << 1;       // ( x0, y0 )
+    const int b  = a1.at( j0 + 1 ) << 1;   // ( x0 + 1, y0 + 1 )
+    const int v  = abs( a - am.at( j0 ) - a1.at( j0 ) ) + abs( b - a0.at( j0 + 1 ) - ap.at( j0 + 1 ) );
+    const int h  = abs( a - a0.at( j0 + 1 ) - a0.at( j0 - 1 ) ) + abs( b - a1.at( j0 + 2 ) - a1.at( j0 ) );
+    const int d0 = abs( a - am.at( j0 - 1 ) - a1.at( j0 + 1 ) ) + abs( b - a0.at( j0 ) - ap.at( j0 + 2 ) );
+    const int d1 = abs( a - a1.at( j0 - 1 ) - am.at( j0 + 1 ) ) + abs( b - ap.at( j0 ) - a0.at( j0 + 2 ) );
+    sum += uint2( uint( v ) | uint( h ) << 16, uint( d0 ) | uint( d1 ) << 16 );
+  }
+  return sum;
+}
+
+// The sums of half h of the tile's block rows (s_cls, see above), by the workgroup's 64 threads
+void cellQuads( int tid, int h, int vbH, int vbPos )
+{
+  for( int t = tid; t < CELL_ROWS * QUADS; t += 64 )
+  {
+    const int r = t / QUADS;
+    const int q = t - r * QUADS;
+    s_cls[t]    = cellPair( 8 * h + r, q, vbH, vbPos ) + cellPair( 8 * h + r, q + 1, vbH, vbPos );   // (cells 2 q .. 2 q + 3)
   }
 }
 
-// Classifies the 4x4 block at (bx, by): sums the Laplacians over its window, the 4x4 cells from ( bx - 2, by - 2 )
-// except the rows that the virtual boundary hides, then works out its activity and directions.
-AlfClass classifyBlock( int bx, int by, int vbH, int vbPos )
+// Classifies the 4x4 block at (bx, by), of half h of the tile's block rows: sums the Laplacians over its window, the
+// 4x4 cells from ( bx - 2, by - 2 ) except the rows that the virtual boundary hides, then works out its activity and
+// directions.
+AlfClass classifyBlock( int bx, int by, int h, int vbH, int vbPos )
 {
   const int byVb = by & ( vbH - 1 );
   int sumV = 0, sumH = 0, sumD0 = 0, sumD1 = 0;
   const int rFirst = byVb == vbPos ? 1 : 0;
   const int rLast  = byVb == vbPos - 4 ? 2 : 3;
-  const int cell0  = ( by - s_y0 ) / 2 * CELLS + ( bx - s_x0 ) / 2;
+  const int at0    = ( ( by - s_y0 ) / 2 - 8 * h ) * QUADS + ( bx - s_x0 ) / 4;
   [unroll]
   for( int r = 0; r < 4; r++ )
   {
     if( r >= rFirst && r <= rLast )
     {
-      [unroll]
-      for( int c = 0; c < 4; c++ )
-      {
-        const uint2 cell = s_cls[cell0 + r * CELLS + c];
-        sumV  += int( cell.x & 0xffffu );
-        sumH  += int( cell.x >> 16 );
-        sumD0 += int( cell.y & 0xffffu );
-        sumD1 += int( cell.y >> 16 );
-      }
+      const uint2 cells = s_cls[at0 + r * QUADS];
+      sumV  += int( cells.x & 0xffffu );
+      sumH  += int( cells.x >> 16 );
+      sumD0 += int( cells.y & 0xffffu );
+      sumD1 += int( cells.y >> 16 );
     }
   }
 
@@ -642,11 +653,25 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
   GroupMemoryBarrierWithGroupSync();
   const int vbH   = 1 << pc.ctuLog2;
   const int vbPos = vbH - 4;
-  cellLaplacians( tid, vbH, vbPos );
-  GroupMemoryBarrierWithGroupSync();
+  const int bx    = int( id.x ) * 4;
+  const int by    = int( id.y ) * 4;
+  // The classification, half the block rows at a time (the top half's 4 rows of threads, then the bottom half's)
+  AlfClass cls;
+  [unroll]
+  for( int h = 0; h < 2; h++ )
+  {
+    cellQuads( tid, h, vbH, vbPos );
+    GroupMemoryBarrierWithGroupSync();
+    if( int( local.y ) >> 2 == h )
+    {
+      cls = classifyBlock( bx, by, h, vbH, vbPos );
+    }
+    if( h == 0 )
+    {
+      GroupMemoryBarrierWithGroupSync();   // (the bottom half's sums replace the top half's)
+    }
+  }
 
-  const int bx = int( id.x ) * 4;
-  const int by = int( id.y ) * 4;
   if( bx >= pc.width || by >= pc.height )
   {
     return;
@@ -665,7 +690,7 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
     }
     return;
   }
-  filterBlock( bx, by, G, set, classifyBlock( bx, by, vbH, vbPos ), vbH, vbPos );
+  filterBlock( bx, by, G, set, cls, vbH, vbPos );
 }
 
 #else   // CHROMA
