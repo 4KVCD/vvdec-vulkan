@@ -9,6 +9,8 @@ Checks and measurements for the Vulkan decoder.
 - `procstat/`: the process launcher the measurements use (wall and CPU time, memory peaks, RAPL energy, output marks).
 - `probes/`: temporary measurement patches (GPU buffers by allocation site, CPU heap by block size).
 - `vkext/`: lists a device's Vulkan extensions.
+- `uiprobe/`: what the desktop sees of the GPU during a decode: a small submission on the graphics queue every 1/60 s,
+  timed from submission to completion (median, percentiles, and how many waited past a frame).
 - Data: `refs/` (per-frame MD5s made by upstream vvdec), `tools_md5_2.txt`, `crc_refs.txt`, `conf_upstream.txt`,
   `check_times.txt`, `fastcheck_times.json`.
 

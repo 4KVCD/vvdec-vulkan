@@ -5,12 +5,20 @@ decodes on the GPU with Vulkan compute shaders. It is not an official Fraunhofer
 
 - **Bit-exact.** Every output frame is identical to upstream VVdeC's. The check decodes, in both GPU modes, the 250
   JVET conformance streams that upstream VVdeC decodes correctly, 34 streams made to exercise particular coding
-  tools, and long film encodes, and compares every frame: 609 of 609 decodes pass.
-- **Faster than the CPU decoder on 4K films, about as fast or slower at 1080p, much slower on small pictures.** With
-  `--gpu 1`, 1.23 to 1.71 times the CPU decoder's speed on four 4K films and 0.76 to 1.04 times on four 1080p films
-  (see Speed).
-- **Tested on one GPU only:** the AMD Radeon 780M integrated in a Ryzen 7 8845HS, on Windows 11 with driver
-  32.0.31041.1004. NVIDIA and Intel GPUs have not been tried.
+  tools, and long film encodes, and compares every frame: 609 of 609 decodes pass on the AMD GPU below. On Intel
+  Graphics, the check's wide tier (every conformance stream and the films' first 240 to 600 frames, in both modes;
+  the tool streams were not on that PC) passes 512 of 512 decodes.
+- **How it compares with the CPU decoder depends on the CPU beside the GPU.** On a laptop's Radeon 780M, `--gpu 1`
+  decodes 4K films 1.23 to 1.71 times as fast as its 8-core CPU and 1080p films 0.76 to 1.04 times. On the Intel
+  Graphics of a Core Ultra 9 285K, `--gpu 1` decodes 4K films at about 111 fps and 1080p films at 329 to 434 fps,
+  while the 24-core CPU decoder is 2.2 to 3.3 times faster but takes about twice the energy a frame (see Speed).
+- **The desktop stays smooth while the GPU decodes.** The decoder's GPU queues run at low priority, and on Intel's
+  GPUs on the compute engine, away from the 3D engine that the desktop's compositor uses. Decoding 4K on Intel
+  Graphics, the compositor's work waited past a 60 Hz frame 0.6% of the time, against 14.3% before.
+- **Tested on three GPUs, on Windows 11:** the AMD Radeon 780M integrated in a Ryzen 7 8845HS (driver
+  32.0.31041.1004), with the full check; an NVIDIA GeForce RTX 5090 (driver 616.92), with seven film cuts; and the
+  Intel Graphics of a Core Ultra 9 285K (driver 101.8991), with the wide tier. The Intel changes (since 1972535)
+  have not been re-checked on AMD or NVIDIA.
 
 ## What runs on the GPU
 
@@ -19,7 +27,7 @@ decodes on the GPU with Vulkan compute shaders. It is not an official Fraunhofer
 | | `--gpu 1` | `--gpu 1` with `VVDEC_GPU_PARSE=2` |
 |---|---|---|
 | Parsing the slice data (CABAC) | CPU | GPU |
-| Motion derivation, deblocking parameters and edges, the order in which intra blocks are predicted | GPU | GPU |
+| Motion derivation, deblocking parameters and edges, the order in which intra blocks are predicted | GPU (CPU on Intel's GPUs) | GPU |
 | Residuals and transforms, intra and inter prediction, LMCS, deblocking, SAO, ALF and CC-ALF, film grain | GPU | GPU |
 
 In both modes the CPU reads the parameter sets, the picture and slice headers and the reference picture lists, and
@@ -34,8 +42,10 @@ correctly either, are decoded on the CPU.
 
 ## Speed
 
-Measured on the laptop above with 16 decoder threads. The fps leave start-up out: they count from the first output
-frame to the end of decoding. Each number is the median of 3 runs, with the three configurations run in turn.
+The fps leave start-up out: they count from the first output frame to the end of decoding. Each number is the median
+of 3 runs, with the three configurations run in turn, with 16 decoder threads.
+
+### AMD Radeon 780M (Ryzen 7 8845HS laptop, 8 cores)
 
 | Video | Size | Substreams a picture | GPU parse (`VVDEC_GPU_PARSE=2`) | `--gpu 1` | CPU decoder (`--gpu 0`) | `--gpu 1` against the CPU |
 |---|---|---|---|---|---|---|
@@ -49,6 +59,24 @@ frame to the end of decoding. Each number is the median of 3 runs, with the thre
 | 1080p film | 1920x1080 | 1 | 296.4 fps | 363.6 fps | 480.8 fps | 0.76x |
 
 All eight films are 10-bit. On each of them `--gpu 1` is at least as fast as the GPU parse.
+
+### Intel Graphics (Core Ultra 9 285K, 24 cores)
+
+| Video | Size | Substreams a picture | GPU parse (`VVDEC_GPU_PARSE=2`) | `--gpu 1` | CPU decoder (`--gpu 0`) | `--gpu 1` against the CPU |
+|---|---|---|---|---|---|---|
+| 4K film, VVenC slower preset | 3840x1608 | 26 | 72.6 fps | 111.9 fps | 300.2 fps | 0.37x |
+| 4K film | 3840x2160 | 1 | 58.2 fps | 111.3 fps | 243.4 fps | 0.46x |
+| 1080p film, VVenC slower preset | 1920x1080 | 18 | 170.8 fps | 328.7 fps | 1,083.2 fps | 0.30x |
+| 1080p film | 1920x1080 | 1 | 129.4 fps | 433.9 fps | 1,220.7 fps | 0.36x |
+
+The processor package (CPU and GPU) drew 19 to 26 W decoding with `--gpu 1` and 114 to 124 W with the CPU decoder:
+the GPU path took 46 to 52% of the CPU decoder's energy a frame (4K: 176 and 237 mJ against 384 and 471 mJ), and left
+the CPU mostly free. Before the Intel changes, `--gpu 1` decoded the 4K film 3840x2160 at 35 fps and the 1080p one
+at 95 fps on this GPU.
+
+On Intel's GPUs the CPU derives the motion and the deblocking parameters (`VVDEC_GPU_FRONT=1`: the GPU), and the
+shaders that allow it run in waves of 16 threads. The GPU parse needs the GPU front end, so `VVDEC_GPU_PARSE=2` keeps
+it on the GPU.
 
 Where it is slow:
 
@@ -85,8 +113,9 @@ scripts\build_vulkan.bat path\to\slangc.exe path\to\Vulkan-Headers\include
 
 This builds Release with Ninja into `build\vulkan`; the programs (`vvdecapp.exe`, `vvdecbatch.exe`) land in
 `bin\release-static`. The script runs CMake with `-DVVDEC_ENABLE_VULKAN=ON -DVVDEC_SLANGC=<slangc>
--DVVDEC_VULKAN_HEADERS=<include dir>`; the shaders are compiled to SPIR-V and embedded in the program. Other
-platforms have not been built.
+-DVVDEC_VULKAN_HEADERS=<include dir>`; the shaders are compiled to SPIR-V and embedded in the program. The same CMake
+options also build with GCC 16.2 (MinGW-w64), adding `-DCMAKE_EXE_LINKER_FLAGS=-static` for programs that need no
+MinGW DLLs. Other platforms have not been built.
 
 At run time the decoder loads the Vulkan loader (`vulkan-1.dll`). It needs a Vulkan 1.2 device with buffer device
 addresses, 8-, 16- and 64-bit integers in shaders, and 8- and 16-bit storage buffer access. The GPU parse and the
@@ -106,8 +135,11 @@ vvdecapp -b input.266 -o output.yuv --gpu 1
 | `VVDEC_GPU_DEVICE=<n>` | use Vulkan device number `n` (default: the first discrete GPU, else the first integrated one, else the first device) |
 | `VVDEC_GPU_CACHE=<file>` | where the compiled pipelines are kept (default: `%LOCALAPPDATA%\vvdec` on Windows); `0` keeps none |
 | `VVDEC_GPU_PRECOMPILE=0` | compile each shader when it is first used instead of in the background at start |
-| `VVDEC_GPU_FRONT=0` | the CPU derives the motion and the deblocking parameters and builds the job lists |
-| `VVDEC_GPU_PROFILE=1` | at exit, print the GPU time of each pass, each shader's registers and the GPU memory peaks |
+| `VVDEC_GPU_FRONT=0` | the CPU derives the motion and the deblocking parameters and builds the job lists (the default on Intel's GPUs; `VVDEC_GPU_FRONT=1` keeps them on the GPU) |
+| `VVDEC_GPU_ENGINE=compute` | the GPU's work on its compute engine (the default on Intel's GPUs); `3d`: on the graphics engine (the default elsewhere) |
+| `VVDEC_GPU_PRIORITY=normal` | the GPU queues at normal priority (default: low, so the desktop's GPU work goes first) |
+| `VVDEC_GPU_PROFILE=1` | at exit, print the GPU time of each pass, each shader's registers (AMD) or statistics (other GPUs) and the GPU memory peaks |
+| `VVDEC_GPU_WAVE=<n>`, `VVDEC_GPU_WAVE_INTER=<n>` | tuning: the wave size of the shaders that work with any (`0`: the driver's choice) |
 | `VVDEC_GPU_MIDER=1` | debugging: compare the GPU's motion, deblocking parameters and job lists with the CPU's |
 | `VVDEC_GPU_PARSE=1` | debugging: the CPU parses, and the GPU's parse of each picture is compared with it |
 
@@ -117,7 +149,8 @@ vvdecapp -b input.266 -o output.yuv --gpu 1
   picture's journey through the tasks and passes). Each source file and shader begins with a description of its part.
 - [`tools/gpu-dev/`](tools/gpu-dev/): the checks and benchmarks used during development (Python 3). `fastcheck.py`
   decodes the conformance and tool streams and compares every frame; `ab_steady.py` measures steady-state speed;
-  `speedsweep.py` times every video against the CPU decoder. The test streams are not in the repository.
+  `speedsweep.py` times every video against the CPU decoder; `uiprobe` measures how long the desktop's GPU work
+  waits while a decode runs. The test streams are not in the repository.
 
 ## License
 
