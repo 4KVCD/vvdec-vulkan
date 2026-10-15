@@ -105,9 +105,12 @@ output frames, not to the reference pictures.
 | variable | effect |
 |---|---|
 | `VVDEC_GPU_DEVICE=<n>` | use the Vulkan device with index n (default: the first discrete GPU, else the first integrated one) |
-| `VVDEC_GPU_PROFILE=1` | print the GPU time of each pass and each shader's registers and memory at exit |
+| `VVDEC_GPU_PROFILE=1` | print the GPU time of each pass and each shader's registers and memory at exit (without `VK_AMD_shader_info`: its statistics from `VK_KHR_pipeline_executable_properties`) |
 | `VVDEC_GPU_ISA=<dir>` | with `VVDEC_GPU_PROFILE=1` on AMD: write each shader's machine code to `<dir>/<name>.isa` |
-| `VVDEC_GPU_FRONT=0` | path 2: the CPU builds the GPU's jobs |
+| `VVDEC_GPU_FRONT=0` | path 2: the CPU builds the GPU's jobs (the default on Intel's GPUs; `VVDEC_GPU_FRONT=1`: path 1) |
+| `VVDEC_GPU_ENGINE=compute` | the compute queue in a compute-only family, the GPU's compute engine (the default on Intel's GPUs); `3d`: in the graphics family (the default elsewhere) |
+| `VVDEC_GPU_PRIORITY=normal` | the queues at normal global priority (default: low, `VK_KHR_global_priority` where the device has it) |
+| `VVDEC_GPU_WAVE=<n>`, `VVDEC_GPU_WAVE_INTER=<n>` | the wave size of the shaders that work with any, and of inter's variants (`0`: the driver's choice; default: 16 and the driver's on Intel's GPUs, 32 and the driver's elsewhere) |
 | `VVDEC_GPU_MIDER=1` | path 2 plus the GPU front end, compared with the CPU's (debugging) |
 | `VVDEC_GPU_ASYNC=0` | run the front end on the compute queue instead of an async compute queue |
 | `VVDEC_GPU_PARSE=1` | the GPU parses the slice data too, compared with the CPU's parse (debugging) |
