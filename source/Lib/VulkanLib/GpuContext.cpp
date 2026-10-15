@@ -138,6 +138,7 @@ static constexpr const char* kExtShaderClock    = "VK_KHR_shader_clock";        
 static constexpr const char* kExtSubgroupBallot = "VK_EXT_shader_subgroup_ballot";   // the parse's OpSubgroupReadInvocationKHR
 static constexpr const char* kExtMaintenance5   = "VK_KHR_maintenance5";             // (the pipelines' binaries need it)
 static constexpr const char* kExtPipelineBinary = "VK_KHR_pipeline_binary";          // the pipelines' binaries kept in a file
+static constexpr const char* kExtExecutables    = "VK_KHR_pipeline_executable_properties";   // the shaders' statistics
 
 bool Context::init()
 {
@@ -433,6 +434,7 @@ Context::DeviceExtensions Context::findExtensions() const
     found.subgroupBallot |= strcmp( extension.extensionName, kExtSubgroupBallot ) == 0;
     found.maintenance5 |= strcmp( extension.extensionName, kExtMaintenance5 ) == 0;
     found.pipelineBinary |= strcmp( extension.extensionName, kExtPipelineBinary ) == 0;
+    found.executables |= m_options.profile && strcmp( extension.extensionName, kExtExecutables ) == 0;
     if( strcmp( extension.extensionName, "VK_KHR_global_priority" ) == 0 )
     {
       found.globalPriority = "VK_KHR_global_priority";
@@ -518,6 +520,7 @@ struct DeviceFeatures
   VkPhysicalDeviceShaderClockFeaturesKHR      clock{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR };
   VkPhysicalDeviceMaintenance5FeaturesKHR     maintenance5{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR };
   VkPhysicalDevicePipelineBinaryFeaturesKHR   binaries{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
+  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executables{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
   std::vector<const char*>                    extensions;
 
   // The features the decoder needs (Context::checkFeatures): timeline semaphores for the async queues, and subgroup size
@@ -549,6 +552,14 @@ struct DeviceFeatures
     clock.shaderDeviceClock   = VK_TRUE;
     chain( clock );
     extensions.push_back( kExtShaderClock );
+  }
+
+  // VK_KHR_pipeline_executable_properties' statistics of the pipelines
+  void enableExecutableStatistics()
+  {
+    executables.pipelineExecutableInfo = VK_TRUE;
+    chain( executables );
+    extensions.push_back( kExtExecutables );
   }
 
   // VK_KHR_pipeline_binary, with the VK_KHR_maintenance5 it needs
@@ -590,6 +601,12 @@ bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgro
   if( found.shaderInfo )
   {
     features.extensions.push_back( kExtShaderInfo );
+  }
+  // (VVDEC_GPU_PROFILE=1 without VK_AMD_shader_info: the shaders' statistics, VK_KHR_pipeline_executable_properties)
+  const bool executables = found.executables && !found.shaderInfo;
+  if( executables )
+  {
+    features.enableExecutableStatistics();
   }
   if( m_shaderClock )
   {
@@ -651,6 +668,12 @@ bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgro
   if( found.shaderInfo )
   {
     m_getShaderInfo = (PFN_vkGetShaderInfoAMD) m_api.vkGetDeviceProcAddr( m_device, "vkGetShaderInfoAMD" );
+  }
+  if( executables )
+  {
+    m_getExecutables = (PFN_vkGetPipelineExecutablePropertiesKHR) m_api.vkGetDeviceProcAddr( m_device, "vkGetPipelineExecutablePropertiesKHR" );
+    m_getExecutableStatistics
+      = (PFN_vkGetPipelineExecutableStatisticsKHR) m_api.vkGetDeviceProcAddr( m_device, "vkGetPipelineExecutableStatisticsKHR" );
   }
   if( binaries )
   {
@@ -1627,6 +1650,10 @@ VkPipeline Context::createPipelineOf( int shaderId )
   info.stage.module = module;
   info.stage.pName  = "main";
   info.layout       = m_layout;
+  if( m_getExecutableStatistics )
+  {
+    info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+  }
   VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
   size.requiredSubgroupSize = waveSizeOf( shaderId );
   if( size.requiredSubgroupSize != 0 )
@@ -1658,6 +1685,40 @@ VkPipeline Context::createPipelineOf( int shaderId )
 // VVDEC_GPU_ISA=<directory> its machine code into <directory>/<name>.isa
 void Context::reportShader( int shaderId, VkPipeline pipe ) const
 {
+  if( m_getExecutables && m_getExecutableStatistics )
+  {
+    // each executable's statistics (Intel's: its SIMD width, registers, spills and fills, scratch, instructions)
+    VkPipelineInfoKHR pipeInfo{ VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
+    pipeInfo.pipeline = pipe;
+    uint32_t count    = 0;
+    m_getExecutables( m_device, &pipeInfo, &count, nullptr );
+    std::vector<VkPipelineExecutablePropertiesKHR> props( count, VkPipelineExecutablePropertiesKHR{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR } );
+    m_getExecutables( m_device, &pipeInfo, &count, props.data() );
+    for( uint32_t e = 0; e < count; e++ )
+    {
+      VkPipelineExecutableInfoKHR exe{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
+      exe.pipeline        = pipe;
+      exe.executableIndex = e;
+      uint32_t n          = 0;
+      m_getExecutableStatistics( m_device, &exe, &n, nullptr );
+      std::vector<VkPipelineExecutableStatisticKHR> stats( n, VkPipelineExecutableStatisticKHR{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR } );
+      m_getExecutableStatistics( m_device, &exe, &n, stats.data() );
+      std::string line;
+      for( const VkPipelineExecutableStatisticKHR& st: stats )
+      {
+        char value[64];
+        switch( st.format )
+        {
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: snprintf( value, sizeof( value ), "%s", st.value.b32 ? "yes" : "no" ); break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: snprintf( value, sizeof( value ), "%lld", (long long) st.value.i64 ); break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: snprintf( value, sizeof( value ), "%llu", (unsigned long long) st.value.u64 ); break;
+        default: snprintf( value, sizeof( value ), "%g", st.value.f64 ); break;
+        }
+        line += std::string( "  " ) + st.name + " " + value;
+      }
+      msg( INFO, "GPU shader %-16s %s (subgroup %u):%s\n", kShaders[shaderId].name, props[e].name, props[e].subgroupSize, line.c_str() );
+    }
+  }
   if( !m_getShaderInfo )
   {
     return;

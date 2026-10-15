@@ -368,6 +368,7 @@ private:
   {
     bool        shaderInfo = false, shaderClock = false, subgroupBallot = false, maintenance5 = false, pipelineBinary = false;
     const char* globalPriority = nullptr;   // VK_KHR_global_priority, else VK_EXT_global_priority, if the device has one
+    bool        executables    = false;     // VK_KHR_pipeline_executable_properties (when profiling)
   };
   DeviceExtensions findExtensions() const;
   // createDevice's steps: the queues to create (returns their number), whether the shaders may run in waves of 32
@@ -446,6 +447,9 @@ private:
   std::atomic<int64_t>             m_memoryNow[2]  = { { 0 }, { 0 } };
   std::atomic<int64_t>             m_memoryPeak[2] = { { 0 }, { 0 } };
   PFN_vkGetShaderInfoAMD           m_getShaderInfo = nullptr;   // VK_AMD_shader_info, on AMD when profiling or writing machine code
+  // VK_KHR_pipeline_executable_properties, when profiling without VK_AMD_shader_info: the shaders' statistics
+  PFN_vkGetPipelineExecutablePropertiesKHR m_getExecutables          = nullptr;
+  PFN_vkGetPipelineExecutableStatisticsKHR m_getExecutableStatistics = nullptr;
 
   static std::mutex s_mutex;
   static Context*   s_context;

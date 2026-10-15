@@ -51,6 +51,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "CommonLib/AdaptiveLoopFilter.h"
 #include "CommonLib/CodingStructure.h"
 #include "CommonLib/InterpolationFilter.h"
+#include "CommonLib/LoopFilter.h"
 #include "CommonLib/MipData.h"
 #include "CommonLib/Picture.h"
 #include "CommonLib/Rom.h"
@@ -157,6 +158,12 @@ static Buffer uploadGeoWeights( Context* ctx )
   {
     size += t.second;
   }
+  // then deblock.slang's: LoopFilter's tc and beta tables, as 16-bit values
+  static_assert( sizeof( LoopFilter::sm_tcTable ) / sizeof( LoopFilter::sm_tcTable[0] ) == 66
+                   && sizeof( LoopFilter::sm_betaTable ) / sizeof( LoopFilter::sm_betaTable[0] ) == 64,
+                 "the deblocking's tables are not those of shaders/deblock.slang" );
+  CHECK( size != kDeblockTablesAt, "the deblocking's tables are not where deblock.slang reads them" );
+  size += ( 66 + 64 ) * sizeof( int16_t );
   Buffer   buf = ctx->alloc( size, MemKind::Upload );
   uint8_t* at  = static_cast<uint8_t*>( buf.mapped );
   memcpy( at, g_globalGeoWeights, sizeof( g_globalGeoWeights ) );
@@ -165,6 +172,15 @@ static Buffer uploadGeoWeights( Context* ctx )
   {
     memcpy( at, t.first, t.second );
     at += t.second;
+  }
+  int16_t* deblock = reinterpret_cast<int16_t*>( at );
+  for( int i = 0; i < 66; i++ )
+  {
+    deblock[i] = int16_t( LoopFilter::sm_tcTable[i] );
+  }
+  for( int i = 0; i < 64; i++ )
+  {
+    deblock[66 + i] = int16_t( LoopFilter::sm_betaTable[i] );
   }
   return buf;
 }

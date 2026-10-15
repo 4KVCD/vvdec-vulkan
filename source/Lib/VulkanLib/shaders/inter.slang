@@ -243,6 +243,30 @@ static const Taps kChromaRPR2     = { 1024 };
 static const Taps kLumaHpel       = { 1152 };
 static const Taps kBilinear       = { 1160 };
 
+// A phase's taps at once, a row of a luma table (8 taps, one 16-byte load) or of a chroma table (4 taps, 8 bytes): the
+// rows lie aligned in pc.geo. Tap k is lumaTap( row, k ).
+uint4 lumaRow( Taps table, int phase )
+{
+  return *at( (uint4*)pc.geo, ( kGeoValues + table.base ) / 8 + uint( phase ) );
+}
+
+uint2 chromaRow( Taps table, int phase )
+{
+  return *at( (uint2*)pc.geo, ( kGeoValues + table.base ) / 4 + uint( phase ) );
+}
+
+int16_t lumaTap( uint4 row, int k )
+{
+  const uint w = row[k >> 1];
+  return int16_t( ( k & 1 ) != 0 ? w >> 16 : w );
+}
+
+int16_t chromaTap( uint2 row, int k )
+{
+  const uint w = row[k >> 1];
+  return int16_t( ( k & 1 ) != 0 ? w >> 16 : w );
+}
+
 // RPR's filter taps by filter index (InterpolationFilter::filterHor, filterVer).
 // Luma: 0 the regular filter (its half-sample variant with hpel), 2 the 4x4
 // one, 3 and 4 the RPR ones, 5 and 6 affine's RPR ones. Chroma: 3 and 4 the RPR
@@ -2591,12 +2615,14 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    const int xFrac = mvR[s].x & 15, yFrac = mvR[s].y & 15;
+    const int   xFrac = mvR[s].x & 15, yFrac = mvR[s].y & 15;
+    const uint4 rowX  = hpel && xFrac == 8 ? lumaRow( kLumaHpel, 0 ) : lumaRow( kLuma, xFrac );   // (coeff's taps)
+    const uint4 rowY  = hpel && yFrac == 8 ? lumaRow( kLumaHpel, 0 ) : lumaRow( kLuma, yFrac );
     [unroll]
     for( int k = 0; k < 8; k++ )
     {
-      cxY[s][k] = int16_t( coeff( 0, xFrac, hpel, k ) );
-      cyY[s][k] = int16_t( coeff( 0, yFrac, hpel, k ) );
+      cxY[s][k] = lumaTap( rowX, k );
+      cyY[s][k] = lumaTap( rowY, k );
     }
     // (a filter's taps start at the window's first column or row; unfiltered, the samples start at the motion's integer
     // position, the window's sample 3)
@@ -2670,12 +2696,14 @@ void tile<let FULL : int>( int tid, uint* job, int x, int y, int w, int h, int c
   [unroll]
   for( int s = 0; s < 2; s++ )
   {
-    const int xFrac = mvR[s].x & 31, yFrac = mvR[s].y & 31;
+    const int   xFrac = mvR[s].x & 31, yFrac = mvR[s].y & 31;
+    const uint2 rowX  = chromaRow( kChroma, xFrac );
+    const uint2 rowY  = chromaRow( kChroma, yFrac );
     [unroll]
     for( int k = 0; k < 4; k++ )
     {
-      cxC[s][k] = int16_t( kChroma[xFrac * 4 + k] );
-      cyC[s][k] = int16_t( kChroma[yFrac * 4 + k] );
+      cxC[s][k] = chromaTap( rowX, k );
+      cyC[s][k] = chromaTap( rowY, k );
     }
     crx0[s] = xFrac != 0 ? 0 : 1;
     cry0[s] = yFrac != 0 ? 0 : 1;

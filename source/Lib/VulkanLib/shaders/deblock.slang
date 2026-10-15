@@ -42,6 +42,7 @@ struct Params
   int      ladfOffset0, ladfOffset1, ladfOffset2, ladfOffset3, ladfOffset4;   // QP offset of each interval
   int      ladfBound1, ladfBound2, ladfBound3, ladfBound4;   // lower bound of each interval but the first
   uint*    countAt;     // when count < 0: the number of edges and the index of the first, from the GPU front end
+  int16_t* tables;      // LoopFilter's tc table (66 entries), then its beta table (64)
 };
 
 int  edgeCount() { return pc.count >= 0 ? pc.count : int( pc.countAt[0] ); }
@@ -49,14 +50,17 @@ uint firstEdge() { return pc.count >= 0 ? 0u : pc.countAt[1]; }
 
 [[vk::push_constant]] Params pc;
 
-static const int kTcTable[66] = {
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 4, 4, 4, 4, 5, 5, 5, 5, 7, 7, 8, 9, 10, 10, 11, 13, 14, 15, 17, 19,
-  21, 24, 25, 29, 33, 36, 41, 45, 51, 57, 64, 71, 80, 89, 100, 112, 125, 141, 157, 177, 198, 222, 250, 280, 314, 352, 395
-};
-static const int kBetaTable[64] = {
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24, 26, 28, 30, 32,
-  34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88
-};
+// LoopFilter's tc and beta tables, read from memory (pc.tables): as the shader's own constant arrays, read with a
+// run-time index, Intel's compiler copied each into the thread's scratch memory at each use (21 KB of scratch).
+int tcTable( int index )
+{
+  return int( *at( pc.tables, uint( index ) ) );
+}
+
+int betaTable( int index )
+{
+  return int( *at( pc.tables, 66u + uint( index ) ) );
+}
 
 #define MAX_QP 63
 
@@ -85,7 +89,7 @@ int ctuParam( int x, int y, int i )
 int tcFromTable( int index )
 {
   const int bd = pc.bitDepth;
-  return bd < 10 ? ( ( kTcTable[index] + ( 1 << ( 9 - bd ) ) ) >> ( 10 - bd ) ) : ( kTcTable[index] << ( bd - 10 ) );
+  return bd < 10 ? ( ( tcTable( index ) + ( 1 << ( 9 - bd ) ) ) >> ( 10 - bd ) ) : ( tcTable( index ) << ( bd - 10 ) );
 }
 
 // Access to a line across the edge: sample k < 0 is on the P side (p0 is k = -1), k >= 0 on the Q side (q0 is k = 0).
@@ -423,7 +427,7 @@ EdgeFilter decideEdge( uint2 edge, int x, int y, int bs, int l0[16], int l3[16],
   const int indexTc        = clip3( 0, MAX_QP + 2, qp + 2 * ( bs - 1 ) + tcOffsetDiv2 * 2 );
   const int indexB         = clip3( 0, MAX_QP, qp + betaOffsetDiv2 * 2 );
   const int tc             = tcFromTable( indexTc );
-  const int beta           = kBetaTable[indexB] << ( pc.bitDepth - 8 );
+  const int beta           = betaTable( indexB ) << ( pc.bitDepth - 8 );
   const int sideThreshold  = ( beta + ( beta >> 1 ) ) >> 3;
   const int dp0 = abs( l0[5] - 2 * l0[6] + l0[7] );    // |p2 - 2 p1 + p0|
   const int dq0 = abs( l0[8] - 2 * l0[9] + l0[10] );   // |q0 - 2 q1 + q2|
@@ -721,7 +725,7 @@ void main( uint3 id : SV_DispatchThreadID )
     if( largeBoundary )
     {
       const int indexB = clip3( 0, MAX_QP, qp + ctuParam( lx, ly, 3 + 2 * c ) * 2 );
-      const int beta   = kBetaTable[indexB] * ( 1 << ( pc.bitDepth - 8 ) );
+      const int beta   = betaTable( indexB ) * ( 1 << ( pc.bitDepth - 8 ) );
       const int dp0    = calcDP( p, base0, off, chromaCtbBoundary );
       const int dq0    = calcDQ( p, base0, off );
       const int dp3    = calcDP( p, base3, off, chromaCtbBoundary );

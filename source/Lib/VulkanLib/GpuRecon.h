@@ -94,6 +94,10 @@ struct AlfPush;        // (GpuReconFilters.cpp)
 struct IntraSortPush;  // (GpuReconFrontEnd.cpp)
 struct InterPush;      // (GpuReconPrediction.cpp)
 
+// Where the deblocking's tables (LoopFilter's tc, 66 entries, then beta, 64; 16 bits each) lie in the tables' buffer
+// (Tables::geoWeights), in bytes: after GPM's masks (6 of 112 x 112) and the interpolation filters' taps (1192)
+static constexpr size_t kDeblockTablesAt = ( 6 * 112 * 112 + 1192 ) * sizeof( int16_t );
+
 // What a decoder's GpuRecon instances share.
 // - The front end's buffers whose size changes with the picture (the job lists, the CUs' motion and job counts, the
 //   intra order, the edges) are ranges of one RangeArena. A picture takes them when its front end is recorded and gives
@@ -529,7 +533,8 @@ private:
     Buffer transform;    // TrQuant's transform matrices (trafo.slang)
     Buffer lfnst;        // LFNST's matrices (trafo.slang)
     Buffer mip;          // MIP's matrices (intra.slang)
-    Buffer geoWeights;   // GPM's weight masks, g_globalGeoWeights (inter.slang)
+    Buffer geoWeights;   // GPM's weight masks, g_globalGeoWeights, then the interpolation filters' taps (inter.slang)
+                         // and, at kDeblockTablesAt, the deblocking's tc and beta tables (deblock.slang)
   } m_tables;
 
   // The CPU front end's jobs and edges, uploaded per picture

@@ -100,9 +100,13 @@ private:
   void deriveLADFShift            ( const Pel* src, const ptrdiff_t stride, int& shift, const DeblockEdgeDir edgeDir, const SPS& sps ) const;
 
 #endif
+
+public:
+  // (public: the GPU's deblocking reads them too, uploaded by gpu::GpuRecon)
   static const uint16_t sm_tcTable  [MAX_QP + 3];
   static const uint8_t  sm_betaTable[MAX_QP + 1];
 
+private:
   void( *xFilteringPandQ )( Pel* src, ptrdiff_t step, const ptrdiff_t offset, int numberPSide, int numberQSide, int tc );
 
 #if defined(TARGET_SIMD_X86)  && ENABLE_SIMD_DBLF
