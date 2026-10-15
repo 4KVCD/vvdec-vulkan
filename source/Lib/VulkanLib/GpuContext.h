@@ -144,6 +144,9 @@ struct Options
   bool        parse         = false;   // VVDEC_GPU_PARSE=1: the GPU parses the slice data too, compared with the CPU's parse
   bool        parseDrives   = false;   // VVDEC_GPU_PARSE=2: the GPU parses the slice data instead of the CPU
   bool        precompile    = true;    // VVDEC_GPU_PRECOMPILE=0: the pipelines are not compiled in the background at start-up
+  bool        lowPriority   = true;    // VVDEC_GPU_PRIORITY=normal: the queues not at low global priority
+  std::string engine;                  // VVDEC_GPU_ENGINE=compute or 3d: the compute queue in a compute-only family (the
+                                       // GPU's compute engine) or in the graphics family (empty: per GPU, m_computeEngine)
 
   static Options fromEnvironment();
 };
@@ -301,6 +304,7 @@ private:
   std::string                      m_deviceName;
   bool                             m_discrete = false;   // VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
   bool                             m_wave32 = false;   // the shaders may ask for waves of 32 threads
+  bool                             m_computeEngine = false;   // the compute queue in a compute-only family (chooseDevice)
   bool                             m_splitStores      = false;   // the shaders' kSplitStores is set (NVIDIA's GPUs)
   bool                             m_integerAddresses = false;   // their kIntegerAddresses is set (Intel's GPUs)
   bool                             m_coherentReads    = false;   // their kCoherentReads is set (NVIDIA's GPUs)
@@ -355,7 +359,8 @@ private:
   // The extensions the device has, of those the decoder uses
   struct DeviceExtensions
   {
-    bool shaderInfo = false, shaderClock = false, subgroupBallot = false, maintenance5 = false, pipelineBinary = false;
+    bool        shaderInfo = false, shaderClock = false, subgroupBallot = false, maintenance5 = false, pipelineBinary = false;
+    const char* globalPriority = nullptr;   // VK_KHR_global_priority, else VK_EXT_global_priority, if the device has one
   };
   DeviceExtensions findExtensions() const;
   // createDevice's steps: the queues to create (returns their number), whether the shaders may run in waves of 32

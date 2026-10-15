@@ -124,6 +124,8 @@ Options Options::fromEnvironment()
   options.parse         = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 1;
   options.parseDrives   = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 2;
   options.precompile    = !( value( "VVDEC_GPU_PRECOMPILE" ) && atoi( value( "VVDEC_GPU_PRECOMPILE" ) ) == 0 );
+  options.lowPriority   = !( value( "VVDEC_GPU_PRIORITY" ) && strcmp( value( "VVDEC_GPU_PRIORITY" ), "normal" ) == 0 );
+  options.engine        = value( "VVDEC_GPU_ENGINE" ) ? value( "VVDEC_GPU_ENGINE" ) : "";
   return options;
 }
 
@@ -293,6 +295,12 @@ bool Context::chooseDevice( VkPhysicalDeviceProperties& props )
   m_splitStores      = props.vendorID == kVendorNvidia;
   m_integerAddresses = props.vendorID == kVendorIntel;
   m_coherentReads    = props.vendorID == kVendorNvidia;
+  // The compute queue on the GPU's compute engine (a compute-only family) instead of the graphics engine, where the
+  // desktop's compositor runs, on Intel's GPUs (VVDEC_GPU_ENGINE=compute or 3d chooses). Intel Graphics (285K, driver
+  // 101.8991), VideoQ 4K beside a 60 Hz probe of the graphics queue: its submissions late for a frame 16.3% -> 0.1%;
+  // VideoQ 1080p 94.4 -> 89.5 fps (the front end then shares the compute queue: on another queue of the compute
+  // family, 85.8 fps)
+  m_computeEngine = m_options.engine == "compute" || ( m_options.engine != "3d" && props.vendorID == kVendorIntel );
   if( props.apiVersion < VK_API_VERSION_1_2 || props.limits.maxPushConstantsSize < kPushConstantSize )
   {
     msg( WARNING, "Vulkan: %s lacks Vulkan 1.2 or 256 bytes of push constants\n", props.deviceName );
@@ -324,9 +332,16 @@ bool Context::checkFeatures( const VkPhysicalDeviceProperties& props, bool& time
 
 bool Context::chooseQueueFamilies( const std::vector<VkQueueFamilyProperties>& families, bool timelineSemaphore, const char* deviceName )
 {
-  // a queue with compute: the first family that has it
+  // a queue with compute: the first family that has it; with m_computeEngine the first without graphics, if any
   const uint32_t count = uint32_t( families.size() );
   m_queueFamily        = UINT32_MAX;
+  for( uint32_t i = 0; i < count && m_queueFamily == UINT32_MAX && m_computeEngine; i++ )
+  {
+    if( ( families[i].queueFlags & VK_QUEUE_COMPUTE_BIT ) && !( families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT ) && families[i].timestampValidBits )
+    {
+      m_queueFamily = i;
+    }
+  }
   for( uint32_t i = 0; i < count && m_queueFamily == UINT32_MAX; i++ )
   {
     if( ( families[i].queueFlags & VK_QUEUE_COMPUTE_BIT ) && families[i].timestampValidBits )
@@ -406,6 +421,14 @@ Context::DeviceExtensions Context::findExtensions() const
     found.subgroupBallot |= strcmp( extension.extensionName, kExtSubgroupBallot ) == 0;
     found.maintenance5 |= strcmp( extension.extensionName, kExtMaintenance5 ) == 0;
     found.pipelineBinary |= strcmp( extension.extensionName, kExtPipelineBinary ) == 0;
+    if( strcmp( extension.extensionName, "VK_KHR_global_priority" ) == 0 )
+    {
+      found.globalPriority = "VK_KHR_global_priority";
+    }
+    else if( !found.globalPriority && strcmp( extension.extensionName, "VK_EXT_global_priority" ) == 0 )
+    {
+      found.globalPriority = "VK_EXT_global_priority";
+    }
   }
   return found;
 }
@@ -564,13 +587,42 @@ bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgro
     features.enablePipelineBinaries();
   }
 
+  // Every queue at low global priority (VVDEC_GPU_PRIORITY=normal: not), so that other programs' GPU work, the
+  // desktop's, goes first; a device that refuses it is made without. Intel Graphics, VideoQ 4K beside a 60 Hz probe
+  // of the graphics queue, the compute queue on the graphics engine: probe submissions late for a frame 16.3% -> 7.6%,
+  // the decode's speed unchanged
+  VkDeviceQueueGlobalPriorityCreateInfoKHR lowPriority{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR };
+  lowPriority.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR;
+  const bool priority        = m_options.lowPriority && found.globalPriority;
+  if( priority )
+  {
+    for( uint32_t i = 0; i < numQueueInfos; i++ )
+    {
+      queueInfos[i].pNext = &lowPriority;
+    }
+    features.extensions.push_back( found.globalPriority );
+  }
+
   VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
   deviceInfo.pNext                   = &features.enable;
   deviceInfo.queueCreateInfoCount    = numQueueInfos;
   deviceInfo.pQueueCreateInfos       = queueInfos;
   deviceInfo.enabledExtensionCount   = uint32_t( features.extensions.size() );
   deviceInfo.ppEnabledExtensionNames = features.extensions.empty() ? nullptr : features.extensions.data();
-  if( m_api.vkCreateDevice( m_physical, &deviceInfo, nullptr, &m_device ) != VK_SUCCESS )
+  VkResult created                   = m_api.vkCreateDevice( m_physical, &deviceInfo, nullptr, &m_device );
+  if( created != VK_SUCCESS && priority )
+  {
+    for( uint32_t i = 0; i < numQueueInfos; i++ )
+    {
+      queueInfos[i].pNext = nullptr;
+    }
+    features.extensions.pop_back();
+    deviceInfo.enabledExtensionCount   = uint32_t( features.extensions.size() );
+    deviceInfo.ppEnabledExtensionNames = features.extensions.empty() ? nullptr : features.extensions.data();
+    created                            = m_api.vkCreateDevice( m_physical, &deviceInfo, nullptr, &m_device );
+    msg( WARNING, "Vulkan: %s refused low queue priorities\n", props.deviceName );
+  }
+  if( created != VK_SUCCESS )
   {
     msg( WARNING, "Vulkan: creating the device on %s failed\n", props.deviceName );
     return false;
