@@ -7,18 +7,22 @@ decodes on the GPU with Vulkan compute shaders. It is not an official Fraunhofer
   JVET conformance streams that upstream VVdeC decodes correctly, 34 streams made to exercise particular coding
   tools, and long film encodes, and compares every frame: 609 of 609 decodes pass on the AMD GPU below. On Intel
   Graphics, the check's wide tier (every conformance stream and the films' first 240 to 600 frames, in both modes;
-  the tool streams were not on that PC) passes 512 of 512 decodes.
+  the tool streams were not on that PC) passes 512 of 512 decodes. On an NVIDIA GeForce RTX 3070, four films (600
+  to 1200 frames each, every frame compared) pass in both modes; the conformance streams were not run there.
 - **How it compares with the CPU decoder depends on the CPU beside the GPU.** On a laptop's Radeon 780M, `--gpu 1`
   decodes 4K films 1.23 to 1.71 times as fast as its 8-core CPU and 1080p films 0.76 to 1.04 times. On the Intel
   Graphics of a Core Ultra 9 285K, `--gpu 1` decodes 4K films at about 111 fps and 1080p films at 329 to 434 fps,
-  while the 24-core CPU decoder is 2.2 to 3.3 times faster but takes about twice the energy a frame (see Speed).
+  while the 24-core CPU decoder is 2.2 to 3.3 times faster but takes about twice the energy a frame (see Speed). On
+  an NVIDIA GeForce RTX 3070 beside an 8-core Core i7-10700, `--gpu 1` decodes 4K films 1.83 to 1.85 times as fast as
+  the CPU decoder and 1080p films 1.25 to 1.41 times, using about one CPU core instead of twelve.
 - **The desktop stays smooth while the GPU decodes.** The decoder's GPU queues run at low priority, and on Intel's
   GPUs on the compute engine, away from the 3D engine that the desktop's compositor uses. Decoding 4K on Intel
   Graphics, the compositor's work waited past a 60 Hz frame 0.6% of the time, against 14.3% before.
-- **Tested on three GPUs, on Windows 11:** the AMD Radeon 780M integrated in a Ryzen 7 8845HS (driver
-  32.0.31041.1004), with the full check; an NVIDIA GeForce RTX 5090 (driver 616.92), with seven film cuts; and the
-  Intel Graphics of a Core Ultra 9 285K (driver 101.8991), with the wide tier. The Intel changes (since 1972535)
-  have not been re-checked on AMD or NVIDIA.
+- **Tested on four GPUs, on Windows 11:** the AMD Radeon 780M integrated in a Ryzen 7 8845HS (driver
+  32.0.31041.1004), with the full check; an NVIDIA GeForce RTX 5090 (driver 616.92), with seven film cuts; the
+  Intel Graphics of a Core Ultra 9 285K (driver 101.8991), with the wide tier; and an NVIDIA GeForce RTX 3070 (driver
+  616.92), with four films. The Intel changes (since 1972535) have not been re-checked on AMD or the RTX 5090, and
+  the NVIDIA changes (the GPU parse on NVIDIA, more pictures in parse on discrete GPUs) only on the RTX 3070.
 
 ## What runs on the GPU
 
@@ -59,6 +63,27 @@ of 3 runs, with the three configurations run in turn, with 16 decoder threads.
 | 1080p film | 1920x1080 | 1 | 296.4 fps | 363.6 fps | 480.8 fps | 0.76x |
 
 All eight films are 10-bit. On each of them `--gpu 1` is at least as fast as the GPU parse.
+
+### NVIDIA GeForce RTX 3070 (Core i7-10700, 8 cores, PCIe 3.0)
+
+| Video | Size | Substreams a picture | GPU parse (`VVDEC_GPU_PARSE=2`) | `--gpu 1` | CPU decoder (`--gpu 0`) | `--gpu 1` against the CPU |
+|---|---|---|---|---|---|---|
+| 4K film, VVenC slower preset | 3840x1608 | 26 | 187.8 fps | 261.9 fps | 143.1 fps | 1.83x |
+| 4K film | 3840x2160 | 1 | 170.4 fps | 243.1 fps | 131.5 fps | 1.85x |
+| 1080p film, VVenC slower preset | 1920x1080 | 18 | 482.1 fps | 645.5 fps | 457.3 fps | 1.41x |
+| 1080p film | 1920x1080 | 1 | 459.5 fps | 698.4 fps | 559.0 fps | 1.25x |
+
+The decoder used 0.4 to 0.7 CPU cores with the GPU parse, 0.7 to 1.5 with `--gpu 1` and 12 to 14 as the CPU
+decoder. With the GPU parse the GPU drew about 120 W on the 4K films (nvidia-smi), well below this card's 270 W limit.
+
+- **The GPU parse is 25 to 34% slower than `--gpu 1` here.** It runs on NVIDIA since 7275718 (before, the decoder
+  turned it off there and parsed on the CPU). Discrete GPUs parse 32 to 64 pictures at a time, integrated ones 8 to
+  16.
+- **A larger GPU does not make it much faster.** The speed is set by chains of work that wait on one another rather
+  than by the GPU's size: the motion derivation runs as a wavefront over the CTUs (3840x2160 with 64x64 CTUs: about
+  126 steps one after another), and each picture's motion derivation waits for its colocated picture's first pass (TMVP).
+- **The bus caps 4K.** Every decoded frame is copied to host memory over PCIe: a 3840x2160 10-bit frame (24.9 MB)
+  took 2.0 to 2.2 ms on this PC, which caps such films at about 465 to 500 fps however fast the rest is.
 
 ### Intel Graphics (Core Ultra 9 285K, 24 cores)
 
