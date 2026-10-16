@@ -161,14 +161,6 @@ bool Context::init()
     // 90.2 -> 206.5 fps. The GPU parse (VVDEC_GPU_PARSE=2) needs the GPU front end: with it, the front end stays there.
     m_options.frontEnd = false;
   }
-  if( m_coherentReads && ( m_options.parse || m_options.parseDrives ) )
-  {
-    // The parse's substreams hand each other CTUs with a release store and plain loads (parse.slang's ctuParsed), which
-    // NVIDIA's GPUs do not make visible in order (see common.slang's kCoherentReads): the CPU parses there.
-    msg( WARNING, "Vulkan: the GPU parse (VVDEC_GPU_PARSE) is off on %s; the CPU parses\n", props.deviceName );
-    m_options.parse       = false;
-    m_options.parseDrives = false;
-  }
   uint32_t count = 0;
   m_api.vkGetPhysicalDeviceQueueFamilyProperties( m_physical, &count, nullptr );
   std::vector<VkQueueFamilyProperties> families( count );

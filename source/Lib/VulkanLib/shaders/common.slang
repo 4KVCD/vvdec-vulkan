@@ -42,7 +42,7 @@ int16_t* samplesAt( int16_t* p, int index )
 }
 
 // Reads of what other workgroups of the same dispatch wrote, after waiting for them (intra.slang's neighbours,
-// mider.slang's segment above, jobs.slang's wave map). With kCoherentReads (set on NVIDIA's GPUs,
+// mider.slang's segment above, jobs.slang's wave map, parse.slang's WPP contexts and bottom rows). With kCoherentReads (set on NVIDIA's GPUs,
 // Context::createPipelineOf) they are device-scope atomic loads: there (driver 616.92) a plain load, or a Volatile one,
 // could still read the value from before the other workgroup wrote it, and an intra picture came out wrong.
 [vk::constant_id( 2 )] const bool kCoherentReads = false;

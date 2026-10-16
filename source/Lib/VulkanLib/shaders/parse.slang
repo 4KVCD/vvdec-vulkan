@@ -870,12 +870,14 @@ void initContexts()
   GroupMemoryBarrierWithGroupSync();
 }
 
-// WPP: replaces the context states with those saved in slot (the rates stay the slice's)
+// WPP: replaces the context states with those saved in slot (the rates stay the slice's). Another substream's
+// workgroup saved them, so they are read as common.slang's coherentLoad reads such words.
 void loadContexts( int slot )
 {
   for( int i = g_lane; i < CTX_COUNT; i += 32 )
   {
-    s_ctx[i].x = pc.wppCtx[uint( slot * CTX_COUNT + i )];
+    const uint at = uint( slot * CTX_COUNT + i );
+    s_ctx[i].x    = kCoherentReads ? coherentLoad( (uint64_t)pc.wppCtx + uint64_t( at ) * 4 ) : pc.wppCtx[at];
   }
   GroupMemoryBarrierWithGroupSync();
 }
@@ -914,7 +916,7 @@ bool ctuParsed( int ctu )
   if( g_lane == 0 )
   {
     int spins = 0;
-    while( pc.sync[2 + ctu].load( MemoryOrder.Relaxed ) == 0 && spins < kCtuParsedPolls )
+    while( pollCounter( pc.sync + 2 + ctu ) == 0 && spins < kCtuParsedPolls )
     {
       spins++;
     }
@@ -977,7 +979,11 @@ void beginCtu()
   }
   for( int i = g_lane; i < 2 * kMapRow; i += 32 )
   {
-    s_above[i] = g_aboveAvail ? pc.bottomRows[bottomRowsAt( g_ctu - g_widthInCtus, i )] : uint2( 0, 0 );
+    // (with kCoherentReads, each word as coherentLoad reads it: another substream's workgroup may have written them)
+    const uint64_t at = (uint64_t)pc.bottomRows + uint64_t( g_aboveAvail ? bottomRowsAt( g_ctu - g_widthInCtus, i ) : 0u ) * 8;
+    s_above[i]        = !g_aboveAvail ? uint2( 0, 0 )
+                        : kCoherentReads ? uint2( coherentLoad( at ), coherentLoad( at + 4 ) )
+                                         : pc.bottomRows[bottomRowsAt( g_ctu - g_widthInCtus, i )];
     if( !g_leftAvail )
     {
       s_left[i] = uint2( 0, 0 );
@@ -1062,7 +1068,7 @@ void giveUpSubstream( int first, int k, int count )
     pc.sync[1].add( 1u );
     for( int j = k; j < count; j++ )
     {
-      pc.sync[2 + int( pc.ctuList[( first + j ) * 2] )].store( 1u, MemoryOrder.Release );
+      pc.sync[2 + int( pc.ctuList[( first + j ) * 2] )].add( 1u, MemoryOrder.Release );
     }
   }
 }
@@ -1194,7 +1200,9 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     AllMemoryBarrierWithGroupSync();
     if( g_lane == 0 )
     {
-      pc.sync[2 + g_ctu].store( 1u, MemoryOrder.Release );
+      // (an atomic add, as mider.slang publishes its progress: on NVIDIA's GPUs a release store did not publish the
+      // writes before it)
+      pc.sync[2 + g_ctu].add( 1u, MemoryOrder.Release );
     }
     k++;
     // This dispatch's share of bins is spent: pause after the CTU
