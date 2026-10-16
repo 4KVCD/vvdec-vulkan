@@ -84,21 +84,26 @@ static constexpr size_t   kParseTotalsSerial = 15;        // the totals' word th
 static constexpr size_t   kParseLevelChunk   = 4096;      // parse.slang's kLevelChunk: the levels a substream takes at a time
 static constexpr size_t   kGroupsPerRow      = 32768;     // the shaders take group.y as rows of 32768 workgroups
 
-// How many pictures are in parse at a time. Each step runs one workgroup per substream, and two workgroups fill a
-// compute unit, so too few substreams leave units idle. At least kMinParsing pictures are in parse, and more start
-// while their substreams number fewer than kStreamsInParse, up to kMaxParsing. Each picture in parse holds the room
-// for its parse results, so more pictures cost memory. Each submission runs kStepsPerSubmission steps of every picture
-// in parse, so that a picture can be handed over as soon as its parse is done.
+// Each submission runs kStepsPerSubmission steps of every picture in parse, so that a picture can be handed over as
+// soon as its parse is done.
 static constexpr uint32_t kStepsPerSubmission = 1;
-static constexpr size_t   kMinParsing         = 8;
-static constexpr size_t   kMaxParsing         = 16;
-static constexpr size_t   kStreamsInParse     = 180;
-// The most pictures in parse or parsed and not yet given back (their reconstruction still has to read the results):
-// no more start while this many are. Short steps let the parse run far ahead of the reconstruction, and that lead hides
-// the long parses of intra pictures, but every picture parsed ahead holds its records. 48 keeps almost all of the
-// lead's speed for a little memory (Beekeeper slower 4K at 15 W: 172.0 fps and 503 MB of GPU memory, against 172.9 fps
-// and 543 MB without a cap).
-static constexpr size_t   kMaxAhead           = 48;
+
+// How many pictures are in parse at a time (ParseLimits; ParseService::m_limits). Each step runs one workgroup per
+// substream, and a substream's parse is a chain of bins, each waiting for the one before: a workgroup keeps a compute
+// unit mostly idle, so too few substreams leave the GPU idle. At least minParsing pictures are in parse, and more start
+// while their substreams number fewer than streamsInParse, up to maxParsing. Each picture in parse holds the room for
+// its parse results, so more pictures cost memory.
+// maxAhead: the most pictures in parse or parsed and not yet given back (their reconstruction still has to read the
+// results): no more start while this many are. Short steps let the parse run far ahead of the reconstruction, and that
+// lead hides the long parses of intra pictures, but every picture parsed ahead holds its records.
+// - An integrated GPU (tuned on a Radeon 780M, 12 compute units): 48 ahead keeps almost all of the lead's speed for a
+//   little memory (Beekeeper slower 4K at 15 W: 172.0 fps and 503 MB of GPU memory, against 172.9 fps and 543 MB
+//   without a cap).
+// - A discrete GPU (tuned on an RTX 3070, 46 SMs, 16 decoder threads, against the integrated GPU's limits): Beekeeper
+//   slower 4K 173.8 -> 247.4 fps, Top Gun slower 1080p 468.0 -> 613.6, VideoQ 1080p 413.4 -> 480.2, VideoQ 4K 159.2 ->
+//   177.9; GPU memory at 4K +125 to +245 MB. (24 to 48 pictures with 96 ahead gave 3 to 4% less.)
+static constexpr ParseLimits kIntegratedLimits = { 8, 16, 180, 48 };
+static constexpr ParseLimits kDiscreteLimits   = { 32, 64, 1000, 128 };
 // An intra picture with at most kSerialStreams substreams (no WPP, one tile) parses in one or two long chains, several
 // times as long as a B picture's parse. Such a picture starts as soon as it is enqueued, ahead of the pictures
 // enqueued before it, so that its parse is done when the reconstruction reaches it; at most kSerialIntraInParse of
@@ -108,9 +113,10 @@ static constexpr size_t   kSerialStreams      = 2;
 static constexpr size_t   kSerialIntraInParse = 2;
 // In an all-intra stream without WPP every picture's parse is one such long chain, and the parse holds the whole decode
 // back. So while every picture in parse is a serial intra picture, more of them parse side by side, up to
-// kMaxSerialIntraParsing. Each one holds its parse room (4K: ~25 MB of GPU memory). With 24 instead of 16 the all-intra
-// 4K streams decode 32% to 39% faster at 15 W for 250 to 300 MB more memory; 32 is no faster. (Random-access streams
-// without WPP gain nothing from more pictures in parse.)
+// kMaxSerialIntraParsing (or maxParsing, when the GPU's limits allow more). Each one holds its parse room (4K: ~25 MB of
+// GPU memory). With 24 instead of 16 the all-intra 4K streams decode 32% to 39% faster at 15 W on the integrated GPU
+// for 250 to 300 MB more memory; 32 is no faster there. (Not measured on a discrete GPU: no all-intra stream on that
+// PC.)
 static constexpr size_t   kMaxSerialIntraParsing = 24;
 
 // Returns the size in bytes of the picture's largest substream, the one whose parse takes longest
@@ -585,7 +591,7 @@ void applyParsedSaoAlf( CodingStructure& cs, const ParsedPicture& parsed )
 // ====================================================================================================================
 
 ParseService::ParseService( Context* ctx, std::function<void()> wakeUp )
-  : m_ctx( ctx ), m_wakeUp( std::move( wakeUp ) ), m_records( ctx, kIdlePictures )
+  : m_ctx( ctx ), m_wakeUp( std::move( wakeUp ) ), m_records( ctx, kIdlePictures ), m_limits( ctx->discrete() ? kDiscreteLimits : kIntegratedLimits )
 {
   CHECK( !ctx->parseQueue(), "Vulkan: the GPU parse ahead of the reconstruction needs an async compute queue" );
   for( StepFrame& frame: m_frames )
@@ -652,7 +658,7 @@ void ParseService::release( ParsedPicture* parsed )
   std::lock_guard<std::mutex> lock( m_mutex );
   parsed->picture = nullptr;
   m_released.push_back( parsed );
-  m_wake.notify_one();   // (a picture waiting for room ahead may start: kMaxAhead)
+  m_wake.notify_one();   // (a picture waiting for room ahead may start: m_limits.maxAhead)
 }
 
 ParseStats ParseService::stats() const
@@ -690,14 +696,15 @@ size_t ParseService::heldResults() const
 bool ParseService::hasWork() const
 {
   return !m_parsing.empty() || !m_copying.empty() || m_inFlight > 0 || !m_restarting.empty() || !m_freeing.empty()
-         || ( !m_waiting.empty() && m_parsing.size() + heldResults() < kMaxAhead );
+         || ( !m_waiting.empty() && m_parsing.size() + heldResults() < m_limits.maxAhead );
 }
 
 std::vector<Picture*> ParseService::takeStartingPictures()
 {
-  // The pictures enqueued since, oldest first, as many as may be parsed at a time: while the parse is not too far
-  // ahead (kMaxAhead), up to kMaxParsing pictures in parse (kMaxSerialIntraParsing while all are serial intra
-  // pictures), and past kMinParsing only while the substreams in parse are fewer than kStreamsInParse
+  // The pictures enqueued since, oldest first, as many as may be parsed at a time (m_limits): while the parse is not
+  // too far ahead (maxAhead), up to maxParsing pictures in parse (kMaxSerialIntraParsing, or maxParsing if more, while
+  // all are serial intra pictures), and past minParsing only while the substreams in parse are fewer than
+  // streamsInParse
   std::sort( m_waiting.begin(), m_waiting.end(), []( const Picture* a, const Picture* b ) { return a->decodingOrderNumber < b->decodingOrderNumber; } );
   size_t streams = 0;
   for( const ParseSlot* slot: m_parsing )
@@ -707,12 +714,12 @@ std::vector<Picture*> ParseService::takeStartingPictures()
   const size_t ahead          = m_parsing.size() + heldResults();
   bool         allSerialIntra = std::all_of( m_parsing.begin(), m_parsing.end(), []( const ParseSlot* slot ) { return serialIntraPicture( *slot->picture ); } );
   size_t       count          = 0;
-  while( count < m_waiting.size() && ahead + count < kMaxAhead )
+  while( count < m_waiting.size() && ahead + count < m_limits.maxAhead )
   {
     const size_t inParse = m_parsing.size() + count;
     allSerialIntra       = allSerialIntra && serialIntraPicture( *m_waiting[count] );
-    const size_t cap     = allSerialIntra ? kMaxSerialIntraParsing : kMaxParsing;
-    if( inParse >= cap || ( inParse >= kMinParsing && streams >= kStreamsInParse ) )
+    const size_t cap     = allSerialIntra ? std::max( kMaxSerialIntraParsing, m_limits.maxParsing ) : m_limits.maxParsing;
+    if( inParse >= cap || ( inParse >= m_limits.minParsing && streams >= m_limits.streamsInParse ) )
     {
       break;
     }

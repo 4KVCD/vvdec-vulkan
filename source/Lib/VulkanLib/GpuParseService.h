@@ -243,6 +243,13 @@ private:
 // picture, as the CPU's parse leaves them
 void applyParsedSaoAlf( CodingStructure& cs, const ParsedPicture& parsed );
 
+// How many pictures the ParseService has in parse and ahead of their reconstruction (GpuParseService.cpp's
+// kIntegratedLimits and kDiscreteLimits say why)
+struct ParseLimits
+{
+  size_t minParsing, maxParsing, streamsInParse, maxAhead;
+};
+
 // The GPU's parse of the pictures ahead of their reconstruction (VVDEC_GPU_PARSE=2), on the parse queue
 class ParseService
 {
@@ -333,6 +340,8 @@ private:
   // larger pictures than now), while a chunk in use now and then stays.
   static constexpr uint64_t kIdlePictures = 64;
   RangeArena                m_records;
+  // how many pictures may be in parse and ahead, for the GPU's kind (GpuParseService.cpp's ParseLimits)
+  const ParseLimits         m_limits;
   // the most records and levels a picture had so far (startRoom): of the intra pictures, of the others, of the others
   // in each temporal layer
   Counts                  m_mostIntra, m_mostInter, m_mostLayer[MAX_TLAYER];
