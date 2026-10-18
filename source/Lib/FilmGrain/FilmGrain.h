@@ -114,7 +114,11 @@ class FilmGrain
   std::unique_ptr<FilmGrainImpl> m_impl;
 
   std::vector<uint32_t> m_line_seeds;
-  fgs_sei               fgs;
+  fgs_sei               fgs;   // as signalled; init_sei adapts the chroma values to the chroma format
+  bool                  m_fgsReceived = false;
+
+  // The chroma patterns depend on the chroma format, which is only known per picture.
+  vvdecColorFormat m_colorFormat = VVDEC_CF_YUV420_PLANAR;
 
 public:
   FilmGrain();
