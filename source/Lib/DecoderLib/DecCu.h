@@ -75,14 +75,15 @@ public:
   void TaskCriticalIntraKernel ( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea );
   void TaskFinishMotionInfo    ( CodingStructure &cs, const int ctuRsAddr, const int col, const int row );
 #if VVDEC_VULKAN
-  // instead of TaskCriticalIntraKernel when the GPU predicts: the jobs of the
-  // CTU's intra and IBC blocks, with their waves, with jobs.inter of its inter
-  // blocks (else they are finished here, as TaskCriticalIntraKernel does), and
-  // with jobs.trafo of its residuals (instead of TaskTrafoCtu)
+  // Instead of TaskCriticalIntraKernel when the GPU predicts: makes the jobs of
+  // the CTU's intra and IBC blocks, with their waves. With jobs.inter it also
+  // makes the jobs of its inter blocks (else it finishes them here, as
+  // TaskCriticalIntraKernel does), and with jobs.trafo those of its residuals
+  // (instead of TaskTrafoCtu).
   void TaskGpuCtu              ( CodingStructure& cs, const int ctuRsAddr, const UnitArea& ctuArea, const gpu::CtuJobs& jobs );
-  // TaskFinishMotionInfo with the inter prediction on the GPU: the motion for
-  // TMVP in the next pictures as the CTU tasks derived it; the GPU stores
-  // that of the CUs DMVR refines into it (shaders/inter.slang)
+  // TaskFinishMotionInfo with the inter prediction on the GPU: stores the
+  // motion for TMVP in the next pictures as the CTU tasks derived it. The GPU
+  // stores the motion of the CUs that DMVR refines (shaders/inter.slang).
   void TaskColMotion           ( CodingStructure& cs, const int ctuRsAddr );
 #endif
 

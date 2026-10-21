@@ -108,13 +108,13 @@ struct CtuData
 // coding structure
 // ---------------------------------------------------------------------------
 
-// the CU maps of the pictures' coding structures (a CodingUnit pointer a 4x4
-// block, luma and chroma: 8 MB at 4K), kept for the next pictures: a picture
-// gives its map back once reconstructed, zeroed (deallocTempInternals, on a
-// worker thread), and the next one set up takes it (allocTempInternals).
-// Allocated anew, a map came zeroed in fresh pages, on the parser's thread,
-// and was zeroed once more there (initStructData): most of a picture's
-// set-up (4K: 4.4 ms).
+// The CU maps of the pictures' coding structures (a CodingUnit pointer per
+// 4x4 block, luma and chroma: 8 MB at 4K), kept for the next pictures. A
+// picture gives its map back zeroed once it is reconstructed
+// (deallocTempInternals, on a worker thread), and the next picture set up
+// takes it (allocTempInternals). Don't allocate a map anew per picture: its
+// fresh pages are zeroed on the parser's thread, which takes most of a
+// picture's set-up (4K: 4.4 ms).
 class CuMapCache
 {
 public:

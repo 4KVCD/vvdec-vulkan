@@ -91,11 +91,11 @@ void DecSlice::parseSlice( Slice* slice, InputBitstream* bitstream, int threadId
 
   AdaptiveLoopFilter::reconstructCoeffAPSs( *slice );
 #if VVDEC_VULKAN
-  // the CTUs' SAO and ALF parameters for the comparison with the GPU's parse
+  // Keep the CTUs' SAO and ALF parameters for the comparison with the GPU's parse.
   const bool gpuCapture = gpu::parseShadowRequested();
-  if( gpuCapture && cs.m_gpuSaoAlf.size() != 7 * size_t( cs.pcv->sizeInCtus ) )
+  if( gpuCapture && cs.m_gpuSaoAlf.size() != gpu::kParseSaoAlfWords * size_t( cs.pcv->sizeInCtus ) )
   {
-    cs.m_gpuSaoAlf.assign( 7 * size_t( cs.pcv->sizeInCtus ), 0u );
+    cs.m_gpuSaoAlf.assign( gpu::kParseSaoAlfWords * size_t( cs.pcv->sizeInCtus ), 0u );
   }
 #endif
 
@@ -171,7 +171,7 @@ void DecSlice::parseSlice( Slice* slice, InputBitstream* bitstream, int threadId
 #if VVDEC_VULKAN
     if( gpuCapture )
     {
-      gpu::captureSaoAlf( cs, int( ctuRsAddr ), cs.m_gpuSaoAlf.data() + 7 * size_t( ctuRsAddr ) );
+      gpu::captureSaoAlf( cs, int( ctuRsAddr ), cs.m_gpuSaoAlf.data() + gpu::kParseSaoAlfWords * size_t( ctuRsAddr ) );
     }
 #endif
 
@@ -227,7 +227,8 @@ bool DecSlice::claimSlice( Slice* slice )
   AdaptiveLoopFilter::reconstructCoeffAPSs( *slice );
   for( unsigned ctuIdx = 0; ctuIdx < slice->getNumCtuInSlice(); ctuIdx++ )
   {
-    // (the picture has no CTU data yet: its CTUs' slices are set when its reconstruction starts, attachCtuData)
+    // Only mark the CTU: the picture has no CTU data yet. Its CTUs' slices are set when its reconstruction starts
+    // (attachCtuData).
     const unsigned ctuRsAddr = slice->getCtuAddrInSlice( ctuIdx );
     CHECK( cs.m_ctuClaimed[ctuRsAddr], "CTU " << ctuRsAddr << " has already been coded in a previous slice" );
     cs.m_ctuClaimed[ctuRsAddr] = 1;

@@ -241,7 +241,7 @@ int VVDecImpl::reset()
     }
   };
 
-  xGrainDoneAll();   // (the GPU's grain done before the frames and pictures go)
+  xGrainDoneAll();   // the GPU's grain must be done before the frames and pictures go
   for( auto& entry: m_rcFrameList )
   {
     vvdec_frame_reset( &std::get<vvdecFrame>( entry ) );
@@ -483,7 +483,7 @@ int VVDecImpl::decode( vvdecAccessUnit& rcAccessUnit, vvdecFrame** ppcFrame )
       }
       else if( !xGrainDone( std::get<vvdecFrame>( *m_pcFrameNext ).sequenceNumber, false ) )
       {
-        *ppcFrame = nullptr;   // (the GPU's grain of the next frame under way: it goes out at a later call)
+        *ppcFrame = nullptr;   // the GPU's grain of the next frame is under way: it goes out at a later call
       }
       else
       {
@@ -978,6 +978,9 @@ void VVDecImpl::xAddGrain( vvdecFrame* frame )
 }
 
 #if VVDEC_VULKAN
+// Frames of more luma samples than this (1920 x 1088) keep fewer frames' grain under way (m_grainFramesAhead).
+static constexpr size_t kGrainLargeFrameSamples = 1920 * 1088;
+
 int64_t VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft, int confTop, bool copied )
 {
   if( !m_gpuFilmGrain )
@@ -990,8 +993,8 @@ int64_t VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft
   const int height = int( frame->planes[0].height );
   m_filmGrainSynth->prepareBlockSeeds( width, height, m_gpuFilmGrain->seeds( size_t( ( width + 15 ) / 16 ) * ( ( height + 15 ) / 16 ) ) );
 
-  // from the picture (at the frame's origin) into the frame: in place, or the
-  // copy in the frame's storage
+  // The grain goes from the picture (at the frame's origin) into the frame: in
+  // place, or into the copy in the frame's storage.
   const PelStorage& pic = pcPic->m_bufs[PIC_RECONSTRUCTION];
   VkDeviceAddress   addr[MAX_NUM_COMPONENT];
   int               stride[MAX_NUM_COMPONENT];
@@ -1043,8 +1046,8 @@ int64_t VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft
 void VVDecImpl::xGrainReap()
 {
 #if VVDEC_VULKAN
-  // the frames whose grain is done: the pictures it read back to the decoder at once (held until their frames go
-  // out, they ran the decoder short of pictures)
+  // The frames whose grain is done give the pictures it read back to the decoder at once. Don't hold the pictures
+  // until their frames go out: that runs the decoder short of pictures.
   for( auto it = m_grainInFlight.begin(); it != m_grainInFlight.end(); )
   {
     if( !m_gpuFilmGrain->done( it->ticket ) )
@@ -1099,7 +1102,7 @@ void VVDecImpl::xGrainDoneAll()
 
 int VVDecImpl::xAddPicture( Picture* pcPic )
 {
-  // (with the GPU's parse, its planes filled from its twins now)
+  // With the GPU's parse, this fills the picture's planes from its twins now.
   m_cDecLib->prepareOutput( pcPic );
 
   // copy internal picture to external (Priority PPS > SPS)
@@ -1356,7 +1359,7 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
   }
 
   // Grain synthesis
-  bool grainReadsPicture = false;   // (the GPU's grain, under way, reads the picture: released once it is done)
+  bool grainReadsPicture = false;   // the GPU's grain, under way, reads the picture, which is released once it is done
   if( m_enableFilmGrain && m_filmGrainCharacteristicsState != FgcNone )
   {
 #if VVDEC_VULKAN
@@ -1368,7 +1371,7 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
     {
       const int64_t ticket = xAddGrainGpu( &cFrame, pcPic, confLeft, confTop, bCreateStorage );
       grainReadsPicture    = bCreateStorage;
-      m_grainFramesAhead   = size_t( cFrame.width ) * cFrame.height > 1920 * 1088 ? 2 : 3;
+      m_grainFramesAhead   = size_t( cFrame.width ) * cFrame.height > kGrainLargeFrameSamples ? 2 : 3;   // see m_grainInFlight
       m_grainInFlight.push_back( { cFrame.sequenceNumber, ticket, bCreateStorage ? pcPic : nullptr } );
     }
     else

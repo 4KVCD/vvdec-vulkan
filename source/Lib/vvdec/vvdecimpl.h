@@ -228,17 +228,18 @@ private:
   void xUpdateFGC                  ( vvdecSEI *sei );
   void xAddGrain                   ( vvdecFrame *frame );
 #if VVDEC_VULKAN
-  // the grain on the GPU: the frame's planes the picture's (cropped by
-  // confLeft, confTop), or (copied) the GPU's copy in the frame's storage;
-  // returns the grain's ticket (gpu::GpuFilmGrain::apply)
+  // Adds the grain on the GPU. The frame's planes are the picture's (cropped
+  // by confLeft and confTop), or with copied the GPU's copy in the frame's
+  // storage. Returns the grain's ticket (gpu::GpuFilmGrain::apply).
   int64_t xAddGrainGpu             ( vvdecFrame *frame, Picture* pcPic, int confLeft, int confTop, bool copied );
 #endif
-  // Whether the frame with the sequence number seq may go out: the GPU adds
-  // no grain to it, or that grain is done -- waited for with wait, and when
-  // m_grainFramesAhead frames' grain is under way -- and then the picture it
-  // read is released. xGrainDoneAll waits for every frame's grain.
+  // Returns whether the frame with the sequence number seq may go out. It may
+  // when the GPU adds no grain to it or when its grain is done. Otherwise
+  // xGrainDone waits for the grain with wait, or when m_grainFramesAhead
+  // frames' grain is under way, and then releases the picture the grain read.
+  // xGrainDoneAll waits for every frame's grain.
   bool xGrainDone                  ( uint64_t seq, bool wait );
-  void xGrainReap                  ();   // (the pictures of the frames whose grain is done, released)
+  void xGrainReap                  ();   // releases the pictures of the frames whose grain is done
   void xGrainDoneAll               ();
 
   static int xRetrieveNalStartCode ( unsigned char *pB, int iZerosInStartcode );
@@ -291,8 +292,9 @@ private:
   int                                      m_grainFramesCpu                = 0;   // and on the CPU
   // The frames whose grain the GPU adds while the decoder goes on: a frame's sequence number, its grain's ticket, and
   // the picture the grain reads (released once the grain is done; null where the frame holds the picture). A frame
-  // goes out once its grain is done, or once m_grainFramesAhead frames' grain is under way (xGrainDone): three up
-  // to 1920 x 1088 (two: 1080p -18%), two past it (each frame holds its storage: 4K, three, 79 MB more for no gain).
+  // goes out once its grain is done, or once m_grainFramesAhead frames' grain is under way (xGrainDone): three up to
+  // 1920 x 1088, because two make 1080p 18% slower, and two above that size, because each frame holds its storage and
+  // three take 79 MB more at 4K for no gain.
   struct GrainInFlight
   {
     uint64_t seq;

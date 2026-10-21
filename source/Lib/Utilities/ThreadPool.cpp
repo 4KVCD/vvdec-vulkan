@@ -92,8 +92,9 @@ static std::chrono::microseconds busyWaitTimeMin( bool shortBusyWait )
 }
 
 // With the GPU (shortBusyWait), the idle thread that keeps looking for tasks while the others block sleeps this long
-// between its looks. Some task waiting for the GPU (a fence) is nearly always running then, so the pool never pauses,
-// and that thread, yielding, kept a core busy: Top Gun slower 1080p took 3.8 ms of CPU a frame, 1.1 ms with 50 us.
+// between its looks. Some task waiting for the GPU (a fence) is nearly always running then, so the pool never pauses.
+// Don't let that thread only yield: it keeps a core busy (Top Gun slower 1080p takes 3.8 ms of CPU a frame, 1.1 ms
+// with a 50 us sleep).
 static std::chrono::microseconds idleSleep( bool shortBusyWait )
 {
   return shortBusyWait ? std::chrono::microseconds( 50 ) : std::chrono::microseconds( 0 );

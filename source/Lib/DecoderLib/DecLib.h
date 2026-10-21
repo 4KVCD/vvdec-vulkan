@@ -131,6 +131,11 @@ public:
 
 private:
   void     reconPicture( Picture* pcPic );
+#if VVDEC_VULKAN
+  // Prints, when the decoder closes, which passes ran on the GPU and the totals of the GPU parse's and the GPU front
+  // end's checks. parseAhead: the stats of the GPU's parse ahead (VVDEC_GPU_PARSE=2), when parseAheadOn.
+  void     reportGpuStatistics( bool parseAheadOn, const gpu::ParseStats& parseAhead ) const;
+#endif
 #if JVET_R0270
   int      finishPicture    ( Picture* pcPic, MsgLevel msgl = NOTICE, bool associatedWithNewClvs );
 #else

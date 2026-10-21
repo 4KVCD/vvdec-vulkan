@@ -348,9 +348,10 @@ Picture* DecLibParser::getNextDecodablePicture()
       continue;
 
 #if VVDEC_VULKAN
-    // A picture the GPU parses is parsed once its GPU parse is done too (parseDone: the CPU read its headers). Taken
-    // before, its instance would wait for the parse -- the longest are those of the pictures this picks first, intra
-    // pictures and a GOP's first pictures (VideoQ 1080p: 190 ms, 450 ms) -- and the decoder thread for that instance.
+    // A picture the GPU parses is parsed only once its GPU parse is done too; parseDone only says that the CPU read
+    // its headers. Don't take it before: its instance would wait for the parse, and the decoder thread would wait for
+    // that instance. The longest parses are those of the pictures this picks first, intra pictures and a GOP's first
+    // pictures (VideoQ 1080p: 190 ms, 450 ms).
     if( pic->gpuParsed.getState() == Barrier::locked && m_gpuParseService && gpu::GpuRecon::parsesPicture( *pic, *pic->cs->sps ) )
       continue;
 #endif
@@ -1005,7 +1006,8 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
       }
 
 #if VVDEC_VULKAN
-      // the slice data for the GPU's parse: compared with this one's (VVDEC_GPU_PARSE=1), or instead of it (=2)
+      // Keep the slice data for the GPU's parse, which is compared with this parse (VVDEC_GPU_PARSE=1) or replaces it
+      // (VVDEC_GPU_PARSE=2).
       const bool gpuParses = decLib->m_gpuParseService && gpu::GpuRecon::parsesPicture( *pic, *slice->getSPS() );
       if( gpuParses || gpu::parseShadowRequested() )
       {
@@ -1015,7 +1017,7 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
       }
       if( gpuParses )
       {
-        // the picture to the GPU's parse once its last slice is in
+        // Hand the picture to the GPU's parse once its last slice is in.
         if( decLib->m_cSliceDecoder.claimSlice( slice ) )
         {
           decLib->m_gpuParseService->enqueue( pic );
@@ -1120,13 +1122,15 @@ void DecLibParser::xActivateParameterSets( const int layerId )
     // assign these fields already, because they are needed by PicListManager::getPicListRange() and Slice::applyReferencePictureSet()
     m_pcParsePic->poc          = m_apcSlicePilot->getPOC();
     m_pcParsePic->eNalUnitType = m_apcSlicePilot->getNalUnitType();
-    // the colocated motion cleared by the first parse task, off this thread; no CU map and no IBC buffer for a picture
-    // the GPU parses (the CPU reconstructs none of its blocks), its CTU data only while it is reconstructed
-    // (CodingStructure::attachCtuData), and its colocated motion only once its work goes to the GPU (gpu::PlanePool)
+    // The first parse task clears the colocated motion, off this thread. A picture the GPU parses gets no CU map and
+    // no IBC buffer, because the CPU reconstructs none of its blocks; it gets its CTU data only while it is
+    // reconstructed (CodingStructure::attachCtuData), and its colocated motion only once its work goes to the GPU
+    // (gpu::PlanePool).
 #if VVDEC_VULKAN
     const bool gpuParses = m_gpuParseService && gpu::GpuRecon::parsesPictures( m_pcParsePic->gpuMemory, *sps );
-    // its planes: once its work goes to the GPU when the GPU parses it (stand-ins until then: DecLibRecon::queueGpuTask),
-    // at once when the CPU does (its parse writes the levels into them)
+    // A picture the GPU parses gets stand-ins of its planes, and its planes only when it is about to be output
+    // (gpu::PlanePool). A picture the CPU parses gets its planes at once, because its parse writes the levels into
+    // them.
     if( m_gpuPlanes )
     {
       if( gpuParses )
@@ -1377,7 +1381,7 @@ void DecLibParser::prepareUnavailablePicture( bool isLost, const PPS* pps, int i
 #if VVDEC_VULKAN
   if( m_gpuPlanes )
   {
-    m_gpuPlanes->acquire( *cFillPic );   // (the CPU fills the lost reference's picture in)
+    m_gpuPlanes->acquire( *cFillPic );   // the CPU fills in the lost reference picture
   }
 #endif
   const APS* nullAlfApss[ALF_CTB_MAX_NUM_APS] = { nullptr, };

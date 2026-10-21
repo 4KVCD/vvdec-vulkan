@@ -285,7 +285,7 @@ void DecLibRecon::borderExtPic( Picture* pic, const Picture* currPic )
 #if VVDEC_VULKAN
       if( m_gpuPlanes )
       {
-        m_gpuPlanes->acquire( *pic );   // (it may have failed before its planes came)
+        m_gpuPlanes->acquire( *pic );   // it may have failed before it got its planes
       }
 #endif
       pic->fillGrey( currPic->cs->sps.get() );
@@ -479,7 +479,8 @@ void DecLibRecon::swapBufs( CodingStructure& cs )
 void DecLibRecon::decompressPicture( Picture* pcPic )
 {
   m_currDecompPic = pcPic;
-  // the CTU data of a picture the GPU parsed, which it has only while it is reconstructed (back in finishGpuTask)
+  // A picture that the GPU parsed has its CTU data only while it is reconstructed: it gets it here and gives it back
+  // in finishGpuTask.
   if( !pcPic->cs->hasCtuData() )
   {
     pcPic->cs->attachCtuData();
@@ -844,9 +845,10 @@ Picture* DecLibRecon::waitForPrevDecompressedPic()
 Picture* DecLibRecon::releasePrevDecompressedPic()
 {
 #if VVDEC_VULKAN
-  // the picture's work on the GPU done but for its download: the instance is
-  // free (what the next picture's work takes from it, the picture's work
-  // there no longer needs, the download's commands aside: GpuRecon)
+  // Once the picture's work on the GPU is done except for its download, the
+  // instance is free: the picture's work no longer needs what the next
+  // picture's work takes from the instance, apart from the download's
+  // commands, which GpuRecon keeps in two sets that take turns.
   if( m_currDecompPic && m_currDecompReleasable && m_decodeThreadPool->numThreads() > 0 )
   {
     bool released = false;
@@ -966,13 +968,13 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
 #if VVDEC_VULKAN
       if( ( decLib.m_gpuFrontEndCheck || param->common.gpuFrontEnd ) && param->common.gpuIntra && !decLib.m_gpuParseDrives )
       {
-        // the CTU's records, written before the motion derivation turns the
-        // motion vector differences into motion vectors
+        // The CTU's records, written before the motion derivation turns the
+        // motion vector differences into motion vectors.
         gpu::writeCuRecords( cs, ctuRsAddr, decLib.m_gpuCuRecords[ctuRsAddr], decLib.m_gpuTuRecords[ctuRsAddr] );
       }
       if( param->common.gpuFrontEnd )
       {
-        // (the GPU front end derives the motion)
+        // The GPU front end derives the motion.
         thisCtuState = MIDER_cont;
         continue;
       }
@@ -1013,7 +1015,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
 #if VVDEC_VULKAN
       if( param->common.gpuFrontEnd )
       {
-        continue;   // (the GPU front end derives the deblocking parameters and edges)
+        continue;   // the GPU front end derives the deblocking parameters and edges
       }
 #endif
       memset( ctuData.lfParam[0], 0, sizeof( LoopFilterParam ) * 2 * cs.pcv->num4x4CtuBlks );
@@ -1060,7 +1062,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       const CtuData& ctuData = cs.getCtuData( ctuRsAddr );
 
 #if VVDEC_VULKAN
-      if( !param->common.gpuResidual )   // (otherwise TaskGpuCtu makes the residual jobs)
+      if( !param->common.gpuResidual )   // otherwise TaskGpuCtu makes the residual jobs
 #endif
       decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskTrafoCtu( cs, ctuRsAddr, ctuArea );
 
@@ -1070,7 +1072,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
       // it has refined it.
       if( !ctuData.slice->isIntra() && param->common.gpuInter )
       {
-        if( cs.picture->stillReferenced && !param->common.gpuFrontEnd )   // (with the GPU front end, mider.slang stores it)
+        if( cs.picture->stillReferenced && !param->common.gpuFrontEnd )   // with the GPU front end, mider.slang stores it
         {
           decLib.m_pcThreadResource[tid]->m_cCuDecoder.TaskColMotion( cs, ctuRsAddr );
         }
@@ -1123,7 +1125,7 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
 #if VVDEC_VULKAN
       if( param->common.gpuFrontEnd )
       {
-        // (the GPU front end makes the jobs)
+        // The GPU front end makes the jobs.
       }
       else if( param->common.gpuIntra )
       {
@@ -1151,9 +1153,9 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
     {
       if( line == decLib.m_gpuEarlyRows - 1 && col == tasksPerLine - 1 )
       {
-        // the early rows' last task: the other tasks of its line are done
-        // (each waited for the one before it), and so are the lines above (this
-        // one waited for the last task of the line above)
+        // The early rows' last task. The other tasks of its line are done,
+        // because each waited for the one before it, and so are the lines
+        // above, because this one waited for the last task of the line above.
         decLib.m_gpuEarlyRowsDone.store( true, std::memory_order_release );
       }
       thisCtuState = DONE;
@@ -1376,20 +1378,20 @@ bool DecLibRecon::ctuTask( int tid, void* task_param )
 // The GPU path
 // ====================================================================================================================
 
-// For the GPU front end's jobs: where each explicit scaling list's dequantization matrix starts among the picture's
-// matrices, plus one, per list (6), log2 width and log2 height (0..6); 0 where there is none
-// (GpuRecon::setDequantOffsets)
+// Returns, for the GPU front end's jobs, where each explicit scaling list's dequantization matrix starts among the
+// picture's matrices, plus one, so that 0 means none: per list, log2 width and log2 height
+// (GpuRecon::setDequantOffsets).
 static std::vector<uint32_t> dequantOffsets( TrQuant& trQuant )
 {
-  std::vector<uint32_t> offsets( 6 * 7 * 7, 0 );
-  for( uint32_t list = 0; list < 6; list++ )
+  std::vector<uint32_t> offsets( gpu::kDequantOffsets, 0 );
+  for( uint32_t list = 0; list < gpu::kScalingLists; list++ )
   {
-    for( uint32_t w = 0; w < 7; w++ )
+    for( uint32_t w = 0; w < gpu::kScalingLog2Sizes; w++ )
     {
-      for( uint32_t h = 0; h < 7; h++ )
+      for( uint32_t h = 0; h < gpu::kScalingLog2Sizes; h++ )
       {
         const int* m = trQuant.getDequantCoeff( list, w, h );
-        offsets[( list * 7 + w ) * 7 + h] = m ? uint32_t( m - trQuant.getDequantCoeffBuf() ) + 1 : 0;
+        offsets[( list * gpu::kScalingLog2Sizes + w ) * gpu::kScalingLog2Sizes + h] = m ? uint32_t( m - trQuant.getDequantCoeffBuf() ) + 1 : 0;
       }
     }
   }
@@ -1563,7 +1565,8 @@ void DecLibRecon::addGpuTasks( Picture* pic, FinishPicTaskParam& finishParam )
   CBarrierVec queueBarriers{ pic->m_ctuTaskCounter.donePtr(), &m_gpuFiltersPrepared };
   if( m_gpuEarlyRows > 0 )
   {
-    // (a ready check rather than a barrier, so that a CTU task's failure fails it instead of leaving it waiting)
+    // The task waits through a ready check rather than a barrier, so that a CTU task's failure fails it instead of
+    // leaving it waiting.
     m_gpuEarlyRowsQueued.clearException();
     m_gpuEarlyRowsQueued.lock();
     m_decodeThreadPool->addBarrierTask( TP_TASK_NAME_ARG( "POC:" + std::to_string( pic->poc ) + " earlyRowsTask" )
@@ -1664,7 +1667,7 @@ bool DecLibRecon::earlyRowsTask( int, void* taskParam )
   DecLibRecon*        dec   = param->decLib;
   if( dec->m_gpuPlanes )
   {
-    dec->m_gpuPlanes->acquire( *param->pic );   // (its planes, as in queueGpuTask)
+    dec->m_gpuPlanes->acquire( *param->pic );   // gives the picture its planes and colocated motion where it lacks them
   }
   gpu::PictureJobs    jobs;
   jobs.trafo = &dec->m_gpuTrafoJobs;
@@ -1687,23 +1690,24 @@ bool DecLibRecon::queueGpuTask( int, void* taskParam )
     dec->m_gpuPlanes->acquireColMotion( *param->pic );
     param->pic->gpuNeedsDownload = !dec->m_gpuPlanes->hasPlanes( *param->pic );
   }
-  // With the GPU's parse: what it left (the records in the parse result, the coefficient levels in the picture)
+  // With the GPU's parse: what the parse left, its records and its coefficient levels (the parse result)
   gpu::ParsedPicture* parsed = dec->m_gpuParseDrives ? cs.picture->gpuParseResult : nullptr;
   if( dec->m_gpuParseDrives && !parsed )
   {
     THROW_RECOVERABLE( "Vulkan: the GPU parse gave up on the slice data of POC " << cs.picture->poc );
   }
-  // The picture's slice table (its CTUs are parsed, so their slices are known), for the GPU's motion derivation of
-  // this picture and of the pictures it is the colocated picture of
+  // The picture's slice table, for the GPU's motion derivation of this picture and of the pictures whose colocated
+  // picture it is. Its CTUs are parsed, so their slices are known.
   if( ( dec->m_gpuFrontEndCheck || dec->m_gpuFrontEnd ) && cs.colMiAllocator )
   {
     gpu::writeSliceTable( cs, cs.gpuSliceTable( gpu::sliceTableWords( cs ) ) );
   }
   gpu::PictureJobs jobs = dec->gpuPictureJobs( cs );
   jobs.parsed           = parsed;
-  jobs.shared           = parsed ? dec->m_gpuShared : nullptr;   // (with the GPU's front end: no early rows)
+  // The shared buffers only with the GPU's parse, which comes with the GPU front end and so without early rows
+  jobs.shared = parsed ? dec->m_gpuShared : nullptr;
   // With DMVR and the CPU front end, the GPU stores the refined motion for TMVP in the first part (the CTU tasks
-  // stored the rest), which the next pictures' CTU tasks wait for.
+  // stored the rest of the motion), and the next pictures' CTU tasks wait for that part.
   const bool refine = dec->m_gpuInter && cs.picture->stillReferenced && !dec->m_gpuFrontEnd;
   param->download   = dec->m_gpuRecon->startPicture( cs, jobs, dec->m_doDeblock, dec->m_doSAO ? &dec->m_cSAO : nullptr,
                                                      dec->m_doALF ? &dec->m_cALF : nullptr, cs.picture->m_bufs[PIC_RECONSTRUCTION], refine );
@@ -1719,8 +1723,8 @@ bool DecLibRecon::computeDoneTask( int, void* taskParam )
   Picture* pic = param->pic;
   if( pic->gpuParseResult )
   {
-    // the parse result back to the GPU's parse: both parts of the front end read its records, and the picture's work,
-    // the second part's too, is done
+    // Give the parse result back to the GPU's parse. Both parts of the front end read its records, and all of the
+    // picture's work is done now.
     dec->m_gpuParseService->release( pic->gpuParseResult );
     pic->gpuParseResult = nullptr;
   }
@@ -1730,7 +1734,7 @@ bool DecLibRecon::computeDoneTask( int, void* taskParam )
   }
   if( dec->m_gpuFrontEndCheck && dec->m_gpuIntra )
   {
-    // the check: the GPU front end's results against the CPU's
+    // The check: the GPU front end's results against the CPU's
     gpu::PictureJobs cpuJobs;
     cpuJobs.trafo = dec->m_gpuResidual ? &dec->m_gpuTrafoJobs : nullptr;
     cpuJobs.inter = dec->m_gpuInter ? &dec->m_gpuInterJobs : nullptr;
@@ -1746,7 +1750,7 @@ bool DecLibRecon::finishGpuTask( int, void* taskParam )
   FinishPicTaskParam* param = static_cast<FinishPicTaskParam*>( taskParam );
   param->decLib->m_gpuRecon->endDownload( param->download );
   param->pic->cs->deallocTempInternals();
-  param->pic->cs->detachCtuData();   // (a picture the GPU parsed: nothing reads its CTU data after its GPU work)
+  param->pic->cs->detachCtuData();   // for a picture the GPU parsed: nothing reads its CTU data after its GPU work
 
 #ifdef TRACE_ENABLE_ITT
   // mark end of frame

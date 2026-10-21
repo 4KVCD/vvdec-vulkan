@@ -62,6 +62,13 @@ namespace vvdec
 #if VVDEC_VULKAN
 // The reconstruction instances (DecLibRecon) the decoder takes turns with when the GPU reconstructs
 static constexpr size_t kGpuReconInstances = 3;
+// With the GPU and the CPU's front end, pictures of up to this many luma samples (1080p, in whole 16-sample rows) take
+// only kSmallPictureInstances of the instances (reconPicture).
+static constexpr int    kSmallPictureSamples   = 1920 * 1088;
+static constexpr size_t kSmallPictureInstances = 2;
+// The pictures parsed ahead at most by default with the GPU (create)
+static constexpr int    kGpuParseDelay      = 12;
+static constexpr int    kGpuParseAheadDelay = 96;   // with the GPU's parse ahead (VVDEC_GPU_PARSE=2)
 #endif
 
 #ifdef TRACE_ENABLE_ITT
@@ -172,29 +179,28 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
 #endif
 
 #if VVDEC_VULKAN
-  // with the GPU, 12 pictures parsed ahead at most by default (the CPU's
-  // default, 1.5 a thread, is 24 at 16 threads): as fast (VideoQ, 16 threads:
-  // 1080p 642.4 -> 653.1 fps, 4K 177.7 -> 179.4), and each picture parsed
-  // ahead holds its buffers (1080p 13 MB, 4K 44 MB): peak commit 1080p 793 ->
-  // 633 MB, 4K 2546 -> 2014 MB. 8 saves 60 MB more at 1080p but is slower
-  // there (634 vs 657 fps).
+  // With the GPU, at most kGpuParseDelay (12) pictures are parsed ahead by default; the CPU's default, 1.5 a thread,
+  // is 24 at 16 threads. That is as fast (VideoQ, 16 threads: 1080p 642.4 -> 653.1 fps, 4K 177.7 -> 179.4), and each
+  // picture parsed ahead holds its buffers (1080p 13 MB, 4K 44 MB): the peak commit goes from 793 to 633 MB at 1080p
+  // and from 2546 to 2014 MB at 4K. 8 saves 60 MB more at 1080p but is slower there (634 vs 657 fps).
   //
-  // With the GPU's parse ahead, 96: a picture waiting for its reconstruction holds only what the parse left (its
-  // records and levels; stand-ins of its planes), and the window hides the long serial parse of the intra pictures
-  // (~200 ms at 1080p, ~500 ms at 4K) behind the reconstruction of the pictures before: with 64 the reconstruction
-  // still stalled at each intra picture, 80-120 ms at 1080p. (VideoQ, 16 threads, 12 pictures parsed at a time:
-  // 1080p 254.8 / 288.6 / 288.9 fps with 64 / 96 / 128, peak commit 953 / 1063 / 1193 MB; 4K 102.4 / 112.0 / 109.5
-  // fps, 2359 / 2608 / 2891 MB; the first frame 40 ms later with 96 than with 64. With 12: 1080p 180.7 fps, 4K 71.5.)
+  // With the GPU's parse ahead, kGpuParseAheadDelay (96). A picture waiting for its reconstruction holds only what the
+  // parse left (its records and levels, and stand-ins of its planes), and the window hides the long serial parse of
+  // the intra pictures (~200 ms at 1080p, ~500 ms at 4K) behind the reconstruction of the pictures before. With 64 the
+  // reconstruction still stalls at each intra picture, 80-120 ms at 1080p. (VideoQ, 16 threads, 12 pictures parsed at
+  // a time: 1080p 254.8 / 288.6 / 288.9 fps with 64 / 96 / 128, peak commit 953 / 1063 / 1193 MB; 4K 102.4 / 112.0 /
+  // 109.5 fps, 2359 / 2608 / 2891 MB; the first frame 40 ms later with 96 than with 64. With 12: 1080p 180.7 fps, 4K
+  // 71.5.)
   if( m_gpu && defaultParseDelay )
   {
-    parserFrameDelay  = gpuParsesAhead( *m_gpu ) ? 96 : std::min( parserFrameDelay, 12 );
+    parserFrameDelay  = gpuParsesAhead( *m_gpu ) ? kGpuParseAheadDelay : std::min( parserFrameDelay, kGpuParseDelay );
     m_parseFrameDelay = parserFrameDelay;
   }
 #endif
 
 #if VVDEC_VULKAN
-  // with the GPU, the CPU waits for it a lot: its idle threads block at once
-  // instead of spinning (which on an APU takes power from the GPU too)
+  // With the GPU, the CPU waits for it a lot, so its idle threads block at once
+  // instead of spinning, which on an APU takes power from the GPU too.
   m_decodeThreadPool.reset( new ThreadPool( numDecThreads, "DecThread", m_gpu != nullptr ) );
 #else
   m_decodeThreadPool.reset( new ThreadPool( numDecThreads, "DecThread" ) );
@@ -221,7 +227,7 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
   m_decLibParser.create  ( m_decodeThreadPool.get(), m_parseFrameDelay, (int) m_decLibRecon.size(), numDecThreads, errHandlingFlags );
 
 #if VVDEC_VULKAN
-  // what the instances share (the front end's ranges; with the GPU's parse, the deferred predictions' planes)
+  // What the instances share: the front end's ranges, and with the GPU's parse the deferred predictions' planes
   if( m_gpu )
   {
     m_gpuShared = std::make_unique<gpu::SharedReconBuffers>( m_gpu );
@@ -280,11 +286,164 @@ void DecLib::create( int numDecThreads, int parserFrameDelay, const UserAllocato
   DTRACE_UPDATE( g_trace_ctx, std::make_pair( "final", 1 ) );
 }
 
+#if VVDEC_VULKAN
+// Adds the counts of the GPU parse's check of one instance to sum.
+static void addParseStats( gpu::ParseStats& sum, const gpu::ParseStats& s )
+{
+  sum.pictures += s.pictures;
+  sum.errors += s.errors;
+  sum.cusCompared += s.cusCompared;
+  sum.cusDiffer += s.cusDiffer;
+  sum.tusCompared += s.tusCompared;
+  sum.tusDiffer += s.tusDiffer;
+  sum.ctusCompared += s.ctusCompared;
+  sum.ctusDiffer += s.ctusDiffer;
+  sum.levelsCompared += s.levelsCompared;
+  sum.levelsDiffer += s.levelsDiffer;
+  sum.substreams += s.substreams;
+  sum.runs += s.runs;
+  sum.submissions += s.submissions;
+  sum.capsCompared += s.capsCompared;
+  sum.capsDiffer += s.capsDiffer;
+  for( int i = 0; i < gpu::kParseProfileWords; i++ )
+  {
+    sum.prof[i] += s.prof[i];
+  }
+}
+
+// Adds the counts of the GPU front end's check of one instance to sum.
+static void addFrontEndStats( gpu::FrontEndStats& sum, const gpu::FrontEndStats& s )
+{
+  sum.pictures += s.pictures;
+  sum.compared += s.compared;
+  sum.mismatched += s.mismatched;
+  sum.lfpCompared += s.lfpCompared;
+  sum.lfpMismatched += s.lfpMismatched;
+  sum.lfpEdges += s.lfpEdges;
+  for( int k = 0; k < gpu::kJobKinds; k++ )
+  {
+    sum.jobsCompared[k] += s.jobsCompared[k];
+    sum.jobsMismatched[k] += s.jobsMismatched[k];
+  }
+  sum.edgesCompared += s.edgesCompared;
+  sum.sortedCompared += s.sortedCompared;
+  sum.sortedMismatched += s.sortedMismatched;
+  sum.edgesMismatched += s.edgesMismatched;
+}
+
+// Prints the GPU parse's profile (VVDEC_GPU_PROFILE with the shader clock), when it counted anything. The parts are in
+// the device clock's ticks (100 MHz on AMD, shown as ms), decodeBin's in the subgroup's cycles; the indices are
+// parse.slang's kProf counters.
+static void reportParseProfile( const gpu::ParseStats& parse )
+{
+  if( parse.prof[0] == 0 )
+  {
+    return;
+  }
+  const auto ms = [&]( int k ) { return double( parse.prof[k] ) / 1e5; };
+  msg( INFO,
+       "GPU: parse's profile, summed over the substreams: dispatches %.1f ms (their starts %.1f ms), CTUs %.1f ms, of which CUs %.1f ms "
+       "(residuals %.1f ms, of which levels written %.1f ms), records %.1f ms, SAO/ALF %.1f ms; decodeBin %llu cycles, decodeBinEP %llu; "
+       "bins %llu context-coded, %llu bypass; CUs %llu, TUs %llu, coded blocks %llu, levels %llu" "\n",
+       ms( 14 ), ms( 15 ), ms( 0 ), ms( 1 ), ms( 2 ), ms( 3 ), ms( 4 ), ms( 5 ), (unsigned long long) parse.prof[6],
+       (unsigned long long) parse.prof[7], (unsigned long long) parse.prof[8], (unsigned long long) parse.prof[9],
+       (unsigned long long) parse.prof[10], (unsigned long long) parse.prof[11], (unsigned long long) parse.prof[12],
+       (unsigned long long) parse.prof[13] );
+}
+
+void DecLib::reportGpuStatistics( bool parseAheadOn, const gpu::ParseStats& parseAhead ) const
+{
+  // Which passes ran on the GPU and which on the CPU
+  int filtersGpu = 0, filtersCpu = 0, intraGpu = 0, intraCpu = 0, interGpu = 0, interCpu = 0, residualGpu = 0, residualCpu = 0;
+  for( auto& dec: m_decLibRecon )
+  {
+    filtersGpu  += dec.filterPicturesGpu();
+    filtersCpu  += dec.filterPicturesCpu();
+    intraGpu    += dec.intraPicturesGpu();
+    intraCpu    += dec.intraPicturesCpu();
+    interGpu    += dec.interPicturesGpu();
+    interCpu    += dec.interPicturesCpu();
+    residualGpu += dec.residualPicturesGpu();
+    residualCpu += dec.residualPicturesCpu();
+  }
+  msg( INFO,
+       "GPU: residuals of %d pictures on the GPU, %d on the CPU; inter prediction of %d on the GPU, %d on the CPU; intra prediction of %d on the GPU, "
+       "%d on the CPU; in-loop filters of %d on the GPU, %d on the CPU\n",
+       residualGpu, residualCpu, interGpu, interCpu, intraGpu, intraCpu, filtersGpu, filtersCpu );
+
+  // The GPU parse: its check against the CPU's parse (VVDEC_GPU_PARSE=1), or the parse ahead (VVDEC_GPU_PARSE=2)
+  gpu::ParseStats parse;
+  bool            parseOn = false;
+  for( auto& dec: m_decLibRecon )
+  {
+    if( const gpu::ParseStats* s = dec.parseStats() )
+    {
+      parseOn = true;
+      addParseStats( parse, *s );
+    }
+  }
+  if( parseAheadOn )
+  {
+    parse = parseAhead;
+  }
+  if( parseOn || parseAheadOn )
+  {
+    reportParseProfile( parse );
+  }
+  if( parseOn )
+  {
+    msg( INFO,
+         "GPU: parse (VVDEC_GPU_PARSE) of %lld pictures: CUs %lld compared with the CPU's, %lld differ; TUs %lld, %lld; CTUs (with SAO, ALF) %lld, "
+         "%lld; levels %lld, %lld; substreams %lld in %lld runs, %lld submissions" "\n",
+         (long long) parse.pictures, (long long) parse.cusCompared, (long long) parse.cusDiffer, (long long) parse.tusCompared,
+         (long long) parse.tusDiffer, (long long) parse.ctusCompared, (long long) parse.ctusDiffer, (long long) parse.levelsCompared,
+         (long long) parse.levelsDiffer, (long long) parse.substreams, (long long) parse.runs, (long long) parse.submissions );
+    msg( INFO, "GPU: parse's job lists' room (VVDEC_GPU_PARSE): %lld pictures compared with the CPU's records' (gpu::frontCapacities), %lld differ\n",
+         (long long) parse.capsCompared, (long long) parse.capsDiffer );
+  }
+  if( parseAheadOn )
+  {
+    msg( INFO,
+         "GPU: parse ahead (VVDEC_GPU_PARSE=2) of %lld pictures: %lld submissions with %.1f pictures each on average, %lld pictures parsed again "
+         "for room, %lld failed; substreams %lld in %lld runs; at most %lld CU and %lld TU records a picture\n",
+         (long long) parse.pictures, (long long) parse.submissions,
+         parse.submissions > 0 ? double( parse.parsingSum ) / double( parse.submissions ) : 0.0, (long long) parse.restarts,
+         (long long) parse.errors, (long long) parse.substreams, (long long) parse.runs, (long long) parse.maxCus, (long long) parse.maxTus );
+  }
+
+  // The GPU front end's check against the CPU front end (VVDEC_GPU_MIDER=1)
+  gpu::FrontEndStats check;
+  bool               checkOn = false;
+  for( auto& dec: m_decLibRecon )
+  {
+    if( const gpu::FrontEndStats* s = dec.frontEndStats() )
+    {
+      checkOn = true;
+      addFrontEndStats( check, *s );
+    }
+  }
+  if( checkOn )
+  {
+    msg( INFO, "GPU: motion derivation (VVDEC_GPU_MIDER) of %lld pictures: %lld 4x4 blocks compared with the CPU's, %lld differ\n",
+         (long long) check.pictures, (long long) check.compared, (long long) check.mismatched );
+    msg( INFO, "GPU: deblocking parameters (VVDEC_GPU_MIDER): %lld compared with the CPU's (%lld with a boundary strength), %lld differ\n",
+         (long long) check.lfpCompared, (long long) check.lfpEdges, (long long) check.lfpMismatched );
+    msg( INFO, "GPU: jobs (VVDEC_GPU_MIDER): residuals' %lld compared with the CPU's, %lld differ; inter's %lld, %lld; intra's %lld, %lld\n",
+         (long long) check.jobsCompared[0], (long long) check.jobsMismatched[0], (long long) check.jobsCompared[1],
+         (long long) check.jobsMismatched[1], (long long) check.jobsCompared[2], (long long) check.jobsMismatched[2] );
+    msg( INFO, "GPU: deblocking edges (VVDEC_GPU_MIDER): %lld compared with the CPU's, %lld differ\n", (long long) check.edgesCompared,
+         (long long) check.edgesMismatched );
+    msg( INFO, "GPU: intra's order (VVDEC_GPU_MIDER): %lld bands compared with the CPU's, %lld differ\n", (long long) check.sortedCompared,
+         (long long) check.sortedMismatched );
+  }
+}
+#endif
+
 void DecLib::destroy()
 {
 #if VVDEC_VULKAN
-  // the GPU's parse ahead stops (its last submission done) after the thread pool's threads, which hand it pictures,
-  // and before the pool, which it wakes, and the pictures it writes into go
+  // The GPU's parse ahead stops, once its last submission is done, after the thread pool's threads, which hand it
+  // pictures, and before the pool, which it wakes, and before the pictures it writes into go.
   const bool      parseAheadOn = m_gpuParseService != nullptr;
   gpu::ParseStats parseAhead;
   const auto      stopParseAhead = [&]() {
@@ -304,135 +463,14 @@ void DecLib::destroy()
     m_decodeThreadPool.reset();
   }
 #if VVDEC_VULKAN
-  stopParseAhead();   // (without a thread pool)
+  stopParseAhead();   // when there is no thread pool
 #endif
 
   m_decLibParser.destroy();
 #if VVDEC_VULKAN
   if( m_gpu )
   {
-    int filtersGpu = 0, filtersCpu = 0, intraGpu = 0, intraCpu = 0, interGpu = 0, interCpu = 0, residualGpu = 0, residualCpu = 0;
-    for( auto& dec: m_decLibRecon )
-    {
-      filtersGpu += dec.filterPicturesGpu();
-      filtersCpu += dec.filterPicturesCpu();
-      intraGpu   += dec.intraPicturesGpu();
-      intraCpu   += dec.intraPicturesCpu();
-      interGpu   += dec.interPicturesGpu();
-      interCpu   += dec.interPicturesCpu();
-      residualGpu += dec.residualPicturesGpu();
-      residualCpu += dec.residualPicturesCpu();
-    }
-    msg( INFO,
-         "GPU: residuals of %d pictures on the GPU, %d on the CPU; inter prediction of %d on the GPU, %d on the CPU; intra prediction of %d on the GPU, "
-         "%d on the CPU; in-loop filters of %d on the GPU, %d on the CPU\n",
-         residualGpu, residualCpu, interGpu, interCpu, intraGpu, intraCpu, filtersGpu, filtersCpu );
-    gpu::ParseStats parse;
-    bool            parseOn = false;
-    for( auto& dec: m_decLibRecon )
-    {
-      if( const gpu::ParseStats* s = dec.parseStats() )
-      {
-        parseOn = true;
-        parse.pictures += s->pictures;
-        parse.errors += s->errors;
-        parse.cusCompared += s->cusCompared;
-        parse.cusDiffer += s->cusDiffer;
-        parse.tusCompared += s->tusCompared;
-        parse.tusDiffer += s->tusDiffer;
-        parse.ctusCompared += s->ctusCompared;
-        parse.ctusDiffer += s->ctusDiffer;
-        parse.levelsCompared += s->levelsCompared;
-        parse.levelsDiffer += s->levelsDiffer;
-        parse.substreams += s->substreams;
-        parse.runs += s->runs;
-        parse.submissions += s->submissions;
-        parse.capsCompared += s->capsCompared;
-        parse.capsDiffer += s->capsDiffer;
-        for( int i = 0; i < 16; i++ )
-        {
-          parse.prof[i] += s->prof[i];
-        }
-      }
-    }
-    if( parseAheadOn )
-    {
-      parse = parseAhead;
-    }
-    if( parseOn || parseAheadOn )
-    {
-      if( parse.prof[0] != 0 )
-      {
-        // the parts in the device clock's ticks (100 MHz on AMD: shown as ms), decodeBin's in the subgroup's cycles
-        const auto ms = [&]( int k ) { return double( parse.prof[k] ) / 1e5; };
-        msg( INFO,
-             "GPU: parse's profile, summed over the substreams: dispatches %.1f ms (their starts %.1f ms), CTUs %.1f ms, of which CUs %.1f ms "
-             "(residuals %.1f ms, of which levels written %.1f ms), records %.1f ms, SAO/ALF %.1f ms; decodeBin %llu cycles, decodeBinEP %llu; "
-             "bins %llu context-coded, %llu bypass; CUs %llu, TUs %llu, coded blocks %llu, levels %llu" "\n",
-             ms( 14 ), ms( 15 ), ms( 0 ), ms( 1 ), ms( 2 ), ms( 3 ), ms( 4 ), ms( 5 ), (unsigned long long) parse.prof[6],
-             (unsigned long long) parse.prof[7], (unsigned long long) parse.prof[8], (unsigned long long) parse.prof[9],
-             (unsigned long long) parse.prof[10], (unsigned long long) parse.prof[11], (unsigned long long) parse.prof[12],
-             (unsigned long long) parse.prof[13] );
-      }
-    }
-    if( parseOn )
-    {
-      msg( INFO,
-           "GPU: parse (VVDEC_GPU_PARSE) of %lld pictures: CUs %lld compared with the CPU's, %lld differ; TUs %lld, %lld; CTUs (with SAO, ALF) %lld, "
-           "%lld; levels %lld, %lld; substreams %lld in %lld runs, %lld submissions" "\n",
-           (long long) parse.pictures, (long long) parse.cusCompared, (long long) parse.cusDiffer, (long long) parse.tusCompared,
-           (long long) parse.tusDiffer, (long long) parse.ctusCompared, (long long) parse.ctusDiffer, (long long) parse.levelsCompared,
-           (long long) parse.levelsDiffer, (long long) parse.substreams, (long long) parse.runs, (long long) parse.submissions );
-      msg( INFO, "GPU: parse's job lists' room (VVDEC_GPU_PARSE): %lld pictures compared with the CPU's records' (gpu::frontCapacities), %lld differ\n",
-           (long long) parse.capsCompared, (long long) parse.capsDiffer );
-    }
-    if( parseAheadOn )
-    {
-      msg( INFO,
-           "GPU: parse ahead (VVDEC_GPU_PARSE=2) of %lld pictures: %lld submissions with %.1f pictures each on average, %lld pictures parsed again "
-           "for room, %lld failed; substreams %lld in %lld runs; at most %lld CU and %lld TU records a picture\n",
-           (long long) parse.pictures, (long long) parse.submissions,
-           parse.submissions > 0 ? double( parse.parsingSum ) / double( parse.submissions ) : 0.0, (long long) parse.restarts,
-           (long long) parse.errors, (long long) parse.substreams, (long long) parse.runs, (long long) parse.maxCus, (long long) parse.maxTus );
-    }
-    gpu::FrontEndStats check;
-    bool               checkOn = false;
-    for( auto& dec: m_decLibRecon )
-    {
-      if( const gpu::FrontEndStats* s = dec.frontEndStats() )
-      {
-        checkOn = true;
-        check.pictures += s->pictures;
-        check.compared += s->compared;
-        check.mismatched += s->mismatched;
-        check.lfpCompared += s->lfpCompared;
-        check.lfpMismatched += s->lfpMismatched;
-        check.lfpEdges += s->lfpEdges;
-        for( int k = 0; k < 3; k++ )
-        {
-          check.jobsCompared[k] += s->jobsCompared[k];
-          check.jobsMismatched[k] += s->jobsMismatched[k];
-        }
-        check.edgesCompared += s->edgesCompared;
-        check.sortedCompared += s->sortedCompared;
-        check.sortedMismatched += s->sortedMismatched;
-        check.edgesMismatched += s->edgesMismatched;
-      }
-    }
-    if( checkOn )
-    {
-      msg( INFO, "GPU: motion derivation (VVDEC_GPU_MIDER) of %lld pictures: %lld 4x4 blocks compared with the CPU's, %lld differ\n",
-           (long long) check.pictures, (long long) check.compared, (long long) check.mismatched );
-      msg( INFO, "GPU: deblocking parameters (VVDEC_GPU_MIDER): %lld compared with the CPU's (%lld with a boundary strength), %lld differ\n",
-           (long long) check.lfpCompared, (long long) check.lfpEdges, (long long) check.lfpMismatched );
-      msg( INFO, "GPU: jobs (VVDEC_GPU_MIDER): residuals' %lld compared with the CPU's, %lld differ; inter's %lld, %lld; intra's %lld, %lld\n",
-           (long long) check.jobsCompared[0], (long long) check.jobsMismatched[0], (long long) check.jobsCompared[1],
-           (long long) check.jobsMismatched[1], (long long) check.jobsCompared[2], (long long) check.jobsMismatched[2] );
-      msg( INFO, "GPU: deblocking edges (VVDEC_GPU_MIDER): %lld compared with the CPU's, %lld differ\n", (long long) check.edgesCompared,
-           (long long) check.edgesMismatched );
-      msg( INFO, "GPU: intra's order (VVDEC_GPU_MIDER): %lld bands compared with the CPU's, %lld differ\n", (long long) check.sortedCompared,
-           (long long) check.sortedMismatched );
-    }
+    reportGpuStatistics( parseAheadOn, parseAhead );
   }
 #endif
   for( auto &dec: m_decLibRecon )
@@ -441,16 +479,16 @@ void DecLib::destroy()
   }
 
 #if VVDEC_VULKAN
-  m_gpuShared.reset();   // (as the instances' own buffers: their work is done)
+  m_gpuShared.reset();   // like the instances' own buffers, after their work is done
   if( m_gpuPlanes )
   {
-    m_gpuPlanes->waitDownloads();   // (the downloads started ahead write into planes freed now)
+    m_gpuPlanes->waitDownloads();   // the downloads started ahead write into planes that are freed now
   }
 #endif
   m_picListManager.deleteBuffers();
 
 #if VVDEC_VULKAN
-  // after the last picture buffer is gone (the pictures' stand-ins are the pool's)
+  // After the last picture buffer is gone, because the pictures' stand-ins are the pool's
   m_gpuPlanes.reset();
   if( m_gpu )
   {
@@ -613,7 +651,7 @@ void DecLib::sanitizeBrokenPicture( Picture* pcParsedPic )
 #if VVDEC_VULKAN
   if( m_gpuPlanes )
   {
-    m_gpuPlanes->acquire( *pcParsedPic );   // (stand-ins until its GPU work is queued, which it did not get to)
+    m_gpuPlanes->acquire( *pcParsedPic );   // it has stand-ins until its GPU work is queued, which it did not get to
   }
 #endif
   pcParsedPic->fillGrey( m_decLibParser.getParameterSetManager().getFirstSPS() );
@@ -648,7 +686,7 @@ int DecLib::finishPicture( Picture* pcPic, MsgLevel msgl )
 #if VVDEC_VULKAN
     if( m_gpuPlanes )
     {
-      m_gpuPlanes->acquire( *pcPic );   // (it may have failed before its planes came)
+      m_gpuPlanes->acquire( *pcPic );   // it may have failed before it got its planes
     }
 #endif
     pcPic->fillGrey( pcPic->cs->sps.get() );
@@ -772,9 +810,10 @@ int DecLib::finishPicture( Picture* pcPic, MsgLevel msgl )
   return pcSlice->getPOC();
 }
 
-// With the GPU's parse, the next pictures to output whose downloads start when a picture is output (PlanePool): its
-// download is usually done when its turn comes, and only these pictures and the ones the application holds have their
-// planes in host memory. (Two: as fast as three, with a picture's planes less; one was ~1-2% slower at 1080p.)
+// With the GPU's parse, the number of next pictures to output whose downloads start when a picture is output
+// (PlanePool). A picture's download is then usually done when its turn comes, and only these pictures and the ones the
+// application holds have their planes in host memory. Two are as fast as three and hold a picture's planes less; one
+// is about 1-2% slower at 1080p.
 static constexpr size_t kOutputsDownloadedAhead = 2;
 
 void DecLib::prepareOutput( Picture* pcPic )
@@ -812,7 +851,7 @@ void DecLib::checkPictureHashSEI( Picture* pcPic )
 #if VVDEC_VULKAN
   if( m_gpuPlanes )
   {
-    m_gpuPlanes->finishDownload( *pcPic );   // (the hash reads its planes)
+    m_gpuPlanes->finishDownload( *pcPic );   // the hash reads its planes
   }
 #endif
 
@@ -940,8 +979,8 @@ void DecLib::reconPicture( Picture* pcPic )
   CHECK_FATAL( std::any_of( m_decLibRecon.begin(), m_decLibRecon.end(), [=]( auto& rec ) { return rec.getCurrPic() == pcPic; } ),
          "(Reused) Picture structure is still in progress in decLibRecon." );
 
-  // the instances in turn: the first takes the picture and goes behind the
-  // last of those in turn
+  // The instances take turns: the first takes the picture and goes behind the
+  // last of those that take turns.
   size_t inTurn = m_decLibRecon.size();
 #if VVDEC_VULKAN
   // With the GPU and the CPU's front end, pictures up to 1080p take the first
@@ -951,13 +990,13 @@ void DecLib::reconPicture( Picture* pcPic )
   // colocated picture's first part and more pictures in flight keep the GPU
   // busy.
   const bool gpuFrontEnd = m_gpu && m_gpu->options().frontEnd && !m_gpu->options().frontEndCheck;
-  if( m_gpu && pcPic->lumaSize().area() <= 1920 * 1088 && !gpuFrontEnd )
+  if( m_gpu && pcPic->lumaSize().area() <= kSmallPictureSamples && !gpuFrontEnd )
   {
-    inTurn = std::min<size_t>( inTurn, 2 );
+    inTurn = std::min<size_t>( inTurn, kSmallPictureInstances );
   }
   if( inTurn < m_reconInTurn )
   {
-    // the pictures of the instances leaving the turns finished now
+    // The pictures of the instances that leave the turns are finished now.
     auto leaving = m_decLibRecon.begin();
     std::advance( leaving, inTurn );
     for( ; leaving != m_decLibRecon.end(); ++leaving )
@@ -975,8 +1014,8 @@ void DecLib::reconPicture( Picture* pcPic )
   std::advance( behind, inTurn );
   m_decLibRecon.splice( behind, m_decLibRecon, m_decLibRecon.begin() );
 
-  // the instance's previous picture: with the GPU, possibly still downloading
-  // while this one starts
+  // The instance's previous picture. With the GPU, it may still be downloading
+  // while this one starts.
   Picture* donePic = reconInstance->releasePrevDecompressedPic();
   try
   {
