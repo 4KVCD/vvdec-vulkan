@@ -174,10 +174,11 @@ static void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const Lo
   }
 }
 
-// Compares one of the GPU's job buffers (count jobs; list is its JobKind) with the CTU tasks' jobs of that kind.
+// Compares one of the GPU's job buffers (list is its JobKind) with the CTU tasks' jobs of that kind. count is how many
+// jobs the GPU made; the buffer holds the first stored of them (fewer when the GPU made more than the buffer's room).
 template<typename Job>
-static void compareJobs( const CodingStructure& cs, int list, const uint32_t* gpu, size_t count, const std::vector<std::vector<Job>>& cpu,
-                         FrontEndStats& stats )
+static void compareJobs( const CodingStructure& cs, int list, const uint32_t* gpu, size_t count, size_t stored,
+                         const std::vector<std::vector<Job>>& cpu, FrontEndStats& stats )
 {
   static const char* const names[kJobKinds] = { "residuals'", "inter's", "intra's" };
   constexpr size_t         words            = sizeof( Job ) / sizeof( uint32_t );
@@ -197,7 +198,7 @@ static void compareJobs( const CodingStructure& cs, int list, const uint32_t* gp
     for( const Job& job: cpu[ctu] )
     {
       stats.jobsCompared[list]++;
-      if( at < count && memcmp( &job, gpu + at * words, sizeof( Job ) ) != 0 )
+      if( at < stored && memcmp( &job, gpu + at * words, sizeof( Job ) ) != 0 )
       {
         stats.jobsMismatched[list]++;
         if( stats.jobsReported < kMaxReports )
@@ -376,22 +377,22 @@ void GpuRecon::compareFrontEnd( const CodingStructure& cs, const MotionInfo* cpu
     // jobs.slang's totals of the residual, inter (its three lists) and intra jobs, after its blocks' sums
     const uint32_t* lists = reinterpret_cast<const uint32_t*>( m_check.jobBlocks.mapped ) + size_t( m_frontEnd.jobBlockCount ) * kJobLists;
     const uint32_t  totals[kJobKinds] = { lists[kListTrafo], lists[kListInter] + lists[kListInterBdof] + lists[kListInterAffine], lists[kListIntra] };
-    const auto      count             = [&]( int k ) { return std::min<size_t>( totals[k], m_frontEnd.jobCapacity[k] ); };
+    const auto      stored            = [&]( int k ) { return std::min<size_t>( totals[k], m_frontEnd.jobCapacity[k] ); };
     if( jobs->trafo )
     {
       compareJobs( cs, kTrafoJobs, reinterpret_cast<const uint32_t*>( m_check.jobs[kTrafoJobs].mapped ),
-                   totals[kTrafoJobs] > m_frontEnd.jobCapacity[kTrafoJobs] ? totals[kTrafoJobs] : count( kTrafoJobs ), *jobs->trafo, m_check.stats );
+                   totals[kTrafoJobs], stored( kTrafoJobs ), *jobs->trafo, m_check.stats );
     }
     if( jobs->inter )
     {
       compareJobs( cs, kInterJobs, reinterpret_cast<const uint32_t*>( m_check.jobs[kInterJobs].mapped ),
-                   totals[kInterJobs] > m_frontEnd.jobCapacity[kInterJobs] ? totals[kInterJobs] : count( kInterJobs ),
+                   totals[kInterJobs], stored( kInterJobs ),
                    interJobsInBufferOrder( *jobs->inter ), m_check.stats );
     }
     if( jobs->intra )
     {
       compareJobs( cs, kIntraJobs, reinterpret_cast<const uint32_t*>( m_check.jobs[kIntraJobs].mapped ),
-                   totals[kIntraJobs] > m_frontEnd.jobCapacity[kIntraJobs] ? totals[kIntraJobs] : count( kIntraJobs ), *jobs->intra, m_check.stats );
+                   totals[kIntraJobs], stored( kIntraJobs ), *jobs->intra, m_check.stats );
       // intrasort.slang's band count, and its flag for a wave past the waves it can order
       const uint32_t* info = reinterpret_cast<const uint32_t*>( m_check.sortInfo.mapped );
       if( info[FrontEndCheck::kSortInfoFlags] != 0 )

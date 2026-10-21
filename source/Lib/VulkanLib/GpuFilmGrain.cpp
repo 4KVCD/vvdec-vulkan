@@ -92,7 +92,13 @@ GpuFilmGrain::~GpuFilmGrain()
 {
   for( Slot& slot: m_slots )
   {
-    finish( slot );   // the frame's grain must be done before the commands, tables and seeds go
+    // The frame's grain must be done before the commands, tables and seeds go. finish() would throw on a failed wait,
+    // and an exception leaving a destructor ends the program, so the destructor waits itself: a failed wait means a
+    // lost device, whose work has stopped anyway.
+    if( slot.ticket >= 0 )
+    {
+      m_ctx->api().vkWaitForFences( m_ctx->device(), 1, &slot.fence, VK_TRUE, UINT64_MAX );
+    }
     m_ctx->destroyFence( slot.fence );
     m_ctx->destroyCommandPool( slot.pool );
     m_ctx->free( slot.tables );
