@@ -370,16 +370,16 @@ static void listSliceCtus( const CodingStructure& cs, Slice& slice, size_t si, u
   auto beginStream = [&]() {
     const size_t at = in.streams.size();
     in.streams.resize( at + kParseStreamWords, 0u );
-    in.streams[at + 0] = streamOffset;
-    in.streams[at + 1] = streamSize( subStream );
-    in.streams[at + 2] = uint32_t( in.ctuList.size() / 2 );
-    in.streams[at + 4] = uint32_t( si );
+    in.streams[at + kParseStreamStart] = streamOffset;
+    in.streams[at + kParseStreamSize]  = streamSize( subStream );
+    in.streams[at + kParseStreamCtu]   = uint32_t( in.ctuList.size() / 2 );
+    in.streams[at + kParseStreamSlice] = uint32_t( si );
     in.numStreams++;
   };
   auto endStream = [&]() {
-    const size_t at    = in.streams.size() - kParseStreamWords;
-    in.streams[at + 3] = uint32_t( in.ctuList.size() / 2 ) - in.streams[at + 2];
-    CHECK( in.streams[at + 0] + in.streams[at + 1] > sliceOffset + dataSize, "a substream past its slice's data" );
+    const size_t at                   = in.streams.size() - kParseStreamWords;
+    in.streams[at + kParseStreamCtus] = uint32_t( in.ctuList.size() / 2 ) - in.streams[at + kParseStreamCtu];
+    CHECK( in.streams[at + kParseStreamStart] + in.streams[at + kParseStreamSize] > sliceOffset + dataSize, "a substream past its slice's data" );
   };
   beginStream();
   const int widthInCtus = int( pcv.widthInCtus );
@@ -740,7 +740,7 @@ bool checkParseContexts()
   return ok;
 }
 
-void captureSaoAlf( const CodingStructure& cs, int ctuRsAddr, uint32_t out[7] )
+void captureSaoAlf( const CodingStructure& cs, int ctuRsAddr, uint32_t out[kParseSaoAlfWords] )
 {
   const CtuData& ctu = cs.getCtuData( ctuRsAddr );
   for( int comp = 0; comp < 3; comp++ )
@@ -787,7 +787,7 @@ static constexpr int kMaxReports = 20;
 static constexpr size_t kCuWords     = sizeof( CuRecord ) / sizeof( uint32_t );
 static constexpr size_t kTuWords     = sizeof( TuRecord ) / sizeof( uint32_t );
 static constexpr size_t kCtuWords    = sizeof( CtuRecord ) / sizeof( uint32_t );
-static constexpr size_t kSaoAlfWords = 7;
+static constexpr size_t kSaoAlfWords = kParseSaoAlfWords;
 // A TU record's words from 9 on say where the GPU's parse put the levels, so only the words before are compared (the
 // levels' check compares the levels)
 static constexpr int kTuWordsCompared = 9;
@@ -920,24 +920,25 @@ void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint
   writeCtuRecords( cs, cpuCus, cpuTus, cpuCtus.data() );
   for( int ctu = 0; ctu < ctus; ctu++ )
   {
-    const uint32_t* gpuCtu = gpuCtus + kCtuWords * ctu;
-    const uint32_t* out    = gpuCtuOut + kParseCtuOutWords * ctu;
-    compareCtu( poc, ctu, cpuCtus[ctu], gpuCtu, cpuSaoAlf.empty() ? nullptr : cpuSaoAlf.data() + kSaoAlfWords * ctu, out + 2, stats );
-    // The CTU's CUs and TUs, record by record, when the GPU's parse found as many of each as the CPU's; otherwise all
-    // of them count as differing. (The CTU record holds its first CU and their count, and its first TU; the CTU's
-    // output holds its TU count.)
+    const CtuRecord& gpuCtu = *reinterpret_cast<const CtuRecord*>( gpuCtus + kCtuWords * ctu );
+    const uint32_t*  out    = gpuCtuOut + kParseCtuOutWords * ctu;
+    compareCtu( poc, ctu, cpuCtus[ctu], gpuCtu.w, cpuSaoAlf.empty() ? nullptr : cpuSaoAlf.data() + kSaoAlfWords * ctu, out + kParseCtuOutSaoAlf,
+                stats );
+    // Compare the CTU's CUs and TUs record by record when the GPU's parse found as many of each as the CPU's;
+    // otherwise all of them count as differing. The CTU record holds its first CU, their count, and its first TU; the
+    // CTU's ctuOut holds its TU count.
     const auto& cus = cpuCus[ctu];
     const auto& tus = cpuTus[ctu];
     stats.cusCompared += int64_t( cus.size() );
     stats.tusCompared += int64_t( tus.size() );
-    if( ( gpuCtu[1] & 0xffff ) != cus.size() || out[1] != tus.size() )
+    if( gpuCtu.numCus() != cus.size() || out[kParseCtuOutTuCount] != tus.size() )
     {
       stats.cusDiffer += int64_t( cus.size() );
       stats.tusDiffer += int64_t( tus.size() );
       continue;
     }
-    compareCus( poc, ctu, cus, gpuCus + kCuWords * gpuCtu[0], stats );
-    compareTus( poc, ctu, tus, gpuTus + kTuWords * gpuCtu[3], stats );
+    compareCus( poc, ctu, cus, gpuCus + kCuWords * gpuCtu.firstCu(), stats );
+    compareTus( poc, ctu, tus, gpuTus + kTuWords * gpuCtu.firstTu(), stats );
   }
   addLevels( poc, levels, gpuTus, stats );
 }

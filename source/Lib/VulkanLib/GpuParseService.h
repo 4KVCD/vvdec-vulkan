@@ -117,7 +117,7 @@ public:
   // into levels (the slot holds both until takeStaged and takeLevels), every substream at its start. Returns false
   // when a slice's data was not captured.
   bool prepare( const CodingStructure& cs, StagedRecords staged, Buffer levels );
-  // With VVDEC_GPU_PROFILE and the shader clock: the parse's cycle counts are added up at prof (16 words)
+  // With VVDEC_GPU_PROFILE and the shader clock: the parse's cycle counts are added up at prof (kParseProfileWords)
   void setProfile( VkDeviceAddress prof ) { m_prof = prof; }
   // Records into cmd the clearing of the parse's counters (in GPU memory) when the parse starts from the beginning
   // (after prepare or restart). The steps after it need a barrier.
@@ -162,7 +162,7 @@ public:
   size_t                 numTus() const { return m_numTus; }
   size_t                 numLevels() const { return m_numLevels; }
   const FrontCapacities& capacities() const { return m_caps; }
-  // CTU ctu's SAO and ALF parameters, as the parse wrote them (gpu::captureSaoAlf's layout: 7 words)
+  // CTU ctu's SAO and ALF parameters, as the parse wrote them (gpu::captureSaoAlf's layout: kParseSaoAlfWords words)
   const uint32_t*        saoAlf( int ctu ) const;
   // Records into cmd the copies of the records to their places in raster order: the CU and TU records into cus and
   // tus (numCus() and numTus() of them), the CTU records into ctus. Without a barrier after them.
@@ -177,8 +177,8 @@ public:
   uint32_t          errors() const;   // the substreams given up on, or left unparsed
   const uint32_t*   ctuRecords() const { return reinterpret_cast<const uint32_t*>( m_ctus.mapped ); }   // CtuRecord a CTU
   const uint32_t*   ctuOut() const { return reinterpret_cast<const uint32_t*>( m_ctuOut.mapped ); }     // kParseCtuOutWords a CTU
-  // the numbers of CUs and TUs (the CTUs' counts), then the parse's counters: the staged CU and TU records, the job
-  // lists' room (5 words); those of the step progress() read last
+  // The numbers of CUs and TUs (the CTUs' counts), then the parse's counters: the staged CU and TU records, the job
+  // lists' room (5 words) and the levels. These are the totals of the step that progress() read last.
   const uint32_t*   totals() const;
 
   Picture* picture  = nullptr;   // the picture parsed (ParseService)
@@ -218,15 +218,16 @@ private:
 };
 
 // What the GPU's parse left of a picture once it is done (ParseService): its CU, TU and CTU records in raster order
-// (GpuFrontEnd.h's layout) and its coefficient levels (each TU record says where its are), in GPU memory of their own
-// and of their exact size; its CTUs' SAO and ALF parameters; the room the front end's job lists need. The picture holds it until its GPU work is done (ParseService::release).
+// (GpuFrontEnd.h's layout) and its coefficient levels (each TU record says where its levels are), in GPU memory of
+// their own and of their exact size; its CTUs' SAO and ALF parameters; the room the front end's job lists need. The
+// picture holds it until its GPU work is done (ParseService::release).
 class ParsedPicture
 {
 public:
   size_t                 numCus() const { return m_numCus; }
   size_t                 numTus() const { return m_numTus; }
   const FrontCapacities& capacities() const { return m_caps; }
-  // CTU ctu's SAO and ALF parameters, as the parse wrote them (gpu::captureSaoAlf's layout: 7 words)
+  // CTU ctu's SAO and ALF parameters, as the parse wrote them (gpu::captureSaoAlf's layout: kParseSaoAlfWords words)
   const uint32_t*        saoAlf( int ctu ) const { return m_saoAlf.data() + size_t( ctu ) * kSaoAlfWords; }
   VkDeviceAddress        cus() const { return m_cus.addr; }
   VkDeviceAddress        tus() const { return m_tus.addr; }
@@ -240,7 +241,7 @@ public:
 
 private:
   friend class ParseService;
-  static constexpr size_t kSaoAlfWords = 7;
+  static constexpr size_t kSaoAlfWords = kParseSaoAlfWords;
   size_t                  m_numCus = 0, m_numTus = 0, m_numLevels = 0;
   FrontCapacities         m_caps;
   std::vector<uint32_t>   m_saoAlf;

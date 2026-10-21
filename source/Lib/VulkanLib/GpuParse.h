@@ -67,11 +67,21 @@ namespace gpu
 // The layout of parse.slang's tables (keep in step with its constants)
 static constexpr int kParsePicWords    = 160 + 3 * 128;   // the picture's: 160 parameter words, 3 chroma QP maps of 128
 static constexpr int kParseSliceWords  = 16;    // a slice's parameter words (its initial contexts follow them)
-static constexpr int kParseStreamWords = 8;     // a substream's words
-static constexpr int kParseStreamSize  = 1;     // the word of a substream's that holds its size in bytes
+static constexpr int kParseStreamWords = 8;     // a substream's words, of which these hold:
+static constexpr int kParseStreamStart = 0;     // its first byte in the slice data
+static constexpr int kParseStreamSize  = 1;     // its size in bytes
+static constexpr int kParseStreamCtu   = 2;     // its first CTU in the CTU list
+static constexpr int kParseStreamCtus  = 3;     // its number of CTUs
+static constexpr int kParseStreamSlice = 4;     // the index of its slice
 static constexpr int kParseCtuOutWords = 16;    // the words parse.slang writes per CTU besides the records (ctuOut)
 static constexpr int kParseScanTab     = 961;   // the scan table's words (writeParseScans)
 static constexpr int kParseProfileWords = 16;   // parse_prof's counters (parse.slang's kProf...)
+// The words of a CTU's ctuOut: its CU count, its TU count, then its SAO and ALF parameters (kParseSaoAlfWords of them,
+// in captureSaoAlf's layout)
+static constexpr int kParseCtuOutCuCount = 0;
+static constexpr int kParseCtuOutTuCount = 1;
+static constexpr int kParseCtuOutSaoAlf  = 2;
+static constexpr int kParseSaoAlfWords   = 7;
 
 // The inputs of a picture's parse, laid out as parse.slang reads them
 struct ParseInput
@@ -114,9 +124,9 @@ void writeParseScans( uint32_t* out );
 // Checks parsectx.slang's context sets against vvdec's (Ctx), and the grouped scans parse.slang composes from the
 // scan table against vvdec's. Returns false, after printing what differs, when anything does.
 bool checkParseContexts();
-// Writes a CTU's SAO and ALF parameters as the CPU's parse left them, in the 7 words that parse.slang writes for them
-// (words 2..8 of the CTU's ctuOut).
-void captureSaoAlf( const CodingStructure& cs, int ctuRsAddr, uint32_t out[7] );
+// Writes a CTU's SAO and ALF parameters as the CPU's parse left them, in the kParseSaoAlfWords words that parse.slang
+// writes for them (from word kParseCtuOutSaoAlf of the CTU's ctuOut on).
+void captureSaoAlf( const CodingStructure& cs, int ctuRsAddr, uint32_t out[kParseSaoAlfWords] );
 
 // The comparison of the GPU's parse with the CPU's, summed over the pictures
 struct ParseStats
@@ -131,7 +141,7 @@ struct ParseStats
   int64_t ctusDiffer     = 0;   // CTUs whose record or SAO / ALF parameters differ
   int64_t levelsCompared = 0;
   int64_t levelsDiffer   = 0;
-  int     reported       = 0;   // the differences printed so far (compareParse prints at most 20: kMaxReports)
+  int     reported       = 0;   // the differences printed so far (compareParse prints at most kMaxReports, 20)
   int64_t substreams     = 0;
   int64_t runs           = 0;    // the substreams' runs: one per substream and dispatch until the substream is parsed
   int64_t submissions    = 0;    // the parse's submissions (GpuRecon::runParse)
@@ -148,8 +158,8 @@ struct ParseStats
 // Compares the GPU's parse of a picture with the CPU's, adds the counts to stats and prints the first differences.
 // gpuCus, gpuTus: the GPU's CU and TU records in raster order of the CTUs (gathered by parsecompact.slang); gpuCtus:
 // its CTU records; gpuCtuOut: parse.slang's ctuOut words.
-// cpuCus, cpuTus: the CPU's records, CTU by CTU; cpuSaoAlf: the CPU's SAO and ALF parameters, 7 words per CTU
-// (captureSaoAlf's; empty when they were not captured). levels: the levels check's counts (the levels compared, the
+// cpuCus, cpuTus: the CPU's records, CTU by CTU; cpuSaoAlf: the CPU's SAO and ALF parameters, kParseSaoAlfWords words
+// per CTU (captureSaoAlf's; empty when they were not captured). levels: the levels check's counts (the levels compared, the
 // levels that differ, the index + 1 of the first TU found to differ, a component of it that differs). errors: the
 // number of substreams that gave up or were left unparsed.
 void compareParse( const CodingStructure& cs, const uint32_t* gpuCus, const uint32_t* gpuTus, const uint32_t* gpuCtus, const uint32_t* gpuCtuOut,
