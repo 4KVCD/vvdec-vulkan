@@ -55,21 +55,38 @@ struct Params
 
 [[vk::push_constant]] Params pc;
 
-#define THREADS 64
+static const int kThreads       = 64;
+static const int kTrafoJobWords = 10;   // TrafoJob's words
 
-#define FLAG_TS 1
-#define FLAG_BDPCM_HOR 2
-#define FLAG_BDPCM_VER 4
-#define FLAG_ZERO 8
+// The job's flags (TrafoJob::Flags)
+static const int FLAG_TS        = 1;   // transform skip
+static const int FLAG_BDPCM_HOR = 2;
+static const int FLAG_BDPCM_VER = 4;
+static const int FLAG_ZERO      = 8;   // no coefficients: the residual is zero
 
-#define COEFF_MIN ( -32768 )   // maxLog2TrDynamicRange 15
-#define COEFF_MAX 32767
+// The coefficients' and intermediate values' range: 16 bits (vvdec's maxLog2TrDynamicRange of 15)
+static const int kMaxLog2TrDynamicRange = 15;
+static const int COEFF_MIN              = -32768;
+static const int COEFF_MAX              = 32767;
+
+// The transform matrices' entries have TRANSFORM_MATRIX_SHIFT fractional bits. The vertical transform rounds its sums
+// by kFirstShift bits; the horizontal one by secondShift(), which brings the residual to the sample's scale.
+static const int TRANSFORM_MATRIX_SHIFT = 6;
+static const int kFirstShift            = TRANSFORM_MATRIX_SHIFT + 1;
+
+int secondShift()
+{
+  return TRANSFORM_MATRIX_SHIFT + kMaxLog2TrDynamicRange - 1 - pc.bitDepth;
+}
+
+// The coefficients are kept in rows of kCoefRow: a block has at most 32 x 32 of them.
+static const int kCoefRow = 32;
 
 // A block has at most 32 x 32 levels (64-point transforms keep only the first 32 coefficients). The coefficients and
 // the vertical transform's output are 16-bit (dequantization, LFNST and the vertical transform clip them to 16 bits):
 // read back as 16-bit values, they take the GPU's fast 24-bit multiply-add instead of a 32-bit multiply.
-groupshared int16_t s_coef[32 * 32];   // [row][column]
-groupshared int16_t s_mid[64 * 32];    // the vertical transform's output, [row][column]
+groupshared int16_t s_coef[32 * kCoefRow];   // [row][column]
+groupshared int16_t s_mid[64 * kCoefRow];    // the vertical transform's output, [row][column]
 groupshared int     s_lfnst[16];       // LFNST's input
 
 // LFNST's input order: the top-left 4x4 coefficients in diagonal scan order, as positions x + 4 y
@@ -90,12 +107,17 @@ int strideOf( int comp )
   return comp == 0 ? pc.stride0 : pc.stride12;
 }
 
-// Offset of the N x N matrix (N = 1 << log2) of a transform type in matrices,
-// which holds DCT-II from 2 to 64 points, then DST-VII and DCT-VIII from 4 to 32.
+// The layout of pc.matrices: DCT-II's N x N matrices from 2 to 64 points, then DST-VII's and DCT-VIII's from 4 to 32
+// (the sums of N * N over those sizes).
+static const int kDst7At = 4 + 16 + 64 + 256 + 1024 + 4096;
+static const int kDct8At = kDst7At + 16 + 64 + 256 + 1024;
+
+// Offset of the N x N matrix (N = 1 << log2) of a transform type (vvdec's TransType: 0 DCT-II, 1 DCT-VIII, 2 DST-VII)
+// in pc.matrices.
 int matrixOffset( int type, int log2 )
 {
   const int first = type == 0 ? 1 : 2;
-  int       at    = type == 0 ? 0 : ( type == 2 ? 5460 : 6820 );
+  int       at    = type == 0 ? 0 : ( type == 2 ? kDst7At : kDct8At );
   for( int m = first; m < log2; m++ )
   {
     at += 1 << ( 2 * m );
@@ -137,14 +159,14 @@ void fillBlock( int16_t* p, int stride, int log2W, int log2H, bool wide, int tid
   {
     const uint pair  = ( uint( v ) & 0xffffu ) * 0x10001u;
     const int  log2G = log2W - 2;   // the 4-sample groups of a row
-    for( int s = tid; s < ( 1 << ( log2G + log2H ) ); s += THREADS )
+    for( int s = tid; s < ( 1 << ( log2G + log2H ) ); s += kThreads )
     {
       *(uint2*)at( p, uint( ( s >> log2G ) * stride + ( s & ( ( 1 << log2G ) - 1 ) ) * 4 ) ) = uint2( pair, pair );
     }
   }
   else
   {
-    for( int s = tid; s < ( 1 << ( log2W + log2H ) ); s += THREADS )
+    for( int s = tid; s < ( 1 << ( log2W + log2H ) ); s += kThreads )
     {
       *at( p, uint( ( s >> log2W ) * stride + ( s & ( ( 1 << log2W ) - 1 ) ) ) ) = int16_t( v );
     }
@@ -181,7 +203,7 @@ void horizontalRows<let NX : int>( int16_t* mHor, int16_t* block, int16_t* other
     [ForceUnroll]
     for( int k = 0; k < NX; k++ )
     {
-      sum += int( s_mid[y * 32 + k] ) * m[k];
+      sum += int( s_mid[y * kCoefRow + k] ) * m[k];
     }
     storeGroup( block, other, stride, 4 * g, y, clamp( sum >> shift2, int4( COEFF_MIN ), int4( COEFF_MAX ) ), ict );
   }
@@ -263,23 +285,23 @@ void storeResidual( TrafoBlock t, int x, int y, int r )
 void transformSkip( int tid, TrafoBlock t )
 {
   const bool bdpcm = ( t.flags & ( FLAG_BDPCM_HOR | FLAG_BDPCM_VER ) ) != 0;
-  for( int s = tid; s < t.width * t.height; s += THREADS )
+  for( int s = tid; s < t.width * t.height; s += kThreads )
   {
     const int x     = s & ( t.width - 1 );
     const int y     = s >> t.log2W;
     const int level = x <= t.lastX && y <= t.lastY ? int( *at( t.levels, uint( y * t.levelStride + x ) ) ) : 0;
-    s_coef[y * 32 + x] = int16_t( bdpcm ? level : dequant( level, t.scale, t.rightShift, t.inputMaximum ) );
+    s_coef[y * kCoefRow + x] = int16_t( bdpcm ? level : dequant( level, t.scale, t.rightShift, t.inputMaximum ) );
   }
   GroupMemoryBarrierWithGroupSync();
   if( bdpcm )
   {
     const bool hor = ( t.flags & FLAG_BDPCM_HOR ) != 0;
-    for( int line = tid; line < ( hor ? t.height : t.width ); line += THREADS )
+    for( int line = tid; line < ( hor ? t.height : t.width ); line += kThreads )
     {
       int sum = 0;
       for( int k = 0; k < ( hor ? t.width : t.height ); k++ )
       {
-        const int i     = hor ? line * 32 + k : k * 32 + line;
+        const int i     = hor ? line * kCoefRow + k : k * kCoefRow + line;
         const int level = int( s_coef[i] );
         sum             = k == 0 ? level : clip3( COEFF_MIN, COEFF_MAX, sum + level );
         s_coef[i]       = int16_t( dequant( sum, t.scale, t.rightShift, t.inputMaximum ) );
@@ -290,20 +312,20 @@ void transformSkip( int tid, TrafoBlock t )
   if( t.wide )
   {
     const int log2G = t.log2W - 2;   // the 4-sample groups of a row
-    for( int s = tid; s < t.height << log2G; s += THREADS )
+    for( int s = tid; s < t.height << log2G; s += kThreads )
     {
       const int y = s >> log2G;
       const int x = ( s & ( ( 1 << log2G ) - 1 ) ) * 4;
-      const int i = y * 32 + x;
+      const int i = y * kCoefRow + x;
       storeGroup( t.block, t.other, t.stride, x, y, int4( int( s_coef[i] ), int( s_coef[i + 1] ), int( s_coef[i + 2] ), int( s_coef[i + 3] ) ), t.ict );
     }
     return;
   }
-  for( int s = tid; s < t.width * t.height; s += THREADS )
+  for( int s = tid; s < t.width * t.height; s += kThreads )
   {
     const int x = s & ( t.width - 1 );
     const int y = s >> t.log2W;
-    storeResidual( t, x, y, int( s_coef[y * 32 + x] ) );
+    storeResidual( t, x, y, int( s_coef[y * kCoefRow + x] ) );
   }
 }
 
@@ -315,7 +337,7 @@ void oneDimensionalTransform( int tid, TrafoBlock t, int16_t* m, int shift2 )
   const int  n     = ver ? t.height : t.width;
   const int  count = ver ? t.lastY + 1 : t.lastX + 1;
   const int  shift = shift2 + 1;
-  for( int s = tid; s < n; s += THREADS )
+  for( int s = tid; s < n; s += kThreads )
   {
     int sum = 0;
     for( int k = 0; k < count; k++ )
@@ -331,8 +353,12 @@ void oneDimensionalTransform( int tid, TrafoBlock t, int16_t* m, int shift2 )
 // xInvLfnst: the set's matrix times the top-left 4x4 coefficients (only 8 of them for 4x4 and 8x8 blocks) gives the
 // top-left 4x4 for blocks 4 wide or high, else the top-left 8x8 without its bottom-right 4x4, row by row or
 // (transposed) column by column; into s_coef, whose other coefficients (of the top-left 8x8 at most) it zeroes.
+// LFNST's matrices (pc.lfnst): g_lfnst8x8, 4 sets x 2 indices x 48 rows of 16, then g_lfnst4x4, 4 x 2 x 16 rows of 16
+static const int kLfnst4x4At = 4 * 2 * 48 * 16;
+
 void lfnstCoefficients( int tid, TrafoBlock t )
 {
+  // TrafoJob::setLfnst's word
   const int  index     = int( t.lfnst & 3 ) - 1;
   const int  set       = int( ( t.lfnst >> 2 ) & 3 );
   const bool transpose = ( t.lfnst & 16 ) != 0;
@@ -344,15 +370,15 @@ void lfnstCoefficients( int tid, TrafoBlock t )
   }
   const int nx = min( t.width, 8 );
   const int ny = min( t.height, 8 );
-  for( int s = tid; s < nx * ny; s += THREADS )
+  for( int s = tid; s < nx * ny; s += kThreads )
   {
     const int k = s / nx;
-    s_coef[k * 32 + s - k * nx] = int16_t( 0 );
+    s_coef[k * kCoefRow + s - k * nx] = int16_t( 0 );
   }
   GroupMemoryBarrierWithGroupSync();
   if( tid < ( block8 ? 48 : 16 ) )
   {
-    int8_t* row = pc.lfnst + ( block8 ? ( ( set * 2 + index ) * 48 + tid ) * 16 : 6144 + ( ( set * 2 + index ) * 16 + tid ) * 16 );
+    int8_t* row = pc.lfnst + ( block8 ? ( ( set * 2 + index ) * 48 + tid ) * 16 : kLfnst4x4At + ( ( set * 2 + index ) * 16 + tid ) * 16 );
     int     sum = 0;
     for( int i = 0; i < inputs; i++ )
     {
@@ -375,7 +401,7 @@ void lfnstCoefficients( int tid, TrafoBlock t )
       x = transpose ? 4 + ( ( tid - 32 ) >> 2 ) : ( tid - 32 ) & 3;
       y = transpose ? ( tid - 32 ) & 3 : 4 + ( ( tid - 32 ) >> 2 );
     }
-    s_coef[y * 32 + x] = int16_t( clip3( COEFF_MIN, COEFF_MAX, ( sum + 64 ) >> 7 ) );
+    s_coef[y * kCoefRow + x] = int16_t( clip3( COEFF_MIN, COEFF_MAX, ( sum + 64 ) >> 7 ) );
   }
 }
 
@@ -383,25 +409,25 @@ void lfnstCoefficients( int tid, TrafoBlock t )
 void verticalGroups( int tid, TrafoBlock t, int16_t* mVer, int nx, int ny )
 {
   const int log2Nx = firstbithigh( uint( nx ) );
-  for( int i = tid; i < ( t.height >> 2 ) << log2Nx; i += THREADS )
+  for( int i = tid; i < ( t.height >> 2 ) << log2Nx; i += kThreads )
   {
     const int x   = i & ( nx - 1 );
     const int y   = ( i >> log2Nx ) * 4;
-    int4      sum = int4( 64 );
+    int4      sum = int4( 1 << ( kFirstShift - 1 ) );
     for( int k = 0; k < ny; k += 4 )
     {
       [ForceUnroll]
       for( int j = 0; j < 4; j++ )
       {
         const uint2 w = *(uint2*)at( mVer, uint( ( k + j ) * t.height + y ) );
-        sum += int( s_coef[( k + j ) * 32 + x] ) * unpackSamples( w );
+        sum += int( s_coef[( k + j ) * kCoefRow + x] ) * unpackSamples( w );
       }
     }
-    const int4 mid            = clamp( sum >> 7, int4( COEFF_MIN ), int4( COEFF_MAX ) );
-    s_mid[y * 32 + x]         = int16_t( mid.x );
-    s_mid[( y + 1 ) * 32 + x] = int16_t( mid.y );
-    s_mid[( y + 2 ) * 32 + x] = int16_t( mid.z );
-    s_mid[( y + 3 ) * 32 + x] = int16_t( mid.w );
+    const int4 mid            = clamp( sum >> kFirstShift, int4( COEFF_MIN ), int4( COEFF_MAX ) );
+    s_mid[y * kCoefRow + x]         = int16_t( mid.x );
+    s_mid[( y + 1 ) * kCoefRow + x] = int16_t( mid.y );
+    s_mid[( y + 2 ) * kCoefRow + x] = int16_t( mid.z );
+    s_mid[( y + 3 ) * kCoefRow + x] = int16_t( mid.w );
   }
 }
 
@@ -411,7 +437,7 @@ void horizontalGroups( int tid, TrafoBlock t, int16_t* mHor, int nx, int shift2 
   const int log2G   = t.log2W - 2;
   const int g       = tid & ( ( 1 << log2G ) - 1 );
   const int y0      = tid >> log2G;
-  const int rowStep = THREADS >> log2G;
+  const int rowStep = kThreads >> log2G;
   if( nx == 4 )
   {
     horizontalRows<4>( mHor, t.block, t.other, t.stride, t.width, t.height, g, y0, rowStep, shift2, t.ict );
@@ -428,7 +454,7 @@ void horizontalGroups( int tid, TrafoBlock t, int16_t* mHor, int nx, int shift2 
     for( int k = 0; k < nx; k++ )
     {
       const uint2 w = *(uint2*)at( mHor, uint( k * t.width + 4 * g ) );
-      sum += int( s_mid[y * 32 + k] ) * unpackSamples( w );
+      sum += int( s_mid[y * kCoefRow + k] ) * unpackSamples( w );
     }
     storeGroup( t.block, t.other, t.stride, 4 * g, y, clamp( sum >> shift2, int4( COEFF_MIN ), int4( COEFF_MAX ) ), t.ict );
   }
@@ -437,33 +463,33 @@ void horizontalGroups( int tid, TrafoBlock t, int16_t* mHor, int nx, int shift2 
 // Both transforms a thread per sample (blocks 2 wide or high, or rows not 8-byte aligned)
 void transformSamples( int tid, TrafoBlock t, int16_t* mVer, int16_t* mHor, int nx, int ny, int shift2 )
 {
-  for( int s = tid; s < nx * t.height; s += THREADS )
+  for( int s = tid; s < nx * t.height; s += kThreads )
   {
     const int y   = s / nx;
     const int x   = s - y * nx;
     int       sum = 0;
     for( int k = 0; k < ny; k++ )
     {
-      sum += int( s_coef[k * 32 + x] ) * int( mVer[k * t.height + y] );
+      sum += int( s_coef[k * kCoefRow + x] ) * int( mVer[k * t.height + y] );
     }
-    s_mid[y * 32 + x] = int16_t( clip3( COEFF_MIN, COEFF_MAX, ( sum + 64 ) >> 7 ) );
+    s_mid[y * kCoefRow + x] = int16_t( clip3( COEFF_MIN, COEFF_MAX, ( sum + ( 1 << ( kFirstShift - 1 ) ) ) >> kFirstShift ) );
   }
   GroupMemoryBarrierWithGroupSync();
-  for( int s = tid; s < t.width * t.height; s += THREADS )
+  for( int s = tid; s < t.width * t.height; s += kThreads )
   {
     const int x   = s & ( t.width - 1 );
     const int y   = s >> t.log2W;
     int       sum = 0;
     for( int k = 0; k < nx; k++ )
     {
-      sum += int( s_mid[y * 32 + k] ) * int( mHor[k * t.width + x] );
+      sum += int( s_mid[y * kCoefRow + k] ) * int( mHor[k * t.width + x] );
     }
     storeResidual( t, x, y, clip3( COEFF_MIN, COEFF_MAX, ( sum + ( 1 << ( shift2 - 1 ) ) ) >> shift2 ) );
   }
 }
 
 [shader( "compute" )]
-[numthreads( THREADS, 1, 1 )]
+[numthreads( kThreads, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
   const int index = int( workgroupIndex( group ) );
@@ -473,7 +499,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     return;   // (the whole workgroup returns here)
   }
   const int        tid = int( local.x );
-  const TrafoBlock t   = trafoBlock( pc.jobs + ( ( pc.count >= 0 ? 0 : int( pc.countAt[1] ) ) + index ) * 10 );
+  const TrafoBlock t   = trafoBlock( pc.jobs + ( ( pc.count >= 0 ? 0 : int( pc.countAt[1] ) ) + index ) * kTrafoJobWords );
   if( ( t.flags & FLAG_ZERO ) != 0 )
   {
     fillBlock( t.block, t.stride, t.log2W, t.log2H, t.wide, tid, 0 );
@@ -488,7 +514,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   // TrQuant::xIT: the vertical transform (rounded and clipped), then the horizontal one.
   int16_t*  mVer   = pc.matrices + matrixOffset( t.typeVer, t.log2H );
   int16_t*  mHor   = pc.matrices + matrixOffset( t.typeHor, t.log2W );
-  const int shift2 = 6 + 15 - 1 - pc.bitDepth;
+  const int shift2 = secondShift();
   if( t.width == 1 || t.height == 1 )
   {
     oneDimensionalTransform( tid, t, t.width == 1 ? mVer : mHor, shift2 );
@@ -499,7 +525,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     // Only the DC coefficient, DCT-II both ways: DCT-II's first basis function is 64 at every point, so the residual
     // is one value, the DC coefficient through both transforms' rounding and clipping.
     const int dc  = dequantAt( t, 0, 0 );
-    const int mid = clip3( COEFF_MIN, COEFF_MAX, ( dc * 64 + 64 ) >> 7 );
+    const int mid = clip3( COEFF_MIN, COEFF_MAX, ( dc * 64 + ( 1 << ( kFirstShift - 1 ) ) ) >> kFirstShift );
     const int r   = clip3( COEFF_MIN, COEFF_MAX, ( mid * 64 + ( 1 << ( shift2 - 1 ) ) ) >> shift2 );
     fillBlock( t.block, t.stride, t.log2W, t.log2H, t.wide, tid, r );
     if( t.ict != 0 )
@@ -528,11 +554,11 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   }
   else
   {
-    for( int s = tid; s < nx * ny; s += THREADS )
+    for( int s = tid; s < nx * ny; s += kThreads )
     {
       const int k = s / nx;
       const int x = s - k * nx;
-      s_coef[k * 32 + x] = int16_t( dequantAt( t, x, k ) );
+      s_coef[k * kCoefRow + x] = int16_t( dequantAt( t, x, k ) );
     }
   }
   GroupMemoryBarrierWithGroupSync();
