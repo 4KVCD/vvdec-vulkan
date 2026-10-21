@@ -110,18 +110,14 @@ void GpuRecon::submitParseCommands( const std::function<void()>& record )
   const VkCommandBuffer recording = m_cmd;   // (the picture's first part, recorded meanwhile)
   m_cmd                           = m_parse.cmd;
   vk.vkResetCommandPool( m_ctx->device(), m_parse.pool, 0 );
-  beginOneTime( m_cmd );
+  m_ctx->beginOneTime( m_cmd );
   fullBarrier();   // the inputs and what the submission before wrote, visible
   record();
   hostReadBarrier();
   vk.vkEndCommandBuffer( m_cmd );
   vk.vkResetFences( m_ctx->device(), 1, &m_parse.fence );
   m_ctx->submit( m_cmd, m_parse.fence );
-  const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_parse.fence, VK_TRUE, UINT64_MAX );
-  if( result != VK_SUCCESS )
-  {
-    THROW_FATAL( "Vulkan: waiting for the GPU's parse failed (" << result << ")" );
-  }
+  m_ctx->waitForFence( m_parse.fence, "the GPU's parse" );
   m_cmd = recording;
 }
 

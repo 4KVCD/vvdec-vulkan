@@ -170,7 +170,7 @@ void GpuRecon::recordFrontEndAsync( const CodingStructure& cs, const PictureJobs
 {
   m_ctx->api().vkResetCommandPool( m_ctx->device(), m_poolFrontEnd, 0 );
   m_cmd = m_cmdFrontEnd1;
-  beginOneTime( m_cmd );
+  m_ctx->beginOneTime( m_cmd );
   // what the front ends before wrote (the colocated pictures' motion) visible
   fullBarrier();
   // Part 1 waits for the first parts of the picture's colocated pictures: their inter prediction writes DMVR's
@@ -213,7 +213,7 @@ void GpuRecon::splitFrontEnd()
   m_ctx->api().vkEndCommandBuffer( m_cmdFrontEnd1 );
   m_ctx->submitFront( m_asyncQueue, m_cmdFrontEnd1, m_frontEndWait, m_frontEnd1Done, m_frontEndParseWait );
   m_cmd = m_cmdFrontEnd2;
-  beginOneTime( m_cmd );
+  m_ctx->beginOneTime( m_cmd );
   fullBarrier();   // what part 1 wrote, visible
 }
 

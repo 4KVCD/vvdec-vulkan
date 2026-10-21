@@ -177,9 +177,7 @@ int64_t GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane 
   }
 
   vk.vkResetCommandPool( m_ctx->device(), slot.pool, 0 );
-  VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vk.vkBeginCommandBuffer( slot.cmd, &begin );
+  m_ctx->beginOneTime( slot.cmd );
 
   // On a discrete GPU, the planes' rows that the shader reads are copied into slot.before (whole, from the first row's
   // sample 0 to the last row's last sample read), and it writes into slot.after, with the same layouts.
@@ -208,11 +206,8 @@ int64_t GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane 
       srcAt[c] += slot.before.addr;
       dstAt[c] += slot.after.addr;
     }
-    VkMemoryBarrier copied{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vk.vkCmdPipelineBarrier( slot.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &copied, 0, nullptr, 0,
-                             nullptr );
+    m_ctx->memoryBarrier( slot.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_SHADER_READ_BIT );
   }
 
   vk.vkCmdBindPipeline( slot.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_filmgrain ) );
@@ -243,11 +238,8 @@ int64_t GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane 
   if( copies )
   {
     // slot.after's rows into the output, row by row: the bytes between the rows (dst may be the picture) stay as they are
-    VkMemoryBarrier written{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    written.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    written.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    vk.vkCmdPipelineBarrier( slot.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &written, 0, nullptr, 0,
-                             nullptr );
+    m_ctx->memoryBarrier( slot.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_ACCESS_TRANSFER_READ_BIT );
     for( int c = 0; c < numPlanes; c++ )
     {
       const int          rows     = lumaHeight / ( c ? impl.subY() : 1 );
@@ -261,12 +253,10 @@ int64_t GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane 
       vk.vkCmdCopyBuffer( slot.cmd, slot.after.buffer, dst[c].buffer, uint32_t( rows ), slot.rows.data() );
     }
   }
-  // the host reads the frame after the fence
-  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-  barrier.srcAccessMask = copies ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  vk.vkCmdPipelineBarrier( slot.cmd, copies ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
-                           1, &barrier, 0, nullptr, 0, nullptr );
+  // The CPU reads the frame once the fence is signalled: the last writes (the copies', or the shader's) become visible to
+  // it.
+  m_ctx->memoryBarrier( slot.cmd, copies ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        copies ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT );
   vk.vkEndCommandBuffer( slot.cmd );
 
   vk.vkResetFences( m_ctx->device(), 1, &slot.fence );

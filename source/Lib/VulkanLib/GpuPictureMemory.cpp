@@ -547,9 +547,7 @@ void PlanePool::startDownloadLocked( Picture& pic )
   const Api&        vk       = m_ctx->api();
   const PelStorage& planes   = pic.m_bufs[PIC_RECONSTRUCTION];
   vk.vkResetCommandPool( m_ctx->device(), download.pool, 0 );
-  VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vk.vkBeginCommandBuffer( download.cmd, &begin );
+  m_ctx->beginOneTime( download.cmd );
   for( int comp = 0; comp < (int) planes.bufs.size(); comp++ )
   {
     const HostPlane*   plane  = hostPlane( planes, ComponentID( comp ) );
@@ -558,10 +556,8 @@ void PlanePool::startDownloadLocked( Picture& pic )
     CHECK_FATAL( !plane->twin.valid(), "Vulkan: a picture to download without its twins" );
     vk.vkCmdCopyBuffer( download.cmd, plane->twin.buffer, plane->host.buffer, 1, &region );
   }
-  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };   // (the copies' writes visible to the CPU)
-  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  vk.vkCmdPipelineBarrier( download.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+  // The copies' writes become visible to the CPU.
+  m_ctx->memoryBarrier( download.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT );
   vk.vkEndCommandBuffer( download.cmd );
   vk.vkResetFences( m_ctx->device(), 1, &download.fence );
   m_ctx->submitCopy( download.cmd, download.fence );

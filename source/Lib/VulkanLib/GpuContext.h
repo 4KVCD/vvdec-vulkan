@@ -69,11 +69,15 @@ namespace vvdec
 namespace gpu
 {
 
-// v rounded up to a multiple of alignment (a power of 2)
+// Returns v rounded up to a multiple of alignment, which must be a power of 2.
 constexpr size_t alignUp( size_t v, size_t alignment )
 {
   return ( v + alignment - 1 ) & ~( alignment - 1 );
 }
+
+// A dispatch of one workgroup per job lays its workgroups out in rows of kGroupsPerRow, because a dispatch's x count
+// is limited. A job shader finds its job at x + kGroupsPerRow * y (common.slang's workgroupIndex must match).
+static constexpr size_t kGroupsPerRow = 32768;
 
 // The Vulkan functions the decoder uses, loaded at run time from vulkan-1.dll (or libvulkan.so).
 #define VVDEC_VK_INSTANCE_FUNCS( X )                                                                                    \
@@ -122,7 +126,8 @@ struct Buffer
   VkDeviceAddress addr   = 0;         // the address the shaders use
   MemKind         kind   = MemKind::Device;
   VkDeviceSize    memorySize = 0;     // the size of the memory allocated for the buffer (at least size)
-  // Where the buffer's bytes start in buffer: 0, but for a range of a larger buffer (RangeArena), which owns no memory
+  // Where the buffer's bytes start within buffer. It is 0 except for a range of a larger buffer (RangeArena), which
+  // owns no memory.
   VkDeviceSize    offset = 0;
 
   bool valid() const { return buffer != VK_NULL_HANDLE; }
@@ -175,16 +180,17 @@ public:
   // Makes buf hold at least size bytes of kind: when it is smaller, frees it and allocates one of size rounded up to
   // 64 KB (so that a buffer whose need grows a little at a time is not allocated again each time).
   void   ensure( Buffer& buf, size_t size, MemKind kind );
-  // Frees a buffer once the work queued on the compute queue so far is done (it waits for that work): for a buffer that
-  // other threads' queued work may still use, such as the instances' shared planes. (Freed while queued work still
-  // uses it, its memory would go while the GPU reads it: a GPU fault.)
+  // Waits until the work queued on the compute queue so far is done, then frees buf. Use it for a buffer that other
+  // threads' queued work may still use, such as the instances' shared planes. Don't free such a buffer with free():
+  // the GPU would read freed memory and fault.
   void   freeAfterQueued( Buffer& buf );
 
   // A pool for the device-local buffers that come and go with the pictures: their planes on the GPU and the scratch
-  // planes of their filters. allocPooled() returns a buffer of the same size given back earlier, or a new one.
-  // Returned buffers stay in the pool for later pictures, because freeing and allocating them during decoding costs
-  // too much time (VideoQ 1080p: -15%), until buffers of another size are requested (a new resolution). A buffer
-  // may be returned while queued work still uses it, as long as whatever takes it next is queued after that work.
+  // planes of their filters. allocPooled() returns a buffer of the same size that was given back earlier, or a new
+  // one. Buffers given back stay in the pool for later pictures, because freeing and allocating them during decoding
+  // costs too much time (VideoQ 1080p: -15%). The pool is emptied when buffers of another size are requested (a new
+  // resolution). A buffer may be given back while queued work still uses it, as long as whatever takes it next is
+  // queued after that work.
   Buffer allocPooled( size_t size );
   void   recycle( Buffer& buf );
 
@@ -214,12 +220,23 @@ public:
   void          destroySemaphore( VkSemaphore semaphore );
   void          destroyQueries( VkQueryPool queries );
 
+  // --- Commands ---
+  // Begins recording cmd for a single submission.
+  void beginOneTime( VkCommandBuffer cmd ) const;
+  // Records into cmd a barrier that makes the srcAccess writes of the srcStage stages visible to the dstAccess
+  // accesses of the dstStage stages.
+  void memoryBarrier( VkCommandBuffer cmd, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage,
+                      VkAccessFlags dstAccess ) const;
+  // Waits until fence is signalled. Throws when the wait fails (a lost device); the message names what was waited for.
+  void waitForFence( VkFence fence, const char* what ) const;
+
   // --- The compute queue, which all decoder instances of the process share ---
   // A picture's work is submitted in two parts. submitFirst() submits the first part, which signals firstDone.
-  // With the async queues, the first part also waits for waitFront (the semaphore of the picture's front end) and
-  // for the parse's copies' timeline to reach waitParse (the picture's parsed records, when its front end is in its
-  // first part: submitParseCopy), and signals the timeline semaphore; the value it signals is returned (0 without the
-  // async queues).
+  // With the async queues, the first part also waits for waitFront, the semaphore of the picture's front end. When
+  // waitParse is not 0, it also waits until the timeline of the parse's copies reaches waitParse, which means the
+  // picture's parsed records are in place (submitParseCopy); that wait is needed when the picture's front end is
+  // recorded into its first part. The first part then signals the compute queue's timeline semaphore, and
+  // submitFirst() returns the value it signals (0 without the async queues).
   uint64_t submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemaphore waitFront = VK_NULL_HANDLE, uint64_t waitParse = 0 );
   // submitRest() submits the rest, which waits for waitFront (the front end's second submission) when given and
   // signals restDone. With a copy queue it also submits the picture's download (transfer), which waits for the

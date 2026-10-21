@@ -82,7 +82,6 @@ static constexpr size_t   kParseCounters     = 8;         // the staged CUs and 
 static constexpr size_t   kParseTotals       = 16;        // the CUs and TUs, then the counters (compaction pass 0)
 static constexpr size_t   kParseTotalsSerial = 15;        // the totals' word that holds the number of the step they are of
 static constexpr size_t   kParseLevelChunk   = 4096;      // parse.slang's kLevelChunk: the levels a substream takes at a time
-static constexpr size_t   kGroupsPerRow      = 32768;     // the shaders take group.y as rows of 32768 workgroups
 
 // Each submission runs kStepsPerSubmission steps of every picture in parse, so that a picture can be handed over as
 // soon as its parse is done.
@@ -180,33 +179,25 @@ static void dispatch( Context* ctx, VkCommandBuffer cmd, int shader, const Push&
   vk.vkCmdDispatch( cmd, uint32_t( std::min( groups, kGroupsPerRow ) ), uint32_t( ( groups + kGroupsPerRow - 1 ) / kGroupsPerRow ), 1 );
 }
 
-// Records into cmd a barrier: the writes of the stages src visible to the accesses dstAccess of the stages dst
-static void barrier( Context* ctx, VkCommandBuffer cmd, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkAccessFlags dstAccess )
-{
-  VkMemoryBarrier memory{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-  memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-  memory.dstAccessMask = dstAccess;
-  ctx->api().vkCmdPipelineBarrier( cmd, src, dst, 0, 1, &memory, 0, nullptr, 0, nullptr );
-}
-
+// Records into cmd a barrier that makes the compute shaders' writes visible to the compute shaders after it.
 static void computeBarrier( Context* ctx, VkCommandBuffer cmd )
 {
-  barrier( ctx, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT );
+  ctx->memoryBarrier( cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT );
 }
 
+// Records into cmd a barrier that makes the compute shaders' writes visible to the CPU.
 static void hostReadBarrier( Context* ctx, VkCommandBuffer cmd )
 {
-  barrier( ctx, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT );
+  ctx->memoryBarrier( cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT );
 }
 
-// what the submission before wrote and the fills before it (recordClear), visible to the compute shaders
+// Records into cmd a barrier that makes what the submission before wrote, and the fills recorded before it
+// (recordClear), visible to the compute shaders after it.
 static void startBarrier( Context* ctx, VkCommandBuffer cmd )
 {
-  VkMemoryBarrier memory{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-  memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-  memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-  ctx->api().vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
-                                   &memory, 0, nullptr, 0, nullptr );
+  ctx->memoryBarrier( cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT );
 }
 
 // ====================================================================================================================
@@ -985,14 +976,10 @@ void ParseService::startPicture( Picture* pic )
   m_stats.substreams += slot->input().numStreams;
 }
 
-// Waits for fence, which a submission of the parse's signals (its steps' or its copies')
+// Waits for fence, which a submission of the parse's steps or of its copies signals.
 static void waitFor( Context* ctx, VkFence fence )
 {
-  const VkResult result = ctx->api().vkWaitForFences( ctx->device(), 1, &fence, VK_TRUE, UINT64_MAX );
-  if( result != VK_SUCCESS )
-  {
-    THROW_FATAL( "Vulkan: waiting for the GPU's parse failed (" << result << ")" );
-  }
+  ctx->waitForFence( fence, "the GPU's parse" );
 }
 
 // Returns how many steps to keep in the parse queue: 2 while a picture whose parse is one or two long chains
@@ -1078,9 +1065,7 @@ void ParseService::submitSteps()
   StepFrame& frame = nextFreeFrame();
   const Api& vk    = m_ctx->api();
   vk.vkResetCommandPool( m_ctx->device(), frame.pool, 0 );
-  VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vk.vkBeginCommandBuffer( frame.cmd, &begin );
+  m_ctx->beginOneTime( frame.cmd );
   // the counters of the pictures starting cleared; what the submission before wrote visible
   for( ParseSlot* slot: m_parsing )
   {
@@ -1126,9 +1111,7 @@ void ParseService::submitCopies()
 {
   const Api& vk = m_ctx->api();
   vk.vkResetCommandPool( m_ctx->device(), m_copyPool, 0 );
-  VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vk.vkBeginCommandBuffer( m_copyCmd, &begin );
+  m_ctx->beginOneTime( m_copyCmd );
   startBarrier( m_ctx, m_copyCmd );   // (what the parse wrote, visible)
   uint64_t after = 0;
   for( const auto& copy: m_copying )

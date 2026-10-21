@@ -79,9 +79,12 @@ int        Context::s_refs     = 0;
 void*      Context::s_library  = nullptr;
 VkInstance Context::s_instance = VK_NULL_HANDLE;
 
+// The bytes of push constants that every shader's pipeline layout has (the device must offer at least this many).
 static constexpr uint32_t kPushConstantSize = 256;
 static constexpr uint32_t kVendorNvidia     = 0x10de;   // VkPhysicalDeviceProperties::vendorID
 static constexpr uint32_t kVendorIntel      = 0x8086;
+// Every buffer's size is rounded up to a multiple of this many bytes.
+static constexpr size_t kBufferAlignment = 256;
 
 Context* Context::acquire()
 {
@@ -110,25 +113,52 @@ void Context::release()
   }
 }
 
+// Returns the value of the environment variable name, or an empty string when it is not set.
+static std::string environmentString( const char* name )
+{
+  const char* value = getenv( name );
+  return value ? value : "";
+}
+
+// Returns whether the environment variable name is set and reads as the number number (as atoi reads it).
+static bool environmentIs( const char* name, int number )
+{
+  const char* value = getenv( name );
+  return value && atoi( value ) == number;
+}
+
+// Returns whether the environment variable name is set and reads as a number other than 0 (as atoi reads it).
+static bool environmentNonZero( const char* name )
+{
+  const char* value = getenv( name );
+  return value && atoi( value ) != 0;
+}
+
+// Returns the environment variable name read as a number (as atoi reads it), or fallback when it is not set.
+static int environmentInt( const char* name, int fallback )
+{
+  const char* value = getenv( name );
+  return value ? atoi( value ) : fallback;
+}
+
 Options Options::fromEnvironment()
 {
-  const auto value = []( const char* name ) -> const char* { return getenv( name ); };
-  Options    options;
-  options.device        = value( "VVDEC_GPU_DEVICE" ) ? value( "VVDEC_GPU_DEVICE" ) : "";
-  options.profile       = value( "VVDEC_GPU_PROFILE" ) && atoi( value( "VVDEC_GPU_PROFILE" ) ) != 0;
-  options.isaDir        = value( "VVDEC_GPU_ISA" ) ? value( "VVDEC_GPU_ISA" ) : "";
-  options.pipelineCache = value( "VVDEC_GPU_CACHE" ) ? value( "VVDEC_GPU_CACHE" ) : "";
-  options.async         = !( value( "VVDEC_GPU_ASYNC" ) && atoi( value( "VVDEC_GPU_ASYNC" ) ) == 0 );
-  options.frontEnd      = !( value( "VVDEC_GPU_FRONT" ) && atoi( value( "VVDEC_GPU_FRONT" ) ) == 0 );
-  options.frontEndSet   = value( "VVDEC_GPU_FRONT" ) != nullptr;
-  options.frontEndCheck = value( "VVDEC_GPU_MIDER" ) && atoi( value( "VVDEC_GPU_MIDER" ) ) != 0;
-  options.parse         = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 1;
-  options.parseDrives   = value( "VVDEC_GPU_PARSE" ) && atoi( value( "VVDEC_GPU_PARSE" ) ) == 2;
-  options.precompile    = !( value( "VVDEC_GPU_PRECOMPILE" ) && atoi( value( "VVDEC_GPU_PRECOMPILE" ) ) == 0 );
-  options.waveSize      = value( "VVDEC_GPU_WAVE" ) ? atoi( value( "VVDEC_GPU_WAVE" ) ) : -1;
-  options.waveSizeInter = value( "VVDEC_GPU_WAVE_INTER" ) ? atoi( value( "VVDEC_GPU_WAVE_INTER" ) ) : -1;
-  options.lowPriority   = !( value( "VVDEC_GPU_PRIORITY" ) && strcmp( value( "VVDEC_GPU_PRIORITY" ), "normal" ) == 0 );
-  options.engine        = value( "VVDEC_GPU_ENGINE" ) ? value( "VVDEC_GPU_ENGINE" ) : "";
+  Options options;
+  options.device        = environmentString( "VVDEC_GPU_DEVICE" );
+  options.profile       = environmentNonZero( "VVDEC_GPU_PROFILE" );
+  options.isaDir        = environmentString( "VVDEC_GPU_ISA" );
+  options.pipelineCache = environmentString( "VVDEC_GPU_CACHE" );
+  options.async         = !environmentIs( "VVDEC_GPU_ASYNC", 0 );
+  options.frontEnd      = !environmentIs( "VVDEC_GPU_FRONT", 0 );
+  options.frontEndCheck = environmentNonZero( "VVDEC_GPU_MIDER" );
+  options.parse         = environmentIs( "VVDEC_GPU_PARSE", 1 );
+  options.parseDrives   = environmentIs( "VVDEC_GPU_PARSE", 2 );
+  options.precompile    = !environmentIs( "VVDEC_GPU_PRECOMPILE", 0 );
+  options.frontEndSet   = getenv( "VVDEC_GPU_FRONT" ) != nullptr;
+  options.waveSize      = environmentInt( "VVDEC_GPU_WAVE", -1 );
+  options.waveSizeInter = environmentInt( "VVDEC_GPU_WAVE_INTER", -1 );
+  options.lowPriority   = environmentString( "VVDEC_GPU_PRIORITY" ) != "normal";
+  options.engine        = environmentString( "VVDEC_GPU_ENGINE" );
   return options;
 }
 
@@ -403,7 +433,7 @@ Context::AsyncQueueLayout Context::chooseAsyncQueues( const std::vector<VkQueueF
   }
   layout.parseIndex = layout.split ? 0u : uint32_t( m_asyncCount );
   layout.copyIndex  = layout.split ? 2u : uint32_t( m_asyncCount + 1 );
-  layout.grainIndex = 4u;   // (with split: one of the even queues the parse leaves, the film grain's)
+  layout.grainIndex = 4u;   // only used with split: an even queue that the parse (0) and its copies (2) leave free
   layout.queues     = layout.split ? uint32_t( 2 * kMaxAsync )
                                    : uint32_t( m_asyncCount + ( layout.ownParseQueue ? 1 : 0 ) + ( layout.ownCopyQueue ? 1 : 0 ) );
   return layout;
@@ -747,13 +777,13 @@ bool Context::createPipelineLayout()
 // The compiled pipelines' binaries
 // ====================================================================================================================
 // The driver keeps the pipelines it compiled in a cache of its own, but per program. So the first run of a program it
-// has not seen (a new or updated one, or any program after a driver update) compiled every shader again on first use,
-// and VideoQ 1080p showed its first frame 12.3 s after the start instead of 0.85 s. A VkPipelineCache of the decoder's own does not
-// help on AMD's driver (it compiles again, the cache's entries being per program too). With VK_KHR_pipeline_binary the
-// decoder keeps each pipeline's binaries itself and makes the pipeline from them, whatever the program: a set of
-// shaders is compiled once per driver. The binaries are kept in a file per device, with the driver's global key
-// (binaries of another driver do not fit) and the hash of the decoder's shaders (a new set starts the file anew, so it
-// does not grow with every version); it is rewritten when binaries were added.
+// has not seen (a new or updated one, or any program after a driver update) compiles every shader again on first use:
+// VideoQ 1080p shows its first frame 12.3 s after the start instead of 0.85 s. A VkPipelineCache of the decoder's own
+// does not help on AMD's driver, whose cache entries are per program too. With VK_KHR_pipeline_binary the decoder
+// keeps each pipeline's binaries itself and makes the pipeline from them, whatever the program, so a set of shaders is
+// compiled once per driver. The binaries are kept in a file per device. The file holds the driver's global key,
+// because binaries of another driver do not fit. It also holds the hash of the decoder's shaders: a new set of shaders
+// starts the file anew, so that it does not grow with every version. The file is rewritten when binaries were added.
 
 struct Context::PipelineBinaries
 {
@@ -780,6 +810,10 @@ struct Context::PipelineBinaries
 
 static constexpr uint32_t kBinariesMagic   = 0x42445656;   // "VVDB"
 static constexpr uint32_t kBinariesVersion = 2;
+// Upper limits on a pipeline's key size and on its number of binaries. A file that exceeds them is damaged and is
+// ignored.
+static constexpr uint32_t kMaxPipelineKeyBytes    = 256;
+static constexpr uint32_t kMaxBinariesPerPipeline = 64;
 
 static constexpr uint64_t kHashSeed = 0x9e3779b97f4a7c15ull;
 
@@ -862,7 +896,7 @@ std::map<std::vector<uint8_t>, std::vector<Context::PipelineBinaries::Binary>> C
     file.insert( file.end(), chunk, chunk + got );
   }
   fclose( f );
-  // (each read checked against the file's end: a cut or damaged file leaves no binaries)
+  // Each read is checked against the file's end, so a cut or damaged file yields no binaries.
   size_t     at = 0;
   const auto take = [&]( void* to, size_t size ) {
     if( at + size > file.size() )
@@ -895,7 +929,8 @@ std::map<std::vector<uint8_t>, std::vector<Context::PipelineBinaries::Binary>> C
   {
     std::vector<uint8_t> key;
     uint32_t             binaryCount = 0;
-    if( !take( &keySize, 4 ) || keySize > 256 || !takeBytes( key, keySize ) || !take( &binaryCount, 4 ) || binaryCount > 64 )
+    if( !take( &keySize, 4 ) || keySize > kMaxPipelineKeyBytes || !takeBytes( key, keySize ) || !take( &binaryCount, 4 )
+        || binaryCount > kMaxBinariesPerPipeline )
     {
       return {};
     }
@@ -994,10 +1029,11 @@ void Context::closePipelineBinaries()
 {
   if( m_binaries && m_binaries->added && !m_binaries->path.empty() )
   {
-    // with the binaries another decoder added to the file meanwhile (decoders running side by side)
+    // Merge in the binaries that another decoder running at the same time added to the file meanwhile. Where both
+    // have binaries for a pipeline, ours are kept (insert does not replace).
     for( auto& pipeline: m_binaries->read() )
     {
-      m_binaries->pipelines.insert( std::move( pipeline ) );   // (ours kept where both have one)
+      m_binaries->pipelines.insert( std::move( pipeline ) );
     }
     m_binaries->write();
   }
@@ -1152,7 +1188,7 @@ void Context::addTime( const char* label, double milliseconds )
 
 Buffer Context::allocPooled( size_t size )
 {
-  const VkDeviceSize rounded = alignUp( size, 256 );
+  const VkDeviceSize rounded = alignUp( size, kBufferAlignment );
   {
     std::lock_guard<std::mutex> lock( m_poolMutex );
     for( auto it = m_pool.begin(); it != m_pool.end(); ++it )
@@ -1164,9 +1200,9 @@ Buffer Context::allocPooled( size_t size )
         return buf;
       }
     }
-    // none of the size: those of the sizes not wanted any more go, once the
-    // work queued is done (the scratch planes come back while their work is
-    // queued)
+    // No buffer of this size is in the pool. When the size is new, the buffers of the sizes in use before are not
+    // wanted any more: free them all. Wait for the queued work first, because scratch planes are given back while
+    // their work is still queued.
     if( !m_pool.empty() && m_poolSizes.count( rounded ) == 0 )
     {
       {
@@ -1200,7 +1236,7 @@ Buffer Context::allocHost( size_t size, MemKind kind )
 {
   {
     std::lock_guard<std::mutex> lock( m_hostCacheMutex );
-    // the smallest that fits, so that a larger one stays for a larger picture
+    // Take the smallest buffer that fits, so that a larger one stays for a larger picture.
     auto best = m_hostCache.end();
     for( auto it = m_hostCache.begin(); it != m_hostCache.end(); ++it )
     {
@@ -1239,9 +1275,10 @@ void Context::keepHost( Buffer& buf )
       m_hostCache.pop_front();
     }
   }
+  // Free outside the lock: freeing memory takes time.
   for( Buffer& old: evicted )
   {
-    free( old );   // (outside the lock: freeing memory takes time)
+    free( old );
   }
   buf = Buffer();
 }
@@ -1302,29 +1339,20 @@ Context::~Context()
     {
       m_api.vkDestroyPipelineLayout( m_device, m_layout, nullptr );
     }
-    if( m_timeline )
-    {
-      m_api.vkDestroySemaphore( m_device, m_timeline, nullptr );
-    }
-    if( m_parseTimeline )
-    {
-      m_api.vkDestroySemaphore( m_device, m_parseTimeline, nullptr );
-    }
-    if( m_parseCopyTimeline )
-    {
-      m_api.vkDestroySemaphore( m_device, m_parseCopyTimeline, nullptr );
-    }
+    destroySemaphore( m_timeline );
+    destroySemaphore( m_parseTimeline );
+    destroySemaphore( m_parseCopyTimeline );
     m_api.vkDestroyDevice( m_device, nullptr );
   }
   delete[] m_pipelines;
   delete[] m_pipelineOnce;
-  // the instance and the Vulkan library stay (s_instance)
+  // The instance and the Vulkan library stay for the rest of the process (see s_instance).
 }
 
 int Context::memoryType( uint32_t typeBits, MemKind kind ) const
 {
-  // flags a type must have, flags it should have, and flags it must not have
-  // (AMD's uncached device-coherent types are slow for ordinary use)
+  // The flags a type must have, the flags it should have, and the flags it must not have. AMD's uncached
+  // device-coherent types are avoided because they are slow for ordinary use.
   VkMemoryPropertyFlags required = 0, preferred = 0;
   const VkMemoryPropertyFlags avoid = VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
   switch( kind )
@@ -1348,7 +1376,8 @@ int Context::memoryType( uint32_t typeBits, MemKind kind ) const
       const VkMemoryPropertyFlags flags = m_memProps.memoryTypes[i].propertyFlags;
       if( ( typeBits & ( 1u << i ) ) && ( flags & want ) == want && !( flags & avoid ) )
       {
-        // for device memory, a type the CPU cannot see is the one that is not a scarce BAR window
+        // For device memory, prefer a type the CPU cannot see: a host-visible device-local type is the scarce BAR
+        // window. The last loop below falls back to it.
         if( kind == MemKind::Device && ( flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ) && want == required )
         {
           continue;
@@ -1375,7 +1404,7 @@ Buffer Context::alloc( size_t size, MemKind kind )
 {
   Buffer buf;
   buf.kind = kind;
-  buf.size = alignUp( size, 256 );
+  buf.size = alignUp( size, kBufferAlignment );
 
   VkBufferCreateInfo info{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
   info.size  = buf.size;
@@ -1420,7 +1449,7 @@ Buffer Context::alloc( size_t size, MemKind kind )
   VkResult result = m_api.vkAllocateMemory( m_device, &allocInfo, nullptr, &buf.memory );
   if( result != VK_SUCCESS && kind == MemKind::Upload )
   {
-    // the BAR window is small: fall back to plain host memory
+    // The BAR window is small and may be full: fall back to plain host memory.
     m_api.vkDestroyBuffer( m_device, buf.buffer, nullptr );
     return alloc( size, MemKind::HostCached );
   }
@@ -1478,7 +1507,8 @@ void Context::freeAfterQueued( Buffer& buf )
     return;
   }
   {
-    // (under the queue's lock nothing is queued meanwhile: the wait is for the work queued so far)
+    // Hold the queue's lock while waiting, so that nothing is queued meanwhile and the wait covers exactly the work
+    // queued so far.
     std::lock_guard<std::mutex> lock( m_queueMutex );
     const VkResult result = m_api.vkQueueWaitIdle( m_queue );
     if( result != VK_SUCCESS )
@@ -1584,15 +1614,18 @@ static std::vector<int> precompileOrder( const Options& options, bool subgroupBa
 void Context::startPrecompile()
 {
   m_precompileOrder = precompileOrder( m_options, m_subgroupBallot );
-  // Compiles running side by side slow each other (the parse shader: 4.5 s alone, 7.1 s among 8), so a few threads
-  // serve better than many.
-  const unsigned cores   = std::thread::hardware_concurrency();
-  const int      threads = int( std::min( 4u, std::max( 2u, cores / 4 ) ) );
+  // Compiles running side by side slow each other down (the parse shader takes 4.5 s alone, 7.1 s among 8), so a few
+  // threads serve better than many: a quarter of the cores, within these limits.
+  static constexpr unsigned kMinPrecompileThreads = 2;
+  static constexpr unsigned kMaxPrecompileThreads = 4;
+  const unsigned            cores                 = std::thread::hardware_concurrency();
+  const int                 threads               = int( std::min( kMaxPrecompileThreads, std::max( kMinPrecompileThreads, cores / 4 ) ) );
   for( int t = 0; t < threads; t++ )
   {
     m_precompileThreads.emplace_back( [this]() {
 #ifdef _WIN32
-      SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL );   // (the decode's threads come first)
+      // The decoding threads come first.
+      SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL );
 #endif
       while( !m_precompileStop.load( std::memory_order_relaxed ) )
       {
@@ -1607,7 +1640,7 @@ void Context::startPrecompile()
         }
         catch( ... )
         {
-          // (the decode thread that needs this pipeline will meet the failure itself)
+          // Ignore the failure here: the decoding thread that needs this pipeline meets it again and reports it.
         }
       }
     } );
@@ -1626,7 +1659,6 @@ void Context::stopPrecompile()
 
 VkPipeline Context::createPipelineOf( int shaderId )
 {
-
   VkShaderModuleCreateInfo moduleInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
   moduleInfo.codeSize = kShaders[shaderId].size;
   moduleInfo.pCode    = kShaders[shaderId].words;
@@ -1753,7 +1785,9 @@ uint64_t Context::submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemap
   VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
   info.commandBufferCount = 1;
   info.pCommandBuffers    = &first;
-  // the waits: the front end's results (its buffers, the indirect dispatches' arguments), the picture's parsed records
+  // The waits: first for the front end's results (its buffers and the indirect dispatches' arguments), then for the
+  // picture's parsed records. stages holds the stages of both waits in that order; without the front end's wait, the
+  // parse's wait comes first and takes stages[1] (pWaitDstStageMask below).
   const VkPipelineStageFlags    stages[2]   = { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
   VkSemaphore                   waits[2];
@@ -1764,7 +1798,7 @@ uint64_t Context::submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemap
   if( waitFront )
   {
     waits[numWaits]      = waitFront;
-    waitValues[numWaits] = 0;   // (a binary semaphore's)
+    waitValues[numWaits] = 0;   // ignored: waitFront is a binary semaphore
     numWaits++;
   }
   if( waitParse > 0 )
@@ -1808,11 +1842,11 @@ void Context::submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, V
   info.signalSemaphoreCount = 1;
   info.pSignalSemaphores    = &done;
   const VkPipelineStageFlags    stages[2]   = { VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
-  const uint64_t                signalValue = 0;   // (a binary semaphore's)
+  const uint64_t                signalValue = 0;   // ignored: done is a binary semaphore
   VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
   timeline.signalSemaphoreValueCount = 1;
   timeline.pSignalSemaphoreValues    = &signalValue;
-  // the waits: the colocated pictures' first parts, the picture's parsed records
+  // The waits: for the first parts of the picture's colocated pictures, and for the picture's parsed records.
   VkSemaphore waits[2];
   uint64_t    waitValues[2];
   uint32_t    numWaits = 0;
@@ -1868,7 +1902,8 @@ uint64_t Context::submitParseCopy( VkCommandBuffer cmd, VkFence done, uint64_t w
   VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
   info.commandBufferCount = 1;
   info.pCommandBuffers    = &cmd;
-  // the wait: the parse's steps that wrote what the copy reads (done already: the parse's thread saw them done)
+  // The wait is for the parse's steps that wrote what the copy reads. The parse's thread has already seen them done,
+  // so the wait only orders the copy after them on the GPU.
   const VkPipelineStageFlags    stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
   VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
   if( waitParse > 0 )
@@ -1903,7 +1938,8 @@ void Context::submitRest( VkCommandBuffer rest, VkFence restDone, VkSemaphore se
     info.pCommandBuffers      = &rest;
     info.signalSemaphoreCount = transfer ? 1 : 0;
     info.pSignalSemaphores    = &semaphore;
-    // (the front end's second part: intra's waves and order, the deblocking's parameters and edges, their arguments)
+    // waitFront is the front end's second part, which writes intra's waves and order, the deblocking parameters and
+    // edges, and their dispatch arguments.
     const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     if( waitFront )
     {
@@ -1964,6 +2000,31 @@ void Context::submitCopy( VkCommandBuffer cmd, VkFence done )
   if( result != VK_SUCCESS )
   {
     THROW_FATAL( "Vulkan: vkQueueSubmit (copies) failed (" << result << ")" );
+  }
+}
+
+void Context::beginOneTime( VkCommandBuffer cmd ) const
+{
+  VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  m_api.vkBeginCommandBuffer( cmd, &begin );
+}
+
+void Context::memoryBarrier( VkCommandBuffer cmd, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage,
+                             VkAccessFlags dstAccess ) const
+{
+  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+  barrier.srcAccessMask = srcAccess;
+  barrier.dstAccessMask = dstAccess;
+  m_api.vkCmdPipelineBarrier( cmd, srcStage, dstStage, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+}
+
+void Context::waitForFence( VkFence fence, const char* what ) const
+{
+  const VkResult result = m_api.vkWaitForFences( m_device, 1, &fence, VK_TRUE, UINT64_MAX );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: waiting for " << what << " failed (" << result << ")" );
   }
 }
 

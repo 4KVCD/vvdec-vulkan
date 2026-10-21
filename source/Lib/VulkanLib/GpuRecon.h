@@ -257,7 +257,6 @@ private:
   // Begins recording m_cmd. With resetPool, the command pool is reset first, and the commands start with a barrier
   // over the work submitted before.
   void beginCommands( bool resetPool = true );
-  void beginOneTime( VkCommandBuffer cmd );   // begins recording cmd for a single submission
   // Ends the first part's commands and submits them, then begins the rest's.
   void splitCommands();
   // Ends and submits the rest's commands, and the download of pic: on the copy queue after the rest's semaphore
@@ -271,8 +270,7 @@ private:
   // VVDEC_GPU_PROFILE=1: adds up the picture's marks; waited is how long the CPU waited for the GPU, in ms.
   void readTimestamps( double waited );
 
-  // Barriers between the commands recorded into m_cmd (or cmd)
-  void memoryBarrier( VkCommandBuffer cmd, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess );
+  // Barriers between the commands recorded into m_cmd
   void memoryBarrier( VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess );
   void fullBarrier();                // all earlier writes visible to all later commands
   void computeBarrier();             // compute shaders' writes visible to later compute shaders
@@ -290,7 +288,7 @@ private:
     pushConstants( &push, sizeof( Push ) );
   }
   void dispatchGroups( uint32_t groupsX, uint32_t groupsY = 1 );
-  void dispatchJobs( size_t count );         // one workgroup per job, in rows of 32768 workgroups (kGroupsPerRow)
+  void dispatchJobs( size_t count );         // one workgroup per job, in rows of kGroupsPerRow workgroups
   void dispatchIndirect( FrontPass pass );   // with the front end's dispatch arguments for pass
   // Binds shader, sets push and dispatches groupsX x groupsY workgroups.
   template<class Push>

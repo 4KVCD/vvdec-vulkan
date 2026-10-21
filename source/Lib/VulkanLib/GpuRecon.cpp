@@ -67,11 +67,8 @@ namespace vvdec
 namespace gpu
 {
 
-// Dispatches of one workgroup per job lay their workgroups out in rows of kGroupsPerRow, so a job shader finds its job
-// at x + kGroupsPerRow * y of its workgroup (dispatchJobs; common.slang's workgroupIndex does the same).
-static constexpr size_t kGroupsPerRow = 32768;
-// The first word of the passes' job counts in the front end's argument buffer (see FrontPass; common.slang's
-// kFrontCounts must match it).
+// The front end's argument buffer holds each pass's indirect dispatch arguments first, then from this word on each
+// pass's job count and first job (see FrontPass). common.slang's kFrontCounts must match it.
 static constexpr size_t kFrontCounts = 32;
 
 // ====================================================================================================================
@@ -283,13 +280,6 @@ GpuRecon::~GpuRecon()
 // Commands and submissions
 // ====================================================================================================================
 
-void GpuRecon::beginOneTime( VkCommandBuffer cmd )
-{
-  VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  m_ctx->api().vkBeginCommandBuffer( cmd, &begin );
-}
-
 void GpuRecon::beginCommands( bool resetPool )
 {
   const Api& vk = m_ctx->api();
@@ -297,7 +287,7 @@ void GpuRecon::beginCommands( bool resetPool )
   {
     vk.vkResetCommandPool( m_ctx->device(), m_pool, 0 );
   }
-  beginOneTime( m_cmd );
+  m_ctx->beginOneTime( m_cmd );
 
   m_marks   = 0;
   m_gapMark = 0;
@@ -333,7 +323,7 @@ void GpuRecon::splitCommands()
 
   // The rest, after what the first part wrote
   m_cmd = m_cmdRest;
-  beginOneTime( m_cmd );
+  m_ctx->beginOneTime( m_cmd );
   fullBarrier();
   // In the GPU profile, the time until the rest begins (other pictures' work may run between the parts) counts on
   // its own, not as the picture's or its next pass's.
@@ -374,11 +364,7 @@ int GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
   m_waitFrontEnd2 = VK_NULL_HANDLE;
   if( waitFirst )
   {
-    const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_fenceFirst, VK_TRUE, UINT64_MAX );
-    if( result != VK_SUCCESS )
-    {
-      THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
-    }
+    m_ctx->waitForFence( m_fenceFirst, "the GPU" );
   }
   return turn;
 }
@@ -391,7 +377,7 @@ void GpuRecon::recordDownload( const PelStorage& pic, int turn )
   Download&  download = m_downloads[turn];
   CHECK_FATAL( download.pending.load( std::memory_order_acquire ), "Vulkan: a download not waited for (endDownload) before its commands are reused" );
   vk.vkResetCommandPool( m_ctx->device(), download.pool, 0 );
-  beginOneTime( download.cmd );
+  m_ctx->beginOneTime( download.cmd );
   if( download.queries )
   {
     vk.vkCmdResetQueryPool( download.cmd, download.queries, 0, 2 );
@@ -404,7 +390,7 @@ void GpuRecon::recordDownload( const PelStorage& pic, int turn )
     VkBufferCopy     region{ 0, layout.hostOffset, layout.size };
     vk.vkCmdCopyBuffer( download.cmd, planeTwin( pic, ComponentID( comp ) ).buffer, plane->host.buffer, 1, &region );
   }
-  memoryBarrier( download.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT );
+  m_ctx->memoryBarrier( download.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT );
   if( download.queries )
   {
     vk.vkCmdWriteTimestamp( download.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, download.queries, 1 );
@@ -416,12 +402,7 @@ void GpuRecon::recordDownload( const PelStorage& pic, int turn )
 
 void GpuRecon::endCompute()
 {
-  const Api&     vk     = m_ctx->api();
-  const VkResult result = vk.vkWaitForFences( m_ctx->device(), 1, &m_fence, VK_TRUE, UINT64_MAX );
-  if( result != VK_SUCCESS )
-  {
-    THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
-  }
+  m_ctx->waitForFence( m_fence, "the GPU" );
   readTimestamps( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - m_submitted ).count() );
   giveFrontEnd();   // (the rest done: so are the front end's parts, which the picture's parts wait for)
 }
@@ -432,13 +413,9 @@ void GpuRecon::endDownload( int turn )
   {
     return;
   }
-  const Api&     vk       = m_ctx->api();
-  Download&      download = m_downloads[turn];
-  const VkResult result   = vk.vkWaitForFences( m_ctx->device(), 1, &download.fence, VK_TRUE, UINT64_MAX );
-  if( result != VK_SUCCESS )
-  {
-    THROW_FATAL( "Vulkan: waiting for the GPU failed (" << result << ")" );
-  }
+  const Api& vk       = m_ctx->api();
+  Download&  download = m_downloads[turn];
+  m_ctx->waitForFence( download.fence, "the GPU" );
   if( download.queries )
   {
     uint64_t stamps[2];
@@ -524,18 +501,9 @@ void GpuRecon::readTimestamps( double waited )
 
 // --- Barriers ---
 
-void GpuRecon::memoryBarrier( VkCommandBuffer cmd, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage,
-                              VkAccessFlags dstAccess )
-{
-  VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-  barrier.srcAccessMask = srcAccess;
-  barrier.dstAccessMask = dstAccess;
-  m_ctx->api().vkCmdPipelineBarrier( cmd, srcStage, dstStage, 0, 1, &barrier, 0, nullptr, 0, nullptr );
-}
-
 void GpuRecon::memoryBarrier( VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess )
 {
-  memoryBarrier( m_cmd, srcStage, srcAccess, dstStage, dstAccess );
+  m_ctx->memoryBarrier( m_cmd, srcStage, srcAccess, dstStage, dstAccess );
 }
 
 void GpuRecon::fullBarrier()
@@ -927,7 +895,7 @@ void GpuRecon::startEarlyRows( CodingStructure& cs, const PictureJobs& jobs, siz
   // picture is done.
   m_cmd = m_cmdEarlyRows;
   vk.vkResetCommandPool( m_ctx->device(), m_pool, 0 );
-  beginOneTime( m_cmd );
+  m_ctx->beginOneTime( m_cmd );
   m_earlyRowsMarks = 0;
   if( m_earlyRowsQueries )
   {
