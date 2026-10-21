@@ -59,8 +59,7 @@ namespace gpu
 
 VkDeviceSize RangeArena::chunkSizeFor( size_t lumaSamples )
 {
-  constexpr VkDeviceSize kMB = VkDeviceSize( 1 ) << 20;
-  return std::min( ( 2 * VkDeviceSize( lumaSamples ) + kMB - 1 ) / kMB * kMB, 8 * kMB );
+  return std::min( ( 2 * VkDeviceSize( lumaSamples ) + kChunkStep - 1 ) / kChunkStep * kChunkStep, VkDeviceSize( kMaxChunkSize ) );
 }
 
 RangeArena::~RangeArena()
@@ -78,7 +77,7 @@ Buffer RangeArena::take( VkDeviceSize size )
   VkDeviceSize start = 0;
   if( !bestGap( size, chunk, start ) )
   {
-    // none holds it: a new chunk (one of its own for a range larger than the chunks)
+    // No gap holds it: take a new chunk, one of its own for a range larger than the chunks.
     chunk = &addChunk( std::max<VkDeviceSize>( m_chunkSize, alignUp( size, kLarge ) ) );
     start = 0;
   }
@@ -87,7 +86,7 @@ Buffer RangeArena::take( VkDeviceSize size )
   chunk->gaps.erase( gap );
   if( room > size )
   {
-    chunk->gaps.emplace( start + size, room - size );   // (the rest of the gap)
+    chunk->gaps.emplace( start + size, room - size );   // the rest of the gap
   }
   chunk->taken += size;
   chunk->lastTake = m_ticks;
@@ -121,7 +120,7 @@ void RangeArena::tick()
     Chunk& chunk = *m_chunks[i];
     if( chunk.taken == 0 && m_ticks - chunk.lastTake > m_idleTicks )
     {
-      m_ctx->free( chunk.buf );   // (no range taken: the GPU is done with all of it)
+      m_ctx->free( chunk.buf );   // no range is taken, so the GPU is done with all of it
       m_chunks.erase( m_chunks.begin() + i );
       continue;
     }
@@ -169,7 +168,7 @@ void RangeArena::addGap( Chunk& chunk, VkDeviceSize start, VkDeviceSize size )
   auto next = chunk.gaps.lower_bound( start );
   if( next != chunk.gaps.end() && next->first == start + size )
   {
-    size += next->second;   // (the gap after it, merged)
+    size += next->second;   // merge the gap after it
     next = chunk.gaps.erase( next );
   }
   if( next != chunk.gaps.begin() )
@@ -177,7 +176,7 @@ void RangeArena::addGap( Chunk& chunk, VkDeviceSize start, VkDeviceSize size )
     const auto prev = std::prev( next );
     if( prev->first + prev->second == start )
     {
-      prev->second += size;   // (merged into the gap before it)
+      prev->second += size;   // merge it into the gap before it
       return;
     }
   }

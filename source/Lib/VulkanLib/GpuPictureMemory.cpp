@@ -76,8 +76,8 @@ static constexpr vvdecComponentType kColMotion = vvdecComponentType( VVDEC_MAX_N
 
 static void* createHostPlane( void* opaque, vvdecComponentType comp, uint32_t size, uint32_t, void** allocator )
 {
-  // (a picture's planes from the context's cache when it has some that fit: Context::allocHost; the colocated motion in
-  // the scarce memory the CPU maps on the GPU's side is never cached)
+  // A picture's planes come from the context's cache when it has some that fit (Context::allocHost). The colocated
+  // motion is never cached: it is in the scarce GPU memory that the CPU maps.
   Context*   context = static_cast<Context*>( opaque );
   HostPlane* plane   = new HostPlane;
   plane->host        = comp == kColMotion ? context->alloc( size, MemKind::Upload ) : context->allocHost( size, MemKind::HostCached );
@@ -98,7 +98,7 @@ static void unrefHostPlane( void* opaque, void* allocator )
   Context*   context = static_cast<Context*>( opaque );
   if( plane->host.kind == MemKind::HostCached )
   {
-    context->keepHost( plane->host );   // (for the next picture created: Context::allocHost)
+    context->keepHost( plane->host );   // kept for the next picture created (Context::allocHost)
   }
   else
   {
@@ -108,8 +108,8 @@ static void unrefHostPlane( void* opaque, void* allocator )
   delete plane;
 }
 
-// A stand-in of a plane: address space reserved without memory, of the plane's size; and the plane's twin while
-// the picture has stand-ins (PlanePool: a picture reconstructed on the GPU before it is downloaded)
+// A stand-in of a plane: address space of the plane's size, reserved without memory. It also holds the plane's twin
+// while the picture has stand-ins (PlanePool: a picture reconstructed on the GPU before it is downloaded).
 struct StandIn
 {
   void*  base = nullptr;
@@ -148,8 +148,8 @@ static void releaseStandIn( void* opaque, void* allocator )
   delete standIn;
 }
 
-// The records of a picture's planes: none of the GPU path's (planes in the CPU's own memory), host planes, or their
-// stand-ins
+// The kind of records a picture's planes have: none of the GPU path's (planes in the CPU's own memory), host planes,
+// or their stand-ins
 enum class PlaneRecords
 {
   None,
@@ -178,8 +178,8 @@ static PlaneRecords planeRecords( const PelStorage& storage )
   return allocator->create == reserveStandIn ? PlaneRecords::StandIns : PlaneRecords::None;
 }
 
-// Where a plane's memory (or its stand-in's address space) begins, and the size the plane asked for: the same for a
-// plane and its stand-in, so that both give the same layout on the GPU (gpuLayout)
+// Where a plane's memory (or its stand-in's address space) begins, and the size the plane asked for. Both are the
+// same for a plane and its stand-in, so that both give the same layout on the GPU (gpuLayout).
 struct PlaneSpan
 {
   const uint8_t* base;
@@ -232,9 +232,9 @@ void releaseTwins( Picture& pic )
   const PelStorage& planes = pic.m_bufs[PIC_RECONSTRUCTION];
   if( !pic.gpuMemory || planeRecords( planes ) == PlaneRecords::None )
   {
-    return;   // (planes in the CPU's own memory: no twins)
+    return;   // planes in the CPU's own memory have no twins
   }
-  pic.gpuCurrent   = false;   // should it be referenced after all, it is uploaded again
+  pic.gpuCurrent   = false;   // should the picture be referenced after all, it is uploaded again
   Context* context = static_cast<Context*>( pic.gpuMemory->opaque );
   for( int comp = 0; comp < (int) planes.bufs.size(); comp++ )
   {
@@ -246,7 +246,7 @@ HostPlane* hostPlane( const PelStorage& storage, ComponentID comp )
 {
   HostPlane* plane = static_cast<HostPlane*>( storage.getBufAllocator( comp ) );
   CHECK_FATAL( !plane || !storage.isExternAllocator(), "Vulkan: a picture buffer the GPU cannot reach" );
-  // (a picture's stand-ins have no HostPlane: the GPU must never get their addresses)
+  // A picture's stand-ins have no HostPlane: the GPU must never get their addresses.
   CHECK_FATAL( storage.getUserAllocator()->create != createHostPlane, "Vulkan: a picture's stand-ins used as its planes" );
   return plane;
 }
@@ -272,8 +272,9 @@ GpuLayout gpuLayout( const PelStorage& storage, ComponentID comp )
   const PlaneSpan    span   = planeSpan( storage, comp );
   const VkDeviceSize offset = planeOffset( storage, comp );
   const VkDeviceSize stride = VkDeviceSize( storage.bufs[comp].stride ) * sizeof( Pel );
-  const VkDeviceSize top    = offset / stride;                                 // the rows of margin above (as many are below)
-  const VkDeviceSize rows   = VkDeviceSize( span.bytes ) / stride - 2 * top;   // (the plane's memory also has an extra sample)
+  const VkDeviceSize top    = offset / stride;   // the rows of margin above (as many are below)
+  // The rows between the margins. The plane's memory also has an extra sample, which the division drops.
+  const VkDeviceSize rows   = VkDeviceSize( span.bytes ) / stride - 2 * top;
   CHECK_FATAL( rows < VkDeviceSize( storage.bufs[comp].height ), "Vulkan: a plane laid out unexpectedly" );
   return { top * stride, rows * stride, offset % stride };
 }
@@ -289,7 +290,7 @@ PlanePool::PlanePool( const UserAllocator* planes )
 
 PlanePool::~PlanePool()
 {
-  // the downloads done, and their commands gone
+  // Wait for the downloads, then free their commands. A failed wait is ignored here: a destructor must not throw.
   for( const auto& download: m_downloads )
   {
     if( download->pic )
@@ -299,7 +300,7 @@ PlanePool::~PlanePool()
     m_ctx->destroyFence( download->fence );
     m_ctx->destroyCommandPool( download->pool );
   }
-  // (the planes kept go back to their allocator with m_free; the colocated motion too)
+  // The planes kept go back to their allocator when m_free goes; the colocated motion is given back here.
   for( const ColMotion& c: m_freeColMotion )
   {
     m_planes->unref( m_planes->opaque, c.allocation );
@@ -345,7 +346,7 @@ void PlanePool::acquireColMotion( Picture& pic )
 void PlanePool::acquire( Picture& pic )
 {
   std::unique_lock<std::mutex> lock( m_mutex );
-  waitDownloadLocked( lock, pic );   // (one running for it: its planes are the CPU's to write now)
+  waitDownloadLocked( lock, pic );   // a download running for it must end: its planes are the CPU's to write now
   acquireColMotionLocked( pic, false );
   acquirePlanesLocked( pic );
   pic.gpuNeedsDownload = false;
@@ -353,7 +354,7 @@ void PlanePool::acquire( Picture& pic )
 
 void PlanePool::acquireColMotionLocked( Picture& pic, bool gpuOnly )
 {
-  // the colocated motion, of its size and memory from the pool, else new
+  // Colocated motion of the picture's size and in the right memory from the pool, else new
   if( !pic.cs || pic.cs->m_colMiMap || !pic.cs->colMiAllocator )
   {
     return;
@@ -384,7 +385,7 @@ void PlanePool::acquirePlanesLocked( Picture& pic )
   {
     return;
   }
-  // planes of its layout from the pool, else new ones
+  // Planes of the picture's layout from the pool, else new ones
   PelStorage&                 current = pic.m_bufs[PIC_RECONSTRUCTION];
   std::unique_ptr<PelStorage> planes;
   for( auto it = m_free.begin(); it != m_free.end(); ++it )
@@ -400,12 +401,12 @@ void PlanePool::acquirePlanesLocked( Picture& pic )
   {
     planes = makeStorage( pic, m_planes );
   }
-  // its twins (a picture reconstructed with its stand-ins) go with it to the planes
+  // Its twins (of a picture reconstructed with its stand-ins) move with it to the planes.
   for( int comp = 0; comp < (int) current.bufs.size(); comp++ )
   {
     std::swap( planeTwin( current, ComponentID( comp ) ), planeTwin( *planes, ComponentID( comp ) ) );
   }
-  current.swap( *planes );   // (planes now holds the stand-ins)
+  current.swap( *planes );   // planes now holds the stand-ins
   pic.gpuSwappedPlanes = std::move( planes );
   if( pic.cs )
   {
@@ -416,10 +417,11 @@ void PlanePool::acquirePlanesLocked( Picture& pic )
 void PlanePool::release( Picture& pic )
 {
   std::unique_lock<std::mutex> lock( m_mutex );
-  waitDownloadLocked( lock, pic );   // (one started ahead that its output did not need after all)
+  waitDownloadLocked( lock, pic );   // a download started ahead that the picture's output did not need after all
   pic.gpuNeedsDownload = false;
-  // the colocated motion back to the pool (a picture the CPU parsed has it from its set-up: from the same allocator),
-  // with the memory it is in (one meant for the GPU's memory is in host memory when the BAR was full: the CPU's too)
+  // The colocated motion goes back to the pool; a picture the CPU parsed has it from its set-up, from the same
+  // allocator. It is kept with the kind of memory it is in: motion meant for the GPU's memory is in host memory when
+  // the BAR was full, and then it counts as the CPU's.
   if( pic.cs && pic.cs->m_colMiAllocation && pic.cs->colMiAllocator == m_planes )
   {
     const uint32_t bytes      = uint32_t( sizeof( ColocatedMotionInfo ) * pic.cs->m_colMiMapSize );
@@ -428,7 +430,7 @@ void PlanePool::release( Picture& pic )
     const bool     gpuOnly    = static_cast<HostPlane*>( allocation )->host.kind != MemKind::HostCached;
     m_freeColMotion.push_back( ColMotion{ allocation, map, bytes, gpuOnly } );
   }
-  // its twins back to the GPU's pool (from its planes or their stand-ins), then its planes to this one
+  // Its twins go back to the GPU's pool (from its planes or their stand-ins), then its planes to this pool.
   releaseTwins( pic );
   swapStandInsLocked( pic );
 }
@@ -449,8 +451,8 @@ void PlanePool::swapStandInsLocked( Picture& pic )
   {
     return;
   }
-  // the stand-ins swapped out when the planes came in, or new ones (a picture made with its planes); its twins (when
-  // it has them still) go with it
+  // The stand-ins swapped out when the planes came in, or new ones for a picture made with its planes. Its twins, when
+  // it still has them, move with it to the stand-ins.
   std::unique_ptr<PelStorage> standIns = std::move( pic.gpuSwappedPlanes );
   if( !standIns )
   {
@@ -461,7 +463,7 @@ void PlanePool::swapStandInsLocked( Picture& pic )
   {
     std::swap( planeTwin( current, ComponentID( comp ) ), planeTwin( *standIns, ComponentID( comp ) ) );
   }
-  current.swap( *standIns );   // (standIns now holds the planes)
+  current.swap( *standIns );   // standIns now holds the planes
   m_free.push_back( std::move( standIns ) );
   if( pic.cs )
   {
@@ -541,8 +543,9 @@ void PlanePool::startDownloadLocked( Picture& pic )
   }
   CHECK_FATAL( pic.progress < Picture::reconstructed, "Vulkan: a picture downloaded before its work on the GPU is done" );
   acquirePlanesLocked( pic );
-  // the copies of its twins into its planes' rows that hold the picture (gpuLayout), on the copy queue: its work on
-  // the GPU is done (it is reconstructed), and its last commands made their writes visible to the host
+  // The copies of its twins into the rows of its planes that hold the picture (gpuLayout), on the copy queue. They
+  // need no wait: the picture's work on the GPU is done (it is reconstructed), and its last commands made their
+  // writes visible to the host.
   Download&         download = freeDownload();
   const Api&        vk       = m_ctx->api();
   const PelStorage& planes   = pic.m_bufs[PIC_RECONSTRUCTION];
@@ -571,7 +574,8 @@ void PlanePool::waitDownloadLocked( std::unique_lock<std::mutex>& lock, Picture&
   {
     return;
   }
-  // (unlocked while it waits: the other pictures' downloads may start meanwhile; the record stays where it is)
+  // Unlock while waiting, so that the other pictures' downloads may start meanwhile; the record stays where it is.
+  // The download is marked done before a failed wait throws.
   const VkFence fence = download->fence;
   lock.unlock();
   const VkResult result = m_ctx->api().vkWaitForFences( m_ctx->device(), 1, &fence, VK_TRUE, UINT64_MAX );

@@ -75,10 +75,10 @@ public:
 
   // The size of the chunks allocated from now on (a range larger than that gets a chunk of its own)
   void   setChunkSize( VkDeviceSize size ) { m_chunkSize = size; }
-  // The chunks' size for pictures of lumaSamples samples: twice that in bytes, in steps of 1 MB, at most 8 MB.
-  // (Replays of the parse's takes and gives: Beekeeper slower 4K, up to 96 MB of records and levels at once, held
-  // 105 MB in 8 MB chunks, 112 MB in 16 MB ones, 128 MB in 32 MB ones; Top Gun slower 1080p, up to 76 MB at once, held
-  // 80 MB in 4 MB chunks.)
+  // Returns the chunks' size for pictures of lumaSamples samples: twice that in bytes, in steps of kChunkStep, at most
+  // kMaxChunkSize. Larger chunks hold more memory for nothing: in replays of the parse's takes and gives, Beekeeper
+  // slower 4K, with up to 96 MB of records and levels at once, held 105 MB in 8 MB chunks, 112 MB in 16 MB ones and
+  // 128 MB in 32 MB ones; Top Gun slower 1080p, with up to 76 MB at once, held 80 MB in 4 MB chunks.
   static VkDeviceSize chunkSizeFor( size_t lumaSamples );
   // A range of GPU memory (MemKind::Device) of at least size bytes, in steps of kAlign
   Buffer take( VkDeviceSize size );
@@ -96,8 +96,10 @@ private:
     VkDeviceSize                         taken    = 0;   // the bytes of the ranges taken
     uint64_t                             lastTake = 0;   // the tick of the last range taken
   };
-  static constexpr VkDeviceSize kAlign = 256;            // (a range never shares a cache line with another)
+  static constexpr VkDeviceSize kAlign = 256;            // so that a range never shares a cache line with another
   static constexpr VkDeviceSize kLarge = 1 << 20;        // a chunk of a range's own: its size in steps of this
+  static constexpr VkDeviceSize kChunkStep    = VkDeviceSize( 1 ) << 20;   // chunkSizeFor's steps
+  static constexpr VkDeviceSize kMaxChunkSize = VkDeviceSize( 8 ) << 20;   // chunkSizeFor's largest size
 
   Chunk& addChunk( VkDeviceSize size );
   Chunk& chunkOf( const Buffer& range );
@@ -109,8 +111,8 @@ private:
   Context*                            m_ctx;
   uint64_t                            m_idleTicks;
   uint64_t                            m_ticks     = 0;
-  VkDeviceSize                        m_chunkSize = VkDeviceSize( 8 ) << 20;
-  std::vector<std::unique_ptr<Chunk>> m_chunks;   // (in the order they were allocated)
+  VkDeviceSize                        m_chunkSize = kMaxChunkSize;
+  std::vector<std::unique_ptr<Chunk>> m_chunks;   // in the order they were allocated
 };
 
 }   // namespace gpu

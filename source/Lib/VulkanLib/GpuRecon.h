@@ -506,8 +506,6 @@ private:
   static constexpr uint32_t kMaxMarks       = 64;   // profiling marks per picture
   static constexpr uint32_t kEarlyRowsMarks = 8;    // and in the early rows' submission
   static constexpr uint32_t kDownloadMarks  = 2;    // and in a download's: its start and its end
-  // The reference table's smallest allocation, so that it seldom grows
-  static constexpr size_t   kMinRefTableBytes = 1024;
 
   Context*            m_ctx;
   SharedReconBuffers* m_shared;   // what the decoder's instances share

@@ -657,6 +657,8 @@ struct RefEntry
   int32_t         ratioX, ratioY, winLeft, winTop, scaled, unused[3];
 };
 static_assert( sizeof( RefEntry ) == 64, "the reference table laid out differently from shaders/inter.slang's" );
+// The reference table's smallest allocation, so that it seldom grows
+static constexpr size_t kMinRefTableBytes = 1024;
 
 // RPR: the scaling ratio of refPic as the picture's slices reference it, horizontally and vertically (1 <<
 // SCALE_RATIO_BITS when no slice references it). The ratio is the same in every slice of the picture; the last

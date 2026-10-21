@@ -64,9 +64,9 @@ namespace gpu
 
 // A plane of a picture. host is in host memory that the GPU can reach, where vvdec's CPU code reads and writes the
 // plane. twin is its copy in the GPU's own memory, where the GPU reconstructs the picture and keeps it as a
-// reference picture: allocated when first used, and returned to the pool when no picture references the picture
-// any more (releaseTwins). (While a picture has stand-ins of its planes, PlanePool, its twins are in the stand-ins'
-// records: planeTwin.) bytes: the size the plane asked for (host's is rounded up).
+// reference picture. The twin is allocated when first used, and returned to the pool when no picture references the
+// picture any more (releaseTwins). While a picture has stand-ins of its planes (PlanePool), its twins are in the
+// stand-ins' records instead (planeTwin). bytes is the size the plane asked for; host's size is rounded up.
 struct HostPlane
 {
   Buffer   host;
@@ -86,12 +86,12 @@ VkDeviceAddress hostAllocationAddress( void* allocation );
 // their stand-ins). The picture is then no longer gpuCurrent.
 void releaseTwins( Picture& pic );
 
-// The planes of the pictures the GPU parses (VVDEC_GPU_PARSE=2): a picture has them only from when it is about to be
-// output (DecLib::prepareOutput: its download, below) until it is finished and may be reused
+// The planes of the pictures the GPU parses (VVDEC_GPU_PARSE=2). A picture has them only from when it is about to be
+// output (DecLib::prepareOutput starts its download, below) until it is finished and may be reused
 // (PicListManager::markUnusedPicturesReusable). Before and after, the PelStorage of its planes holds stand-ins with the
-// same layout (address space reserved without memory), so that the sizes and strides are there for whatever reads
-// them, and a stray access to the samples faults at once; its twins stay with the stand-ins meanwhile (planeTwin). The
-// pool keeps the planes given back for the next pictures.
+// same layout: address space reserved without memory. So the sizes and strides are there for whatever reads them, and
+// a stray access to the samples faults at once. Meanwhile its twins stay with the stand-ins (planeTwin). The pool
+// keeps the planes given back for the next pictures.
 class PlanePool
 {
 public:
@@ -103,20 +103,20 @@ public:
 
   // The stand-ins' allocator, for the picture list's new pictures (PicListManager::setGpuPlanes)
   UserAllocator* standIns() { return &m_standIns; }
-  // Gives the picture colocated motion (from the pool, or new) when it has none: when its work goes to the GPU, whose
-  // front end alone writes and reads it (in GPU memory the CPU can map)
+  // Gives the picture colocated motion (from the pool, or new) when it has none. For a picture whose work goes to the
+  // GPU: only the GPU front end writes and reads that motion, so it is in GPU memory the CPU can map.
   void acquireColMotion( Picture& pic );
-  // Swaps planes (from the pool, or new ones) in for the picture's stand-ins, its twins going with it, for the CPU to
-  // write them (a picture filled in grey, a picture the CPU parses), and gives it colocated motion (the same); nothing
-  // of what it has. The picture needs no download afterwards.
+  // Swaps planes (from the pool, or new ones) in for the picture's stand-ins, its twins moving with it, so that the
+  // CPU can write them (a picture filled in grey, a picture the CPU parses). Also gives it colocated motion, as
+  // acquireColMotion does. Leaves alone what the picture has already. The picture needs no download afterwards.
   void acquire( Picture& pic );
-  // Swaps stand-ins in for the picture's planes, which go back to the pool, its twins to the GPU's pool, and its
-  // colocated motion back to the pool; nothing of what it does not have. For a finished picture whose buffer may be
-  // reused, and a buffer used for a picture the GPU parses.
+  // Swaps stand-ins in for the picture's planes, which go back to the pool; its twins go back to the GPU's pool, and
+  // its colocated motion back to this pool. Leaves alone what the picture does not have. For a finished picture whose
+  // buffer may be reused, and for a buffer used for a picture the GPU parses.
   void release( Picture& pic );
   // Swaps stand-ins in for the planes of a picture that was output (the application gave it back) but may still be
-  // referenced: the planes go back to the pool, its twins stay (with the stand-ins); nothing when its twins are not
-  // current (its planes hold it: a picture filled in grey)
+  // referenced: the planes go back to the pool, and its twins stay with the stand-ins. Does nothing when its twins are
+  // not current, because then its planes hold it (a picture filled in grey).
   void releasePlanes( Picture& pic );
   // Whether the picture has its planes (not their stand-ins)
   bool hasPlanes( const Picture& pic ) const;
@@ -125,14 +125,15 @@ public:
   // reference pictures' twins).
   std::unique_lock<std::mutex> lockPlanes() { return std::unique_lock<std::mutex>( m_mutex ); }
 
-  // --- The download of a picture whose work went to the GPU with stand-ins of its planes (Picture::gpuNeedsDownload:
-  // its twins hold it): only when it is about to be output, so that the pictures waiting for their turn (in random
-  // access, references most of them) are not held twice, on the GPU and in host memory ---
-  // Starts the copies of the picture's twins into planes it gets now, on the copy queue (its work on the GPU done)
+  // --- Downloads ---
+  // A picture whose work went to the GPU with stand-ins of its planes is held by its twins (Picture::gpuNeedsDownload).
+  // It is downloaded only when it is about to be output, so that the pictures waiting for their turn (in random
+  // access, references most of them) are not held twice, on the GPU and in host memory.
+  // Starts the copies of the picture's twins, on the copy queue, into planes it gets now; its work on the GPU is done.
   void startDownload( Picture& pic );
-  // Waits for the picture's download, started now if it was not: its planes hold it afterwards
+  // Waits for the picture's download, which starts now if it has not yet: the picture's planes hold it afterwards.
   void finishDownload( Picture& pic );
-  // Waits for every download running (before the pictures' planes are freed: the decoder closing)
+  // Waits for every download running. For the decoder closing, before the pictures' planes are freed.
   void waitDownloads();
 
 private:
@@ -146,21 +147,21 @@ private:
   };
 
   std::unique_ptr<PelStorage> makeStorage( const Picture& pic, const UserAllocator* allocator ) const;   // of its layout
-  // (with m_mutex locked)
-  void      acquireColMotionLocked( Picture& pic, bool gpuOnly );   // gpuOnly: acquireColMotion's, else acquire's
-  void      acquirePlanesLocked( Picture& pic );   // its planes, its twins going with it
-  void      swapStandInsLocked( Picture& pic );    // its planes back to the pool, its twins going to the stand-ins
+  // The steps of the public functions, called with m_mutex locked
+  void      acquireColMotionLocked( Picture& pic, bool gpuOnly );   // gpuOnly: for acquireColMotion, else for acquire
+  void      acquirePlanesLocked( Picture& pic );   // gives it its planes; its twins move with it
+  void      swapStandInsLocked( Picture& pic );    // its planes back to the pool; its twins move to the stand-ins
   void      startDownloadLocked( Picture& pic );
-  void      waitDownloadLocked( std::unique_lock<std::mutex>& lock, Picture& pic );   // unlocked while it waits
+  void      waitDownloadLocked( std::unique_lock<std::mutex>& lock, Picture& pic );   // unlocks while it waits
   Download* downloadOf( const Picture& pic ) const;   // the download running for the picture, or null
   Download& freeDownload();                           // a download free, or a new one
 
   const UserAllocator*                     m_planes;
   UserAllocator                            m_standIns;
   Context*                                 m_ctx;
-  std::mutex                               m_mutex;   // (acquire and release run on the decoder's threads)
+  std::mutex                               m_mutex;   // acquire and release run on the decoder's threads
   std::vector<std::unique_ptr<PelStorage>> m_free;    // planes no picture has
-  // colocated motion no picture has (from m_planes: the pictures' colMiAllocator)
+  // Colocated motion that no picture has (from m_planes, the pictures' colMiAllocator)
   struct ColMotion
   {
     void*    allocation;
@@ -169,7 +170,7 @@ private:
     bool     gpuOnly;   // in GPU memory: for a picture whose work goes to the GPU, not one the CPU writes
   };
   std::vector<ColMotion> m_freeColMotion;
-  std::vector<std::unique_ptr<Download>> m_downloads;   // (their records stay where they are while one is waited for)
+  std::vector<std::unique_ptr<Download>> m_downloads;   // pointers, so that a record stays put while it is waited for
 };
 
 // The HostPlane of a component of a picture whose planes come from hostPictureAllocator.
@@ -180,10 +181,10 @@ Buffer&    planeTwin( const PelStorage& storage, ComponentID comp );
 // Where a plane's sample (0, 0) is in its host buffer, in bytes.
 VkDeviceSize planeOffset( const PelStorage& storage, ComponentID comp );
 
-// How a plane is laid out on the GPU (in its twin, or in scratch memory like it): the host plane's rows that hold
-// the picture, including its extension to whole CTUs but not its margins above and below, which no shader reads.
-// The stride is the host plane's, so that a sample has the same place within its row. (A plane's stand-in gives the
-// same layout.)
+// How a plane is laid out on the GPU, in its twin or in scratch memory like it: the host plane's rows that hold the
+// picture, including its extension to whole CTUs but not its margins above and below, which no shader reads. The
+// stride is the host plane's, so that a sample has the same place within its row. A plane's stand-in gives the same
+// layout.
 struct GpuLayout
 {
   VkDeviceSize hostOffset;   // where the first of these rows starts in the host buffer
