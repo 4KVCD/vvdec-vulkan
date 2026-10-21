@@ -139,4 +139,7 @@ output frames, not to the reference pictures.
 - `GpuFilmGrain.*`: film grain synthesis on the output frames.
 - `shaders/*.slang`: one file per pass (some with variants, see `cmake/modules/vvdecVulkanShaders.cmake`). The build
   embeds their SPIR-V in the generated `vvdec_gpu/GpuShaders.h`, which only `GpuContext.cpp` includes; the other
-  files name shaders through `vvdec_gpu/GpuShaderIds.h`.
+  files name shaders through `vvdec_gpu/GpuShaderIds.h`. The passes share a few includes: `common.slang` (sample
+  access, packing, the indirect dispatches' arguments), `records.slang` (the layout of `GpuFrontEnd.h`'s records),
+  `intrajob.slang` (the intra jobs' kinds and flags), `scan.slang` (a workgroup's prefix sum) and the generated
+  `parsectx.slang` (the CABAC contexts).
