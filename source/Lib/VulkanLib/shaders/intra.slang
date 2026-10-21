@@ -72,14 +72,22 @@ struct Params
 
 [[vk::push_constant]] Params pc;
 
-#define PLANAR_IDX 0
-#define DC_IDX 1
-#define HOR_IDX 18
-#define DIA_IDX 34
-#define VER_IDX 50
-#define VDIA_IDX 66
+// The intra prediction modes that the angular code singles out (vvdec's names)
+static const int PLANAR_IDX = 0;
+static const int DC_IDX     = 1;
+static const int HOR_IDX    = 18;
+static const int DIA_IDX    = 34;
+static const int VER_IDX    = 50;
+static const int VDIA_IDX   = 66;
 
-#define MAX_REF 136   // 2 x 64 + 1, rounded up
+// A workgroup has kThreads threads, and makes at most kThreads * kPerThread samples (a band of the block's rows).
+static const int kThreads   = 64;
+static const int kPerThread = 4;
+
+// The reference samples of a side: up to 2 x 64 + 1 (with MRL's extra lines), rounded up. Each thread loads
+// kRefsPerThread of them per side.
+static const int kMaxRef        = 136;
+static const int kRefsPerThread = 3;
 
 static const int kAngTable[32] = { 0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 18, 20, 23, 26, 29, 32, 35, 39, 45, 51, 57, 64, 73, 86, 102, 128, 171, 256, 341, 512, 1024 };
 static const int kInvAngTable[32] = { 0, 16384, 8192, 5461, 4096, 2731, 2048, 1638, 1365, 1170, 1024, 910, 819, 712, 630, 565,
@@ -121,34 +129,34 @@ int sampleAt( int comp, int x, int y )
 }
 
 // The reference samples, shared by the block's threads and laid out as vvdec's
-// xFillReferenceSamples (and xFilterReferenceSamples) lay them out: t[0] is the
-// top-left sample, t[1..] the row above (including the above-right part), l[0]
-// the top-left sample again, and l[1..] the column to the left (including the
-// below-left part). tf and lf hold the filtered references.
-groupshared int t[MAX_REF];
-groupshared int l[MAX_REF];
-groupshared int tf[MAX_REF];
-groupshared int lf[MAX_REF];
+// xFillReferenceSamples (and xFilterReferenceSamples) lay them out: s_top[0] is the
+// top-left sample, s_top[1..] the row above (including the above-right part), s_left[0]
+// the top-left sample again, and s_left[1..] the column to the left (including the
+// below-left part). s_topFiltered and s_leftFiltered hold the filtered references.
+groupshared int s_top[kMaxRef];
+groupshared int s_left[kMaxRef];
+groupshared int s_topFiltered[kMaxRef];
+groupshared int s_leftFiltered[kMaxRef];
 groupshared int  s_dc;      // DC's value
 groupshared int3 s_model;   // CCLM's a, b, shift
-groupshared int16_t s_res[256];    // the residual of the workgroup's samples, read from the picture
-groupshared int16_t s_luma[256];   // CCLM: the downsampled luma of the workgroup's samples
+groupshared int16_t s_res[kThreads * kPerThread];    // the residual of the workgroup's samples, read from the picture
+groupshared int16_t s_luma[kThreads * kPerThread];   // CCLM: the downsampled luma of the workgroup's samples
 groupshared int     s_tmpl[4];         // CCLM: the luma of the template samples that the model picks
 groupshared int     s_cubic[128];      // kCubic, for luma's angular modes
 
 // The reads of xFillReferenceSamples. Each thread loads its own reference
-// samples, t[tid + 64 k] and l[tid + 64 k] (k < 3), from the reference line r
+// samples, s_top[tid + kThreads k] and s_left[tid + kThreads k] (k < kRefsPerThread), from the reference line r
 // rows above and r columns left of the block's neighbours (MRL: r =
-// cu.multiRefIdx(), which is 0 except for luma's extra lines). t[0 .. r] and
-// l[0 .. r] are the corner, t[1 + r + i] is the row above from x0 + i, and
-// l[1 + r + i] the column to the left from y0 + i. Where neighbours are
+// cu.multiRefIdx(), which is 0 except for luma's extra lines). s_top[0 .. r] and
+// s_left[0 .. r] are the corner, s_top[1 + r + i] is the row above from x0 + i, and
+// s_left[1 + r + i] the column to the left from y0 + i. Where neighbours are
 // missing, the samples are padded as vvdec pads them: the code works out each
 // element's source sample (or the middle value) first, so that all the reads
 // can be issued together.
 struct References
 {
-  int t[3];
-  int l[3];
+  int top[kRefsPerThread];
+  int left[kRefsPerThread];
 };
 
 // The inputs of a block's xFillReferenceSamples: the block, the lengths of its
@@ -191,7 +199,7 @@ RefFill refFill( int comp, int x0, int y0, int predSize, int predHSize, int nTL,
   return f;
 }
 
-// The source sample of element j of t (in row y0 - 1 - r).
+// The source sample of element j of s_top (in row y0 - 1 - r).
 int2 topSource( RefFill f, int j )
 {
   const int rowY = f.y0 - 1 - f.r;
@@ -207,7 +215,7 @@ int2 topSource( RefFill f, int j )
   return f.nAbove != 0 ? int2( f.x0 + min( j - 1 - f.r, f.tmpA - 1 ), rowY ) : f.pad;
 }
 
-// The source sample of element i of l (in column x0 - 1 - r).
+// The source sample of element i of s_left (in column x0 - 1 - r).
 int2 leftSource( RefFill f, int i )
 {
   const int rowY = f.y0 - 1 - f.r;
@@ -237,12 +245,12 @@ References loadReferences( int tid, RefFill f )
 {
   References refs;
   [unroll]
-  for( int k = 0; k < 3; k++ )
+  for( int k = 0; k < kRefsPerThread; k++ )
   {
-    const int j = tid + 64 * k;
-    const int i = tid + 64 * k;
-    refs.t[k]   = j <= f.predSize + f.r ? fillValue( f, topSource( f, j ) ) : 0;
-    refs.l[k]   = i <= f.predHSize + f.r ? fillValue( f, leftSource( f, i ) ) : 0;
+    const int j = tid + kThreads * k;
+    const int i = tid + kThreads * k;
+    refs.top[k]  = j <= f.predSize + f.r ? fillValue( f, topSource( f, j ) ) : 0;
+    refs.left[k] = i <= f.predHSize + f.r ? fillValue( f, leftSource( f, i ) ) : 0;
   }
   return refs;
 }
@@ -256,7 +264,7 @@ struct IspCu
   bool leftAvail, aboveAvail;
 };
 
-IspCu ispCuOf( uint job[12] )
+IspCu ispCuOf( uint job[kIntraJobWords] )
 {
   IspCu cu;
   cu.x          = int( job[4] & 0xffff );
@@ -284,9 +292,9 @@ References loadReferencesIsp( int tid, RefFill f, int px, int py, int pw, int ph
   const bool first = px == cx && py == cy;
   References refs;
   [unroll]
-  for( int k = 0; k < 3; k++ )
+  for( int k = 0; k < kRefsPerThread; k++ )
   {
-    const int j = tid + 64 * k;
+    const int j = tid + kThreads * k;
     int2      at;
     bool      fromFill;   // true: from the CU's fill; false: a sample of the picture
     if( first )
@@ -309,12 +317,12 @@ References loadReferencesIsp( int tid, RefFill f, int px, int py, int pw, int ph
       fromFill = false;
       at       = int2( cx + min( j - 1, pw - 1 ), py - 1 );
     }
-    refs.t[k] = j <= cw + pw ? ( fromFill ? fillValue( f, at ) : sampleAt( 0, at.x, at.y ) ) : 0;
+    refs.top[k] = j <= cw + pw ? ( fromFill ? fillValue( f, at ) : sampleAt( 0, at.x, at.y ) ) : 0;
   }
   [unroll]
-  for( int k = 0; k < 3; k++ )
+  for( int k = 0; k < kRefsPerThread; k++ )
   {
-    const int i = tid + 64 * k;
+    const int i = tid + kThreads * k;
     int2      at;
     bool      fromFill;
     if( first )
@@ -325,33 +333,33 @@ References loadReferencesIsp( int tid, RefFill f, int px, int py, int pw, int ph
     else if( cu.ver )
     {
       fromFill = false;
-      at       = int2( px - 1, cy + min( max( i - 1, 0 ), ph - 1 ) );   // (l[0] is t[0])
+      at       = int2( px - 1, cy + min( max( i - 1, 0 ), ph - 1 ) );   // (s_left[0] is s_top[0])
     }
     else
     {
       fromFill = cu.leftAvail;
       at       = cu.leftAvail ? leftSource( f, py - cy + i ) : int2( cx, py - 1 );
     }
-    refs.l[k] = i <= ch + ph ? ( fromFill ? fillValue( f, at ) : sampleAt( 0, at.x, at.y ) ) : 0;
+    refs.left[k] = i <= ch + ph ? ( fromFill ? fillValue( f, at ) : sampleAt( 0, at.x, at.y ) ) : 0;
   }
   return refs;
 }
 
-// The writes of xFillReferenceSamples: t[0 .. topLast] and l[0 .. leftLast]
-// (l[0], the corner, equals t[0]).
+// The writes of xFillReferenceSamples: s_top[0 .. topLast] and s_left[0 .. leftLast]
+// (s_left[0], the corner, equals s_top[0]).
 void storeReferences( int tid, int topLast, int leftLast, References refs )
 {
   [unroll]
-  for( int k = 0; k < 3; k++ )
+  for( int k = 0; k < kRefsPerThread; k++ )
   {
-    const int j = tid + 64 * k;
+    const int j = tid + kThreads * k;
     if( j <= topLast )
     {
-      t[j] = refs.t[k];
+      s_top[j] = refs.top[k];
     }
     if( j <= leftLast )
     {
-      l[j] = j == 0 ? refs.t[0] : refs.l[k];
+      s_left[j] = j == 0 ? refs.top[0] : refs.left[k];
     }
   }
 }
@@ -361,24 +369,24 @@ void filterReferences( int tid, int w, int h )
 {
   const int predSize  = w << 1;
   const int predHSize = h << 1;
-  for( int i = tid; i <= predHSize; i += 64 )
+  for( int i = tid; i <= predHSize; i += kThreads )
   {
-    lf[i] = i == predHSize ? l[i] : ( i == 0 ? ( l[1] + 2 * t[0] + t[1] + 2 ) >> 2 : ( l[i + 1] + 2 * l[i] + l[i - 1] + 2 ) >> 2 );
+    s_leftFiltered[i] = i == predHSize ? s_left[i] : ( i == 0 ? ( s_left[1] + 2 * s_top[0] + s_top[1] + 2 ) >> 2 : ( s_left[i + 1] + 2 * s_left[i] + s_left[i - 1] + 2 ) >> 2 );
   }
-  for( int i = tid; i <= predSize; i += 64 )
+  for( int i = tid; i <= predSize; i += kThreads )
   {
-    tf[i] = i == predSize ? t[i] : ( i == 0 ? ( l[1] + 2 * t[0] + t[1] + 2 ) >> 2 : ( t[i + 1] + 2 * t[i] + t[i - 1] + 2 ) >> 2 );
+    s_topFiltered[i] = i == predSize ? s_top[i] : ( i == 0 ? ( s_left[1] + 2 * s_top[0] + s_top[1] + 2 ) >> 2 : ( s_top[i + 1] + 2 * s_top[i] + s_top[i - 1] + 2 ) >> 2 );
   }
 }
 
 int refT( bool filtered, int i )
 {
-  return filtered ? tf[i] : t[i];
+  return filtered ? s_topFiltered[i] : s_top[i];
 }
 
 int refL( bool filtered, int i )
 {
-  return filtered ? lf[i] : l[i];
+  return filtered ? s_leftFiltered[i] : s_left[i];
 }
 
 int wideAngle( int w, int h, int predMode )
@@ -420,7 +428,7 @@ struct Angular
 };
 
 // refMain[k] and refSide[k] of xPredIntraAng, before xPredIntraAng offsets them
-// by the reference line (k indexes t and l)
+// by the reference line (k indexes s_top and s_left)
 int refMain( Angular a, bool filtered, int k )
 {
   return a.isVer ? refT( filtered, k ) : refL( filtered, k );
@@ -586,17 +594,18 @@ int pdpcPlanarDc( bool filtered, int w, int h, int x, int y, int val )
 // MIP (Mip::PredictorMIP): the block's top and left references are averaged down to 2 or 4 samples each, a matrix
 // multiplies them into the reduced prediction (4x4 or 8x8), and that is upsampled linearly to the block's size
 // (horizontally, then vertically, starting from the references at the block's edges). The reduced boundary and the
-// reduced prediction are kept in s_luma (CCLM's buffer), from MIP_BDRY and from 0.
+// reduced prediction are kept in s_luma (CCLM's buffer), from kMipBoundaryAt and from 0.
 // --------------------------------------------------------------------------------------------------------------------
 
-#define MIP_BDRY 64
+// Where MIP keeps its reduced boundary in s_luma (its reduced prediction starts at 0)
+static const int kMipBoundaryAt = 64;
 
 int mipSizeId( int w, int h )
 {
   return ( w == 4 && h == 4 ) ? 0 : ( ( w == 4 || h == 4 || ( w == 8 && h == 8 ) ) ? 1 : 2 );
 }
 
-// boundaryDownsampling1D: element b of the reduced boundary (the top part for b < bdry, then the left), from t and l
+// boundaryDownsampling1D: element b of the reduced boundary (the top part for b < bdry, then the left), from s_top and s_left
 int mipBoundary( int b, int bdry, int w, int h )
 {
   const bool top    = b < bdry;
@@ -605,19 +614,19 @@ int mipBoundary( int b, int bdry, int w, int h )
   const int  factor = len / bdry;
   if( factor == 1 )
   {
-    return top ? t[1 + idx] : l[1 + idx];
+    return top ? s_top[1 + idx] : s_left[1 + idx];
   }
   int sum = 0;
   for( int k = 0; k < factor; k++ )
   {
-    sum += top ? t[1 + idx * factor + k] : l[1 + idx * factor + k];
+    sum += top ? s_top[1 + idx * factor + k] : s_left[1 + idx * factor + k];
   }
   const int log2F = log2Int( factor );
   return ( sum + ( 1 << ( log2F - 1 ) ) ) >> log2F;
 }
 
 // computeReducedPred: computes output o (in the order of the matrix's rows) of mode `mode` from the reduced
-// boundary in s_luma[MIP_BDRY ..], and writes it where the (possibly transposed) reduced prediction keeps it.
+// boundary in s_luma[kMipBoundaryAt ..], and writes it where the (possibly transposed) reduced prediction keeps it.
 void mipReducedPred( int o, int sizeId, int mode, bool transposed )
 {
   const int bdry    = sizeId == 0 ? 2 : 4;
@@ -633,7 +642,7 @@ void mipReducedPred( int o, int sizeId, int mode, bool transposed )
   for( int i = 0; i < 8; i++ )
   {
     const int src = transposed ? ( i < bdry ? bdry + i : i - bdry ) : i;
-    in[i]         = i < inSize ? int( s_luma[MIP_BDRY + src] ) : 0;
+    in[i]         = i < inSize ? int( s_luma[kMipBoundaryAt + src] ) : 0;
   }
   const int inputOffset = in[0];
   in[0] = sizeId < 2 ? ( 1 << ( pc.bitDepth - 1 ) ) - inputOffset : 0;
@@ -668,7 +677,7 @@ int mipRow( int k, int x, int w, int h, int pred )
   const int log2H  = log2Int( upH );
   const int j      = x >> log2H;
   const int i      = x & ( upH - 1 );
-  const int before = j == 0 ? l[1 + ( upV - 1 ) + k * upV] : int( s_luma[k * pred + j - 1] );
+  const int before = j == 0 ? s_left[1 + ( upV - 1 ) + k * upV] : int( s_luma[k * pred + j - 1] );
   const int behind = int( s_luma[k * pred + j] );
   return ( ( before << log2H ) + ( upH >> 1 ) + ( i + 1 ) * ( behind - before ) ) >> log2H;
 }
@@ -684,7 +693,7 @@ int mipSample( int x, int y, int w, int h, int pred )
   const int log2V  = log2Int( upV );
   const int k      = y >> log2V;
   const int i      = y & ( upV - 1 );
-  const int before = k == 0 ? t[1 + x] : mipRow( k - 1, x, w, h, pred );
+  const int before = k == 0 ? s_top[1 + x] : mipRow( k - 1, x, w, h, pred );
   const int behind = mipRow( k, x, w, h, pred );
   return ( ( before << log2V ) + ( upV >> 1 ) + ( i + 1 ) * ( behind - before ) ) >> log2V;
 }
@@ -784,8 +793,30 @@ int lumaTemplateLeft( int lx, int ly, int j, bool bAbove )
   return ( lumaAt( x, y ) * 2 + lumaAt( x - 1, y ) + lumaAt( x + 1, y ) + lumaAt( x, y + 1 ) * 2 + lumaAt( x - 1, y + 1 ) + lumaAt( x + 1, y + 1 ) + 4 ) >> 3;
 }
 
-// The template samples that the linear model picks: cntT above (t[1 + startPos0
-// + k * pickStep0]), then cntL to the left (l[1 + startPos1 + k * pickStep1]);
+// CCLM's neighbours (IntraJob::setCclm, words 4 and 5): whether the luma template has samples above and to the left
+// (vvdec's bAbove, bLeft), whether the chroma block has neighbours above and to the left (getLmAvailability), and how
+// many neighbouring chroma samples are available above and to the left
+struct CclmNeighbours
+{
+  bool lumaAbove, lumaLeft;
+  bool aboveAvailable, leftAvailable;
+  int  actualTop, actualLeft;
+};
+
+CclmNeighbours cclmNeighboursOf( uint word4, uint word5 )
+{
+  CclmNeighbours n;
+  n.lumaAbove      = ( ( word4 >> 16 ) & 1 ) != 0;
+  n.lumaLeft       = ( ( word4 >> 17 ) & 1 ) != 0;
+  n.aboveAvailable = ( ( word4 >> 18 ) & 1 ) != 0;
+  n.leftAvailable  = ( ( word4 >> 19 ) & 1 ) != 0;
+  n.actualTop      = int( word5 & 0xffff );
+  n.actualLeft     = int( word5 >> 16 );
+  return n;
+}
+
+// The template samples that the linear model picks: cntT above (s_top[1 + startPos0
+// + k * pickStep0]), then cntL to the left (s_left[1 + startPos1 + k * pickStep1]);
 // four at most.
 struct CclmPicks
 {
@@ -797,12 +828,12 @@ struct CclmPicks
   int pickStep1;
 };
 
-CclmPicks cclmPicks( uint lm, uint lm2 )
+CclmPicks cclmPicks( CclmNeighbours n )
 {
-  const bool aboveAvailable = ( ( lm >> 18 ) & 1 ) != 0;
-  const bool leftAvailable  = ( ( lm >> 19 ) & 1 ) != 0;
-  const int  actualTop      = int( lm2 & 0xffff );
-  const int  actualLeft     = int( lm2 >> 16 );
+  const bool aboveAvailable = n.aboveAvailable;
+  const bool leftAvailable  = n.leftAvailable;
+  const int  actualTop      = n.actualTop;
+  const int  actualLeft     = n.actualLeft;
 
   const int aboveIs4 = leftAvailable ? 0 : 1;
   const int leftIs4  = aboveAvailable ? 0 : 1;
@@ -817,21 +848,19 @@ CclmPicks cclmPicks( uint lm, uint lm2 )
 }
 
 // The downsampled luma of template sample k (k < cntT + cntL).
-int cclmTemplateLuma( int x0, int y0, uint lm, CclmPicks p, int k )
+int cclmTemplateLuma( int x0, int y0, CclmNeighbours n, CclmPicks p, int k )
 {
-  const bool bAbove = ( ( lm >> 16 ) & 1 ) != 0;
-  const bool bLeft  = ( ( lm >> 17 ) & 1 ) != 0;
-  return k < p.cntT ? lumaTemplateAbove( x0 << pc.scaleX, y0 << pc.scaleY, p.startPos0 + k * p.pickStep0, bLeft )
-                    : lumaTemplateLeft( x0 << pc.scaleX, y0 << pc.scaleY, p.startPos1 + ( k - p.cntT ) * p.pickStep1, bAbove );
+  return k < p.cntT ? lumaTemplateAbove( x0 << pc.scaleX, y0 << pc.scaleY, p.startPos0 + k * p.pickStep0, n.lumaLeft )
+                    : lumaTemplateLeft( x0 << pc.scaleX, y0 << pc.scaleY, p.startPos1 + ( k - p.cntT ) * p.pickStep1, n.lumaAbove );
 }
 
 // The linear model's a, b and shift, from the template's luma in s_tmpl and
-// its chroma in t and l.
-int3 cclmParameters( uint lm, uint lm2 )
+// its chroma in s_top and s_left.
+int3 cclmParameters( CclmNeighbours n )
 {
-  const bool aboveAvailable = ( ( lm >> 18 ) & 1 ) != 0;
-  const bool leftAvailable  = ( ( lm >> 19 ) & 1 ) != 0;
-  const CclmPicks p         = cclmPicks( lm, lm2 );
+  const bool      aboveAvailable = n.aboveAvailable;
+  const bool      leftAvailable  = n.leftAvailable;
+  const CclmPicks p              = cclmPicks( n );
 
   int selLuma[4]   = { 0, 0, 0, 0 };
   int selChroma[4] = { 0, 0, 0, 0 };
@@ -839,12 +868,12 @@ int3 cclmParameters( uint lm, uint lm2 )
   for( int k = 0; k < cntT; k++ )
   {
     selLuma[k]   = s_tmpl[k];
-    selChroma[k] = t[1 + p.startPos0 + k * p.pickStep0];
+    selChroma[k] = s_top[1 + p.startPos0 + k * p.pickStep0];
   }
   for( int k = 0; k < cntL; k++ )
   {
     selLuma[cntT + k]   = s_tmpl[cntT + k];
-    selChroma[cntT + k] = l[1 + p.startPos1 + k * p.pickStep1];
+    selChroma[cntT + k] = s_left[1 + p.startPos1 + k * p.pickStep1];
   }
   if( cntT + cntL == 2 )
   {
@@ -914,18 +943,40 @@ int3 cclmParameters( uint lm, uint lm2 )
 
 groupshared int s_lsum[4];   // the luma sums of the workgroup's subgroups (hardware waves)
 
-// This thread's share of the luma sum: left sample tid and above sample tid.
+// LMCS's scaling of the block (IntraJob::setLmcs, word 9): whether the chroma residual is scaled, whether the CU's
+// luma neighbours left and above are available, and log2 of how many of them each side averages
+bool lmcsScales( uint info )
+{
+  return ( info & 1 ) != 0;
+}
+
+bool lmcsHasLeft( uint info )
+{
+  return ( info & 2 ) != 0;
+}
+
+bool lmcsHasAbove( uint info )
+{
+  return ( info & 4 ) != 0;
+}
+
+int lmcsLog2Count( uint info )
+{
+  return int( ( info >> 4 ) & 15 );
+}
+
+// This thread's share of the luma sum: left sample tid and above sample tid of the luma CU at anchor (x | y << 16).
 int lmcsLuma( int tid, uint anchor, uint info )
 {
   const int x     = int( anchor & 0xffff );
   const int y     = int( anchor >> 16 );
-  const int count = 1 << int( ( info >> 4 ) & 15 );
+  const int count = 1 << lmcsLog2Count( info );
   int       sum   = 0;
-  if( tid < count && ( info & 2 ) != 0 )
+  if( tid < count && lmcsHasLeft( info ) )
   {
     sum += sampleAt( 0, x - 1, min( y + tid, pc.picHeight - 1 ) );
   }
-  if( tid < count && ( info & 4 ) != 0 )
+  if( tid < count && lmcsHasAbove( info ) )
   {
     sum += sampleAt( 0, min( x + tid, pc.picWidth - 1 ), y - 1 );
   }
@@ -946,12 +997,12 @@ void lmcsShare( int tid, int luma )
 int lmcsScale( uint info )
 {
   int sum = 0;
-  for( int k = 0; k < 64 / int( WaveGetLaneCount() ); k++ )
+  for( int k = 0; k < kThreads / int( WaveGetLaneCount() ); k++ )
   {
     sum += s_lsum[k];
   }
-  const int log2Count = int( ( info >> 4 ) & 15 );
-  const int sides     = int( ( info >> 1 ) & 1 ) + int( ( info >> 2 ) & 1 );
+  const int log2Count = lmcsLog2Count( info );
+  const int sides     = ( lmcsHasLeft( info ) ? 1 : 0 ) + ( lmcsHasAbove( info ) ? 1 : 0 );
   const int luma      = sides == 1 ? ( sum + ( 1 << ( log2Count - 1 ) ) ) >> log2Count
                         : ( sides == 2 ? ( sum + ( 1 << log2Count ) ) >> ( log2Count + 1 ) : 1 << ( pc.bitDepth - 1 ) );
   return pc.lmcsScale[luma];
@@ -980,7 +1031,7 @@ struct IntraBlock
   int  maxVal;
 };
 
-IntraBlock intraBlockOf( uint job[12] )
+IntraBlock intraBlockOf( uint job[kIntraJobWords] )
 {
   IntraBlock b;
   b.x0       = int( job[0] & 0xffff );
@@ -1000,7 +1051,7 @@ IntraBlock intraBlockOf( uint job[12] )
   b.s0       = int( job[7] & 0xffff ) * b.w;
   b.m        = int( job[7] >> 16 ) * b.w;
   b.lmcsInfo = job[9];
-  b.lmcs     = ( b.lmcsInfo & 1 ) != 0;
+  b.lmcs     = lmcsScales( b.lmcsInfo );
   b.maxVal   = ( 1 << pc.bitDepth ) - 1;
   return b;
 }
@@ -1008,19 +1059,19 @@ IntraBlock intraBlockOf( uint job[12] )
 // Makes an IBC job, which copies the block from elsewhere in the picture and adds the residual, or an LMCS job (the
 // chroma of an inter CU), which adds the scaled residual to the prediction kept aside. All the reads are issued
 // together, then the writes.
-void copyJob( int tid, uint job[12], IntraBlock b )
+void copyJob( int tid, uint job[kIntraJobWords], IntraBlock b )
 {
   int16_t*  dst    = planeOf( b.comp );
   const int stride = strideOf( b.comp );
   const int bvx    = int( int16_t( job[6] & 0xffff ) );
   const int bvy    = int( int16_t( job[6] >> 16 ) );
   int16_t*  src    = b.kind == kIntraLmcs ? ( b.comp == 1 ? pc.defer1 : pc.defer2 ) : dst;
-  int       pred[4];
-  int       res[4];
+  int       pred[kPerThread];
+  int       res[kPerThread];
   [unroll]
-  for( int k = 0; k < 4; k++ )
+  for( int k = 0; k < kPerThread; k++ )
   {
-    const int i = tid + 64 * k;
+    const int i = tid + kThreads * k;
     const int x = ( b.s0 + i ) & ( b.w - 1 );
     const int y = ( b.s0 + i ) >> b.log2W;
     pred[k]     = i < b.m ? ( b.kind == kIntraLmcs ? int( src[( b.y0 + y ) * stride + b.x0 + x] ) : sampleAt( b.comp, b.x0 + x + bvx, b.y0 + y + bvy ) ) : 0;
@@ -1034,9 +1085,9 @@ void copyJob( int tid, uint job[12], IntraBlock b )
     scale = lmcsScale( b.lmcsInfo );
   }
   [unroll]
-  for( int k = 0; k < 4; k++ )
+  for( int k = 0; k < kPerThread; k++ )
   {
-    const int i = tid + 64 * k;
+    const int i = tid + kThreads * k;
     if( i < b.m )
     {
       const int at = ( b.y0 + ( ( b.s0 + i ) >> b.log2W ) ) * stride + b.x0 + ( ( b.s0 + i ) & ( b.w - 1 ) );
@@ -1059,7 +1110,7 @@ struct PredBlock
   int   topLength, leftLength;
 };
 
-PredBlock predBlockOf( uint job[12], IntraBlock b )
+PredBlock predBlockOf( uint job[kIntraJobWords], IntraBlock b )
 {
   PredBlock p;
   p.isp             = ( b.flags & kIntraIsp ) != 0;
@@ -1078,53 +1129,56 @@ PredBlock predBlockOf( uint job[12], IntraBlock b )
 // Reads what the block needs into shared memory: first the references, then, while those are in flight, the
 // residual, CCLM's luma (or CIIP's inter prediction), kCubic for luma's angular modes and LMCS's luma; then waits at a
 // barrier for all of them.
-void loadInputs( int tid, uint job[12], IntraBlock b, PredBlock p )
+void loadInputs( int tid, uint job[kIntraJobWords], IntraBlock b, PredBlock p )
 {
   int16_t*   dst    = planeOf( b.comp );
   const int  stride = strideOf( b.comp );
-  const uint nb     = job[3];
+  // The units of reference samples available top-left, above and left (IntraJob::setNeighbors; ISP: the CU's)
+  const uint nb      = job[3];
+  const int  nTL     = int( nb & 255 );
+  const int  nAbove  = int( ( nb >> 8 ) & 255 );
+  const int  nLeft   = int( ( nb >> 16 ) & 255 );
   References refs;
   if( p.isp )
   {
     // the CU's fill, as for a block of the CU's size
-    const RefFill f = refFill( b.comp, p.cu.x, p.cu.y, p.cu.w << 1, p.cu.h << 1, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), 0 );
+    const RefFill f = refFill( b.comp, p.cu.x, p.cu.y, p.cu.w << 1, p.cu.h << 1, nTL, nAbove, nLeft, 0 );
     refs = loadReferencesIsp( tid, f, b.x0 - p.xoff, b.y0, p.pw, p.ph, p.cu );
   }
   else
   {
-    refs = loadReferences( tid, refFill( b.comp, b.x0, b.y0, b.w << 1, b.h << 1, int( nb & 255 ), int( ( nb >> 8 ) & 255 ), int( ( nb >> 16 ) & 255 ), b.refLine ) );
+    refs = loadReferences( tid, refFill( b.comp, b.x0, b.y0, b.w << 1, b.h << 1, nTL, nAbove, nLeft, b.refLine ) );
   }
-  const bool lmAbove = ( ( job[4] >> 16 ) & 1 ) != 0;
-  const bool lmLeft  = ( ( job[4] >> 17 ) & 1 ) != 0;
+  const CclmNeighbours cclm = cclmNeighboursOf( job[4], job[5] );
   if( b.kind == kIntraCclm )
   {
     // CCLM: the downsampled luma of the template samples, one thread each (the block's samples follow below)
-    const CclmPicks picks = cclmPicks( job[4], job[5] );
+    const CclmPicks picks = cclmPicks( cclm );
     if( tid < picks.cntT + picks.cntL )
     {
-      s_tmpl[tid] = cclmTemplateLuma( b.x0, b.y0, job[4], picks, tid );
+      s_tmpl[tid] = cclmTemplateLuma( b.x0, b.y0, cclm, picks, tid );
     }
   }
   if( b.kind == kIntraCclm || b.kind == kIntraCiip || b.residual )
   {
     // (CIIP keeps inter's prediction where CCLM keeps its luma, in s_luma)
     int16_t* inter = b.comp == 0 ? pc.defer0 : ( b.comp == 1 ? pc.defer1 : pc.defer2 );
-    int      luma[4];
-    int      res[4];
+    int      luma[kPerThread];
+    int      res[kPerThread];
     [unroll]
-    for( int k = 0; k < 4; k++ )
+    for( int k = 0; k < kPerThread; k++ )
     {
-      const int i = tid + 64 * k;
+      const int i = tid + kThreads * k;
       const int x = ( b.s0 + i ) & ( b.w - 1 );
       const int y = ( b.s0 + i ) >> b.log2W;
-      luma[k]     = i < b.m && b.kind == kIntraCclm ? lumaDown( b.x0 << pc.scaleX, b.y0 << pc.scaleY, x, y, lmAbove, lmLeft )
+      luma[k]     = i < b.m && b.kind == kIntraCclm ? lumaDown( b.x0 << pc.scaleX, b.y0 << pc.scaleY, x, y, cclm.lumaAbove, cclm.lumaLeft )
                     : ( i < b.m && b.kind == kIntraCiip ? int( inter[( b.y0 + y ) * stride + b.x0 + x] ) : 0 );
       res[k]      = i < b.m && b.residual ? int( dst[( b.y0 + y ) * stride + b.x0 + x] ) : 0;
     }
     [unroll]
-    for( int k = 0; k < 4; k++ )
+    for( int k = 0; k < kPerThread; k++ )
     {
-      const int i = tid + 64 * k;
+      const int i = tid + kThreads * k;
       if( i < b.m )
       {
         s_luma[i] = int16_t( luma[k] );
@@ -1135,7 +1189,7 @@ void loadInputs( int tid, uint job[12], IntraBlock b, PredBlock p )
   if( b.kind == kIntraAngular && b.comp == 0 )
   {
     s_cubic[tid]      = kCubic[tid];
-    s_cubic[tid + 64] = kCubic[tid + 64];
+    s_cubic[tid + kThreads] = kCubic[tid + kThreads];
   }
   if( b.lmcs )
   {
@@ -1147,7 +1201,7 @@ void loadInputs( int tid, uint job[12], IntraBlock b, PredBlock p )
 
 // Makes one job (a block of a component, or a band of its rows): the workgroup's threads first read together what the
 // block needs from the picture, then share out the block's samples.
-void make( int tid, uint job[12] )
+void make( int tid, uint job[kIntraJobWords] )
 {
   const IntraBlock b = intraBlockOf( job );
   if( b.kind == kIntraIbc || b.kind == kIntraLmcs )
@@ -1170,7 +1224,7 @@ void make( int tid, uint job[12] )
   {
     if( tid == 0 )
     {
-      s_model = cclmParameters( job[4], job[5] );
+      s_model = cclmParameters( cclmNeighboursOf( job[4], job[5] ) );
     }
     GroupMemoryBarrierWithGroupSync();
   }
@@ -1194,7 +1248,7 @@ void make( int tid, uint job[12] )
     const int bdry   = sizeId == 0 ? 2 : 4;
     if( tid < 2 * bdry )
     {
-      s_luma[MIP_BDRY + tid] = int16_t( mipBoundary( tid, bdry, b.w, b.h ) );
+      s_luma[kMipBoundaryAt + tid] = int16_t( mipBoundary( tid, bdry, b.w, b.h ) );
     }
     GroupMemoryBarrierWithGroupSync();
     if( tid < mipPred * mipPred )
@@ -1214,7 +1268,7 @@ void make( int tid, uint job[12] )
   // Compute the samples, from shared memory only.
   int16_t*  dst    = planeOf( b.comp );
   const int stride = strideOf( b.comp );
-  for( int i = tid; i < b.m; i += 64 )
+  for( int i = tid; i < b.m; i += kThreads )
   {
     const int x = ( b.s0 + i ) & ( b.w - 1 );
     const int y = ( b.s0 + i ) >> b.log2W;
@@ -1257,7 +1311,7 @@ groupshared uint s_job;   // the job the workgroup took
 
 // One workgroup per job: each workgroup takes the next job in wave order.
 [shader( "compute" )]
-[numthreads( 64, 1, 1 )]
+[numthreads( kThreads, 1, 1 )]
 void main( uint3 local : SV_GroupThreadID )
 {
   const int tid = int( local.x );
@@ -1272,9 +1326,9 @@ void main( uint3 local : SV_GroupThreadID )
     return;   // (the whole workgroup: the dispatch, in rows of kGroupsPerRow workgroups, has more workgroups than jobs)
   }
   // Load the job while the workgroup waits for the earlier jobs.
-  const uint4 a = *(uint4*)( pc.jobs + index * 12 );
-  const uint4 b = *(uint4*)( pc.jobs + index * 12 + 4 );
-  const uint4 c = *(uint4*)( pc.jobs + index * 12 + 8 );
+  const uint4 a = *(uint4*)( pc.jobs + index * kIntraJobWords );
+  const uint4 b = *(uint4*)( pc.jobs + index * kIntraJobWords + 4 );
+  const uint4 c = *(uint4*)( pc.jobs + index * kIntraJobWords + 8 );
   if( tid == 0 )
   {
     const uint before = pc.waits[index];
@@ -1284,7 +1338,7 @@ void main( uint3 local : SV_GroupThreadID )
   }
   // The barrier acquires: what those jobs wrote becomes visible to all the threads.
   AllMemoryBarrierWithGroupSync();
-  uint job[12] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w, c.x, c.y, c.z, c.w };
+  uint job[kIntraJobWords] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w, c.x, c.y, c.z, c.w };
   make( tid, job );
   // The barrier releases: the threads' writes complete before the job counts as done.
   AllMemoryBarrierWithGroupSync();
