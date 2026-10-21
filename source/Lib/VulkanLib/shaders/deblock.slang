@@ -62,7 +62,7 @@ int betaTable( int index )
   return int( *at( pc.tables, 66u + uint( index ) ) );
 }
 
-#define MAX_QP 63
+static const int MAX_QP = 63;
 
 // Returns the QP offset of the LADF interval that contains the luma level, as deriveLADFShift does.
 int ladfShift( int level )
@@ -81,9 +81,25 @@ int ladfShift( int level )
   return shift;
 }
 
+// A CTU's record in pc.ctus (see above): kCtuBytes bytes, the field kCtuNoDeblock, then each component's beta and tc
+// offsets (the fields betaOffsetField( comp ) and tcOffsetField( comp ))
+static const int kCtuBytes     = 8;
+static const int kCtuNoDeblock = 0;
+
+int betaOffsetField( int comp )
+{
+  return 1 + 2 * comp;
+}
+
+int tcOffsetField( int comp )
+{
+  return 2 + 2 * comp;
+}
+
+// Field i of the record of the CTU that holds the sample (x, y)
 int ctuParam( int x, int y, int i )
 {
-  return int( pc.ctus[( ( y >> pc.ctuLog2 ) * pc.widthInCtus + ( x >> pc.ctuLog2 ) ) * 8 + i] );
+  return int( pc.ctus[( ( y >> pc.ctuLog2 ) * pc.widthInCtus + ( x >> pc.ctuLog2 ) ) * kCtuBytes + i] );
 }
 
 int tcFromTable( int index )
@@ -422,8 +438,8 @@ EdgeFilter decideEdge( uint2 edge, int x, int y, int bs, int l0[16], int l3[16],
   {
     qp += ladfShift( ( l0[8] + l3[8] + l0[7] + l3[7] ) >> 2 );
   }
-  const int betaOffsetDiv2 = ctuParam( x, y, 1 );
-  const int tcOffsetDiv2   = ctuParam( x, y, 2 );
+  const int betaOffsetDiv2 = ctuParam( x, y, betaOffsetField( 0 ) );
+  const int tcOffsetDiv2   = ctuParam( x, y, tcOffsetField( 0 ) );
   const int indexTc        = clip3( 0, MAX_QP + 2, qp + 2 * ( bs - 1 ) + tcOffsetDiv2 * 2 );
   const int indexB         = clip3( 0, MAX_QP, qp + betaOffsetDiv2 * 2 );
   const int tc             = tcFromTable( indexTc );
@@ -600,7 +616,7 @@ void main( uint3 id : SV_DispatchThreadID )
   const int   x    = int( edge.x & 0xffff );
   const int   y    = int( edge.x >> 16 );
   const int   bs   = int( edge.y >> 8 ) & 3;
-  if( bs == 0 || ctuParam( x, y, 0 ) != 0 )
+  if( bs == 0 || ctuParam( x, y, kCtuNoDeblock ) != 0 )
   {
     return;
   }
@@ -695,7 +711,7 @@ void main( uint3 id : SV_DispatchThreadID )
   const int ly = y << pc.scaleY;
   const int bs = int( edge.y >> 16 ) & 255;
   const int bsC[2] = { ( bs >> 2 ) & 3, ( bs >> 4 ) & 3 };
-  if( ( bsC[0] == 0 && bsC[1] == 0 ) || ctuParam( lx, ly, 0 ) != 0 )
+  if( ( bsC[0] == 0 && bsC[1] == 0 ) || ctuParam( lx, ly, kCtuNoDeblock ) != 0 )
   {
     return;
   }
@@ -719,12 +735,12 @@ void main( uint3 id : SV_DispatchThreadID )
     }
     int16_t*  p       = c == 0 ? pc.pic0 : pc.pic1;
     const int qp      = int( int8_t( ( edge.y >> ( 8 * c ) ) & 255 ) );
-    const int indexTc = clip3( 0, MAX_QP + 2, qp + 2 * ( bsC[c] - 1 ) + ctuParam( lx, ly, 4 + 2 * c ) * 2 );
+    const int indexTc = clip3( 0, MAX_QP + 2, qp + 2 * ( bsC[c] - 1 ) + ctuParam( lx, ly, tcOffsetField( 1 + c ) ) * 2 );
     const int tc      = tcFromTable( indexTc );
     bool      sw      = false;
     if( largeBoundary )
     {
-      const int indexB = clip3( 0, MAX_QP, qp + ctuParam( lx, ly, 3 + 2 * c ) * 2 );
+      const int indexB = clip3( 0, MAX_QP, qp + ctuParam( lx, ly, betaOffsetField( 1 + c ) ) * 2 );
       const int beta   = betaTable( indexB ) * ( 1 << ( pc.bitDepth - 8 ) );
       const int dp0    = calcDP( p, base0, off, chromaCtbBoundary );
       const int dq0    = calcDQ( p, base0, off );

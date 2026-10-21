@@ -39,12 +39,28 @@ struct Params
 
 [[vk::push_constant]] Params pc;
 
-groupshared int16_t s_row[1024 + 2];    // the segment's samples, plus one on each side
-groupshared int16_t s_grain[1024 + 2];  // the raw grain of the samples in s_row
-groupshared uint    s_lut[128];         // the component's sLUT, then its pLUT (bytes, four per word)
+// A workgroup of kThreads threads takes a segment of kSegment samples of a row, kPerThread samples a thread.
+static const int kThreads   = 256;
+static const int kPerThread = 4;
+static const int kSegment   = kThreads * kPerThread;
+
+// The grain's blocks are kBlockSide x kBlockSide luma samples; its patterns kPatternSide x kPatternSide grain values,
+// kPatterns per kind (luma's, then chroma's).
+static const int kBlockSide   = 16;
+static const int kPatternSide = 64;
+static const int kPatterns    = 9;
+
+// A component's LUTs have kLutEntries byte entries, one per 8-bit intensity: pc.luts holds the three components'
+// sLUTs, then their pLUTs. s_lut keeps the component's two, four entries a word.
+static const int kLutEntries = 256;
+static const int kLutWords   = kLutEntries / 4;
+
+groupshared int16_t s_row[kSegment + 2];    // the segment's samples, plus one on each side
+groupshared int16_t s_grain[kSegment + 2];  // the raw grain of the samples in s_row
+groupshared uint    s_lut[2 * kLutWords];   // the component's sLUT, then its pLUT
 
 int lutS( int i ) { return int( ( s_lut[i >> 2] >> ( 8 * ( i & 3 ) ) ) & 0xff ); }
-int lutP( int i ) { return int( ( s_lut[64 + ( i >> 2 )] >> ( 8 * ( i & 3 ) ) ) & 0xff ); }
+int lutP( int i ) { return int( ( s_lut[kLutWords + ( i >> 2 )] >> ( 8 * ( i & 3 ) ) ) & 0xff ); }
 
 // Derives a block's sign and offset into the pattern from the block's seed, as get_offset_y / u / v do.
 void offsets( uint val, out int s, out int ox, out int oy )
@@ -89,7 +105,7 @@ Block blockAt( int bxi, int band, int blocks, int j, bool overlap )
   if( overlap )
   {
     offsets( pc.seeds[( band - 1 ) * blocks + bxi], b.sUp, b.oxUp, b.oyUp );
-    b.oyUp += ( 16 + j ) / pc.suby;
+    b.oyUp += ( kBlockSide + j ) / pc.suby;
   }
   return b;
 }
@@ -99,11 +115,11 @@ Block blockAt( int bxi, int band, int blocks, int j, bool overlap )
 int grainOf( Block b, int i, int intensity, int oc1, int oc2 )
 {
   const int pi   = lutP( intensity ) >> 4;
-  const int base = ( pc.comp != 0 ? 9 : 0 ) + pi;
-  int       p    = int( pc.pattern[( base * 64 + b.oy ) * 64 + b.ox + i] ) * b.s;
+  const int base = ( pc.comp != 0 ? kPatterns : 0 ) + pi;
+  int       p    = int( pc.pattern[( base * kPatternSide + b.oy ) * kPatternSide + b.ox + i] ) * b.s;
   if( oc1 != 0 )
   {
-    p = ( p * oc1 + int( pc.pattern[( base * 64 + b.oyUp ) * 64 + b.oxUp + i] ) * oc2 * b.sUp + 16 ) >> 5;
+    p = ( p * oc1 + int( pc.pattern[( base * kPatternSide + b.oyUp ) * kPatternSide + b.oxUp + i] ) * oc2 * b.sUp + 16 ) >> 5;
   }
   return p;
 }
@@ -113,42 +129,42 @@ int grainOf( Block b, int i, int intensity, int oc1, int oc2 )
 // and past the picture's width its last sample (the border extension).
 void loadSegment( int tid, int seg0, int row, int end )
 {
-  if( tid < 64 )
+  if( tid < kLutWords )
   {
-    s_lut[tid] = pc.luts[( pc.comp * 256 ) / 4 + tid];
+    s_lut[tid] = pc.luts[pc.comp * kLutWords + tid];   // sLUT
   }
-  else if( tid < 128 )
+  else if( tid < 2 * kLutWords )
   {
-    s_lut[tid] = pc.luts[( 768 + pc.comp * 256 ) / 4 + tid - 64];
+    s_lut[tid] = pc.luts[( 3 + pc.comp ) * kLutWords + tid - kLutWords];   // pLUT
   }
   int16_t*  src = pc.src + row * pc.srcStride;
-  const int x0  = seg0 + 4 * tid;
-  for( int k = 0; k < 4; k++ )
+  const int x0  = seg0 + kPerThread * tid;
+  for( int k = 0; k < kPerThread; k++ )
   {
     if( x0 + k < end )
     {
-      s_row[1 + 4 * tid + k] = src[min( x0 + k, pc.readWidth - 1 )];
+      s_row[1 + kPerThread * tid + k] = src[min( x0 + k, pc.readWidth - 1 )];
     }
   }
   if( tid == 0 && seg0 > 0 )
   {
     s_row[0] = src[min( seg0 - 1, pc.readWidth - 1 )];
   }
-  if( tid == 255 && seg0 + 1024 < end )
+  if( tid == kThreads - 1 && seg0 + kSegment < end )
   {
-    s_row[1025] = src[min( seg0 + 1024, pc.readWidth - 1 )];
+    s_row[kSegment + 1] = src[min( seg0 + kSegment, pc.readWidth - 1 )];
   }
 }
 
-// The weights that blend the grain of the band above into the first two luma rows of a band of 16 (0, 0 elsewhere)
+// The weights that blend the grain of the band above into the first two luma rows of a band of blocks (0, 0 elsewhere)
 int2 overlapWeights( int lumaRow )
 {
-  const int j = lumaRow & 15;
-  if( lumaRow > 15 && j == 0 )
+  const int j = lumaRow & ( kBlockSide - 1 );
+  if( lumaRow >= kBlockSide && j == 0 )
   {
     return pc.suby > 1 ? int2( 20, 20 ) : int2( 12, 24 );
   }
-  if( lumaRow > 15 && j == 1 )
+  if( lumaRow >= kBlockSide && j == 1 )
   {
     return int2( 24, 12 );
   }
@@ -159,8 +175,8 @@ int2 overlapWeights( int lumaRow )
 // segment's ends, into s_grain; bxi: the block of the thread's samples
 void segmentGrain( int tid, int seg0, int x0, int bxi, int nb, int blocks, int end, int lumaRow, int2 oc )
 {
-  const int  band    = lumaRow >> 4;
-  const int  j       = lumaRow & 15;
+  const int  band    = lumaRow / kBlockSide;
+  const int  j       = lumaRow & ( kBlockSide - 1 );
   const bool overlap = oc.x != 0;
   if( pc.present == 0 || x0 >= end )
   {
@@ -168,14 +184,14 @@ void segmentGrain( int tid, int seg0, int x0, int bxi, int nb, int blocks, int e
   }
   const Block b = blockAt( bxi, band, blocks, j, overlap );
   const int   i = x0 - bxi * nb;
-  int         g[4];
-  for( int k = 0; k < 4; k++ )
+  int         g[kPerThread];
+  for( int k = 0; k < kPerThread; k++ )
   {
-    g[k] = grainOf( b, i + k, int( s_row[1 + 4 * tid + k] ) >> pc.bs, oc.x, oc.y );
+    g[k] = grainOf( b, i + k, int( s_row[1 + kPerThread * tid + k] ) >> pc.bs, oc.x, oc.y );
   }
-  for( int k = 0; k < 4; k++ )
+  for( int k = 0; k < kPerThread; k++ )
   {
-    s_grain[1 + 4 * tid + k] = int16_t( g[k] );
+    s_grain[1 + kPerThread * tid + k] = int16_t( g[k] );
   }
   if( tid == 0 && seg0 > 0 )
   {
@@ -183,11 +199,11 @@ void segmentGrain( int tid, int seg0, int x0, int bxi, int nb, int blocks, int e
     const Block l  = blockAt( xl / nb, band, blocks, j, overlap );
     s_grain[0]     = int16_t( grainOf( l, xl - ( xl / nb ) * nb, int( s_row[0] ) >> pc.bs, oc.x, oc.y ) );
   }
-  if( tid == 255 && seg0 + 1024 < end )
+  if( tid == kThreads - 1 && seg0 + kSegment < end )
   {
-    const int   xr = seg0 + 1024;
-    const Block r  = blockAt( xr / nb, band, blocks, j, overlap );
-    s_grain[1025]  = int16_t( grainOf( r, xr - ( xr / nb ) * nb, int( s_row[1025] ) >> pc.bs, oc.x, oc.y ) );
+    const int   xr       = seg0 + kSegment;
+    const Block r        = blockAt( xr / nb, band, blocks, j, overlap );
+    s_grain[kSegment + 1] = int16_t( grainOf( r, xr - ( xr / nb ) * nb, int( s_row[kSegment + 1] ) >> pc.bs, oc.x, oc.y ) );
   }
 }
 
@@ -197,14 +213,14 @@ void writeSegment( int tid, int x0, int bxi, int nb, int blocks, int row )
 {
   const int maxVal = 255 << pc.bs;
   uint8_t*  dst    = pc.dst + row * pc.dstStride;
-  for( int k = 0; k < 4; k++ )
+  for( int k = 0; k < kPerThread; k++ )
   {
     const int x = x0 + k;
     if( x >= pc.width )
     {
       break;
     }
-    const int at  = 1 + 4 * tid + k;   // x's index in s_row and s_grain
+    const int at  = 1 + kPerThread * tid + k;   // x's index in s_row and s_grain
     const int v   = int( s_row[at] );
     int       out = v;
     if( pc.present != 0 )
@@ -229,19 +245,19 @@ void writeSegment( int tid, int x0, int bxi, int nb, int blocks, int row )
   }
 }
 
-// One workgroup per segment of 1024 samples of a row (group.x the segment, group.y the row), four samples a thread:
-// the samples, then their grain, then the output
+// One workgroup per segment of a row (group.x the segment, group.y the row): the samples, then their grain, then the
+// output
 [shader( "compute" )]
-[numthreads( 256, 1, 1 )]
+[numthreads( kThreads, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
   const int tid    = int( local.x );
-  const int seg0   = int( group.x ) * 1024;
+  const int seg0   = int( group.x ) * kSegment;
   const int row    = int( group.y );
-  const int nb     = 16 / pc.subx;   // block width in this plane's samples
-  const int blocks = ( pc.lumaWidth + 15 ) >> 4;
-  const int end    = blocks * nb;    // the row's length rounded up to whole blocks
-  const int x0     = seg0 + 4 * tid;
+  const int nb     = kBlockSide / pc.subx;   // block width in this plane's samples
+  const int blocks = ( pc.lumaWidth + kBlockSide - 1 ) / kBlockSide;
+  const int end    = blocks * nb;            // the row's length rounded up to whole blocks
+  const int x0     = seg0 + kPerThread * tid;
   const int bxi    = x0 / nb;        // the thread's four samples all lie in this block
   loadSegment( tid, seg0, row, end );
   GroupMemoryBarrierWithGroupSync();

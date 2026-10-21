@@ -87,11 +87,11 @@ bool readable( int lx, int ly, int w, int h, int avail )
   return bit < 0 || ( ( avail >> bit ) & 1 ) != 0;
 }
 
-#define MAX_CTU 128
-#define BAND 32
+static const int MAX_CTU = 128;
+static const int BAND = 32;
 // Pass 1: a band of the CTU's samples, its rows y0 - 1 .. y0 + BAND and columns -4 .. w + 3, in groups of 4 samples
 // (two to a word); of the first and last groups of each row, only the samples of columns -1 and w are set
-#define TILE_GROUPS ( MAX_CTU / 4 + 2 )
+static const int TILE_GROUPS = ( MAX_CTU / 4 + 2 );
 groupshared uint2 s_tile[( BAND + 2 ) * TILE_GROUPS];
 // the band's last row as deblocked (its groups 1 .. groups): the next band's row above
 groupshared uint2 s_carry[TILE_GROUPS];

@@ -30,18 +30,20 @@
 
 #include "common.slang"
 
-#define CTU_LUMA_SET 0
-#define CTU_CHROMA_APS 1
-#define CTU_CB_ALT 2
-#define CTU_CR_ALT 3
-#define CTU_CC_CB 4
-#define CTU_CC_CR 5
-#define CTU_BOUNDS 6
+// The fields of a CTU's record in pc.ctus, kCtuBytes bytes per CTU (see above)
+static const int kCtuBytes = 8;
+static const int CTU_LUMA_SET = 0;
+static const int CTU_CHROMA_APS = 1;
+static const int CTU_CB_ALT = 2;
+static const int CTU_CR_ALT = 3;
+static const int CTU_CC_CB = 4;
+static const int CTU_CC_CR = 5;
+static const int CTU_BOUNDS = 6;
 
-#define NUM_CLASSES 25
-#define LUMA_COEFF 13
-#define CHROMA_COEFF 7
-#define LUMA_SET_SIZE ( 4 * NUM_CLASSES * LUMA_COEFF )
+static const int NUM_CLASSES = 25;
+static const int LUMA_COEFF = 13;
+static const int CHROMA_COEFF = 7;
+static const int LUMA_SET_SIZE = ( 4 * NUM_CLASSES * LUMA_COEFF );
 
 struct Params
 {
@@ -109,7 +111,7 @@ Region regionOf( int lx, int ly )
   r.cy0             = ( ly >> pc.ctuLog2 ) << pc.ctuLog2;
   r.cx1             = min( r.cx0 + ctuSize, pc.lumaWidth );
   r.cy1             = min( r.cy0 + ctuSize, pc.lumaHeight );
-  const int flags   = int( pc.ctus[( ( ly >> pc.ctuLog2 ) * pc.widthInCtus + ( lx >> pc.ctuLog2 ) ) * 8 + CTU_BOUNDS] );
+  const int flags   = int( pc.ctus[( ( ly >> pc.ctuLog2 ) * pc.widthInCtus + ( lx >> pc.ctuLog2 ) ) * kCtuBytes + CTU_BOUNDS] );
   r.x0              = r.cx0;
   r.x1              = r.cx1;
   r.y0              = r.cy0;
@@ -401,7 +403,7 @@ void main( uint3 id : SV_DispatchThreadID )
     return;
   }
   const int ctu = ( by >> pc.ctuLog2 ) * pc.widthInCtus + ( bx >> pc.ctuLog2 );
-  const int set = int( pc.ctus[ctu * 8 + CTU_LUMA_SET] );
+  const int set = int( pc.ctus[ctu * kCtuBytes + CTU_LUMA_SET] );
   if( set == 255 )
   {
     for( int dy = 0; dy < 4; dy++ )
@@ -429,10 +431,10 @@ void main( uint3 id : SV_DispatchThreadID )
 // registers. Don't read the samples one at a time: a block then reads shared
 // memory some 600 times and waits for most of the reads (the groups cut
 // VideoQ 4K's ALF luma from 1.55 to 1.33 ms per picture with ALF).
-#define TILE 32
-#define MARGIN 3                         // rows above and below
-#define GROUPS ( TILE / 4 + 2 )          // 4-sample groups per row: the tile's, plus one on each side
-#define TILE_H ( TILE + 2 * MARGIN )
+static const int TILE = 32;
+static const int MARGIN = 3;   // rows above and below
+static const int GROUPS = ( TILE / 4 + 2 );   // 4-sample groups per row: the tile's, plus one on each side
+static const int TILE_H = ( TILE + 2 * MARGIN );
 groupshared uint2 s_tile[TILE_H * GROUPS];
 static int        s_x0, s_y0;
 // The classification's Laplacians, computed per cell of 2x2 samples, the
@@ -444,8 +446,8 @@ static int        s_x0, s_y0;
 // (classifyHalf). So kept, the workgroup's shared memory is 3680 bytes, not
 // 5632 with the whole tile's cells: Intel's GPUs allocate it in blocks of 4
 // and 8 KB, and a workgroup of 8 KB let half as many run at a time.
-#define CELL_ROWS 10   // a half's cell rows: its 4 block rows' windows
-#define QUADS 8        // a row's sums: one per block column
+static const int CELL_ROWS = 10;   // a half's cell rows: its 4 block rows' windows
+static const int QUADS     = 8;    // a row's sums: one per block column
 groupshared uint2 s_cls[CELL_ROWS * QUADS];
 
 // The samples ( bx - 4 .. bx + 7, y ) around the 4x4 block at bx: the tile's
@@ -679,7 +681,7 @@ void main( uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
   const int G = ( bx - s_x0 ) / 4 + 1;
   // Each tile lies within one CTU (CTUs are 32 luma samples or larger).
   const int ctu = ( by >> pc.ctuLog2 ) * pc.widthInCtus + ( bx >> pc.ctuLog2 );
-  const int set = int( pc.ctus[ctu * 8 + CTU_LUMA_SET] );
+  const int set = int( pc.ctus[ctu * kCtuBytes + CTU_LUMA_SET] );
   if( set == 255 )
   {
     // (ALF off: the block's samples as they are)
@@ -895,8 +897,8 @@ void main( uint3 id : SV_DispatchThreadID )
     return;
   }
   const int ctu   = ( ( by << pc.scaleY ) >> pc.ctuLog2 ) * pc.widthInCtus + ( ( bx << pc.scaleX ) >> pc.ctuLog2 );
-  const int cbAlt = int( pc.ctus[ctu * 8 + CTU_CB_ALT] ), cbCc = int( pc.ctus[ctu * 8 + CTU_CC_CB] );
-  const int crAlt = int( pc.ctus[ctu * 8 + CTU_CR_ALT] ), crCc = int( pc.ctus[ctu * 8 + CTU_CC_CR] );
+  const int cbAlt = int( pc.ctus[ctu * kCtuBytes + CTU_CB_ALT] ), cbCc = int( pc.ctus[ctu * kCtuBytes + CTU_CC_CB] );
+  const int crAlt = int( pc.ctus[ctu * kCtuBytes + CTU_CR_ALT] ), crCc = int( pc.ctus[ctu * kCtuBytes + CTU_CC_CR] );
   const bool cb   = cbAlt != 255 || cbCc != 255;   // (whether the CTU's Cb is filtered)
   const bool cr   = crAlt != 255 || crCc != 255;
   if( pc.pass == 1 )
@@ -911,7 +913,7 @@ void main( uint3 id : SV_DispatchThreadID )
     }
     return;
   }
-  const int aps = int( pc.ctus[ctu * 8 + CTU_CHROMA_APS] );
+  const int aps = int( pc.ctus[ctu * kCtuBytes + CTU_CHROMA_APS] );
 #if BOUNDS
   s_region = regionOf( bx << pc.scaleX, by << pc.scaleY );
 #endif
