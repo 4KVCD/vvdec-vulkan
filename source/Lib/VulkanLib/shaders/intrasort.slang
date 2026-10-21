@@ -48,8 +48,12 @@ struct Params
 
 [[vk::push_constant]] Params pc;
 
-static const int kBand  = 256;
-static const int kBlock = 1024;
+static const int kBand  = 256;    // the most samples a band (one workgroup of intra.slang) makes
+static const int kBlock = 1024;   // the jobs a workgroup of this shader takes: one per thread
+
+// The radix sort's digits are 8 bits (kDigitValues values): two of them sort waves below kMaxWaves.
+static const uint kDigitValues = 256;
+static const uint kMaxWaves    = 65536;
 
 // The passes (pc.pass; see above, and GpuReconFrontEnd.cpp's IntraSortPass)
 static const int kPassHist     = 0;
@@ -66,10 +70,8 @@ static const int kPassSmall    = 7;
 static const int kArgsBlocks = 50;
 static const int kArgsSingle = 53;
 
-// The words of an intra job (intrajob.slang) that this pass uses. Word 1 holds the block's width and height in
-// samples (bits 0-7 and 8-15). Word kWaveWord holds the job's wave, which jobs.slang sets; in a band's copy of the job,
-// that word holds the band's rows instead (first | count << 16).
-static const int kWaveWord = 7;
+// The words of an intra job (intrajob.slang) that this pass uses: word 1 holds the block's width and height in
+// samples (bits 0-7 and 8-15), and word kWaveWord its wave (or a band's rows).
 
 uint* jobAt( uint index )
 {
@@ -103,8 +105,8 @@ int bandsOf( uint* job )
   return ( jobHeight( job ) + rows - 1 ) / rows;
 }
 
-groupshared uint s_scan[1024];
-groupshared uint s_hist[256];
+groupshared uint s_scan[kBlock];
+groupshared uint s_hist[kDigitValues];
 
 // Synchronizes one wave's threads on its shared memory: each sees what the others wrote before.
 void waveSync()
@@ -212,7 +214,7 @@ void smallSort( int tid, uint n )
   if( valid )
   {
     const uint wave = waveOf( uint( tid ) );
-    if( wave >= 256u )
+    if( wave >= kDigitValues )
     {
       pc.flags[1].store( 1u );   // (as HIST sets it)
     }
@@ -278,11 +280,11 @@ void histPass( int tid, int block, uint i, uint n, uint* src )
   {
     const uint index = pc.shift == 0 ? i : src[i];
     const uint wave  = waveOf( index );
-    if( wave >= 65536u )
+    if( wave >= kMaxWaves )
     {
       pc.flags[0].store( 1u );
     }
-    if( wave >= 256u )
+    if( wave >= kDigitValues )
     {
       pc.flags[1].store( 1u );
     }
@@ -433,7 +435,7 @@ void placeJob( int tid, int block, uint i )
   const uint first = pc.bandSums[block] + s_scan[tid];
   const uint wave  = waveOf( index );
   pc.bandAt[i]     = first;
-  if( ( i == 0 || waveOf( pc.keysA[i - 1] ) != wave ) && wave < 65536u )
+  if( ( i == 0 || waveOf( pc.keysA[i - 1] ) != wave ) && wave < kMaxWaves )
   {
     pc.waveFirst[wave] = first;
   }
@@ -445,7 +447,7 @@ void writeJobWaits( uint i )
 {
   const uint index = pc.keysA[i];
   const uint wave  = waveOf( index );
-  const uint wait  = wave < 65536u ? pc.waveFirst[wave] : 0u;
+  const uint wait  = wave < kMaxWaves ? pc.waveFirst[wave] : 0u;
   const int  b     = bandsOf( jobAt( index ) );
   for( int k = 0; k < b; k++ )
   {
@@ -458,7 +460,7 @@ void writeJobWaits( uint i )
 }
 
 [shader( "compute" )]
-[numthreads( 1024, 1, 1 )]
+[numthreads( kBlock, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
   const int  tid   = int( local.x );

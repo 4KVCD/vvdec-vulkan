@@ -29,6 +29,7 @@
 // them out for the inter, inter_bdof and inter_affine passes.
 
 #include "common.slang"
+#include "records.slang"
 #include "intrajob.slang"
 #include "scan.slang"
 
@@ -220,7 +221,7 @@ int ctuOfLuma( int x, int y ) { return ( y >> pc.log2Ctu ) * pc.widthInCtus + ( 
 
 Cu loadCu( int index )
 {
-  uint* r = pc.cus + index * 32;
+  uint* r = pc.cus + index * kCuRecordWords;
   Cu    cu;
   cu.index         = index;
   cu.predMode      = int( ( r[1] >> 16 ) & 3 );
@@ -251,7 +252,7 @@ Cu loadCu( int index )
   const int lx     = luma ? int( r[0] & 0xffff ) : int( r[19] & 0xffff ) << pc.csx;
   const int ly     = luma ? int( r[0] >> 16 ) : int( r[19] >> 16 ) << pc.csy;
   cu.ctu           = ctuOfLuma( lx, ly );
-  cu.firstTu       = int( pc.ctus[cu.ctu * 4 + 3] ) + int( r[16] & 0xffff );
+  cu.firstTu       = int( ctuFirstTu( pc.ctus, cu.ctu ) ) + int( r[16] & 0xffff );
   cu.numTus        = int( r[16] >> 16 );
   const uint w21   = r[21];
   cu.dmvrOff       = cu.ctu * pc.num8x8 + int( w21 & 0xffff );
@@ -320,7 +321,7 @@ struct Tu
 
 Tu loadTu( int index )
 {
-  uint* r = pc.tus + index * 16;
+  uint* r = pc.tus + index * kTuRecordWords;
   Tu    tu;
   tu.index       = index;
   tu.blk[0]      = ( r[1] & ( 1u << 16 ) ) != 0 ? int4( int( r[0] & 0xffff ), int( r[0] >> 16 ), int( r[1] & 0xff ), int( ( r[1] >> 8 ) & 0xff ) ) : int4( 0 );
@@ -351,14 +352,14 @@ int scaleX( int ch ) { return ch == 0 ? 0 : pc.csx; }
 int scaleY( int ch ) { return ch == 0 ? 0 : pc.csy; }
 
 // Slice records: mider.slang's slice table and the jobs' JobSlice (GpuFrontEnd.h)
-uint* sliceOfCtu( int ctu ) { return pc.slices + pc.widthInCtus * pc.heightInCtus + pc.slices[ctu] * 64; }
-uint* jobSliceOfCtu( int ctu ) { return pc.jobSlices + pc.slices[ctu] * 256; }
+uint* sliceOfCtu( int ctu ) { return sliceRecordOfCtu( pc.slices, pc.widthInCtus * pc.heightInCtus, ctu ); }
+uint* jobSliceOfCtu( int ctu ) { return pc.jobSlices + pc.slices[ctu] * kJobSliceWords; }
 int   slicePoc( uint* s ) { return int( s[0] ); }
 bool  isInterB( uint* s ) { return ( s[1] & ( 1u << 16 ) ) != 0; }
 uint  independentIdx( uint* s ) { return s[3]; }
 bool  usedAsLongTerm( uint* s, int list, int refIdx ) { return ( s[4] & ( 1u << ( 16 * list + refIdx ) ) ) != 0; }
 int   refPoc( uint* s, int list, int refIdx ) { return int( s[16 + 16 * list + refIdx] ); }
-uint  ctuTile( int ctu ) { return pc.ctus[ctu * 4 + 2] >> 16; }
+uint  ctuTile( int ctu ) { return ctuTileIndex( pc.ctus, ctu ); }
 int   sliceType( uint* j ) { return int( j[0] & 3 ); }   // B 0, P 1, I 2
 bool  sliceLmcs( uint* j ) { return ( j[0] & 4 ) != 0; }
 bool  sliceDepQuant( uint* j ) { return ( j[0] & 8 ) != 0; }
@@ -414,7 +415,7 @@ int cuRestricted( int2 pos, Cu cur, int ch )
 // The CTU of the CU with the given index.
 int ctuOfCu( int index )
 {
-  uint* r = pc.cus + index * 32;
+  uint* r = pc.cus + index * kCuRecordWords;
   return ( r[20] & ( 1u << 17 ) ) != 0 ? ctuOfLuma( int( r[0] & 0xffff ), int( r[0] >> 16 ) )
                                        : ctuOfLuma( int( r[19] & 0xffff ) << pc.csx, int( r[19] >> 16 ) << pc.csy );
 }
@@ -422,9 +423,9 @@ int ctuOfCu( int index )
 // The CU's TU at pos, as getTU finds it: the first TU whose block (in channel ch) ends past pos, otherwise the last.
 int tuOf( int cuIndex, int2 pos, int ch )
 {
-  uint*     r     = pc.cus + cuIndex * 32;
+  uint*     r     = pc.cus + cuIndex * kCuRecordWords;
   const int ctu   = ctuOfCu( cuIndex );
-  const int first = int( pc.ctus[ctu * 4 + 3] ) + int( r[16] & 0xffff );
+  const int first = int( ctuFirstTu( pc.ctus, ctu ) ) + int( r[16] & 0xffff );
   const int n     = int( r[16] >> 16 );
   for( int i = 0; i < n - 1; i++ )
   {
@@ -441,28 +442,37 @@ int tuOf( int cuIndex, int2 pos, int ch )
 // Job output: COUNT only counts the jobs; WRITE also writes them at the CU's offsets
 // --------------------------------------------------------------------------------------------------------------------
 
-static const int kLists = 5;
+// The job lists (see the passes above)
+static const int kListTrafo       = 0;   // the residual jobs
+static const int kListInter       = 1;   // inter's regular jobs
+static const int kListIntra       = 2;   // the intra jobs
+static const int kListInterBdof   = 3;   // inter's BDOF jobs
+static const int kListInterAffine = 4;   // inter's affine pairs (two jobs each)
+static const int kLists           = 5;
 
 struct Out
 {
   bool write;
-  int  n[5];      // the CU's jobs so far, per list
-  int  base[5];   // where the CU's jobs start, per list
+  int  n[kLists];      // the CU's jobs so far, per list
+  int  base[kLists];   // where the CU's jobs start, per list
 };
 
-static const int kTrafoWords = 10;   // a transform job's words (GpuJobs.h's TrafoJob)
+// The jobs' sizes in words (GpuJobs.h): a job is made in an array of kJobWords, the largest of them.
+static const int kTrafoWords    = 10;   // TrafoJob
+static const int kInterJobWords = 12;   // InterJob
+static const int kJobWords      = 12;
 
-void emitTrafo( inout Out o, uint w[12] )
+void emitTrafo( inout Out o, uint w[kJobWords] )
 {
-  if( o.write && o.base[0] + o.n[0] < pc.capTrafo )
+  if( o.write && o.base[kListTrafo] + o.n[kListTrafo] < pc.capTrafo )
   {
-    uint* p = pc.trafo + ( o.base[0] + o.n[0] ) * kTrafoWords;
+    uint* p = pc.trafo + ( o.base[kListTrafo] + o.n[kListTrafo] ) * kTrafoWords;
     for( int i = 0; i < kTrafoWords; i++ )
     {
       p[i] = w[i];
     }
   }
-  o.n[0]++;
+  o.n[kListTrafo]++;
 }
 
 // The thread's CU, when it is an SbTMVP CU: interJobs leaves the jobs of its sub-PUs' motion compensation to
@@ -472,23 +482,23 @@ static uint g_sbFlags = 0;
 static int  g_sbBcw   = 0;
 
 // Writes an inter job at index at of the inter buffer, if there is room.
-void writeInter( int at, uint w[12] )
+void writeInter( int at, uint w[kJobWords] )
 {
   if( at < pc.capInter )
   {
-    uint* p = pc.inter + at * 12;
-    for( int i = 0; i < 12; i++ )
+    uint* p = pc.inter + at * kInterJobWords;
+    for( int i = 0; i < kInterJobWords; i++ )
     {
       p[i] = w[i];
     }
   }
 }
 
-// Adds an inter job to its list: BDOF jobs (3), affine pairs (4), or the regular jobs (1).
-void emitInter( inout Out o, uint w[12] )
+// Adds an inter job to its list: the BDOF jobs, the affine pairs, or the regular jobs.
+void emitInter( inout Out o, uint w[kJobWords] )
 {
   const uint flags = w[1] >> 16;
-  const int  list  = ( flags & kInterAffine ) != 0 ? 4 : ( flags & kInterBdof ) != 0 ? 3 : 1;
+  const int  list  = ( flags & kInterAffine ) != 0 ? kListInterAffine : ( flags & kInterBdof ) != 0 ? kListInterBdof : kListInter;
   if( o.write )
   {
     writeInter( o.base[list] + o.n[list], w );
@@ -497,38 +507,38 @@ void emitInter( inout Out o, uint w[12] )
 }
 
 // Adds the second job of an affine pair (InterJob::setAffine's next), right after the first.
-void emitAffineNext( inout Out o, uint w[12] )
+void emitAffineNext( inout Out o, uint w[kJobWords] )
 {
   if( o.write )
   {
-    writeInter( o.base[4] + o.n[4], w );
+    writeInter( o.base[kListInterAffine] + o.n[kListInterAffine], w );
   }
-  o.n[4]++;
+  o.n[kListInterAffine]++;
 }
 
-void emitIntra( inout Out o, uint w[12] )
+void emitIntra( inout Out o, uint w[kJobWords] )
 {
-  if( o.write && o.base[2] + o.n[2] < pc.capIntra )
+  if( o.write && o.base[kListIntra] + o.n[kListIntra] < pc.capIntra )
   {
-    uint* p = pc.intra + ( o.base[2] + o.n[2] ) * 12;
-    for( int i = 0; i < 12; i++ )
+    uint* p = pc.intra + ( o.base[kListIntra] + o.n[kListIntra] ) * kIntraJobWords;
+    for( int i = 0; i < kIntraJobWords; i++ )
     {
       p[i] = w[i];
     }
   }
-  o.n[2]++;
+  o.n[kListIntra]++;
 }
 
-void clearJob( out uint w[12] )
+void clearJob( out uint w[kJobWords] )
 {
-  for( int i = 0; i < 12; i++ )
+  for( int i = 0; i < kJobWords; i++ )
   {
     w[i] = 0;
   }
 }
 
 // TrafoJob::set
-void setTrafo( inout uint w[12], int x, int y, int log2W, int log2H, int comp, int typeHor, int typeVer, uint flags, int ict, int lastX, int lastY,
+void setTrafo( inout uint w[kJobWords], int x, int y, int log2W, int log2H, int comp, int typeHor, int typeVer, uint flags, int ict, int lastX, int lastY,
                int scale, int rightShift, int inputMaximum )
 {
   w[0] = uint( x ) | uint( y ) << 16;
@@ -542,7 +552,7 @@ void setTrafo( inout uint w[12], int x, int y, int log2W, int log2H, int comp, i
 }
 
 // IntraJob::set
-void setIntra( inout uint w[12], int x, int y, int width, int height, int comp, int kind, int mode, uint flags, int bdpcmDir, int refLine )
+void setIntra( inout uint w[kJobWords], int x, int y, int width, int height, int comp, int kind, int mode, uint flags, int bdpcmDir, int refLine )
 {
   clearJob( w );
   w[0] = uint( x ) | uint( y ) << 16;
@@ -551,7 +561,7 @@ void setIntra( inout uint w[12], int x, int y, int width, int height, int comp, 
 }
 
 // InterJob::set
-void setInter( inout uint w[12], int x, int y, int width, int height, uint flags, int2 mv0, int2 mv1, int cuX, int cuY, int ref0, int ref1,
+void setInter( inout uint w[kJobWords], int x, int y, int width, int height, uint flags, int2 mv0, int2 mv1, int cuX, int cuY, int ref0, int ref1,
                int dmvrIndex )
 {
   w[0]  = uint( x ) | uint( y ) << 16;
@@ -566,6 +576,86 @@ void setInter( inout uint w[12], int x, int y, int width, int height, uint flags
   w[9]  = 0;
   w[10] = 0;
   w[11] = 0;
+}
+
+// The setters of the jobs' other words, as GpuJobs.h's of the same names
+
+// TrafoJob::setLfnst (the word lfnstWord makes)
+void setLfnst( inout uint w[kJobWords], uint lfnst )
+{
+  w[6] = lfnst;
+}
+
+// TrafoJob::setScalingList: offsetPlusOne is the block's matrix's offset plus one (pc.scaling holds it so)
+void setScalingList( inout uint w[kJobWords], uint offsetPlusOne )
+{
+  w[7] = offsetPlusOne;
+}
+
+// The GPU parse's levels of the block: where they start and the width of their rows (0: the levels are in the planes)
+void setLevels( inout uint w[kJobWords], uint at, uint rowWidth )
+{
+  w[8] = at;
+  w[9] = rowWidth;
+}
+
+// IntraJob::setNeighbors: the units of reference samples available top-left, above and left
+void setNeighbors( inout uint w[kJobWords], int3 units )
+{
+  w[3] = uint( units.x ) | uint( units.y ) << 8 | uint( units.z ) << 16;
+}
+
+// IntraJob::setCclm
+void setCclm( inout uint w[kJobWords], bool lumaAbove, bool lumaLeft, bool above, bool left, int actualTop, int actualLeft )
+{
+  w[4] = uint( lumaAbove ) << 16 | uint( lumaLeft ) << 17 | uint( above ) << 18 | uint( left ) << 19;
+  w[5] = uint( actualTop ) | uint( actualLeft ) << 16;
+}
+
+// IntraJob::setBlockVector (IBC)
+void setBlockVector( inout uint w[kJobWords], int x, int y )
+{
+  w[6] = uint( uint16_t( int16_t( x ) ) ) | uint( uint16_t( int16_t( y ) ) ) << 16;
+}
+
+// IntraJob::setCiip: planar's weight in the blend
+void setCiip( inout uint w[kJobWords], int intraWeight )
+{
+  w[6] = uint( intraWeight );
+}
+
+// IntraJob::setIsp
+void setIsp( inout uint w[kJobWords], int4 cuArea, int split, bool leftAvail, bool aboveAvail )
+{
+  w[4] = uint( cuArea.x ) | uint( cuArea.y ) << 16;
+  w[5] = uint( cuArea.z ) | uint( cuArea.w ) << 8 | uint( split ) << 16 | uint( leftAvail ) << 18 | uint( aboveAvail ) << 19;
+}
+
+// IntraJob::setLmcs
+void setLmcs( inout uint w[kJobWords], int2 at, bool left, bool above, int log2Count )
+{
+  w[8] = uint( at.x ) | uint( at.y ) << 16;
+  w[9] = 1u | uint( left ) << 1 | uint( above ) << 2 | uint( log2Count ) << 4;
+}
+
+// InterJob::setClipWidth
+void setClipWidth( inout uint w[kJobWords], int width )
+{
+  w[7] |= uint( width ) << 20;
+}
+
+// InterJob::setBcw: list 1's weight out of 8 (as it comes from the table T_BCW1)
+void setBcw( inout uint w[kJobWords], uint weight1 )
+{
+  w[1] |= kInterBcw << 16;
+  w[7] |= ( weight1 + 2 ) << 16;
+}
+
+// InterJob::setGeo
+void setGeo( inout uint w[kJobWords], uint mask, uint mirror, int offsetX, int offsetY )
+{
+  w[1] |= kInterGeo << 16;
+  w[9] = mask | mirror << 8 | uint( offsetX ) << 16 | uint( offsetY ) << 24;
 }
 
 // --------------------------------------------------------------------------------------------------------------------
@@ -588,11 +678,11 @@ int coLocatedLuma( Cu cu )
 // PU::getIntraDirLuma of a CU (planar for a MIP CU)
 int intraDirLuma( int cuIndex )
 {
-  uint* r = pc.cus + cuIndex * 32;
+  uint* r = pc.cus + cuIndex * kCuRecordWords;
   return ( r[17] & ( 1u << 9 ) ) != 0 ? PLANAR_IDX : int( r[18] & 0xff );
 }
 
-bool cuMipOf( int cuIndex ) { return ( pc.cus[cuIndex * 32 + 17] & ( 1u << 9 ) ) != 0; }
+bool cuMipOf( int cuIndex ) { return ( pc.cus[cuIndex * kCuRecordWords + 17] & ( 1u << 9 ) ) != 0; }
 
 // PU::getFinalIntraMode
 int finalIntraMode( Cu cu, int ch )
@@ -883,19 +973,18 @@ void trafoJobs( Cu cu, inout Out o )
         flags |= ( comp == 0 ? cu.bdpcmL : cu.bdpcmC ) == 1 ? kTrafoBdpcmHor : kTrafoBdpcmVer;
       }
 
-      uint w[12];
+      uint w[kJobWords];
       clearJob( w );
       setTrafo( w, block.x, block.y, log2W, log2H, comp, typeHor, typeVer, flags, ict, maxX, maxY, dq.scale, dq.rightShift, dq.inputMax );
-      w[8] = tu.levelsAt[comp];   // the levels' place (the GPU's parse)
-      w[9] = tu.levelsRow[comp];
+      setLevels( w, tu.levelsAt[comp], tu.levelsRow[comp] );
       if( cu.lfnst != 0 && ( pc.sps & kSpsLfnst ) != 0 && !ts && ( isSepTree( cu ) || comp == 0 ) )
       {
-        w[6] = lfnstWord( cu, tu, comp, block );
+        setLfnst( w, lfnstWord( cu, tu, comp, block ) );
       }
       if( scalingList )
       {
         const int list = ( cu.predMode == MODE_INTRA ? 0 : 3 ) + comp;
-        w[7]           = pc.scaling[( list * 7 + log2W ) * 7 + log2H];
+        setScalingList( w, pc.scaling[( list * 7 + log2W ) * 7 + log2H] );
       }
       emitTrafo( o, w );
     }
@@ -1009,7 +1098,7 @@ int3 neighborUnits( Cu cu, int tuIndex, int4 area, int comp, inout Units cache )
 }
 
 // IntraPrediction::getLmAvailability: which of CCLM's templates are available
-void cclmAvailability( Cu cu, int4 area, inout uint w[12] )
+void cclmAvailability( Cu cu, int4 area, inout uint w[kJobWords] )
 {
   const int  mode    = cu.intraDir[1];
   const int  cWidth  = area.z;
@@ -1077,13 +1166,12 @@ void cclmAvailability( Cu cu, int4 area, inout uint w[12] )
       actualLeft = cHeight;
     }
   }
-  w[4] = uint( lumaAbove ) << 16 | uint( lumaLeft ) << 17 | uint( above ) << 18 | uint( left ) << 19;
-  w[5] = uint( actualTop ) | uint( actualLeft ) << 16;
+  setCclm( w, lumaAbove, lumaLeft, above, left, actualTop, actualLeft );
 }
 
 // gpuLmcsChroma: LMCS's chroma scale comes from the luma left of and above the CU at the top-left of the VPDU that
 // holds lumaPos.
-void setLmcsScale( int2 lumaPos, inout uint w[12] )
+void setLmcsScale( int2 lumaPos, inout uint w[kJobWords] )
 {
   const int  ctuSize = 1 << pc.log2Ctu;
   const int  count   = min( 64, ctuSize );
@@ -1093,8 +1181,7 @@ void setLmcsScale( int2 lumaPos, inout uint w[12] )
   const int2 at      = first.blk[0].xy;
   const bool above   = cuRestricted( int2( at.x, at.y - 1 ), first, 0 ) >= 0;
   const bool left    = cuRestricted( int2( at.x - 1, at.y ), first, 0 ) >= 0;
-  w[8]               = uint( at.x ) | uint( at.y ) << 16;
-  w[9]               = 1u | uint( left ) << 1 | uint( above ) << 2 | uint( log2Of( count ) ) << 4;
+  setLmcs( w, at, left, above, log2Of( count ) );
 }
 
 // --------------------------------------------------------------------------------------------------------------------
@@ -1130,8 +1217,8 @@ void intraJobs( Cu cu, inout Out o, inout Units cache )
         // MIP: the luma CU's mode, or for 4:4:4 chroma in DM mode the co-located luma CU's
         kind          = kIntraMip;
         const int lum = comp == 0 ? cu.index : coLocatedLuma( cu );
-        jobMode       = int( pc.cus[lum * 32 + 18] & 0xff );
-        flags |= ( pc.cus[lum * 32 + 17] & ( 1u << 10 ) ) != 0 ? kIntraMipTransposed : 0;
+        jobMode       = int( pc.cus[lum * kCuRecordWords + 18] & 0xff );
+        flags |= ( pc.cus[lum * kCuRecordWords + 17] & ( 1u << 10 ) ) != 0 ? kIntraMipTransposed : 0;
       }
       else if( comp != 0 && isLmcMode( mode ) )
       {
@@ -1148,10 +1235,10 @@ void intraJobs( Cu cu, inout Out o, inout Units cache )
         flags |= kIntraFiltered;
       }
       const int refLine = comp == 0 ? cu.mrl : 0;
-      uint      w[12];
+      uint      w[kJobWords];
       setIntra( w, area.x, area.y, area.z, area.w, comp, kind, kind == kIntraAngular || kind == kIntraMip ? jobMode : 0,
                 flags | ( isp ? kIntraIsp : 0 ), bdpcm, refLine );
-      w[3] = uint( units.x ) | uint( units.y ) << 8 | uint( units.z ) << 16;
+      setNeighbors( w, units );
       if( isp )
       {
         // The predicted block: a vertical split's sub-partitions 1 or 2 samples wide share one block 4 samples wide.
@@ -1164,8 +1251,7 @@ void intraJobs( Cu cu, inout Out o, inout Units cache )
         }
         const bool leftAvail  = cuRestricted( int2( pred.x - 1, pred.y ), cu, 0 ) >= 0;
         const bool aboveAvail = cuRestricted( int2( pred.x, pred.y - 1 ), cu, 0 ) >= 0;
-        w[4]                  = uint( cuArea.x ) | uint( cuArea.y ) << 16;
-        w[5]                  = uint( cuArea.z ) | uint( cuArea.w ) << 8 | uint( cu.isp ) << 16 | uint( leftAvail ) << 18 | uint( aboveAvail ) << 19;
+        setIsp( w, cuArea, cu.isp, leftAvail, aboveAvail );
       }
       // LMCS: the chroma residual is scaled according to the luma around the VPDU of the block's luma
       if( comp != 0 && sliceLmcs( jslice ) && ( pc.ph & kPhLmcsChroma ) != 0 && area.z * area.w > 4 && ( cbfOf( tu, comp ) || tu.jointCbCr != 0 ) )
@@ -1209,9 +1295,9 @@ void ibcJobs( Cu cu, Motion m, inout Out o )
       {
         flags |= kIntraResidual;
       }
-      uint w[12];
+      uint w[kJobWords];
       setIntra( w, area.x, area.y, area.z, area.w, comp, kIntraIbc, 0, flags, 0, 0 );
-      w[6] = uint( uint16_t( int16_t( bvx ) ) ) | uint( uint16_t( int16_t( bvy ) ) ) << 16;
+      setBlockVector( w, bvx, bvy );
       if( comp != 0 && cu.rootCbf && ( pc.ph & kPhLmcs ) != 0 && ( pc.ph & kPhLmcsChroma ) != 0 && sliceLmcs( jslice ) && area.z * area.w > 4
           && ( cbfOf( tu, comp ) || tu.jointCbCr != 0 ) )
       {
@@ -1283,9 +1369,9 @@ bool bdofCondition( Cu cu, Motion m, uint* slice, uint* jslice )
   return !refScaled( jslice, 0, m.refIdx[0] ) && !refScaled( jslice, 1, m.refIdx[1] );
 }
 
-// gpuWp: sets the job's weighted-prediction parameters (flags holds the job's lists and its DMVR and BDOF bits; bcw is
+// gpuWp (InterJob::setWp): sets the job's weighted-prediction parameters (flags holds the job's lists and its DMVR and BDOF bits; bcw is
 // the CU's BCW index). GPM's jobs, which gpuWp leaves without, do not come here.
-void wpJob( int bcw, uint* jslice, int refIdx0, int refIdx1, uint flags, inout uint w[12] )
+void wpJob( int bcw, uint* jslice, int refIdx0, int refIdx1, uint flags, inout uint w[kJobWords] )
 {
   const int st = sliceType( jslice );
   if( ( flags & ( kInterDmvr | kInterBdof ) ) != 0 || !( ( ( pc.ph & kPpsWpBi ) != 0 && st == 0 && bcw == 0 ) || ( ( pc.ph & kPpsWp ) != 0 && st == 1 ) ) )
@@ -1363,14 +1449,13 @@ void setMcLists( uint* slice, uint* jslice, bool dmvr, inout McBlock b )
 
 // Writes into w the job of block b's tile at (x, y), which is tileW x tileH. dmvrIndex is the index of the tile's DMVR
 // refinement.
-void mcTile( McBlock b, uint* jslice, int x, int y, int tileW, int tileH, int dmvrIndex, inout uint w[12] )
+void mcTile( McBlock b, uint* jslice, int x, int y, int tileW, int tileH, int dmvrIndex, inout uint w[kJobWords] )
 {
   setInter( w, x, y, tileW, tileH, b.flags, b.mv[0], b.mv[1], b.pos.x, b.pos.y, b.ref[0], b.ref[1], dmvrIndex );
-  w[7] |= uint( b.width ) << 20;   // setClipWidth
+  setClipWidth( w, b.width );
   if( ( b.flags & kInterL1 ) != 0 && ( b.flags & kInterL0 ) != 0 && b.bcw != 0 && !b.ciip )
   {
-    w[1] |= kInterBcw << 16;
-    w[7] |= ( pc.tables[T_BCW1 + b.bcw] + 2 ) << 16;
+    setBcw( w, pc.tables[T_BCW1 + b.bcw] );
   }
   wpJob( b.bcw, jslice, b.refIdx[0], b.refIdx[1], b.flags, w );
 }
@@ -1406,7 +1491,7 @@ void mcBlock( Cu cu, Motion m, uint* slice, uint* jslice, uint flags, inout Out 
   {
     for( int x = area.x; x < area.x + area.z; x += tileW )
     {
-      uint w[12];
+      uint w[kJobWords];
       mcTile( b, jslice, x, y, tileW, tileH, dmvr ? cu.dmvrOff + num : 0, w );
       emitInter( o, w );
       num++;
@@ -1434,8 +1519,8 @@ void ciipJobs( Cu cu, inout Out o, inout Units cache, bool lmcsChromaOn )
   const int4 y4       = cu.blk[0];
   const int  leftIdx  = cuRestricted( int2( y4.x - 1, y4.y + y4.w - 1 ), cu, 0 );
   const int  aboveIdx = cuRestricted( int2( y4.x + y4.z - 1, y4.y - 1 ), cu, 0 );
-  const bool leftIn   = leftIdx >= 0 && int( ( pc.cus[leftIdx * 32 + 1] >> 16 ) & 3 ) == MODE_INTRA;
-  const bool aboveIn  = aboveIdx >= 0 && int( ( pc.cus[aboveIdx * 32 + 1] >> 16 ) & 3 ) == MODE_INTRA;
+  const bool leftIn   = leftIdx >= 0 && int( ( pc.cus[leftIdx * kCuRecordWords + 1] >> 16 ) & 3 ) == MODE_INTRA;
+  const bool aboveIn  = aboveIdx >= 0 && int( ( pc.cus[aboveIdx * kCuRecordWords + 1] >> 16 ) & 3 ) == MODE_INTRA;
   const int  wIntra   = 3 - ( leftIn ? 0 : 1 ) - ( aboveIn ? 0 : 1 );
   const bool blendCh  = pc.chromaFormat != 0 && cu.blk[1].z > 2;
   const int  numComp  = pc.chromaFormat == 0 ? 1 : 3;
@@ -1453,10 +1538,10 @@ void ciipJobs( Cu cu, inout Out o, inout Units cache, bool lmcsChromaOn )
     {
       flags |= kIntraFiltered;
     }
-    uint w[12];
+    uint w[kJobWords];
     setIntra( w, area.x, area.y, area.z, area.w, comp, kIntraCiip, PLANAR_IDX, flags, 0, 0 );
-    w[3] = uint( units.x ) | uint( units.y ) << 8 | uint( units.z ) << 16;
-    w[6] = uint( comp == 0 || blendCh ? wIntra : 0 );
+    setNeighbors( w, units );
+    setCiip( w, comp == 0 || blendCh ? wIntra : 0 );
     if( comp != 0 && lmcsChromaOn && firstTu.blk[1].z * firstTu.blk[1].w > 4 )
     {
       bool residual = false;
@@ -1532,7 +1617,7 @@ uint residualJobs( Cu cu, int numComp, bool lmcsChroma, inout Out o )
         {
           for( int x = 0; x < block.z; x += 1 << log2Of( block.z - x ) )
           {
-            uint w[12];
+            uint w[kJobWords];
             clearJob( w );
             setTrafo( w, block.x + x, block.y + y, log2Of( block.z - x ), log2Of( block.w - y ), c, 0, 0, kTrafoZero, 0, 0, 0, 0, 0, 0 );
             emitTrafo( o, w );
@@ -1562,15 +1647,29 @@ void geoJobs( Cu cu, Motion m, uint* jslice, uint flags, inout Out o )
   {
     for( int x = y4.x; x < y4.x + y4.z; x += 16 )
     {
-      uint w[12];
+      uint w[kJobWords];
       setInter( w, x, y, min( 16, y4.z ), min( 16, y4.w ), flags | kInterL0 | kInterL1, m.mv[0][1], m.mv[1][1], y4.x, y4.y, ref0, ref1, 0 );
-      w[7] |= uint( y4.z ) << 20;
-      w[1] |= kInterGeo << 16;
-      // (as InterJob::setGeo packs them)
-      w[9] = pc.tables[T_MASK + angle] | pc.tables[T_MIRROR + angle] << 8 | uint( int( int16_t( woff & 0xffff ) ) ) << 16
-             | uint( int( int16_t( woff >> 16 ) ) ) << 24;
+      setClipWidth( w, y4.z );
+      setGeo( w, pc.tables[T_MASK + angle], pc.tables[T_MIRROR + angle], int( int16_t( woff & 0xffff ) ), int( int16_t( woff >> 16 ) ) );
       emitInter( o, w );
     }
+  }
+}
+
+// InterJob::setAffine: an affine tile takes two jobs. The first (w) gets each list's base motion; the second (next) the
+// CU's size, each list's PROF and spread flags, and each list's motion steps across and down.
+void setAffine( inout uint w[kJobWords], out uint next[kJobWords], int cuWidth, int cuHeight, bool prof[2], bool spread[2], int params[2][6] )
+{
+  clearJob( next );
+  w[2]    = uint( params[0][0] );
+  w[3]    = uint( params[0][1] );
+  w[4]    = uint( params[1][0] );
+  w[5]    = uint( params[1][1] );
+  next[0] = uint( cuWidth ) | uint( cuHeight ) << 8 | uint( prof[0] ) << 16 | uint( prof[1] ) << 17 | uint( spread[0] ) << 18 | uint( spread[1] ) << 19;
+  for( int k = 0; k < 4; k++ )
+  {
+    next[1 + k] = uint( params[0][2 + k] );
+    next[5 + k] = uint( params[1][2 + k] );
   }
 }
 
@@ -1634,27 +1733,15 @@ void affineJobs( Cu cu, Motion m, uint* slice, uint* jslice, uint flags, inout O
   {
     for( int x = y4.x; x < y4.x + y4.z; x += 16 )
     {
-      uint w[12];
+      uint w[kJobWords];
       setInter( w, x, y, min( 16, y4.z ), min( 16, y4.w ), aflags | kInterAffine, int2( 0 ), int2( 0 ), y4.x, y4.y, ref0, ref1, 0 );
       if( bcw )
       {
-        w[1] |= kInterBcw << 16;
-        w[7] |= ( pc.tables[T_BCW1 + m.bcw] + 2 ) << 16;
+        setBcw( w, pc.tables[T_BCW1 + m.bcw] );
       }
       wpJob( m.bcw, jslice, m.refIdx[0], m.refIdx[1], aflags, w );
-      uint next[12];
-      clearJob( next );
-      // InterJob::setAffine
-      w[2]    = uint( params[0][0] );
-      w[3]    = uint( params[0][1] );
-      w[4]    = uint( params[1][0] );
-      w[5]    = uint( params[1][1] );
-      next[0] = uint( y4.z ) | uint( y4.w ) << 8 | uint( prof[0] ) << 16 | uint( prof[1] ) << 17 | uint( spread[0] ) << 18 | uint( spread[1] ) << 19;
-      for( int k = 0; k < 4; k++ )
-      {
-        next[1 + k] = uint( params[0][2 + k] );
-        next[5 + k] = uint( params[1][2 + k] );
-      }
+      uint next[kJobWords];
+      setAffine( w, next, y4.z, y4.w, prof, spread, params );
       emitInter( o, w );
       emitAffineNext( o, next );
     }
@@ -1682,7 +1769,7 @@ void lmcsChromaJobs( Cu cu, uint flags, inout Out o )
         {
           const int bw = 1 << log2Of( block.z - x );
           const int bh = 1 << log2Of( block.w - y );
-          uint      w[12];
+          uint      w[kJobWords];
           setIntra( w, block.x + x, block.y + y, bw, bh, c, kIntraLmcs, 0, kIntraResidual, 0, 0 );
           if( scaled )
           {
@@ -1942,7 +2029,7 @@ MapRect unpackRect( uint2 p )
 // Returns the wave-map rectangles of an intra job, given its 12 words, packed by packRect: the five it reads (IBC's
 // reference block or the reference lines above and left, LMCS's neighbours and CCLM's luma) and the one it writes
 // (its own block).
-void jobRects( uint job[12], out uint2 packed[6] )
+void jobRects( uint job[kIntraJobWords], out uint2 packed[6] )
 {
   const int  x     = int( job[0] & 0xffff );
   const int  y     = int( job[0] >> 16 );
@@ -2033,16 +2120,16 @@ groupshared uint4 s_rects[3 * 32];  // the packed rectangles (jobRects) of the 3
 // CTU's first CU.
 int2 intraJobRange( int ctu )
 {
-  const int first = int( pc.ctus[ctu * 4] );
-  const int count = int( pc.ctus[ctu * 4 + 1] & 0xffff );
+  const int first = int( ctuFirstCu( pc.ctus, ctu ) );
+  const int count = int( ctuNumCus( pc.ctus, ctu ) );
   if( count == 0 )
   {
     return int2( 0, 0 );
   }
-  const int begin = int( pc.blocks[( first >> 8 ) * kLists + 2] + pc.counts[first * kLists + 2] );
+  const int begin = int( pc.blocks[( first >> 8 ) * kLists + kListIntra] + pc.counts[first * kLists + kListIntra] );
   const int next  = first + count;
-  const int end   = next < pc.numCus ? int( pc.blocks[( next >> 8 ) * kLists + 2] + pc.counts[next * kLists + 2] )
-                                     : int( pc.blocks[pc.numBlocks * kLists + 2] );
+  const int end   = next < pc.numCus ? int( pc.blocks[( next >> 8 ) * kLists + kListIntra] + pc.counts[next * kLists + kListIntra] )
+                                     : int( pc.blocks[pc.numBlocks * kLists + kListIntra] );
   return int2( begin, min( end, pc.capIntra ) );
 }
 
@@ -2102,11 +2189,11 @@ void main( uint3 local : SV_GroupThreadID )
         const int count = min( 32, range.y - base );
         if( lane < count )
         {
-          uint job[12];
+          uint job[kIntraJobWords];
           [unroll]
           for( int k = 0; k < 3; k++ )
           {
-            const uint4 v = *(uint4*)( pc.intra + ( base + lane ) * 12 + 4 * k );   // (a job's 48 bytes are aligned)
+            const uint4 v = *(uint4*)( pc.intra + ( base + lane ) * kIntraJobWords + 4 * k );   // (a job's 48 bytes are aligned)
             job[4 * k] = v.x; job[4 * k + 1] = v.y; job[4 * k + 2] = v.z; job[4 * k + 3] = v.w;
           }
           uint2 packed[6];
@@ -2126,7 +2213,7 @@ void main( uint3 local : SV_GroupThreadID )
           const int   wave = gatherMax( unpackRect( a.xy ), unpackRect( a.zw ), unpackRect( b.xy ), unpackRect( b.zw ), unpackRect( d.xy ), lane );
           if( lane == 0 )
           {
-            pc.intra[( base + k ) * 12 + 7] = uint( wave + 1 );
+            pc.intra[( base + k ) * kIntraJobWords + kWaveWord] = uint( wave + 1 );
           }
           waveSetRect( unpackRect( d.zw ), wave + 1, lane );
           // (the job's units in shared memory are written before the next job reads them; their copies in memory
@@ -2188,7 +2275,7 @@ void sbtmvpJobs( int tid, int index, inout Out o )
     {
       const Cu cu = loadCu( index );
       s_sbCu[0]   = cu.blk[0];
-      s_sbCu[1]   = int4( cu.ctu, int( g_sbFlags ), g_sbBcw, o.base[1] + o.n[1] );
+      s_sbCu[1]   = int4( cu.ctu, int( g_sbFlags ), g_sbBcw, o.base[kListInter] + o.n[kListInter] );
     }
     if( tid < 16 )
     {
@@ -2233,7 +2320,7 @@ void sbtmvpJobs( int tid, int index, inout Out o )
     const uint job = workgroupPrefixSum( starts ? 1u : 0u, tid, numJobs );
     if( tid == owner )
     {
-      o.n[1] += int( numJobs );
+      o.n[kListInter] += int( numJobs );
     }
     if( o.write && starts )
     {
@@ -2257,7 +2344,7 @@ void sbtmvpJobs( int tid, int index, inout Out o )
       b.width     = verMC ? 8 : 8 * length;
       setMcLists( slice, jslice, false, b );
       const int tileLength = alone ? 8 : 16;   // along the run: two sub-PUs, or the last one alone
-      uint      w[12];
+      uint      w[kJobWords];
       mcTile( b, jslice, x, y, verMC ? 8 : tileLength, verMC ? tileLength : 8, 0, w );
       writeInter( info.w + int( job ), w );
     }
@@ -2275,7 +2362,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     const int per = ( pc.numBlocks + 255 ) / 256;
     const int b0  = min( tid * per, pc.numBlocks );
     const int b1  = min( b0 + per, pc.numBlocks );
-    int       sum[5] = { 0, 0, 0, 0, 0 };
+    int       sum[kLists] = { 0, 0, 0, 0, 0 };
     for( int b = b0; b < b1; b++ )
     {
       for( int k = 0; k < kLists; k++ )
@@ -2283,7 +2370,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
         sum[k] += int( pc.blocks[b * kLists + k] );
       }
     }
-    int at[5];
+    int at[kLists];
     for( int k = 0; k < kLists; k++ )
     {
       uint total;
@@ -2307,9 +2394,9 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       // (total[] and first[] by pass: residual, inter, BDOF, affine. Inter's lists lie one after another in its
       // buffer; first[] holds their first jobs.)
-      const uint regular  = pc.blocks[pc.numBlocks * kLists + 1];
-      const uint bdof     = pc.blocks[pc.numBlocks * kLists + 3];
-      const uint total[4] = { pc.blocks[pc.numBlocks * kLists + 0], regular, bdof, pc.blocks[pc.numBlocks * kLists + 4] / 2 };
+      const uint regular  = pc.blocks[pc.numBlocks * kLists + kListInter];
+      const uint bdof     = pc.blocks[pc.numBlocks * kLists + kListInterBdof];
+      const uint total[4] = { pc.blocks[pc.numBlocks * kLists + kListTrafo], regular, bdof, pc.blocks[pc.numBlocks * kLists + kListInterAffine] / 2 };
       const uint first[4] = { 0, 0, regular, regular + bdof };
       for( int pass = kPassTrafo; pass <= kPassInterAffine; pass++ )
       {
@@ -2330,8 +2417,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   if( o.write )
   {
     // inter's lists lie one after another
-    o.base[3] += int( pc.blocks[pc.numBlocks * kLists + 1] );
-    o.base[4] += int( pc.blocks[pc.numBlocks * kLists + 1] + pc.blocks[pc.numBlocks * kLists + 3] );
+    o.base[kListInterBdof] += int( pc.blocks[pc.numBlocks * kLists + kListInter] );
+    o.base[kListInterAffine] += int( pc.blocks[pc.numBlocks * kLists + kListInter] + pc.blocks[pc.numBlocks * kLists + kListInterBdof] );
   }
   if( index < pc.numCus )
   {

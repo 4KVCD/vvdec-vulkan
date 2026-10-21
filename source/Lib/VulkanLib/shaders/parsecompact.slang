@@ -13,6 +13,7 @@
 // workgroup per TU), and counts the differences. GpuReconParse.cpp records both after the parse's own submissions.
 
 #include "common.slang"
+#include "records.slang"
 
 #ifndef CHECK
 #  define CHECK 0
@@ -53,7 +54,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   {
     return;
   }
-  uint*       r = pc.tus + t * 16;
+  uint*       r = pc.tus + t * kTuRecordWords;
   uint        compared = 0;
   uint        differ   = 0;
   int         firstComp = -1;
@@ -194,10 +195,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       {
         const uint firstCu = baseCu + s_cus[tid] - nc;
         const uint firstTu = baseTu + s_tus[tid] - nt;
-        pc.ctus[ctu * 4 + 0] = firstCu;
-        pc.ctus[ctu * 4 + 1] = nc | pc.ctuInfo[ctu * 2] << 16;
-        pc.ctus[ctu * 4 + 2] = ( ( pc.ctuInfo[ctu * 2 + 1] >> 16 ) & 1u ) | ( pc.ctuInfo[ctu * 2 + 1] & 0xffffu ) << 16;
-        pc.ctus[ctu * 4 + 3] = firstTu;
+        pc.ctus[ctu * kCtuRecordWords + 0] = firstCu;
+        pc.ctus[ctu * kCtuRecordWords + 1] = nc | pc.ctuInfo[ctu * 2] << 16;
+        pc.ctus[ctu * kCtuRecordWords + 2] = ( ( pc.ctuInfo[ctu * 2 + 1] >> 16 ) & 1u ) | ( pc.ctuInfo[ctu * 2 + 1] & 0xffffu ) << 16;
+        pc.ctus[ctu * kCtuRecordWords + 3] = firstTu;
       }
       baseCu += s_cus[1023];
       baseTu += s_tus[1023];
@@ -223,8 +224,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     if( i < uint( pc.numCus ) )
     {
       const uint meta = pc.cuMeta[i];
-      const uint at   = pc.ctus[( meta >> kLocalBits ) * 4u] + ( meta & ( ( 1u << kLocalBits ) - 1u ) );
-      pc.cus[at * 32u + uint( tid & 31 )] = pc.cusIn[i * 32u + uint( tid & 31 )];
+      const uint at   = ctuFirstCu( pc.ctus, int( meta >> kLocalBits ) ) + ( meta & ( ( 1u << kLocalBits ) - 1u ) );
+      pc.cus[at * uint( kCuRecordWords ) + uint( tid & 31 )] = pc.cusIn[i * uint( kCuRecordWords ) + uint( tid & 31 )];
     }
   }
   else if( pc.pass == 2 )
@@ -234,8 +235,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     if( i < uint( pc.numTus ) )
     {
       const uint meta = pc.tuMeta[i];
-      const uint at   = pc.ctus[( meta >> kLocalBits ) * 4u + 3u] + ( meta & ( ( 1u << kLocalBits ) - 1u ) );
-      pc.tus[at * 16u + uint( tid & 15 )] = pc.tusIn[i * 16u + uint( tid & 15 )];
+      const uint at   = ctuFirstTu( pc.ctus, int( meta >> kLocalBits ) ) + ( meta & ( ( 1u << kLocalBits ) - 1u ) );
+      pc.tus[at * uint( kTuRecordWords ) + uint( tid & 15 )] = pc.tusIn[i * uint( kTuRecordWords ) + uint( tid & 15 )];
     }
   }
   else

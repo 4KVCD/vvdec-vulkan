@@ -20,6 +20,7 @@
 // of those CUs.
 
 #include "common.slang"
+#include "records.slang"
 
 #ifndef SUBBLOCKS
 #define SUBBLOCKS 0
@@ -98,7 +99,7 @@ int ctuOfLuma( int x, int y ) { return ( y >> pc.log2Ctu ) * pc.widthInCtus + ( 
 
 Cu loadCu( int index )
 {
-  uint* r = pc.cus + index * 32;
+  uint* r = pc.cus + index * kCuRecordWords;
   Cu    cu;
   cu.index    = index;
   cu.predMode = int( ( r[1] >> 16 ) & 3 );
@@ -117,7 +118,7 @@ Cu loadCu( int index )
   const int  lx        = lumaValid ? int( r[0] & 0xffff ) : int( r[19] & 0xffff ) << pc.csx;
   const int  ly        = lumaValid ? int( r[0] >> 16 ) : int( r[19] >> 16 ) << pc.csy;
   cu.ctu       = ctuOfLuma( lx, ly );
-  cu.firstTu   = int( pc.ctus[cu.ctu * 4 + 3] ) + int( r[16] & 0xffff );
+  cu.firstTu   = int( ctuFirstTu( pc.ctus, cu.ctu ) ) + int( r[16] & 0xffff );
   cu.numTus    = int( r[16] >> 16 );
   return cu;
 }
@@ -149,7 +150,7 @@ struct Tu
 
 Tu loadTu( int index )
 {
-  uint* r = pc.tus + index * 16;
+  uint* r = pc.tus + index * kTuRecordWords;
   Tu    tu;
   tu.blk[0]      = ( r[1] & ( 1u << 16 ) ) != 0 ? int4( int( r[0] & 0xffff ), int( r[0] >> 16 ), int( r[1] & 0xff ), int( ( r[1] >> 8 ) & 0xff ) ) : int4( 0 );
   tu.blk[1]      = ( r[3] & ( 1u << 16 ) ) != 0 ? int4( int( r[2] & 0xffff ), int( r[2] >> 16 ), int( r[3] & 0xff ), int( ( r[3] >> 8 ) & 0xff ) ) : int4( 0 );
@@ -202,13 +203,13 @@ Tu tuAt( Cu cu, int2 pos, int ch )
 Tu lastTu( Cu cu ) { return loadTu( cu.firstTu + cu.numTus - 1 ); }
 
 // Slice records (mider.slang's slice table)
-uint* sliceOfCtu( int ctu ) { return pc.slices + pc.widthInCtus * pc.heightInCtus + pc.slices[ctu] * 64; }
+uint* sliceOfCtu( int ctu ) { return sliceRecordOfCtu( pc.slices, pc.widthInCtus * pc.heightInCtus, ctu ); }
 int   slicePoc( uint* s ) { return int( s[0] ); }
 bool  isInterB( uint* s ) { return ( s[1] & ( 1u << 16 ) ) != 0; }
 bool  deblockingOff( uint* s ) { return ( s[1] & ( 1u << 23 ) ) != 0; }
 uint  independentIdx( uint* s ) { return s[3]; }
 int   refPoc( uint* s, int list, int refIdx ) { return int( s[16 + 16 * list + refIdx] ); }
-uint  ctuTile( int ctu ) { return pc.ctus[ctu * 4 + 2] >> 16; }
+uint  ctuTile( int ctu ) { return ctuTileIndex( pc.ctus, ctu ); }
 
 // --------------------------------------------------------------------------------------------------------------------
 // The parameters

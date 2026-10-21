@@ -233,7 +233,7 @@ void writeCuInfo()
 void writeCuRecord( uint at )
 {
   const Cu  cu  = g_cu;
-  uint*     r   = pc.cus + at * 32u;
+  uint*     r   = pc.cus + at * uint( kCuRecordWords );
   uint      flags = cu.flags | ( cu.chType == 1 ? kChroma : 0u );
   r[0]  = uint( cu.lx ) | uint( cu.ly ) << 16;
   r[1]  = uint( cu.lw ) | uint( cu.lh ) << 8 | uint( cu.predMode ) << 16 | flags << 18;

@@ -4,6 +4,10 @@
 
 static const int kIntraJobWords = 12;
 
+// Word 7 holds the job's wave, which jobs.slang sets (IntraJob::setWave). intrasort.slang cuts the jobs into bands of
+// rows; in a band's copy of the job, the word holds the band's rows instead (first | count << 16, IntraJob::setRows).
+static const int kWaveWord = 7;
+
 // The kinds of intra jobs (IntraJob::Kind)
 static const int kIntraAngular = 0;   // planar, DC and the angular modes
 static const int kIntraBdpcm   = 1;

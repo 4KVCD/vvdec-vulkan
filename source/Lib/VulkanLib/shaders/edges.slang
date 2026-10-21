@@ -11,6 +11,7 @@
 // 2 WRITE: each CTU writes its edges at its offsets.
 
 #include "common.slang"
+#include "records.slang"
 #include "scan.slang"
 
 struct Params
@@ -36,7 +37,7 @@ struct Params
 
 [[vk::push_constant]] Params pc;
 
-uint* sliceOfCtu( int ctu ) { return pc.slices + pc.widthInCtus * pc.heightInCtus + pc.slices[ctu] * 64; }
+uint* sliceOfCtu( int ctu ) { return sliceRecordOfCtu( pc.slices, pc.widthInCtus * pc.heightInCtus, ctu ); }
 bool  deblockingOff( uint* s ) { return ( s[1] & ( 1u << 23 ) ) != 0; }
 
 // Returns which edges a 4x4 block has in direction dir (bit 0: a luma edge, bit 1: a chroma segment) and outputs

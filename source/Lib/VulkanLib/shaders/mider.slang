@@ -23,6 +23,7 @@
 // inherited and constructed affine candidates), affine AMVP, and GPM.
 
 #include "common.slang"
+#include "records.slang"
 
 // LITE=1: the variant for pictures whose SPS turns off GPM, affine and SbTMVP, without their code (GpuRecon picks
 // it). The common paths' code is then a fraction of the shader's, and more of it stays in the instruction cache.
@@ -124,7 +125,7 @@ Cu loadCu( int index )
   }
   else
   {
-    uint* g = pc.cus + index * 32;
+    uint* g = pc.cus + index * kCuRecordWords;
     r       = uint4( g[0], g[1], g[2], g[3] );
   }
   Cu cu;
@@ -153,7 +154,7 @@ void cacheCtuCus( int first, int count )
     for( int j = 0; j < 4; j++ )
     {
       const int i = base + j * 32 + g_lane;
-      v[j]        = i < n ? pc.cus[( first + ( i >> 2 ) ) * 32 + ( i & 3 )] : 0u;
+      v[j]        = i < n ? pc.cus[( first + ( i >> 2 ) ) * kCuRecordWords + ( i & 3 )] : 0u;
     }
     for( int j = 0; j < 4; j++ )
     {
@@ -179,14 +180,14 @@ int  refIdxOf( Cu cu, int list ) { return int( int8_t( ( cu.w3 >> ( 8 * list ) )
 bool affine6Of( Cu cu ) { return ( cu.flags & kAffine6 ) != 0; }
 int2 mvdOf( Cu cu, int list, int k )
 {
-  uint* r = pc.cus + cu.index * 32 + 4 + list * 6 + k * 2;   // (no cast to int*: see copyColMotion)
+  uint* r = pc.cus + cu.index * kCuRecordWords + 4 + list * 6 + k * 2;   // (no cast to int*: see copyColMotion)
   return int2( int( r[0] ), int( r[1] ) );
 }
 
 // CtuRecord fields: the first CU, the CU count, the slice and the tile
-uint ctuSliceIdx( int ctu ) { return pc.ctus[ctu * 4 + 1] >> 16; }
-uint ctuTile( int ctu ) { return pc.ctus[ctu * 4 + 2] >> 16; }
-bool ctuTileColStart( int ctu ) { return ( pc.ctus[ctu * 4 + 2] & 1 ) != 0; }
+uint ctuSliceIdx( int ctu ) { return ctuSliceIndex( pc.ctus, ctu ); }
+uint ctuTile( int ctu ) { return ctuTileIndex( pc.ctus, ctu ); }
+bool ctuTileColStart( int ctu ) { return ctuStartsTileRow( pc.ctus, ctu ); }
 int  ctuOf( int x, int y ) { return ( y >> pc.log2Ctu ) * pc.widthInCtus + ( x >> pc.log2Ctu ); }
 
 // A slice record (GpuFrontEnd.h's SliceRecord, 64 words), read through word( k ): Slice reads it from memory;
@@ -2841,7 +2842,7 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     return;
   }
   Cu         cu    = loadCu( index );
-  uint*      r     = pc.cus + index * 32;
+  uint*      r     = pc.cus + index * kCuRecordWords;
   const uint valid = r[20];
   if( ( valid & ( 1u << 17 ) ) != 0 )
   {
@@ -3063,8 +3064,8 @@ void main( uint3 local : SV_GroupThreadID )
   for( int col = span.x; col < span.y; col++ )
   {
     const int ctu   = row * pc.widthInCtus + col;
-    const int first = int( pc.ctus[ctu * 4] );
-    const int count = int( pc.ctus[ctu * 4 + 1] & 0xffff );
+    const int first = int( ctuFirstCu( pc.ctus, ctu ) );
+    const int count = int( ctuNumCus( pc.ctus, ctu ) );
     cacheCtuCus( first, count );
     // A CTU whose luma CUs are all intra (an intra slice's, unless IBC) reads no neighbour's motion: it does not wait
     // for the segment above, and its CUs' motion, none, is written by all the threads at once rather than CU by CU.

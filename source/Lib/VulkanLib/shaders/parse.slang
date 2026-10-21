@@ -37,6 +37,7 @@
 // parsetree.slang). The parse also adds up the room the front end's job lists need (gpu::frontCapacities).
 
 #include "common.slang"
+#include "records.slang"
 #include "parsectx.slang"
 
 #ifndef PROFILE

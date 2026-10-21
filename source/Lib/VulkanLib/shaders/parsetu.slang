@@ -143,7 +143,7 @@ void writeTuRecords( uint at )
   const int  stored = int( min( uint( g_cu.numTus ), room ) );   // the TUs there is room for
   for( int w = g_lane; w < stored * 16; w += 32 )
   {
-    pc.tus[at * 16u + uint( w )] = s_tu[w];
+    pc.tus[at * uint( kTuRecordWords ) + uint( w )] = s_tu[w];
   }
   if( g_lane < stored )
   {
