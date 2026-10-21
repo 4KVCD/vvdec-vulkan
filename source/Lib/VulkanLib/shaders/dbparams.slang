@@ -204,11 +204,6 @@ Tu lastTu( Cu cu ) { return loadTu( cu.firstTu + cu.numTus - 1 ); }
 
 // Slice records (mider.slang's slice table)
 uint* sliceOfCtu( int ctu ) { return sliceRecordOfCtu( pc.slices, pc.widthInCtus * pc.heightInCtus, ctu ); }
-int   slicePoc( uint* s ) { return int( s[0] ); }
-bool  isInterB( uint* s ) { return ( s[1] & ( 1u << 16 ) ) != 0; }
-bool  deblockingOff( uint* s ) { return ( s[1] & ( 1u << 23 ) ) != 0; }
-uint  independentIdx( uint* s ) { return s[3]; }
-int   refPoc( uint* s, int list, int refIdx ) { return int( s[16 + 16 * list + refIdx] ); }
 uint  ctuTile( int ctu ) { return ctuTileIndex( pc.ctus, ctu ); }
 
 // --------------------------------------------------------------------------------------------------------------------

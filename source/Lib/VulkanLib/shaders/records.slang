@@ -47,3 +47,35 @@ uint* sliceRecordOfCtu( uint* slices, int numCtus, int ctu )
 {
   return slices + numCtus + slices[ctu] * kSliceRecordWords;
 }
+
+// A slice record's words (writeSliceTable): its POC; whether it is a B slice and whether deblocking is off; the index of
+// its independent slice (the dependent slices of one share it); which references are long-term; their POCs.
+int slicePoc( uint* s )
+{
+  return int( s[0] );
+}
+
+bool isInterB( uint* s )
+{
+  return ( s[1] & ( 1u << 16 ) ) != 0;
+}
+
+bool deblockingOff( uint* s )
+{
+  return ( s[1] & ( 1u << 23 ) ) != 0;
+}
+
+uint independentIdx( uint* s )
+{
+  return s[3];
+}
+
+bool usedAsLongTerm( uint* s, int list, int refIdx )
+{
+  return ( s[4] & ( 1u << ( 16 * list + refIdx ) ) ) != 0;
+}
+
+int refPoc( uint* s, int list, int refIdx )
+{
+  return int( s[16 + 16 * list + refIdx] );
+}

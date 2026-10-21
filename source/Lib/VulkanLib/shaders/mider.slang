@@ -198,7 +198,6 @@ interface ISlice
   uint word( int k );
 };
 
-static const int kSliceWords = 64;
 
 struct Slice : ISlice
 {
@@ -206,7 +205,7 @@ struct Slice : ISlice
   uint  word( int k ) { return r[k]; }
 };
 
-groupshared uint s_curSlice[kSliceWords];
+groupshared uint s_curSlice[kSliceRecordWords];
 static uint      g_curSliceIdx = 0xffffffffu;   // the slice whose record s_curSlice holds (its index in pc.slices)
 
 struct CurSlice : ISlice
@@ -214,7 +213,7 @@ struct CurSlice : ISlice
   uint word( int k ) { return s_curSlice[k]; }
 };
 
-groupshared uint s_colSlice[kSliceWords];
+groupshared uint s_colSlice[kSliceRecordWords];
 static uint      g_colSliceIdx = 0xffffffffu;   // the colocated picture's slice whose record s_colSlice holds
 
 struct ColSlice : ISlice
@@ -230,7 +229,7 @@ static uint g_colCtuSlice[2];
 Slice sliceOfCtu( int ctu )
 {
   Slice s;
-  s.r = pc.slices + pc.widthInCtus * pc.heightInCtus + ctuSliceIdx( ctu ) * kSliceWords;
+  s.r = pc.slices + pc.widthInCtus * pc.heightInCtus + ctuSliceIdx( ctu ) * kSliceRecordWords;
   return s;
 }
 
@@ -697,7 +696,7 @@ Motion colMotionAt( Cur cur, int x, int y, out ColSlice colSlice )
   // (the colocated slices of the CTU and the one right of it are at hand: loadColSlices)
   uint*      colTable = colSlices( cur.slice );
   const uint colIdx   = ctuCol == cur.ctu ? g_colCtuSlice[0] : ctuCol == cur.ctu + 1 ? g_colCtuSlice[1] : colTable[ctuCol];
-  colSlice.r          = colTable + pc.widthInCtus * pc.heightInCtus + colIdx * kSliceWords;
+  colSlice.r          = colTable + pc.widthInCtus * pc.heightInCtus + colIdx * kSliceRecordWords;
   colSlice.cached     = colIdx == g_colSliceIdx;
   return m;
 }
@@ -2914,7 +2913,7 @@ void loadCurSlice( int ctu )
   const uint idx = ctuSliceIdx( ctu );
   if( idx != g_curSliceIdx )
   {
-    uint* r                 = pc.slices + pc.widthInCtus * pc.heightInCtus + idx * kSliceWords;
+    uint* r                 = pc.slices + pc.widthInCtus * pc.heightInCtus + idx * kSliceRecordWords;
     s_curSlice[g_lane]      = r[g_lane];
     s_curSlice[g_lane + 32] = r[g_lane + 32];
     g_curSliceIdx           = idx;
@@ -2933,7 +2932,7 @@ void loadColSlices( int ctu, int col )
   g_colCtuSlice[1] = col + 1 < pc.widthInCtus ? colTable[ctu + 1] : g_colCtuSlice[0];
   if( g_colCtuSlice[0] != g_colSliceIdx )
   {
-    uint* r                 = colTable + pc.widthInCtus * pc.heightInCtus + g_colCtuSlice[0] * kSliceWords;
+    uint* r                 = colTable + pc.widthInCtus * pc.heightInCtus + g_colCtuSlice[0] * kSliceRecordWords;
     s_colSlice[g_lane]      = r[g_lane];
     s_colSlice[g_lane + 32] = r[g_lane + 32];
     g_colSliceIdx           = g_colCtuSlice[0];

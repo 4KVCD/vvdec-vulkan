@@ -354,11 +354,6 @@ int scaleY( int ch ) { return ch == 0 ? 0 : pc.csy; }
 // Slice records: mider.slang's slice table and the jobs' JobSlice (GpuFrontEnd.h)
 uint* sliceOfCtu( int ctu ) { return sliceRecordOfCtu( pc.slices, pc.widthInCtus * pc.heightInCtus, ctu ); }
 uint* jobSliceOfCtu( int ctu ) { return pc.jobSlices + pc.slices[ctu] * kJobSliceWords; }
-int   slicePoc( uint* s ) { return int( s[0] ); }
-bool  isInterB( uint* s ) { return ( s[1] & ( 1u << 16 ) ) != 0; }
-uint  independentIdx( uint* s ) { return s[3]; }
-bool  usedAsLongTerm( uint* s, int list, int refIdx ) { return ( s[4] & ( 1u << ( 16 * list + refIdx ) ) ) != 0; }
-int   refPoc( uint* s, int list, int refIdx ) { return int( s[16 + 16 * list + refIdx] ); }
 uint  ctuTile( int ctu ) { return ctuTileIndex( pc.ctus, ctu ); }
 int   sliceType( uint* j ) { return int( j[0] & 3 ); }   // B 0, P 1, I 2
 bool  sliceLmcs( uint* j ) { return ( j[0] & 4 ) != 0; }

@@ -300,6 +300,31 @@ void transformLeaf( int4 luma, int4 chroma, bool chromaValid, int idx, int trDep
 // is split, the chroma goes with the last part, and in the dual tree there is no chroma) or SBT's two parts
 // (getSbtTuTiling). The loop
 // keeps transformLeaf to one call site, as every call is inlined.
+// How transformTree splits the CU into transform units
+static const int kTuWholeCu = 0;   // one TU: the CU
+static const int kTuTiles   = 1;   // tiles of the largest transform size
+static const int kTuIsp     = 2;   // ISP's sub-partitions
+static const int kTuSbt     = 3;   // SBT's two parts
+
+// SBT's part i (0 or 1) of the CU (getSbtTuTiling), in quarters of the CU: x, y, width, height
+int4 sbtPartQuarters( int i, int sbtIdx, int sbtPos )
+{
+  const bool small = ( i == 0 && sbtPos == 0 ) || ( i == 1 && sbtPos == 1 );   // the part of 1 quarter, of a quad split
+  if( sbtIdx == SBT_HOR_QUAD )
+  {
+    return int4( 0, i == 0 ? 0 : ( sbtPos == 0 ? 1 : 3 ), 4, small ? 1 : 3 );
+  }
+  if( sbtIdx == SBT_VER_QUAD )
+  {
+    return int4( i == 0 ? 0 : ( sbtPos == 0 ? 1 : 3 ), 0, small ? 1 : 3, 4 );
+  }
+  if( sbtIdx == SBT_HOR_HALF )
+  {
+    return int4( 0, i == 0 ? 0 : 2, 4, 2 );
+  }
+  return int4( i == 0 ? 0 : 2, 0, 2, 4 );
+}
+
 void transformTree( inout CuCtx ctx )
 {
   const int4 a     = currArea();
@@ -307,7 +332,7 @@ void transformTree( inout CuCtx ctx )
   const int4 c     = chromaOf( a );
   const bool isp   = g_cu.isp != 0 && g_p.chType == 0;
   const bool split = a.z > g_maxTbSize || a.w > g_maxTbSize || g_cu.sbtInfo != 0 || isp;
-  const int  kind  = !split ? 0 : ( isp ? 2 : ( g_cu.sbtInfo != 0 ? 3 : 1 ) );   // 0 the CU, 1 tiles, 2 ISP, 3 SBT
+  const int  kind  = !split ? kTuWholeCu : ( isp ? kTuIsp : ( g_cu.sbtInfo != 0 ? kTuSbt : kTuTiles ) );
   // The tiles of the largest transform size
   const int numTilesH = max( 1, a.z >> g_log2MaxTb );
   const int numTilesV = max( 1, a.w >> g_log2MaxTb );
@@ -319,13 +344,14 @@ void transformTree( inout CuCtx ctx )
   // SBT's type and position
   const int sbtIdx = g_cu.sbtInfo & 0xf;
   const int sbtPos = ( g_cu.sbtInfo >> 4 ) & 3;
-  const int n      = kind == 0 ? 1 : ( kind == 1 ? numTilesH * numTilesV : ( kind == 2 ? ( horizontal ? a.w >> log2i( dim ) : a.z >> log2i( dim ) ) : 2 ) );
+  const int n      = kind == kTuWholeCu ? 1
+                     : ( kind == kTuTiles ? numTilesH * numTilesV : ( kind == kTuIsp ? ( horizontal ? a.w >> log2i( dim ) : a.z >> log2i( dim ) ) : 2 ) );
   for( int i = 0; i < n && !g_error; i++ )
   {
     int4 l   = a;
     int4 cc  = c;
     bool cvi = cv;
-    if( kind == 1 )
+    if( kind == kTuTiles )
     {
       const int zid = rsScanToZ( numLog2H, i );
       const int y   = zid >> numLog2H;
@@ -333,46 +359,18 @@ void transformTree( inout CuCtx ctx )
       l             = int4( a.x + ( a.z >> numLog2H ) * x, a.y + ( a.w >> numLog2V ) * y, a.z >> numLog2H, a.w >> numLog2V );
       cc            = int4( c.x + ( c.z >> numLog2H ) * x, c.y + ( c.w >> numLog2V ) * y, c.z >> numLog2H, c.w >> numLog2V );
     }
-    else if( kind == 2 )
+    else if( kind == kTuIsp )
     {
       l   = horizontal ? int4( a.x, a.y + i * dim, a.z, dim ) : int4( a.x + i * dim, a.y, dim, a.w );
       cvi = cv && !g_dualTree && i == n - 1;
     }
-    else if( kind == 3 )
+    else if( kind == kTuSbt )
     {
-      int wf, hf, xf, yf;
-      if( sbtIdx == SBT_HOR_QUAD )
-      {
-        wf = 4;
-        xf = 0;
-        hf = ( ( i == 0 && sbtPos == 0 ) || ( i == 1 && sbtPos == 1 ) ) ? 1 : 3;
-        yf = i == 0 ? 0 : ( sbtPos == 0 ? 1 : 3 );
-      }
-      else if( sbtIdx == SBT_VER_QUAD )
-      {
-        wf = ( ( i == 0 && sbtPos == 0 ) || ( i == 1 && sbtPos == 1 ) ) ? 1 : 3;
-        xf = i == 0 ? 0 : ( sbtPos == 0 ? 1 : 3 );
-        hf = 4;
-        yf = 0;
-      }
-      else if( sbtIdx == SBT_HOR_HALF )
-      {
-        wf = 4;
-        xf = 0;
-        hf = 2;
-        yf = i == 0 ? 0 : 2;
-      }
-      else
-      {
-        wf = 2;
-        xf = i == 0 ? 0 : 2;
-        hf = 4;
-        yf = 0;
-      }
-      l  = int4( a.x + ( ( a.z * xf ) >> 2 ), a.y + ( ( a.w * yf ) >> 2 ), ( a.z * wf ) >> 2, ( a.w * hf ) >> 2 );
-      cc = int4( c.x + ( ( c.z * xf ) >> 2 ), c.y + ( ( c.w * yf ) >> 2 ), ( c.z * wf ) >> 2, ( c.w * hf ) >> 2 );
+      const int4 q = sbtPartQuarters( i, sbtIdx, sbtPos );
+      l            = int4( a.x + ( ( a.z * q.x ) >> 2 ), a.y + ( ( a.w * q.y ) >> 2 ), ( a.z * q.z ) >> 2, ( a.w * q.w ) >> 2 );
+      cc           = int4( c.x + ( ( c.z * q.x ) >> 2 ), c.y + ( ( c.w * q.y ) >> 2 ), ( c.z * q.z ) >> 2, ( c.w * q.w ) >> 2 );
     }
-    transformLeaf( l, cc, cvi, kind == 0 ? g_lv.idx : i, kind == 0 ? 0 : 1, ctx );
+    transformLeaf( l, cc, cvi, kind == kTuWholeCu ? g_lv.idx : i, kind == kTuWholeCu ? 0 : 1, ctx );
   }
 }
 
