@@ -70,6 +70,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "GpuPictureMemory.h"
 
 #include "CommonLib/Buffer.h"
+#include "CommonLib/ChromaFormat.h"
 #include "CommonLib/Common.h"
 
 namespace vvdec
@@ -80,6 +81,8 @@ class AdaptiveLoopFilter;
 class SampleAdaptiveOffset;
 class Mv;
 class SPS;
+class PPS;
+class PreCalcValues;
 struct Picture;
 struct MotionInfo;
 struct LoopFilterParam;
@@ -87,6 +90,7 @@ struct LoopFilterParam;
 namespace gpu
 {
 
+struct MiderPush;      // (GpuReconFrontEnd.cpp)
 struct JobsPush;       // (GpuReconFrontEnd.cpp)
 struct DbParamsPush;   // (GpuReconFrontEnd.cpp)
 struct DeblockPush;    // (GpuReconFilters.cpp)
@@ -98,6 +102,34 @@ struct InterPush;      // (GpuReconPrediction.cpp)
 // (Tables::geoWeights), in bytes: after GPM's masks (6 of 112 x 112) and the interpolation filters' taps (1192)
 static constexpr size_t kDeblockTablesAt = ( 6 * 112 * 112 + 1192 ) * sizeof( int16_t );
 
+// Where the dequantization matrices of the picture's explicit scaling lists start, as the GPU front end's jobs look
+// them up (GpuRecon::setDequantOffsets): one offset per scaling list (kScalingLists of them), log2 width and log2
+// height (each 0 .. kScalingLog2Sizes - 1), in that order.
+static constexpr size_t kScalingLists     = 6;
+static constexpr size_t kScalingLog2Sizes = 7;
+static constexpr size_t kDequantOffsets   = kScalingLists * kScalingLog2Sizes * kScalingLog2Sizes;
+
+// Returns the number of 4x4 blocks that cover samples luma samples (a picture's width or height).
+inline int blocks4x4( unsigned samples )
+{
+  return int( ( samples + 3 ) >> 2 );
+}
+
+// Returns the horizontal and the vertical subsampling shift of the chroma planes of a chroma format: 0 without chroma.
+inline int chromaShiftX( ChromaFormat format )
+{
+  return isChromaEnabled( format ) ? int( getComponentScaleX( COMPONENT_Cb, format ) ) : 0;
+}
+inline int chromaShiftY( ChromaFormat format )
+{
+  return isChromaEnabled( format ) ? int( getComponentScaleY( COMPONENT_Cb, format ) ) : 0;
+}
+
+// Returns the position of the top-left luma sample of CTU ctu (in raster order).
+Position ctuPosition( const PreCalcValues& pcv, unsigned ctu );
+// Returns whether the PPS has several subpictures and treats one of them as a picture.
+bool subpicturesTreatedAsPictures( const PPS& pps );
+
 // What a decoder's GpuRecon instances share.
 // - The front end's buffers whose size changes with the picture (the job lists, the CUs' motion and job counts, the
 //   intra order, the edges) are ranges of one RangeArena. A picture takes them when its front end is recorded and gives
@@ -108,9 +140,9 @@ static constexpr size_t kDeblockTablesAt = ( 6 * 112 * 112 + 1192 ) * sizeof( in
 //   (GpuRecon::m_defer), in which inter prediction keeps predictions aside for intra jobs. Inter prediction writes them
 //   in a picture's first part and intra prediction reads them in its rest, both on the compute queue, and each part
 //   begins with a barrier over the work submitted before it. So an instance holds them only from the start of a
-//   picture's recording until its rest is submitted (GpuRecon::SharedDeferTurn). Free them only with
-//   Context::freeAfterQueued (planes grown for a larger picture, with RPR): another instance's queued work may still
-//   use them.
+//   picture's recording until its rest is submitted (GpuRecon::SharedDeferTurn). When they grow for a larger picture
+//   (RPR), free them with Context::freeAfterQueued, not Context::free: another instance's queued work may still use
+//   them.
 struct SharedReconBuffers
 {
   explicit SharedReconBuffers( Context* context ) : ctx( context ), frontEnd( context, kIdlePictures ) {}
@@ -118,13 +150,13 @@ struct SharedReconBuffers
   SharedReconBuffers( const SharedReconBuffers& )            = delete;
   SharedReconBuffers& operator=( const SharedReconBuffers& ) = delete;
 
-  // a chunk of the front end's ranges unused for this many pictures is freed (RangeArena::tick)
+  // A chunk of the front end's ranges that no picture used for this many pictures is freed (RangeArena::tick).
   static constexpr uint64_t kIdlePictures = 64;
 
   Context*   ctx;
-  std::mutex deferMutex;   // held by the instance recording a picture with the deferred-prediction planes
+  std::mutex deferMutex;      // held by the instance recording a picture with the deferred-prediction planes
   Buffer     defer;
-  std::mutex frontEndMutex;   // (the instances take and give back ranges from their threads)
+  std::mutex frontEndMutex;   // guards frontEnd: the instances take and give back ranges from their own threads
   RangeArena frontEnd;
 };
 
@@ -143,6 +175,29 @@ enum FrontPass
   kPassDeblockChromaVer = 7,
   kPassDeblockChromaHor = 8,
 };
+
+// The front end's three job buffers (FrontEndBuffers::jobs): the residual, the inter and the intra jobs.
+enum JobKind
+{
+  kTrafoJobs = 0,
+  kInterJobs = 1,
+  kIntraJobs = 2,
+  kJobKinds  = 3,
+};
+
+// jobs.slang's job lists, in the order of its per-CU job counts and of their sums (FrontEndBuffers::jobBlocks: per
+// block of kCusPerJobBlock CUs the kJobLists sums, then the picture's totals). The three inter lists share the inter
+// job buffer, one after the other.
+enum JobList
+{
+  kListTrafo       = 0,
+  kListInter       = 1,   // inter's regular tiles
+  kListIntra       = 2,
+  kListInterBdof   = 3,   // the BDOF tiles
+  kListInterAffine = 4,   // the affine tiles, two jobs each
+  kJobLists        = 5,
+};
+static constexpr size_t kCusPerJobBlock = 256;
 
 class GpuRecon
 {
@@ -180,7 +235,8 @@ public:
   // lists (TrQuant::getDequantCoeffBuf, scalingCount values; null without).
   void setPicture( const PelStorage& pic, const LmcsTables* tables, bool defer, const int* scalingMatrices = nullptr, size_t scalingCount = 0 );
   // For the GPU front end's jobs: where each explicit scaling list's dequantization matrix starts among the
-  // picture's (Quant::getDequantCoeff), plus one, per list (6), log2 width and log2 height (0..6); 0 where none.
+  // picture's matrices (Quant::getDequantCoeff), plus one, so that 0 means none. kDequantOffsets values: per scaling
+  // list, log2 width and log2 height.
   void setDequantOffsets( const std::vector<uint32_t>& offsets ) { m_dequantOffsets = offsets; }
   // Works out the parameters of the picture's in-loop filters (deblocking, SAO, ALF). This runs as a task of its
   // own once the picture is parsed, while its CTU tasks run; startPicture calls it if that task did not run.
@@ -269,6 +325,9 @@ private:
   void mark( const char* label );
   // VVDEC_GPU_PROFILE=1: adds up the picture's marks; waited is how long the CPU waited for the GPU, in ms.
   void readTimestamps( double waited );
+  // VVDEC_GPU_PROFILE=1: reads the first count timestamps of queries into stamps, waiting for them.
+  void   getTimestamps( VkQueryPool queries, uint32_t count, uint64_t* stamps ) const;
+  double ticksToMs( uint64_t ticks ) const;   // a difference of timestamps in milliseconds
 
   // Barriers between the commands recorded into m_cmd
   void memoryBarrier( VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess );
@@ -312,6 +371,9 @@ private:
   // With subpictures treated as pictures: writes each CTU's rectangle (its subpicture's or the picture's) into
   // m_subpics and returns its address. Otherwise returns 0.
   VkDeviceAddress subpicRects( const CodingStructure& cs );
+  // Makes buf hold at least needed bytes: when it is smaller, it is freed and replaced with a buffer of allocated
+  // bytes (at least needed) of kind. Unlike Context::ensure, the new size is the caller's choice.
+  void            replaceIfSmaller( Buffer& buf, size_t needed, size_t allocated, MemKind kind );
   // The upload buffer of the in-loop filters' parameters, with room for size bytes. It holds the deblocking
   // parameters, then ALF's, SAO's and LMCS's (prepareFilters); these return where each starts on the GPU.
   uint8_t*        params( size_t size );
@@ -319,6 +381,13 @@ private:
   VkDeviceAddress alfParams() const { return m_params.addr + m_prepared.dbSize; }
   VkDeviceAddress saoParams() const { return m_params.addr + m_prepared.dbSize + m_prepared.alfSize; }
   VkDeviceAddress lmcsParams() const { return m_params.addr + m_prepared.dbSize + m_prepared.alfSize + m_prepared.saoSize; }
+  // The picture's LMCS tables in m_lmcs (setPicture): the forward and the inverse luma mapping, then the chroma scales
+  void            uploadLmcsTables( const LmcsTables& tables );
+  VkDeviceAddress lmcsForward() const { return m_lmcs.addr; }
+  VkDeviceAddress lmcsInverse() const { return m_lmcs.addr + m_lmcsCount * sizeof( int16_t ); }
+  VkDeviceAddress lmcsChromaScales() const { return m_lmcs.addr + m_lmcsCount * 2 * sizeof( int16_t ); }
+  // The dequantization matrices of the picture's explicit scaling lists in m_scaling (setPicture), a byte per factor
+  void            uploadScalingMatrices( const int* matrices, size_t count );
 
   // --- The order of a picture's work (GpuRecon.cpp) ---
   // The picture's filter parameters (unless prepareFilters ran for it), what jobs says the GPU does, and the deferred
@@ -363,6 +432,7 @@ private:
   void   takeFrontEnd( Buffer& buf, size_t size );
   void   giveFrontEnd();
   void   recordMotion( const CodingStructure& cs, size_t numCus );
+  void   miderPush( const CodingStructure& cs, size_t numCus, MiderPush& push );   // (writes the subpictures' rectangles)
   void   recordDeblockParams( const CodingStructure& cs, size_t numCus );
   void   uploadSubpicInfo( const CodingStructure& cs );   // per CTU, its subpicture and loop filtering across it
   uint32_t nextLfpTag();   // the picture's tag in the deblocking parameters (zeroing them when the tags wrap around)
@@ -435,6 +505,9 @@ private:
   // --- State ---
   static constexpr uint32_t kMaxMarks       = 64;   // profiling marks per picture
   static constexpr uint32_t kEarlyRowsMarks = 8;    // and in the early rows' submission
+  static constexpr uint32_t kDownloadMarks  = 2;    // and in a download's: its start and its end
+  // The reference table's smallest allocation, so that it seldom grows
+  static constexpr size_t   kMinRefTableBytes = 1024;
 
   Context*            m_ctx;
   SharedReconBuffers* m_shared;   // what the decoder's instances share
@@ -515,9 +588,10 @@ private:
   bool   m_scalingOn = false;
   Buffer m_scaling;
 
-  // Buffers. Those the CPU writes once, in order, and the shaders only read (the parameters, the reference table,
-  // the jobs, the edges, the tables) are MemKind::Upload: in the GPU's own memory when the BAR allows it (VideoQ 4K:
-  // the GPU's time per picture -1%; the CPU's write-combined copies of the jobs are no slower).
+  // Buffers. Those that the CPU writes once, in order, and that the shaders only read (the parameters, the reference
+  // table, the jobs, the edges, the tables) are MemKind::Upload: in the GPU's own memory when the BAR allows it. That
+  // takes 1% off the GPU's time per picture at VideoQ 4K, and the CPU's write-combined copies of the jobs are no
+  // slower.
   Buffer m_params;                       // the in-loop filters' parameters (params())
   Buffer m_refs;                         // the reference table: the reference pictures' planes on the GPU
   Buffer m_scratch[MAX_NUM_COMPONENT];   // a picture's worth of GPU memory for SAO's or ALF's output, from the pool while its work is recorded
@@ -562,12 +636,12 @@ private:
     uint32_t lfpTag    = 0;                // the picture's tag in lfp's entries (dbparams.slang's loadLfp)
     VkBuffer lfpZeroed = VK_NULL_HANDLE;   // lfp, once zeroed (a new one is zeroed first)
     // Jobs (jobs.slang): its tables (writeJobTables); the slices' words (writeJobSlices); the scaling lists' matrix
-    // offsets; per CU, its job counts; per block of 256 CUs, their sums, then the totals; the job lists (residual,
-    // inter, intra); each 4x4 block's wave; each CTU row's progress
-    Buffer   jobTables, jobSlices, jobScaling, jobCounts, jobBlocks, jobs[3], waveMap, jobProgress;
+    // offsets; per CU, its job counts (JobList); per block of kCusPerJobBlock CUs, their sums, then the totals; the
+    // job buffers (JobKind); each 4x4 block's wave; each CTU row's progress
+    Buffer   jobTables, jobSlices, jobScaling, jobCounts, jobBlocks, jobs[kJobKinds], waveMap, jobProgress;
     uint32_t waveTag    = 0;                // the picture's tag in waveMap's entries (jobs.slang's mapWave)
     VkBuffer waveZeroed = VK_NULL_HANDLE;   // waveMap, once zeroed
-    size_t jobCapacity[3] = { 0, 0, 0 };   // the room of the job lists, in jobs
+    size_t jobCapacity[kJobKinds] = { 0, 0, 0 };   // the room of the job buffers, in jobs
     int    jobBlockCount  = 0;
     Buffer args;   // the passes' indirect dispatch arguments and job counts (FrontPass)
     // Intra order (intrasort.slang): a radix sort of the intra jobs by wave (the keys, two halves, and the
@@ -610,7 +684,11 @@ private:
   // whether the picture recorded each copy
   struct FrontEndCheck
   {
-    Buffer        motion, lfp, jobBlocks, jobs[3], sortedBands, bandWaits, sortInfo, edges, edgeLists;
+    // The words of sortInfo: intrasort.slang's band count, and its flags (a wave past the waves it can order)
+    static constexpr size_t kSortInfoBandCount = 0;
+    static constexpr size_t kSortInfoFlags     = 2;
+
+    Buffer        motion, lfp, jobBlocks, jobs[kJobKinds], sortedBands, bandWaits, sortInfo, edges, edgeLists;
     bool          lfpRecorded = false, jobsRecorded = false, edgesRecorded = false;
     FrontEndStats stats;
 

@@ -113,10 +113,20 @@ struct EdgesPush
 };
 static_assert( sizeof( EdgesPush ) == 96, "EdgesPush: the layout of edges.slang's Params" );
 
-// The size of a job in words: residual, inter and intra jobs
-static constexpr size_t kJobWords[3] = { sizeof( TrafoJob ) / sizeof( uint32_t ), sizeof( InterJob ) / sizeof( uint32_t ), sizeof( IntraJob ) / sizeof( uint32_t ) };
+// The size of a job in words, per job buffer (JobKind)
+static constexpr size_t kJobWords[kJobKinds] = { sizeof( TrafoJob ) / sizeof( uint32_t ), sizeof( InterJob ) / sizeof( uint32_t ),
+                                                 sizeof( IntraJob ) / sizeof( uint32_t ) };
+// The entries (jobs, intra bands, edges) added to the room of the front end's lists, beyond what the picture can need
+static constexpr size_t kJobBufferSpare = 64;
 // The words of the passes' dispatch arguments and job counts (FrontPass)
 static constexpr size_t kArgsWords = 64;
+// The words of the front end's records per 4x4 block or CU:
+static constexpr size_t kMotionWords   = 5;    // mider.slang's motion of a 4x4 block
+static constexpr size_t kLfpWords      = 2;    // dbparams.slang's parameters of a 4x4 block in one direction
+static constexpr size_t kCuMotionWords = 16;   // mider.slang's motion of a CU
+static constexpr size_t kWaveMapWords  = 3;    // jobs.slang's wave map: per 4x4 luma area, a word in each component's plane
+// The tags in the deblocking parameters and in the wave map run from 1 to kMaxTag, then start again at 1.
+static constexpr uint32_t kMaxTag = 65535;
 // intrasort.slang's passes (its pc.pass and kPass*): two digits of a radix sort by wave (HIST, SCAN, SCATTER), then the
 // jobs' bands (BANDS, BSCAN, PLACE, WAITS); SMALL does all of it in one workgroup for up to 1024 jobs.
 enum IntraSortPass
@@ -144,22 +154,38 @@ static constexpr size_t kSortMaxWaves  = 65536;
 static constexpr size_t kEdgeListsWords = 9;
 
 
-// The address of the picture's slice table (writeSliceTable)
+// Returns the address of the picture's slice table (writeSliceTable).
 static VkDeviceAddress sliceTable( const CodingStructure& cs )
 {
   return hostAllocationAddress( cs.m_gpuSliceAllocation );
 }
 
-// The bytes of the 4x4 blocks' motion (mider.slang: 5 words per block)
+// Returns the bytes of the motion of the picture's 4x4 blocks.
 static size_t motionBytes( const PreCalcValues& pcv )
 {
-  return size_t( pcv.sizeInCtus ) * pcv.num4x4CtuBlks * 5 * sizeof( int32_t );
+  return size_t( pcv.sizeInCtus ) * pcv.num4x4CtuBlks * kMotionWords * sizeof( int32_t );
 }
 
-// The bytes of the deblocking parameters (dbparams.slang: 2 words per 4x4 block and direction)
+// Returns the bytes of the deblocking parameters of the picture's 4x4 blocks, in both directions.
 static size_t lfpBytes( const PreCalcValues& pcv )
 {
-  return size_t( pcv.sizeInCtus ) * 2 * pcv.num4x4CtuBlks * 2 * sizeof( uint32_t );
+  return size_t( pcv.sizeInCtus ) * 2 * pcv.num4x4CtuBlks * kLfpWords * sizeof( uint32_t );
+}
+
+// Returns the timeline value of the latest first part of the picture's colocated pictures (0: none). The front end
+// waits for it, because a colocated picture's inter prediction writes DMVR's refined motion into its colocated motion
+// in its first part, and TMVP reads that motion.
+static uint64_t colocatedFirstParts( const CodingStructure& cs )
+{
+  uint64_t value = 0;
+  for( const Slice* slice: cs.picture->slices )
+  {
+    if( const Picture* col = colocatedPicture( *slice ) )
+    {
+      value = std::max( value, col->gpuFirstValue );
+    }
+  }
+  return value;
 }
 
 // ====================================================================================================================
@@ -171,27 +197,11 @@ void GpuRecon::recordFrontEndAsync( const CodingStructure& cs, const PictureJobs
   m_ctx->api().vkResetCommandPool( m_ctx->device(), m_poolFrontEnd, 0 );
   m_cmd = m_cmdFrontEnd1;
   m_ctx->beginOneTime( m_cmd );
-  // what the front ends before wrote (the colocated pictures' motion) visible
+  // What the front ends before wrote, such as the colocated pictures' motion, becomes visible.
   fullBarrier();
-  // Part 1 waits for the first parts of the picture's colocated pictures: their inter prediction writes DMVR's
-  // refined motion into their colocated motion, which TMVP reads.
-  uint64_t wait = 0;
-  for( const Slice* s: cs.picture->slices )
-  {
-    if( !s->isIntra() )
-    {
-      const RefPicList colList = RefPicList( s->isInterB() ? 1 - s->getColFromL0Flag() : 0 );
-      if( int( s->getColRefIdx() ) < s->getNumRefIdx( colList ) )
-      {
-        if( const Picture* col = s->getRefPic( colList, int( s->getColRefIdx() ) ) )
-        {
-          wait = std::max( wait, col->gpuFirstValue );
-        }
-      }
-    }
-  }
-  m_frontEndWait = wait;
-  // and, with the GPU's parse, for the picture's parse
+  // Part 1 waits for the first parts of the picture's colocated pictures and, with the GPU's parse, for the picture's
+  // parsed records.
+  m_frontEndWait      = colocatedFirstParts( cs );
   m_frontEndParseWait = jobs.parsed ? jobs.parsed->parseValue() : 0;
   // Part 1 (motion and jobs) ends after the jobs (recordJobs calls splitFrontEnd); the picture's first part waits
   // for it. Part 2 holds the rest, which the picture's rest waits for.
@@ -200,7 +210,7 @@ void GpuRecon::recordFrontEndAsync( const CodingStructure& cs, const PictureJobs
   m_splitFrontEnd = false;
   if( m_cmd == m_cmdFrontEnd1 )
   {
-    splitFrontEnd();   // (no jobs were recorded: part 2 stays empty)
+    splitFrontEnd();   // no jobs were recorded, so part 2 stays empty
   }
   m_ctx->api().vkEndCommandBuffer( m_cmd );
   m_ctx->submitFront( m_asyncQueue, m_cmdFrontEnd2, 0, m_frontEnd2Done );
@@ -214,7 +224,7 @@ void GpuRecon::splitFrontEnd()
   m_ctx->submitFront( m_asyncQueue, m_cmdFrontEnd1, m_frontEndWait, m_frontEnd1Done, m_frontEndParseWait );
   m_cmd = m_cmdFrontEnd2;
   m_ctx->beginOneTime( m_cmd );
-  fullBarrier();   // what part 1 wrote, visible
+  fullBarrier();   // what part 1 wrote becomes visible
 }
 
 // ====================================================================================================================
@@ -228,13 +238,13 @@ bool GpuRecon::recordFrontEnd( const CodingStructure& cs, const PictureJobs& job
   if( numCus > 0 )
   {
     recordMotion( cs, numCus );
-    recordJobs( cs, jobs, numCus );   // (with the async queue, part 2 begins after the jobs)
+    recordJobs( cs, jobs, numCus );   // with the async queue, part 2 begins after the jobs
     recordDeblockParams( cs, numCus );
-    // Side by side, one barrier after them (recordEdges' first): the caller's work, the intra jobs' waves (a
-    // wavefront of a few threads) and the edges' first pass
+    // These run side by side, with one barrier after them all (recordEdges' first): the caller's work, the intra
+    // jobs' waves (a wavefront of a few threads) and the edges' first pass.
     if( beside )
     {
-      indirectBarrier();   // (the jobs' dispatch arguments)
+      indirectBarrier();   // the caller's work reads the jobs' dispatch arguments
       beside();
     }
     recordJobWaves( cs, jobs, numCus );
@@ -247,69 +257,56 @@ bool GpuRecon::recordFrontEnd( const CodingStructure& cs, const PictureJobs& job
     {
       copyJobsForCheck( jobs );
     }
-    // the check's copies visible to the shaders that follow
+    // The check's copies become visible to the shaders that follow.
     transferToComputeBarrier();
   }
   mark( "front end" );
   return numCus > 0 && beside;
 }
 
+// Copies the records of all the CTUs, CTU after CTU, to dst. The CPU writes them in order.
+template<typename Record>
+static void copyRecords( const std::vector<std::vector<Record>>& perCtu, uint8_t* dst )
+{
+  Record* to = reinterpret_cast<Record*>( dst );
+  for( const auto& ctu: perCtu )
+  {
+    if( !ctu.empty() )
+    {
+      memcpy( to, ctu.data(), ctu.size() * sizeof( Record ) );
+      to += ctu.size();
+    }
+  }
+}
+
 size_t GpuRecon::uploadRecords( const CodingStructure& cs, const PictureJobs& jobs )
 {
-  const std::vector<std::vector<CuRecord>>& cus = *jobs.cus;
-  const std::vector<std::vector<TuRecord>>& tus = *jobs.tus;
-  const PreCalcValues& pcv    = *cs.pcv;
-  size_t               numCus = 0;
-  size_t               numTus = 0;
-  for( const auto& ctu: cus )
-  {
-    numCus += ctu.size();
-  }
-  for( const auto& ctu: tus )
-  {
-    numTus += ctu.size();
-  }
-  ensureFrontEndBuffers( cs, numCus, numTus );
+  const std::vector<std::vector<CuRecord>>& cus    = *jobs.cus;
+  const std::vector<std::vector<TuRecord>>& tus    = *jobs.tus;
+  const size_t                              numCus = countPerCtu( cus );
+  ensureFrontEndBuffers( cs, numCus, countPerCtu( tus ) );
   m_frontEnd.recordCus    = m_frontEnd.cus.addr;
   m_frontEnd.recordTus    = m_frontEnd.tus.addr;
   m_frontEnd.recordCtus   = m_frontEnd.ctus.addr;
-  m_frontEnd.recordLevels = 0;   // (the CPU's parse left the levels in the picture)
+  m_frontEnd.recordLevels = 0;   // the CPU's parse left the levels in the picture
   if( m_useFrontEnd )
   {
     m_frontEnd.capacities = frontCapacities( cs, cus, tus );
   }
   else
   {
-    m_ctx->ensure( m_check.motion, motionBytes( pcv ), MemKind::HostCached );
+    m_ctx->ensure( m_check.motion, motionBytes( *cs.pcv ), MemKind::HostCached );
   }
-
-  // the records, written in order by the CPU
-  CuRecord* cuDst = reinterpret_cast<CuRecord*>( m_frontEnd.cus.mapped );
-  for( const auto& ctu: cus )
-  {
-    if( !ctu.empty() )
-    {
-      memcpy( cuDst, ctu.data(), ctu.size() * sizeof( CuRecord ) );
-      cuDst += ctu.size();
-    }
-  }
-  TuRecord* tuDst = reinterpret_cast<TuRecord*>( m_frontEnd.tus.mapped );
-  for( const auto& ctu: tus )
-  {
-    if( !ctu.empty() )
-    {
-      memcpy( tuDst, ctu.data(), ctu.size() * sizeof( TuRecord ) );
-      tuDst += ctu.size();
-    }
-  }
+  copyRecords( cus, m_frontEnd.cus.mapped );
+  copyRecords( tus, m_frontEnd.tus.mapped );
   writeCtuRecords( cs, cus, tus, reinterpret_cast<CtuRecord*>( m_frontEnd.ctus.mapped ) );
   return numCus;
 }
 
 size_t GpuRecon::useParsedRecords( const CodingStructure& cs, const ParsedPicture& parsed )
 {
-  // the job lists' room as the parse added it up; the records in raster order where the parse left them (part 1
-  // waits for the parse queue's timeline value that put them there)
+  // The job buffers' room as the parse added it up, and the records in raster order where the parse left them. The
+  // front end's part 1 waits for the parse queue's timeline value that put them there.
   ensureFrontEndBuffers( cs, parsed.numCus(), parsed.numTus(), false );
   m_frontEnd.capacities = parsed.capacities();
   m_frontEnd.recordCus    = parsed.cus();
@@ -321,12 +318,12 @@ size_t GpuRecon::useParsedRecords( const CodingStructure& cs, const ParsedPictur
 
 void GpuRecon::ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, size_t numTus, bool records )
 {
-  // The records: written by the CPU in order, or by the GPU's parse (its scatter). What only the GPU reads and writes
-  // (the CU maps, the CUs' motion, the rows' progress) is in its own memory, where mider.slang's waits for each read
-  // are far shorter (in host memory: VideoQ 1080p took 0.6 s per picture).
+  // The records are written by the CPU in order, or by the GPU's parse (its scatter). What only the GPU reads and
+  // writes (the CU maps, the CUs' motion, the rows' progress) is in its own memory. Don't put those in host memory:
+  // mider.slang's waits for each read become far longer (VideoQ 1080p took 0.6 s per picture).
   const PreCalcValues& pcv       = *cs.pcv;
-  const int            widthIn4  = int( ( pcv.lumaWidth + 3 ) >> 2 );
-  const int            heightIn4 = int( ( pcv.lumaHeight + 3 ) >> 2 );
+  const int            widthIn4  = blocks4x4( pcv.lumaWidth );
+  const int            heightIn4 = blocks4x4( pcv.lumaHeight );
   if( records )
   {
     m_ctx->ensure( m_frontEnd.cus, std::max<size_t>( numCus, 1 ) * sizeof( CuRecord ), MemKind::Upload );
@@ -339,9 +336,9 @@ void GpuRecon::ensureFrontEndBuffers( const CodingStructure& cs, size_t numCus, 
   }
   m_ctx->ensure( m_frontEnd.cuMapLuma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
   m_ctx->ensure( m_frontEnd.cuMapChroma, size_t( widthIn4 ) * heightIn4 * sizeof( uint32_t ), MemKind::Device );
-  takeFrontEnd( m_frontEnd.cuMotion, std::max<size_t>( numCus, 1 ) * 16 * sizeof( int32_t ) );
+  takeFrontEnd( m_frontEnd.cuMotion, std::max<size_t>( numCus, 1 ) * kCuMotionWords * sizeof( int32_t ) );
   m_ctx->ensure( m_frontEnd.motion, motionBytes( pcv ), MemKind::Device );
-  // (mider.slang's progress: per CTU row and tile column, then the segments taken)
+  // mider.slang's progress: a word per CTU row and tile column, then the count of the segments taken
   m_ctx->ensure( m_frontEnd.rowProgress, ( size_t( pcv.heightInCtus ) * cs.pps->getNumTileColumns() + 1 ) * sizeof( uint32_t ), MemKind::Device );
 }
 
@@ -369,14 +366,15 @@ void GpuRecon::giveFrontEnd()
     m_shared->frontEnd.give( *buf );
   }
   m_frontEndRanges.clear();
-  m_shared->frontEnd.tick();   // (a picture's)
+  m_shared->frontEnd.tick();   // a tick per picture
 }
 
-void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
+// mider.slang's push constants for the picture: the records it reads, the maps and the motion it writes, the
+// picture's geometry, the SPS's motion tools, and where the colocated motion goes
+void GpuRecon::miderPush( const CodingStructure& cs, size_t numCus, MiderPush& push )
 {
-  const PreCalcValues& pcv    = *cs.pcv;
-  const bool           chroma = isChromaEnabled( pcv.chrFormat );
-  MiderPush            push{};
+  const PreCalcValues& pcv = *cs.pcv;
+  push                 = MiderPush{};
   push.cus             = m_frontEnd.recordCus;
   push.ctus            = m_frontEnd.recordCtus;
   push.slices          = sliceTable( cs );
@@ -390,7 +388,7 @@ void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
   push.log2Ctu         = int32_t( pcv.maxCUWidthLog2 );
   push.width           = int32_t( pcv.lumaWidth );
   push.height          = int32_t( pcv.lumaHeight );
-  push.widthIn4        = int32_t( ( pcv.lumaWidth + 3 ) >> 2 );
+  push.widthIn4        = blocks4x4( pcv.lumaWidth );
   push.plevel          = int32_t( cs.sps->getLog2ParallelMergeLevelMinus2() + 2 );
   push.wpp             = cs.sps->getEntropyCodingSyncEnabledFlag() ? 1 : 0;
   push.maxNumMergeCand = int32_t( cs.sps->getMaxNumMergeCand() );
@@ -398,28 +396,35 @@ void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
   push.subpicOn        = push.subpics != 0 ? 1 : 0;
   push.sps             = ( cs.sps->getSBTMVPEnabledFlag() ? 1 : 0 ) | ( cs.sps->getUseAffine() ? 2 : 0 ) | ( cs.sps->getUseAffineType() ? 4 : 0 );
   push.cuMapC          = m_frontEnd.cuMapChroma.addr;
-  push.csx             = chroma ? int32_t( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
-  push.csy             = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  push.csx             = chromaShiftX( pcv.chrFormat );
+  push.csy             = chromaShiftY( pcv.chrFormat );
   push.tileCols        = int32_t( cs.pps->getNumTileColumns() );
-  // mider also writes the picture's colocated motion (but not in the check mode, which copies the motion to the host)
+  // mider also writes the picture's colocated motion, except in the check mode, which copies the motion to the host.
   push.colOn           = m_useFrontEnd && cs.m_colMiAllocation ? 1 : 0;
   push.colMotion       = push.colOn ? static_cast<HostPlane*>( cs.m_colMiAllocation )->host.addr : 0;
+}
 
-  // the segments' progress from zero
+void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
+{
+  const PreCalcValues& pcv = *cs.pcv;
+  MiderPush            push;
+  miderPush( cs, numCus, push );
+
+  // The progress of the segments starts from zero.
   m_ctx->api().vkCmdFillBuffer( m_cmd, m_frontEnd.rowProgress.buffer, 0, VK_WHOLE_SIZE, 0 );
   transferToComputeBarrier();
-  // each 4x4 block's CU (mider_cumap: one workgroup per CU), then the motion (mider: one workgroup per CTU row of each
-  // tile column)
+  // First each 4x4 block's CU (mider_cumap: one workgroup per CU), then the motion (mider: one workgroup per CTU row of
+  // each tile column).
   bind( kShader_mider_cumap );
   pushConstants( push );
   dispatchJobs( numCus );
   computeBarrier();
-  // (the variant without GPM, affine and SbTMVP when the SPS turns them all off)
+  // The lite variant leaves out GPM, affine and SbTMVP, for an SPS that turns them all off.
   const SPS& sps  = *cs.sps;
   const bool lite = !sps.getUseGeo() && !sps.getUseAffine() && !sps.getSBTMVPEnabledFlag();
   dispatch( lite ? kShader_mider_lite : kShader_mider, push, uint32_t( pcv.heightInCtus ) * uint32_t( push.tileCols ) );
   mark( "mider" );
-  // In the check mode the 4x4 blocks' motion goes to host memory (otherwise mider wrote the colocated motion).
+  // In the check mode the 4x4 blocks' motion goes to host memory; otherwise mider wrote the colocated motion.
   memoryBarrier( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                  VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT );
   if( !m_useFrontEnd )
@@ -429,8 +434,11 @@ void GpuRecon::recordMotion( const CodingStructure& cs, size_t numCus )
   }
 }
 
-// dbparams.slang's threads per CU in its per-CU passes (kThreadsPerCu)
-static constexpr size_t kDbParamsThreadsPerCu = 8;
+// dbparams.slang's threads per CU in its per-CU passes (kThreadsPerCu), threads per workgroup, and workgroups per row
+// of its dispatches
+static constexpr size_t   kDbParamsThreadsPerCu = 8;
+static constexpr size_t   kDbParamsGroupThreads = 64;
+static constexpr uint32_t kDbParamsGroupsPerRow = 1024;
 
 // Per CTU, its subpicture's index and whether loop filtering crosses the subpicture's boundaries (bit 16), uploaded
 // into m_frontEnd.ctuInfo
@@ -441,19 +449,19 @@ void GpuRecon::uploadSubpicInfo( const CodingStructure& cs )
   uint32_t* info = reinterpret_cast<uint32_t*>( m_frontEnd.ctuInfo.mapped );
   for( unsigned ctu = 0; ctu < pcv.sizeInCtus; ctu++ )
   {
-    const Position pos( ( ctu % pcv.widthInCtus ) * pcv.maxCUWidth, ( ctu / pcv.widthInCtus ) * pcv.maxCUHeight );
-    const SubPic&  sub = cs.pps->getSubPicFromPos( pos );
-    info[ctu]          = sub.getSubPicIdx() | ( sub.getloopFilterAcrossSubPicEnabledFlag() ? 1u << 16 : 0u );
+    const SubPic& sub = cs.pps->getSubPicFromPos( ctuPosition( pcv, ctu ) );
+    info[ctu]         = sub.getSubPicIdx() | ( sub.getloopFilterAcrossSubPicEnabledFlag() ? 1u << 16 : 0u );
   }
 }
 
-// The picture's tag in the deblocking parameters. The parameters start zeroed, as the CTU tasks' LF_INIT leaves them:
-// each entry carries the picture's tag, and an entry with another tag reads as zero, so the map is zeroed (recorded
-// here) only when it is new and when the tags wrap around; in the check mode always (tag 0: the CPU compares the map).
+// Returns the picture's tag in the deblocking parameters. The parameters must read as zeroed at the start, as the CTU
+// tasks' LF_INIT leaves them. Each entry carries the tag of the picture that wrote it, and an entry with another tag
+// reads as zero. So the map needs zeroing (recorded here) only when it is new and when the tags wrap around. In the
+// check mode it is zeroed for every picture, with tag 0, because the CPU compares the whole map.
 uint32_t GpuRecon::nextLfpTag()
 {
   FrontEndBuffers& fe = m_frontEnd;
-  fe.lfpTag           = m_useFrontEnd ? fe.lfpTag % 65535 + 1 : 0;
+  fe.lfpTag           = m_useFrontEnd ? fe.lfpTag % kMaxTag + 1 : 0;
   if( fe.lfpTag <= 1 || fe.lfp.buffer != fe.lfpZeroed )
   {
     m_ctx->api().vkCmdFillBuffer( m_cmd, fe.lfp.buffer, 0, VK_WHOLE_SIZE, 0 );
@@ -467,8 +475,7 @@ uint32_t GpuRecon::nextLfpTag()
 // the picture's geometry, and its loop filter flags and virtual boundaries
 void GpuRecon::dbParamsPush( const CodingStructure& cs, size_t numCus, uint32_t lfpTag, DbParamsPush& push ) const
 {
-  const PreCalcValues& pcv    = *cs.pcv;
-  const bool           chroma = isChromaEnabled( pcv.chrFormat );
+  const PreCalcValues& pcv = *cs.pcv;
   push              = DbParamsPush{};
   push.cus          = m_frontEnd.recordCus;
   push.tus          = m_frontEnd.recordTus;
@@ -486,10 +493,10 @@ void GpuRecon::dbParamsPush( const CodingStructure& cs, size_t numCus, uint32_t 
   push.log2Ctu      = int32_t( pcv.maxCUWidthLog2 );
   push.width        = int32_t( pcv.lumaWidth );
   push.height       = int32_t( pcv.lumaHeight );
-  push.widthIn4     = int32_t( ( pcv.lumaWidth + 3 ) >> 2 );
-  push.csx          = chroma ? int32_t( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
-  push.csy          = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
-  push.chroma       = chroma ? 1 : 0;
+  push.widthIn4     = blocks4x4( pcv.lumaWidth );
+  push.csx          = chromaShiftX( pcv.chrFormat );
+  push.csy          = chromaShiftY( pcv.chrFormat );
+  push.chroma       = isChromaEnabled( pcv.chrFormat ) ? 1 : 0;
   push.qpBdOffset   = cs.sps->getQpBDOffset();
   push.lfpTag       = lfpTag;
   push.flags        = ( cs.pps->getLoopFilterAcrossSlicesEnabledFlag() ? 1 : 0 ) | ( cs.pps->getLoopFilterAcrossTilesEnabledFlag() ? 2 : 0 )
@@ -521,12 +528,12 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
   uploadSubpicInfo( cs );
   DbParamsPush push;
   dbParamsPush( cs, numCus, nextLfpTag(), push );
-  // Pass 0: the luma tree's CUs, kDbParamsThreadsPerCu threads per CU. Then, when the SPS allows sub-block motion or
-  // ISP, the edges inside those CUs, one thread per 4x4 block (dbparams_sub). Pass 1: the chroma tree's CUs, as pass 0.
-  // Threads in rows of 1024 workgroups.
+  // Pass 0 takes the luma tree's CUs, kDbParamsThreadsPerCu threads per CU. Then, when the SPS allows sub-block motion
+  // or ISP, dbparams_sub takes the edges inside those CUs, one thread per 4x4 block. Pass 1 takes the chroma tree's
+  // CUs, as pass 0 does. Each dispatch lays its workgroups out in rows of kDbParamsGroupsPerRow.
   const auto dispatchThreads = [&]( size_t threads ) {
-    const uint32_t groups = uint32_t( ( threads + 63 ) / 64 );
-    dispatchGroups( std::min<uint32_t>( groups, 1024 ), ( groups + 1023 ) / 1024 );
+    const uint32_t groups = uint32_t( ( threads + kDbParamsGroupThreads - 1 ) / kDbParamsGroupThreads );
+    dispatchGroups( std::min<uint32_t>( groups, kDbParamsGroupsPerRow ), ( groups + kDbParamsGroupsPerRow - 1 ) / kDbParamsGroupsPerRow );
     computeBarrier();
   };
   const SPS& sps = *cs.sps;
@@ -538,7 +545,7 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
   {
     bind( kShader_dbparams_sub );
     pushConstants( push );
-    dispatchThreads( size_t( push.widthIn4 ) * ( ( pcv.lumaHeight + 3 ) >> 2 ) );
+    dispatchThreads( size_t( push.widthIn4 ) * size_t( blocks4x4( pcv.lumaHeight ) ) );
     bind( kShader_dbparams );
   }
   push.pass = 1;
@@ -561,29 +568,19 @@ void GpuRecon::recordDeblockParams( const CodingStructure& cs, size_t numCus )
 void GpuRecon::allocateJobBuffers( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus )
 {
   const PreCalcValues& pcv = *cs.pcv;
-  // The job lists' room: with the front end, what the records can need (frontCapacities); in the check mode, the
-  // CTU tasks' counts. Either way with some to spare.
-  const auto total = []( const auto* lists ) {
-    size_t n = 0;
-    if( lists )
-    {
-      for( const auto& ctu: *lists )
-      {
-        n += ctu.size();
-      }
-    }
-    return n;
-  };
-  const FrontCapacities& caps      = m_frontEnd.capacities;
-  const size_t           counts[3] = { m_useFrontEnd ? caps.trafo : total( jobs.trafo ), m_useFrontEnd ? caps.inter : total( jobs.inter ),
-                                       m_useFrontEnd ? caps.intra : total( jobs.intra ) };
+  // The job buffers' room: with the front end, what the records can need (frontCapacities); in the check mode, the
+  // CTU tasks' counts. Either way with kJobBufferSpare jobs to spare.
+  const auto total = []( const auto* lists ) { return lists ? countPerCtu( *lists ) : size_t( 0 ); };
+  const FrontCapacities& caps              = m_frontEnd.capacities;
+  const size_t           counts[kJobKinds] = { m_useFrontEnd ? caps.trafo : total( jobs.trafo ), m_useFrontEnd ? caps.inter : total( jobs.inter ),
+                                               m_useFrontEnd ? caps.intra : total( jobs.intra ) };
   if( !m_frontEnd.args.valid() )
   {
     m_frontEnd.args = m_ctx->alloc( kArgsWords * sizeof( uint32_t ), MemKind::Device );
   }
-  for( int k = 0; k < 3; k++ )
+  for( int k = 0; k < kJobKinds; k++ )
   {
-    m_frontEnd.jobCapacity[k] = counts[k] + 64;
+    m_frontEnd.jobCapacity[k] = counts[k] + kJobBufferSpare;
     takeFrontEnd( m_frontEnd.jobs[k], m_frontEnd.jobCapacity[k] * kJobWords[k] * sizeof( uint32_t ) );
     if( !m_useFrontEnd )
     {
@@ -595,36 +592,52 @@ void GpuRecon::allocateJobBuffers( const CodingStructure& cs, const PictureJobs&
     m_frontEnd.jobTables = m_ctx->alloc( kJobTableWords * sizeof( uint32_t ), MemKind::Upload );
     writeJobTables( reinterpret_cast<uint32_t*>( m_frontEnd.jobTables.mapped ) );
   }
-  m_ctx->ensure( m_frontEnd.jobSlices, cs.picture->slices.size() * 256 * sizeof( uint32_t ), MemKind::Upload );
+  m_ctx->ensure( m_frontEnd.jobSlices, cs.picture->slices.size() * kJobSliceWords * sizeof( uint32_t ), MemKind::Upload );
   writeJobSlices( cs, *jobs.refs, reinterpret_cast<uint32_t*>( m_frontEnd.jobSlices.mapped ) );
-  // the scaling lists' matrix offsets (setDequantOffsets): per list (6), log2 width and log2 height (0..6)
-  m_ctx->ensure( m_frontEnd.jobScaling, 6 * 7 * 7 * sizeof( uint32_t ), MemKind::Upload );
+  // The scaling lists' matrix offsets (setDequantOffsets), 0 where none were set
+  m_ctx->ensure( m_frontEnd.jobScaling, kDequantOffsets * sizeof( uint32_t ), MemKind::Upload );
   uint32_t* scaling = reinterpret_cast<uint32_t*>( m_frontEnd.jobScaling.mapped );
-  for( size_t i = 0; i < 6 * 7 * 7; i++ )
+  for( size_t i = 0; i < kDequantOffsets; i++ )
   {
     scaling[i] = i < m_dequantOffsets.size() ? m_dequantOffsets[i] : 0;
   }
-  // per CU its five job counts; per block of 256 CUs their sums, then the totals
-  m_frontEnd.jobBlockCount = int( ( numCus + 255 ) / 256 );
-  takeFrontEnd( m_frontEnd.jobCounts, std::max<size_t>( numCus, 1 ) * 5 * sizeof( uint32_t ) );
-  takeFrontEnd( m_frontEnd.jobBlocks, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ) );
+  // Per CU its job counts, a word per job list; per block of kCusPerJobBlock CUs their sums, then the totals
+  m_frontEnd.jobBlockCount = int( ( numCus + kCusPerJobBlock - 1 ) / kCusPerJobBlock );
+  takeFrontEnd( m_frontEnd.jobCounts, std::max<size_t>( numCus, 1 ) * kJobLists * sizeof( uint32_t ) );
+  takeFrontEnd( m_frontEnd.jobBlocks, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * kJobLists * sizeof( uint32_t ) );
   if( !m_useFrontEnd )
   {
-    m_ctx->ensure( m_check.jobBlocks, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ), MemKind::HostCached );
+    m_ctx->ensure( m_check.jobBlocks, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * kJobLists * sizeof( uint32_t ), MemKind::HostCached );
   }
-  const int widthIn4  = int( ( pcv.lumaWidth + 3 ) >> 2 );
-  const int heightIn4 = int( ( pcv.lumaHeight + 3 ) >> 2 );
-  m_ctx->ensure( m_frontEnd.waveMap, size_t( widthIn4 ) * heightIn4 * 3 * sizeof( uint32_t ), MemKind::Device );
+  const int widthIn4  = blocks4x4( pcv.lumaWidth );
+  const int heightIn4 = blocks4x4( pcv.lumaHeight );
+  m_ctx->ensure( m_frontEnd.waveMap, size_t( widthIn4 ) * heightIn4 * kWaveMapWords * sizeof( uint32_t ), MemKind::Device );
   m_ctx->ensure( m_frontEnd.jobProgress, ( pcv.heightInCtus + 1 ) * sizeof( uint32_t ), MemKind::Device );
+}
+
+// The SPS's tools as jobs.slang's sps flags hold them
+static uint32_t jobsSpsFlags( const SPS& sps )
+{
+  return ( sps.getUseMTS() ? 1u : 0u ) | ( sps.getUseImplicitMTS() ? 2u : 0u ) | ( sps.getUseIntraMTS() ? 4u : 0u ) | ( sps.getUseInterMTS() ? 8u : 0u )
+         | ( sps.getUseLFNST() ? 16u : 0u ) | ( sps.getDisableScalingMatrixForLfnstBlks() ? 32u : 0u )
+         | ( sps.getScalingMatrixForAlternativeColourSpaceDisabledFlag() ? 64u : 0u ) | ( sps.getScalingMatrixDesignatedColourSpaceFlag() ? 128u : 0u )
+         | ( sps.getUseBIO() ? 256u : 0u ) | ( sps.getUseDMVR() ? 512u : 0u ) | ( sps.getUsePROF() ? 1024u : 0u ) | ( sps.getUseBcw() ? 2048u : 0u )
+         | ( sps.getEntropyCodingSyncEnabledFlag() ? 4096u : 0u );
+}
+
+// The picture header's and the PPS's tools as jobs.slang's ph flags hold them, with whether the GPU makes the
+// residuals (trafo) and the inter predictions (inter)
+static uint32_t jobsPictureFlags( const PicHeader& ph, const PPS& pps, bool trafo, bool inter )
+{
+  return ( ph.getDisDmvrFlag() ? 1u : 0u ) | ( ph.getDisBdofFlag() ? 2u : 0u ) | ( ph.getDisProfFlag() ? 4u : 0u ) | ( ph.getJointCbCrSignFlag() ? 8u : 0u )
+         | ( ph.getLmcsEnabledFlag() ? 16u : 0u ) | ( ph.getLmcsChromaResidualScaleFlag() ? 32u : 0u ) | ( pps.getUseWP() ? 64u : 0u )
+         | ( pps.getWPBiPred() ? 128u : 0u ) | ( trafo ? 256u : 0u ) | ( inter ? 512u : 0u );
 }
 
 void GpuRecon::jobsPush( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus, JobsPush& push ) const
 {
-  const PreCalcValues& pcv    = *cs.pcv;
-  const SPS&           sps    = *cs.sps;
-  const PicHeader&     ph     = *cs.picHeader;
-  const PPS&           pps    = *cs.pps;
-  const bool           chroma = isChromaEnabled( pcv.chrFormat );
+  const PreCalcValues& pcv = *cs.pcv;
+  const SPS&           sps = *cs.sps;
   push.cus          = m_frontEnd.recordCus;
   push.tus          = m_frontEnd.recordTus;
   push.ctus         = m_frontEnd.recordCtus;
@@ -638,9 +651,9 @@ void GpuRecon::jobsPush( const CodingStructure& cs, const PictureJobs& jobs, siz
   push.scaling      = m_frontEnd.jobScaling.addr;
   push.counts       = m_frontEnd.jobCounts.addr;
   push.blocks       = m_frontEnd.jobBlocks.addr;
-  push.trafo        = m_frontEnd.jobs[0].addr;
-  push.inter        = m_frontEnd.jobs[1].addr;
-  push.intra        = m_frontEnd.jobs[2].addr;
+  push.trafo        = m_frontEnd.jobs[kTrafoJobs].addr;
+  push.inter        = m_frontEnd.jobs[kInterJobs].addr;
+  push.intra        = m_frontEnd.jobs[kIntraJobs].addr;
   push.numCus       = int32_t( numCus );
   push.numBlocks    = m_frontEnd.jobBlockCount;
   push.widthInCtus  = int32_t( pcv.widthInCtus );
@@ -648,25 +661,19 @@ void GpuRecon::jobsPush( const CodingStructure& cs, const PictureJobs& jobs, siz
   push.log2Ctu      = int32_t( pcv.maxCUWidthLog2 );
   push.width        = int32_t( pcv.lumaWidth );
   push.height       = int32_t( pcv.lumaHeight );
-  push.widthIn4     = int32_t( ( pcv.lumaWidth + 3 ) >> 2 );
+  push.widthIn4     = blocks4x4( pcv.lumaWidth );
   push.chromaFormat = int32_t( pcv.chrFormat );
-  push.csx          = chroma ? int32_t( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
-  push.csy          = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  push.csx          = chromaShiftX( pcv.chrFormat );
+  push.csy          = chromaShiftY( pcv.chrFormat );
   push.bitDepth     = sps.getBitDepth();
   push.qpBdOffset   = sps.getQpBDOffset();
   push.tsMinQp      = 4 + 6 * sps.getInternalMinusInputBitDepth();
-  push.sps          = ( sps.getUseMTS() ? 1u : 0u ) | ( sps.getUseImplicitMTS() ? 2u : 0u ) | ( sps.getUseIntraMTS() ? 4u : 0u ) | ( sps.getUseInterMTS() ? 8u : 0u )
-             | ( sps.getUseLFNST() ? 16u : 0u ) | ( sps.getDisableScalingMatrixForLfnstBlks() ? 32u : 0u )
-             | ( sps.getScalingMatrixForAlternativeColourSpaceDisabledFlag() ? 64u : 0u ) | ( sps.getScalingMatrixDesignatedColourSpaceFlag() ? 128u : 0u )
-             | ( sps.getUseBIO() ? 256u : 0u ) | ( sps.getUseDMVR() ? 512u : 0u ) | ( sps.getUsePROF() ? 1024u : 0u ) | ( sps.getUseBcw() ? 2048u : 0u )
-             | ( sps.getEntropyCodingSyncEnabledFlag() ? 4096u : 0u );
-  push.ph = ( ph.getDisDmvrFlag() ? 1u : 0u ) | ( ph.getDisBdofFlag() ? 2u : 0u ) | ( ph.getDisProfFlag() ? 4u : 0u ) | ( ph.getJointCbCrSignFlag() ? 8u : 0u )
-            | ( ph.getLmcsEnabledFlag() ? 16u : 0u ) | ( ph.getLmcsChromaResidualScaleFlag() ? 32u : 0u ) | ( pps.getUseWP() ? 64u : 0u )
-            | ( pps.getWPBiPred() ? 128u : 0u ) | ( jobs.trafo || ( m_useFrontEnd && m_frontEndTrafo ) ? 256u : 0u )
-            | ( jobs.inter || ( m_useFrontEnd && m_frontEndInter ) ? 512u : 0u );
-  push.capTrafo = int32_t( m_frontEnd.jobCapacity[0] );
-  push.capInter = int32_t( m_frontEnd.jobCapacity[1] );
-  push.capIntra = int32_t( m_frontEnd.jobCapacity[2] );
+  push.sps          = jobsSpsFlags( sps );
+  push.ph           = jobsPictureFlags( *cs.picHeader, *cs.pps, jobs.trafo || ( m_useFrontEnd && m_frontEndTrafo ),
+                                        jobs.inter || ( m_useFrontEnd && m_frontEndInter ) );
+  push.capTrafo     = int32_t( m_frontEnd.jobCapacity[kTrafoJobs] );
+  push.capInter     = int32_t( m_frontEnd.jobCapacity[kInterJobs] );
+  push.capIntra     = int32_t( m_frontEnd.jobCapacity[kIntraJobs] );
   push.num8x8   = int32_t( pcv.num8x8CtuBlks );
   push.waveMap  = m_frontEnd.waveMap.addr;
   push.waveTag  = m_frontEnd.waveTag;
@@ -677,14 +684,14 @@ void GpuRecon::jobsPush( const CodingStructure& cs, const PictureJobs& jobs, siz
 void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, size_t numCus )
 {
   allocateJobBuffers( cs, jobs, numCus );
-  // the wave map: each entry carries the picture's tag, and an entry with another tag reads as wave 0, so the map is
-  // zeroed only when it is new and when the tags wrap around
+  // Each entry of the wave map carries the tag of the picture that wrote it, and an entry with another tag reads as
+  // wave 0. So the map needs zeroing only when it is new and when the tags wrap around.
   FrontEndBuffers& fe = m_frontEnd;
-  fe.waveTag          = fe.waveTag % 65535 + 1;
+  fe.waveTag          = fe.waveTag % kMaxTag + 1;
   JobsPush push{};
   jobsPush( cs, jobs, numCus, push );
 
-  // the wave map (see above), the rows' progress and the passes' arguments start from zero
+  // The wave map (when it needs it), the rows' progress and the passes' arguments start from zero.
   const Api& vk = m_ctx->api();
   if( fe.waveTag == 1 || fe.waveMap.buffer != fe.waveZeroed )
   {
@@ -694,8 +701,8 @@ void GpuRecon::recordJobs( const CodingStructure& cs, const PictureJobs& jobs, s
   vk.vkCmdFillBuffer( m_cmd, m_frontEnd.jobProgress.buffer, 0, VK_WHOLE_SIZE, 0 );
   vk.vkCmdFillBuffer( m_cmd, m_frontEnd.args.buffer, 0, VK_WHOLE_SIZE, 0 );
   transferToComputeBarrier();
-  // pass 0 counts each CU's jobs (jobs_count: the variant that only counts), pass 1 adds the counts up, pass 2 writes the
-  // jobs (one workgroup per 256 CUs, but one workgroup for pass 1)
+  // Pass 0 counts each CU's jobs (jobs_count, the variant that only counts), pass 1 adds the counts up, and pass 2
+  // writes the jobs. Passes 0 and 2 take one workgroup per block of kCusPerJobBlock CUs, pass 1 a single workgroup.
   for( int pass = 0; pass < 3; pass++ )
   {
     push.pass = pass;
@@ -718,7 +725,8 @@ void GpuRecon::recordJobWaves( const CodingStructure& cs, const PictureJobs& job
 {
   JobsPush push{};
   jobsPush( cs, jobs, numCus, push );
-  // pass 3: the intra jobs' waves (jobs_waves: one workgroup per CTU row); the barrier after it is the next pass's
+  // Pass 3 works out the intra jobs' waves (jobs_waves: one workgroup per CTU row). The barrier after it is the next
+  // pass's.
   push.pass = 3;
   dispatch( kShader_jobs_waves, push, uint32_t( cs.pcv->heightInCtus ) );
 }
@@ -742,13 +750,14 @@ size_t GpuRecon::intraBandCapacity( const PictureJobs& jobs ) const
   return bands;
 }
 
-// Takes the intra sort's buffers, for the room of the intra job list (m_frontEnd.jobCapacity[2]) and bands bands (64
-// more for safety), and in the check mode the host buffers compareFrontEnd reads; then zeroes the sort's flags.
+// Takes the intra sort's buffers, with room for the intra job buffer's jobs (m_frontEnd.jobCapacity[kIntraJobs]) and
+// for bands bands (kJobBufferSpare more for safety), and in the check mode the host buffers that compareFrontEnd
+// reads. Then zeroes the sort's flags.
 void GpuRecon::takeIntraSortBuffers( size_t bands )
 {
   FrontEndBuffers& fe    = m_frontEnd;
-  fe.sortCapacity        = bands + 64;
-  fe.sortBlocks          = int( ( fe.jobCapacity[2] + kSortBlockJobs - 1 ) / kSortBlockJobs );
+  fe.sortCapacity        = bands + kJobBufferSpare;
+  fe.sortBlocks          = int( ( fe.jobCapacity[kIntraJobs] + kSortBlockJobs - 1 ) / kSortBlockJobs );
   const size_t blockJobs = size_t( fe.sortBlocks ) * kSortBlockJobs;
   takeFrontEnd( fe.sortKeys, blockJobs * 2 * sizeof( uint32_t ) );   // two halves: the keys before and after a digit
   takeFrontEnd( fe.sortHistogram, size_t( fe.sortBlocks ) * kSortDigitBins * sizeof( uint32_t ) );
@@ -768,13 +777,13 @@ void GpuRecon::takeIntraSortBuffers( size_t bands )
   transferToComputeBarrier();
 }
 
-// intrasort.slang's push constants for the picture, but the pass and the digit's shift, which change per dispatch
+// intrasort.slang's push constants for the picture, except the pass and the digit's shift, which change per dispatch
 void GpuRecon::intraSortPush( IntraSortPush& push ) const
 {
   const FrontEndBuffers& fe = m_frontEnd;
   push                      = IntraSortPush{};
-  push.jobs                 = fe.jobs[2].addr;
-  push.count                = fe.jobBlocks.addr + ( size_t( fe.jobBlockCount ) * 5 + 2 ) * sizeof( uint32_t );   // jobs.slang's intra total
+  push.jobs                 = fe.jobs[kIntraJobs].addr;
+  push.count                = fe.jobBlocks.addr + ( size_t( fe.jobBlockCount ) * kJobLists + kListIntra ) * sizeof( uint32_t );   // jobs.slang's intra total
   push.args                 = fe.args.addr;
   push.keysA                = fe.sortKeys.addr;
   push.keysB                = fe.sortKeys.addr + size_t( fe.sortBlocks ) * kSortBlockJobs * sizeof( uint32_t );
@@ -795,13 +804,13 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
   IntraSortPush push;
   intraSortPush( push );
   bind( kShader_intrasort );
-  // SMALL sorts up to 1024 jobs alone, and writes the workgroups of the passes after it: none then, else a workgroup
-  // per block (or one)
+  // SMALL sorts up to kSortBlockJobs jobs on its own. It also writes the dispatch arguments of the passes after it: no
+  // workgroups when it sorted the jobs itself, else a workgroup per block (or a single one).
   push.pass  = kSortSmall;
   push.shift = 0;
   pushConstants( push );
   dispatchGroups( 1 );
-  // With room for one block of jobs (most B-pictures), SMALL sorts them all: the other passes are not recorded.
+  // With room for one block of jobs (most B pictures), SMALL sorts them all, so the other passes are not recorded.
   if( m_frontEnd.sortBlocks <= 1 )
   {
     computeBarrier();
@@ -816,7 +825,7 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
     m_ctx->api().vkCmdDispatchIndirect( m_cmd, m_frontEnd.args.buffer, ( perBlock ? kSortArgsBlocks : kSortArgsSingle ) * sizeof( uint32_t ) );
     computeBarrier();
   };
-  // the radix sort by wave, two digits of 8 bits (histograms, their sums, the scatter); then the bands
+  // The radix sort by wave, two digits of 8 bits (the histograms, their sums, the scatter), then the bands
   for( int shift = 0; shift <= 8; shift += 8 )
   {
     pass( kSortHist, shift, true );
@@ -832,15 +841,15 @@ void GpuRecon::recordIntraOrder( const PictureJobs& jobs )
 
 void GpuRecon::copyJobsForCheck( const PictureJobs& jobs )
 {
-  // the job lists, their counts and the intra order, to host memory for compareFrontEnd
+  // The job buffers, their counts and the intra order are copied to host memory for compareFrontEnd.
   const Api& vk = m_ctx->api();
   memoryBarrier( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT );
-  for( int k = 0; k < 3; k++ )
+  for( int k = 0; k < kJobKinds; k++ )
   {
     VkBufferCopy region{ m_frontEnd.jobs[k].offset, 0, m_frontEnd.jobCapacity[k] * kJobWords[k] * sizeof( uint32_t ) };
     vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.jobs[k].buffer, m_check.jobs[k].buffer, 1, &region );
   }
-  VkBufferCopy blocks{ m_frontEnd.jobBlocks.offset, 0, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * 5 * sizeof( uint32_t ) };
+  VkBufferCopy blocks{ m_frontEnd.jobBlocks.offset, 0, ( size_t( m_frontEnd.jobBlockCount ) + 1 ) * kJobLists * sizeof( uint32_t ) };
   vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.jobBlocks.buffer, m_check.jobBlocks.buffer, 1, &blocks );
   if( jobs.intra )
   {
@@ -848,10 +857,11 @@ void GpuRecon::copyJobsForCheck( const PictureJobs& jobs )
     vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.sortedBands.buffer, m_check.sortedBands.buffer, 1, &sorted );
     VkBufferCopy waits{ m_frontEnd.bandWaits.offset, 0, m_frontEnd.sortCapacity * sizeof( uint32_t ) };
     vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.bandWaits.buffer, m_check.bandWaits.buffer, 1, &waits );
-    // the band count (the last of the band sums) and the flags, as sortInfo's words 0 and 2
-    VkBufferCopy count{ m_frontEnd.bandSums.offset + size_t( m_frontEnd.sortBlocks ) * sizeof( uint32_t ), 0, sizeof( uint32_t ) };
+    // The band count (the last of the band sums) and the flags go to their words of sortInfo.
+    VkBufferCopy count{ m_frontEnd.bandSums.offset + size_t( m_frontEnd.sortBlocks ) * sizeof( uint32_t ),
+                        FrontEndCheck::kSortInfoBandCount * sizeof( uint32_t ), sizeof( uint32_t ) };
     vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.bandSums.buffer, m_check.sortInfo.buffer, 1, &count );
-    VkBufferCopy flags{ 0, 2 * sizeof( uint32_t ), sizeof( uint32_t ) };
+    VkBufferCopy flags{ 0, FrontEndCheck::kSortInfoFlags * sizeof( uint32_t ), sizeof( uint32_t ) };
     vk.vkCmdCopyBuffer( m_cmd, m_frontEnd.sortFlags.buffer, m_check.sortInfo.buffer, 1, &flags );
   }
   m_check.jobsRecorded = true;
@@ -867,7 +877,8 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs )
   {
     return;
   }
-  // The room for edges: with the front end, what the records can need; in the check mode, the CTU tasks' count.
+  // The room for edges: with the front end, what the records can need; in the check mode, the CTU tasks' count with
+  // kJobBufferSpare to spare.
   const PreCalcValues& pcv = *cs.pcv;
   size_t               cpu = 0;
   static const std::vector<EdgeLists> none;
@@ -878,8 +889,9 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs )
       cpu += list.size();
     }
   }
-  m_frontEnd.edgeCapacity = m_useFrontEnd ? m_frontEnd.capacities.edges : cpu + 64;
+  m_frontEnd.edgeCapacity = m_useFrontEnd ? m_frontEnd.capacities.edges : cpu + kJobBufferSpare;
   takeFrontEnd( m_frontEnd.edges, m_frontEnd.edgeCapacity * sizeof( Edge ) );
+  // Per CTU, a count per edge list
   m_ctx->ensure( m_frontEnd.edgeCounts, size_t( pcv.sizeInCtus ) * 4 * sizeof( uint32_t ), MemKind::Device );
   m_ctx->ensure( m_frontEnd.edgeLists, kEdgeListsWords * sizeof( uint32_t ), MemKind::Device );
   if( !m_useFrontEnd )
@@ -887,8 +899,7 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs )
     m_ctx->ensure( m_check.edges, m_frontEnd.edgeCapacity * sizeof( Edge ), MemKind::HostCached );
     m_ctx->ensure( m_check.edgeLists, kEdgeListsWords * sizeof( uint32_t ), MemKind::HostCached );
   }
-  const bool chroma = isChromaEnabled( pcv.chrFormat );
-  EdgesPush  push{};
+  EdgesPush push{};
   push.lfp          = m_frontEnd.lfp.addr;
   push.lfpTag       = m_frontEnd.lfpTag;
   push.slices       = sliceTable( cs );
@@ -900,13 +911,13 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs )
   push.log2Ctu      = int32_t( pcv.maxCUWidthLog2 );
   push.width        = int32_t( pcv.lumaWidth );
   push.height       = int32_t( pcv.lumaHeight );
-  push.chroma       = chroma ? 1 : 0;
-  push.csx          = chroma ? int32_t( getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
-  push.csy          = chroma ? int32_t( getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) ) : 0;
+  push.chroma       = isChromaEnabled( pcv.chrFormat ) ? 1 : 0;
+  push.csx          = chromaShiftX( pcv.chrFormat );
+  push.csy          = chromaShiftY( pcv.chrFormat );
   push.capacity     = int32_t( m_frontEnd.edgeCapacity );
   push.args         = m_frontEnd.args.addr;
-  // pass 0 counts each CTU's edges, pass 1 adds the counts up, pass 2 writes the edges (one workgroup per CTU, but
-  // one workgroup for pass 1)
+  // Pass 0 counts each CTU's edges, pass 1 adds the counts up, and pass 2 writes the edges. Passes 0 and 2 take one
+  // workgroup per CTU, pass 1 a single workgroup.
   bind( kShader_edges );
   for( int pass = 0; pass < 3; pass++ )
   {
@@ -920,7 +931,7 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs )
   {
     return;
   }
-  // the edges and the lists' firsts and counts, to host memory for compareFrontEnd
+  // The edges, and each list's first edge and count, are copied to host memory for compareFrontEnd.
   memoryBarrier( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT );
   VkBufferCopy edges{ m_frontEnd.edges.offset, 0, m_frontEnd.edgeCapacity * sizeof( Edge ) };
   m_ctx->api().vkCmdCopyBuffer( m_cmd, m_frontEnd.edges.buffer, m_check.edges.buffer, 1, &edges );
@@ -936,8 +947,8 @@ void GpuRecon::recordEdges( const CodingStructure& cs, const PictureJobs& jobs )
 void GpuRecon::FrontEndBuffers::release( Context* ctx )
 {
   for( Buffer* buf: { &cus, &tus, &ctus, &cuMapLuma, &cuMapChroma, &cuMotion, &motion, &rowProgress, &ctuInfo, &lfp, &jobTables, &jobSlices,
-                      &jobScaling, &jobCounts, &jobBlocks, &jobs[0], &jobs[1], &jobs[2], &waveMap, &jobProgress, &args, &sortKeys, &sortHistogram,
-                      &bandAt, &bandSums, &waveFirst, &sortedBands, &bandWaits, &sortFlags, &edgeCounts, &edgeLists, &edges } )
+                      &jobScaling, &jobCounts, &jobBlocks, &jobs[kTrafoJobs], &jobs[kInterJobs], &jobs[kIntraJobs], &waveMap, &jobProgress, &args,
+                      &sortKeys, &sortHistogram, &bandAt, &bandSums, &waveFirst, &sortedBands, &bandWaits, &sortFlags, &edgeCounts, &edgeLists, &edges } )
   {
     ctx->free( *buf );
   }
@@ -945,7 +956,8 @@ void GpuRecon::FrontEndBuffers::release( Context* ctx )
 
 void GpuRecon::FrontEndCheck::release( Context* ctx )
 {
-  for( Buffer* buf: { &motion, &lfp, &jobBlocks, &jobs[0], &jobs[1], &jobs[2], &sortedBands, &bandWaits, &sortInfo, &edges, &edgeLists } )
+  for( Buffer* buf: { &motion, &lfp, &jobBlocks, &jobs[kTrafoJobs], &jobs[kInterJobs], &jobs[kIntraJobs], &sortedBands, &bandWaits, &sortInfo, &edges,
+                      &edgeLists } )
   {
     ctx->free( *buf );
   }

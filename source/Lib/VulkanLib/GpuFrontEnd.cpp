@@ -65,7 +65,7 @@ namespace vvdec
 namespace gpu
 {
 
-// The CU record's flags (CuRecord::kMerge ...)
+// Returns the CU record's flags (CuRecord::Flags) of cu.
 static uint32_t cuFlags( const CodingUnit& cu )
 {
   uint32_t flags = 0;
@@ -80,7 +80,7 @@ static uint32_t cuFlags( const CodingUnit& cu )
   return flags;
 }
 
-// The record of cu, a CU of CTU ctuRsAddr, but for its TUs' range (word 16), which writeCuRecords sets
+// Returns the record of cu, a CU of CTU ctuRsAddr. Word 16, the range of the CU's TUs, is left for writeCuRecords.
 static CuRecord cuRecord( const CodingStructure& cs, const CodingUnit& cu, int ctuRsAddr )
 {
   CuRecord       r{};
@@ -115,14 +115,15 @@ static CuRecord cuRecord( const CodingStructure& cs, const CodingUnit& cu, int c
     r.w[20]           = uint32_t( b.width ) | uint32_t( b.height ) << 8 | 1u << 16;
   }
   r.w[20] |= cu.blocks[COMPONENT_Y].valid() ? 1u << 17 : 0u;
-  // DMVR's refinements' place in the CTU's (set for luma CUs of 8x8 and more), the neighbours the parse found
+  // Where the CU's DMVR refinements start among its CTU's (set for luma CUs of 8x8 and more), and the neighbours that
+  // the parse found available.
   const ptrdiff_t dmvrOff = cu.mvdL0SubPuOff - ptrdiff_t( ctuRsAddr ) * ptrdiff_t( cs.pcv->num8x8CtuBlks );
   r.w[21] = ( dmvrOff >= 0 && dmvrOff < 0x10000 ? uint32_t( dmvrOff ) : 0u ) | ( cu.left ? 1u << 16 : 0u ) | ( cu.above ? 1u << 17 : 0u )
             | ( cu.smvdMode() ? 1u << 18 : 0u );
   return r;
 }
 
-// The record of tu, a TU of the CU of index cuIndex in its CTU
+// Returns the record of tu, a TU of the CU of index cuIndex in its CTU.
 static TuRecord tuRecord( const TransformUnit& tu, uint32_t cuIndex )
 {
   TuRecord t{};
@@ -164,7 +165,7 @@ void writeCuRecords( CodingStructure& cs, int ctuRsAddr, std::vector<CuRecord>& 
   }
 }
 
-// the index of a slice among its picture's
+// Returns the index of slice among its picture's slices.
 static uint32_t sliceIndex( const CodingStructure& cs, const Slice* slice )
 {
   const auto& slices = cs.picture->slices;
@@ -202,8 +203,36 @@ void writeCtuRecords( const CodingStructure& cs, const std::vector<std::vector<C
 
 size_t sliceTableWords( const CodingStructure& cs )
 {
-  return size_t( cs.pcv->sizeInCtus ) + 64 * cs.picture->slices.size();
+  return size_t( cs.pcv->sizeInCtus ) + kSliceRecordWords * cs.picture->slices.size();
 }
+
+const Picture* colocatedPicture( const Slice& slice )
+{
+  if( slice.isIntra() )
+  {
+    return nullptr;
+  }
+  const RefPicList colList = RefPicList( slice.isInterB() ? 1 - slice.getColFromL0Flag() : 0 );
+  if( int( slice.getColRefIdx() ) >= slice.getNumRefIdx( colList ) )
+  {
+    return nullptr;
+  }
+  return slice.getRefPic( colList, int( slice.getColRefIdx() ) );
+}
+
+// The words of a slice's record in the slice table (mider.slang reads them)
+enum SliceRecordWord : size_t
+{
+  kSlicePoc            = 0,
+  kSliceFlags          = 1,    // the reference counts, the slice's flags and the colocated reference index
+  kSliceMaxCands       = 2,    // the maximum IBC, GPM and affine merge candidates, a byte each
+  kSliceIndependentIdx = 3,
+  kSliceLongTermUsed   = 4,    // bit 16 * list + refIdx: the reference is used as a long-term one
+  kSliceLongTermRpl    = 5,    // bit 16 * list + refIdx: the reference picture list marks it long-term
+  kSliceColMotion      = 6,    // 2 words: the colocated picture's motion
+  kSliceColTable       = 8,    // 2 words: the colocated picture's slice table
+  kSliceRefPocs        = 16,   // [16 * list + refIdx]: the reference pictures' POCs
+};
 
 void writeSliceTable( const CodingStructure& cs, uint32_t* table )
 {
@@ -216,51 +245,45 @@ void writeSliceTable( const CodingStructure& cs, uint32_t* table )
   for( size_t i = 0; i < slices.size(); i++ )
   {
     const Slice& s   = *slices[i];
-    uint32_t*    rec = table + ctus + 64 * i;
-    memset( rec, 0, 64 * sizeof( uint32_t ) );
+    uint32_t*    rec = table + ctus + kSliceRecordWords * i;
+    memset( rec, 0, kSliceRecordWords * sizeof( uint32_t ) );
 
-    // the colocated picture, with its motion and slice table on the GPU's reach
-    const Picture* col = nullptr;
-    if( !s.isIntra() )
-    {
-      const RefPicList colList = RefPicList( s.isInterB() ? 1 - s.getColFromL0Flag() : 0 );
-      if( int( s.getColRefIdx() ) < s.getNumRefIdx( colList ) )
-      {
-        col = s.getRefPic( colList, int( s.getColRefIdx() ) );
-      }
-    }
-    const bool hasCol = col && col->cs && col->cs->m_colMiAllocation && col->cs->m_gpuSliceAllocation;
+    // The colocated picture, when its motion and its slice table are within the GPU's reach.
+    const Picture* col    = colocatedPicture( s );
+    const bool     hasCol = col && col->cs && col->cs->m_colMiAllocation && col->cs->m_gpuSliceAllocation;
 
-    rec[0] = uint32_t( s.getPOC() );
-    rec[1] = uint32_t( s.getNumRefIdx( REF_PIC_LIST_0 ) ) | uint32_t( s.getNumRefIdx( REF_PIC_LIST_1 ) ) << 8 | ( s.isInterB() ? 1u << 16 : 0u )
-             | ( s.getCheckLDC() ? 1u << 17 : 0u ) | ( s.getColFromL0Flag() ? 1u << 18 : 0u )
-             | ( s.getPicHeader()->getEnableTMVPFlag() ? 1u << 19 : 0u ) | ( s.getPicHeader()->getDisFracMMVD() ? 1u << 20 : 0u )
-             | ( hasCol ? 1u << 21 : 0u ) | ( s.isIRAP() ? 1u << 22 : 0u ) | ( s.getDeblockingFilterDisable() ? 1u << 23 : 0u )
-             | ( s.getColRefIdx() & 15 ) << 24;
-    rec[2] = s.getPicHeader()->getMaxNumIBCMergeCand() | s.getPicHeader()->getMaxNumGeoCand() << 8 | s.getPicHeader()->getMaxNumAffineMergeCand() << 16;
-    rec[3] = s.getIndependentSliceIdx();
+    rec[kSlicePoc]   = uint32_t( s.getPOC() );
+    rec[kSliceFlags] = uint32_t( s.getNumRefIdx( REF_PIC_LIST_0 ) ) | uint32_t( s.getNumRefIdx( REF_PIC_LIST_1 ) ) << 8 | ( s.isInterB() ? 1u << 16 : 0u )
+                       | ( s.getCheckLDC() ? 1u << 17 : 0u ) | ( s.getColFromL0Flag() ? 1u << 18 : 0u )
+                       | ( s.getPicHeader()->getEnableTMVPFlag() ? 1u << 19 : 0u ) | ( s.getPicHeader()->getDisFracMMVD() ? 1u << 20 : 0u )
+                       | ( hasCol ? 1u << 21 : 0u ) | ( s.isIRAP() ? 1u << 22 : 0u ) | ( s.getDeblockingFilterDisable() ? 1u << 23 : 0u )
+                       | ( s.getColRefIdx() & 15 ) << 24;
+    rec[kSliceMaxCands] =
+      s.getPicHeader()->getMaxNumIBCMergeCand() | s.getPicHeader()->getMaxNumGeoCand() << 8 | s.getPicHeader()->getMaxNumAffineMergeCand() << 16;
+    rec[kSliceIndependentIdx] = s.getIndependentSliceIdx();
     for( int list = 0; list < 2; list++ )
     {
       for( int refIdx = 0; refIdx < s.getNumRefIdx( RefPicList( list ) ) && refIdx < 16; refIdx++ )
       {
-        rec[4] |= s.getIsUsedAsLongTerm( list, refIdx ) ? 1u << ( 16 * list + refIdx ) : 0u;
-        rec[5] |= s.getRPL( RefPicList( list ) )->isRefPicLongterm( refIdx ) ? 1u << ( 16 * list + refIdx ) : 0u;
-        rec[16 + 16 * list + refIdx] = uint32_t( s.getRefPOC( RefPicList( list ), refIdx ) );
+        rec[kSliceLongTermUsed] |= s.getIsUsedAsLongTerm( list, refIdx ) ? 1u << ( 16 * list + refIdx ) : 0u;
+        rec[kSliceLongTermRpl] |= s.getRPL( RefPicList( list ) )->isRefPicLongterm( refIdx ) ? 1u << ( 16 * list + refIdx ) : 0u;
+        rec[kSliceRefPocs + 16 * list + refIdx] = uint32_t( s.getRefPOC( RefPicList( list ), refIdx ) );
       }
     }
     if( hasCol )
     {
-      const VkDeviceAddress motion = hostAllocationAddress( col->cs->m_colMiAllocation );
-      const VkDeviceAddress table  = hostAllocationAddress( col->cs->m_gpuSliceAllocation );
-      rec[6] = uint32_t( motion );
-      rec[7] = uint32_t( motion >> 32 );
-      rec[8] = uint32_t( table );
-      rec[9] = uint32_t( table >> 32 );
+      const VkDeviceAddress motion   = hostAllocationAddress( col->cs->m_colMiAllocation );
+      const VkDeviceAddress colTable = hostAllocationAddress( col->cs->m_gpuSliceAllocation );
+      rec[kSliceColMotion]     = uint32_t( motion );
+      rec[kSliceColMotion + 1] = uint32_t( motion >> 32 );
+      rec[kSliceColTable]      = uint32_t( colTable );
+      rec[kSliceColTable + 1]  = uint32_t( colTable >> 32 );
     }
   }
 }
 
-// the pieces a block of a power-of-two size a side splits into (SBT's 3/4 blocks into two)
+// Returns the number of pieces that a block side of n samples splits into when it is cut into powers of two (one per
+// bit set: SBT's 3/4 sides split into two).
 static size_t pieces( uint32_t n )
 {
   size_t count = 0;
@@ -271,7 +294,7 @@ static size_t pieces( uint32_t n )
   return count;
 }
 
-// a job's bands of rows (IntraJob::bands)
+// Returns the number of bands of rows that a job of the given size is cut into (IntraJob::bands).
 static size_t bandsOf( uint32_t width, uint32_t height )
 {
   return size_t( IntraJob::bands( int( width ), int( height ) ) );
@@ -287,17 +310,17 @@ FrontCapacities frontCapacities( const CodingStructure& cs, const std::vector<st
   {
     for( const CuRecord& r: cus[ctu] )
     {
-      const uint32_t mode     = ( r.w[1] >> 16 ) & 3;
-      const uint32_t flags    = r.w[1] >> 18;
-      const uint32_t w        = r.w[1] & 0xff;
-      const uint32_t h        = ( r.w[1] >> 8 ) & 0xff;
-      const bool     rootCbf  = ( r.w[17] & ( 1u << 18 ) ) != 0;
-      const uint32_t firstTu  = r.w[16] & 0xffff;
-      const uint32_t numTus   = r.w[16] >> 16;
-      const size_t   tiles16  = size_t( ( w + 15 ) / 16 ) * ( ( h + 15 ) / 16 );
-      if( mode == MODE_INTER && ( r.w[20] & ( 1u << 17 ) ) )
+      const uint32_t mode    = r.predMode();
+      const uint32_t flags   = r.flags();
+      const uint32_t w       = r.width();
+      const uint32_t h       = r.height();
+      const uint32_t firstTu = r.firstTu();
+      const uint32_t numTus  = r.numTus();
+      const size_t   tiles16 = size_t( ( w + 15 ) / 16 ) * ( ( h + 15 ) / 16 );
+      if( mode == MODE_INTER && r.hasLuma() )
       {
-        // GPM, the regular tiles, affine pairs or SbTMVP's sub-PUs (the subblock merge CUs are affine ones)
+        // GPM's tiles, the regular tiles, the affine pairs or SbTMVP's sub-PUs (the subblock merge CUs are affine
+        // ones).
         caps.inter += flags & CuRecord::kAffine ? std::max<size_t>( 2 * tiles16, size_t( std::max<uint32_t>( w / 8, 1 ) ) * std::max<uint32_t>( h / 8, 1 ) )
                                                 : tiles16;
         if( flags & CuRecord::kCiip )
@@ -305,7 +328,7 @@ FrontCapacities frontCapacities( const CodingStructure& cs, const std::vector<st
           caps.intra += 3;
           caps.bands += bandsOf( w, h ) + 2 * bandsOf( w >> sx, h >> sy );
         }
-        // the subblock grid's edges
+        // The edges of the affine subblock grid
         if( flags & CuRecord::kAffine )
         {
           caps.edges += 2 * ( size_t( w / 8 ) * ( h / 4 ) + size_t( h / 8 ) * ( w / 4 ) );
@@ -313,64 +336,84 @@ FrontCapacities frontCapacities( const CodingStructure& cs, const std::vector<st
       }
       for( uint32_t t = firstTu; t < firstTu + numTus; t++ )
       {
-        const TuRecord& tu   = tus[ctu][t];
-        const bool      luma = ( tu.w[1] & ( 1u << 16 ) ) != 0;
-        const bool      chr  = ( tu.w[3] & ( 1u << 16 ) ) != 0;
-        const uint32_t  lw = tu.w[1] & 0xff, lh = ( tu.w[1] >> 8 ) & 0xff;
-        const uint32_t  cw = tu.w[3] & 0xff, ch = ( tu.w[3] >> 8 ) & 0xff;
+        const TuRecord& tu    = tus[ctu][t];
+        const bool      luma  = tu.hasLuma();
+        const bool      chr   = tu.hasChroma();
+        const uint32_t  lw    = tu.width();
+        const uint32_t  lh    = tu.height();
+        const uint32_t  cw    = tu.chromaWidth();
+        const uint32_t  ch    = tu.chromaHeight();
         const int       comps = ( luma ? 1 : 0 ) + ( chr ? 2 : 0 );
-        // a job or the pieces of zeros a component; an intra or IBC job, or LMCS's chroma pieces
+        // Per component, a residual job or the pieces of zeros. Then an intra or IBC job per component, or LMCS's
+        // chroma pieces.
         caps.trafo += ( luma ? pieces( lw ) * pieces( lh ) : 0 ) + ( chr ? 2 * pieces( cw ) * pieces( ch ) : 0 );
-        if( mode != MODE_INTER || rootCbf )
+        if( mode != MODE_INTER || r.rootCbf() )
         {
           caps.intra += size_t( comps ) + ( chr ? 2 * pieces( cw ) * pieces( ch ) : 0 );
           caps.bands += ( luma ? bandsOf( lw, lh ) : 0 ) + ( chr ? 2 * bandsOf( cw, ch ) + 2 * pieces( cw ) * pieces( ch ) * bandsOf( cw, ch ) : 0 );
         }
-        // the edges along the TU's left and top sides, luma's and chroma's (on the luma grid)
+        // The edges along the TU's left and top sides, luma's and chroma's (on the luma grid)
         caps.edges += ( luma ? lw / 4 + lh / 4 : 0 ) + ( chr ? ( cw << sx ) / 4 + ( ch << sy ) / 4 : 0 );
       }
     }
   }
-  caps.trafo += 64;
-  caps.inter += 64;
-  caps.intra += 64;
-  caps.bands += 64;
-  caps.edges += 64;
+  caps.trafo += kFrontCapacitySpare;
+  caps.inter += kFrontCapacitySpare;
+  caps.intra += kFrontCapacitySpare;
+  caps.bands += kFrontCapacitySpare;
+  caps.edges += kFrontCapacitySpare;
   return caps;
 }
+
+// Where each of jobs.slang's T_* tables starts among the job tables' words
+enum JobTable : size_t
+{
+  kTableLfnstLut       = 0,      // g_lfnstLut
+  kTableChroma422Modes = 128,    // g_chroma422IntraAngleMappingTable
+  kTableGeoParams      = 256,    // per GPM split: g_GeoParams' angle | distance << 8
+  kTableGeoMask        = 320,    // per GPM angle: g_angle2mask
+  kTableGeoMirror      = 352,    // per GPM angle: g_angle2mirror
+  kTableGeoOffsets     = 384,    // per GPM split, log2 height and log2 width: g_weightOffset's x | y << 16
+  kTableBcwWeights     = 1408,   // per BCW index: list 1's weight
+};
 
 void writeJobTables( uint32_t* out )
 {
   memset( out, 0, kJobTableWords * sizeof( uint32_t ) );
   for( int i = 0; i < NUM_INTRA_MODE + NUM_EXT_LUMA_MODE - 1; i++ )
   {
-    out[0 + i] = g_lfnstLut[i];
+    out[kTableLfnstLut + i] = g_lfnstLut[i];
   }
   for( int i = 0; i < NUM_INTRA_MODE; i++ )
   {
-    out[128 + i] = g_chroma422IntraAngleMappingTable[i];
+    out[kTableChroma422Modes + i] = g_chroma422IntraAngleMappingTable[i];
   }
   for( int split = 0; split < GEO_NUM_PARTITION_MODE; split++ )
   {
-    out[256 + split] = uint32_t( g_GeoParams[split][0] ) | uint32_t( g_GeoParams[split][1] ) << 8;
+    out[kTableGeoParams + split] = uint32_t( g_GeoParams[split][0] ) | uint32_t( g_GeoParams[split][1] ) << 8;
     for( int h = 0; h < GEO_NUM_CU_SIZE; h++ )
     {
       for( int w = 0; w < GEO_NUM_CU_SIZE; w++ )
       {
-        out[384 + ( split * 4 + h ) * 4 + w] = uint32_t( uint16_t( g_weightOffset[split][h][w][0] ) ) | uint32_t( uint16_t( g_weightOffset[split][h][w][1] ) ) << 16;
+        out[kTableGeoOffsets + ( split * 4 + h ) * 4 + w] =
+          uint32_t( uint16_t( g_weightOffset[split][h][w][0] ) ) | uint32_t( uint16_t( g_weightOffset[split][h][w][1] ) ) << 16;
       }
     }
   }
   for( int a = 0; a < GEO_NUM_ANGLES; a++ )
   {
-    out[320 + a] = uint32_t( int32_t( g_angle2mask[a] ) );
-    out[352 + a] = uint32_t( int32_t( g_angle2mirror[a] ) );
+    out[kTableGeoMask + a]   = uint32_t( int32_t( g_angle2mask[a] ) );
+    out[kTableGeoMirror + a] = uint32_t( int32_t( g_angle2mirror[a] ) );
   }
   for( int i = 0; i < BCW_NUM; i++ )
   {
-    out[1408 + i] = uint32_t( int32_t( getBcwWeight( g_BcwInternBcw[i], REF_PIC_LIST_1 ) ) );
+    out[kTableBcwWeights + i] = uint32_t( int32_t( getBcwWeight( g_BcwInternBcw[i], REF_PIC_LIST_1 ) ) );
   }
 }
+
+// Where the reference pictures' words start in a slice's kJobSliceWords words (see GpuFrontEnd.h)
+static constexpr size_t kJobSliceRefInfo = 32;
+static constexpr size_t kJobSliceWeights = 64;
 
 void writeJobSlices( const CodingStructure& cs, const RefTable& refs, uint32_t* out )
 {
@@ -379,8 +422,8 @@ void writeJobSlices( const CodingStructure& cs, const RefTable& refs, uint32_t* 
   for( size_t i = 0; i < slices.size(); i++ )
   {
     const Slice& s   = *slices[i];
-    uint32_t*    rec = out + 256 * i;
-    memset( rec, 0, 256 * sizeof( uint32_t ) );
+    uint32_t*    rec = out + kJobSliceWords * i;
+    memset( rec, 0, kJobSliceWords * sizeof( uint32_t ) );
     rec[0] = uint32_t( s.getSliceType() ) | ( s.getLmcsEnabledFlag() ? 4u : 0u ) | ( s.getDepQuantEnabledFlag() ? 8u : 0u )
              | ( s.getExplicitScalingListUsed() ? 16u : 0u );
     for( int list = 0; list < 2; list++ )
@@ -396,10 +439,11 @@ void writeJobSlices( const CodingStructure& cs, const RefTable& refs, uint32_t* 
         for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
         {
           info |= wp[c].bPresentFlag ? 1u << ( 10 + c ) : 0u;
-          rec[64 + ( 16 * list + refIdx ) * 3 + c] = uint32_t( uint16_t( int16_t( wp[c].iWeight ) ) ) | uint32_t( uint8_t( int8_t( wp[c].iOffset ) ) ) << 16
-                                                     | ( wp[c].uiLog2WeightDenom & 15 ) << 24;
+          rec[kJobSliceWeights + ( 16 * list + refIdx ) * 3 + c] = uint32_t( uint16_t( int16_t( wp[c].iWeight ) ) )
+                                                                   | uint32_t( uint8_t( int8_t( wp[c].iOffset ) ) ) << 16
+                                                                   | ( wp[c].uiLog2WeightDenom & 15 ) << 24;
         }
-        rec[32 + 16 * list + refIdx] = info;
+        rec[kJobSliceRefInfo + 16 * list + refIdx] = info;
       }
     }
   }

@@ -50,6 +50,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -57,6 +58,18 @@ namespace vvdec
 {
 namespace gpu
 {
+
+// Returns the number of elements (jobs, records) in lists of elements per CTU.
+template<typename T>
+size_t countPerCtu( const std::vector<std::vector<T>>& perCtu )
+{
+  size_t count = 0;
+  for( const auto& ctu: perCtu )
+  {
+    count += ctu.size();
+  }
+  return count;
+}
 
 // A transform block of one component. trafo.slang dequantizes its coefficients and inverse-transforms them into
 // the residual. 10 words.
@@ -186,21 +199,23 @@ struct InterJob
 {
   enum Flags
   {
-    kL0        = 1,
-    kL1        = 2,
-    kDmvr      = 4,
-    kHalfPel   = 8,    // AMVR's half-sample luma filter
-    kResidualY = 16,   // (and kResidualY << 1, << 2 for Cb, Cr) the picture holds a residual to add
-    kLumaMap   = 128,  // LMCS: forward-map the luma prediction
-    kDeferCb   = 256,  // (and kDeferCb << 1 for Cr) LMCS's chroma scaling: keep the prediction aside and leave the
-                       // residual in the picture, for an intra job of kind IntraJob::kLmcs
-    kDeferY    = 1024, // CIIP: the same for luma (with kDeferCb and its Cr flag), for an intra job of kind IntraJob::kCiip
-    kBcw       = 2048, // BCW: weighted bi-prediction (setBcw)
-    kBdof      = 4096, // BDOF (with DMVR: where DMVR's cost leaves it on), run by the inter_bdof variant
-    kAffine    = 8192, // an affine CU's tile: this job and the next make one affine job (setAffine), run by the
-                       // inter_affine variant
-    kGeo       = 16384, // GPM: the "L0" and "L1" predictions are the two partitions', blended (setGeo)
-    kWp        = 32768, // weighted prediction (setWp)
+    kL0         = 1,
+    kL1         = 2,
+    kDmvr       = 4,
+    kHalfPel    = 8,     // AMVR's half-sample luma filter
+    kResidualY  = 16,    // the picture holds a residual of the component to add (kResidualY << c for component c)
+    kResidualCb = 32,
+    kResidualCr = 64,
+    kLumaMap    = 128,   // LMCS: forward-map the luma prediction
+    kDeferCb    = 256,   // LMCS's chroma scaling: keep the component's prediction aside and leave the residual in the
+    kDeferCr    = 512,   // picture, for an intra job of kind IntraJob::kLmcs (kDeferCb << ( c - 1 ) for component c)
+    kDeferY     = 1024,  // CIIP: the same for luma (with kDeferCb and kDeferCr), for an intra job of kind IntraJob::kCiip
+    kBcw        = 2048,  // BCW: weighted bi-prediction (setBcw)
+    kBdof       = 4096,  // BDOF (with DMVR: where DMVR's cost leaves it on), run by the inter_bdof variant
+    kAffine     = 8192,  // an affine CU's tile: this job and the next make one affine job (setAffine), run by the
+                         // inter_affine variant
+    kGeo        = 16384, // GPM: the "L0" and "L1" predictions are the two partitions', blended (setGeo)
+    kWp         = 32768, // weighted prediction (setWp)
   };
 
   uint32_t w[12];
@@ -223,6 +238,8 @@ struct InterJob
     w[8]  = uint32_t( dmvrIndex );
     w[9]  = w[10] = w[11] = 0;
   }
+  // The job's flags (Flags), as set and setBcw, setWp, setGeo add them.
+  uint32_t flags() const { return w[1] >> 16; }
   // The width of the block that clips the motion (clipMv, wrapClipMv): the CU's, or with SbTMVP the joined sub-PUs'.
   void setClipWidth( int width ) { w[7] |= uint32_t( width ) << 20; }
   // BCW: list 1's weight out of 8 (addWeightedAvg's w1; list 0's is 8 - w1). Stored plus 2, as the weights go down
@@ -409,7 +426,6 @@ class PlanePool;
 struct SharedReconBuffers;
 
 // A picture's jobs, per CTU, for the passes that run on the GPU (null: the CPU ran that pass).
-
 struct PictureJobs
 {
   const std::vector<std::vector<TrafoJob>>* trafo = nullptr;
@@ -420,9 +436,9 @@ struct PictureJobs
   // The early rows (CPU front end): the first earlyCtus CTUs, whose residuals and inter blocks went to the GPU ahead
   // of the rest (GpuRecon::startEarlyRows).
   size_t                                    earlyCtus = 0;
-  // The parse's CU and TU records, per CTU (GpuFrontEnd.h). The GPU front end works from them: it drives the picture
-  // with front, and without it runs beside the CPU front end for the comparison (VVDEC_GPU_MIDER=1;
-  // GpuRecon::compareFrontEnd).
+  // The parse's CU and TU records, per CTU (GpuFrontEnd.h). The GPU front end works from them. With useFrontEnd it
+  // drives the picture; without it, it runs beside the CPU front end so that the two can be compared
+  // (VVDEC_GPU_MIDER=1; GpuRecon::compareFrontEnd).
   const std::vector<std::vector<CuRecord>>* cus = nullptr;
   const std::vector<std::vector<TuRecord>>* tus = nullptr;
   // The GPU front end drives the picture: from cus and tus it derives the motion, the deblocking parameters and

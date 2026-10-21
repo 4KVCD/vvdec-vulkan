@@ -71,6 +71,7 @@ static constexpr int kParseStreamWords = 8;     // a substream's words
 static constexpr int kParseStreamSize  = 1;     // the word of a substream's that holds its size in bytes
 static constexpr int kParseCtuOutWords = 16;    // the words parse.slang writes per CTU besides the records (ctuOut)
 static constexpr int kParseScanTab     = 961;   // the scan table's words (writeParseScans)
+static constexpr int kParseProfileWords = 16;   // parse_prof's counters (parse.slang's kProf...)
 
 // The inputs of a picture's parse, laid out as parse.slang reads them
 struct ParseInput
@@ -134,7 +135,7 @@ struct ParseStats
   int64_t substreams     = 0;
   int64_t runs           = 0;    // the substreams' runs: one per substream and dispatch until the substream is parsed
   int64_t submissions    = 0;    // the parse's submissions (GpuRecon::runParse)
-  uint64_t prof[16]      = {};   // VVDEC_GPU_PROFILE: the sums of parse_prof's counters (parse.slang's kProf...)
+  uint64_t prof[kParseProfileWords] = {};   // VVDEC_GPU_PROFILE: the sums of parse_prof's counters (parse.slang's kProf...)
   // the check of the room of the front end's job lists the parse adds up, against gpu::frontCapacities
   int64_t capsCompared   = 0;
   int64_t capsDiffer     = 0;

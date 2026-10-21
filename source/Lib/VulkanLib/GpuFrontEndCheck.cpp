@@ -65,8 +65,15 @@ namespace gpu
 {
 
 static constexpr int kMaxReports = 20;   // differences printed per kind
+// The words of mider.slang's motion of a 4x4 block, of dbparams.slang's parameters of a 4x4 block in one direction,
+// and of an intra job
+static constexpr size_t kMotionWords   = 5;
+static constexpr size_t kLfpWords      = 2;
+static constexpr size_t kIntraJobWords = sizeof( IntraJob ) / sizeof( uint32_t );
+// The kind of motion in the last of a block's motion words (bits 16..23) that IBC's block vector has
+static constexpr int kMotionKindIbc = 3;
 
-// Compares the motion of each 4x4 block as mider.slang wrote it (5 words per block) with vvdec's MotionInfo.
+// Compares the motion of each 4x4 block as mider.slang wrote it (kMotionWords per block) with vvdec's MotionInfo.
 static void compareMotion( const CodingStructure& cs, const int32_t* gpu, const MotionInfo* cpu, FrontEndStats& stats )
 {
   const PreCalcValues& pcv     = *cs.pcv;
@@ -86,7 +93,7 @@ static void compareMotion( const CodingStructure& cs, const int32_t* gpu, const 
           continue;
         }
         const int         at   = ctu * size4 * size4 + y * size4 + x;
-        const int32_t*    g    = gpu + at * 5;
+        const int32_t*    g    = gpu + at * kMotionWords;
         const MotionInfo& c    = cpu[at];
         const uint32_t    w    = uint32_t( g[4] );
         const int         kind = int( ( w >> 16 ) & 0xff );
@@ -97,8 +104,8 @@ static void compareMotion( const CodingStructure& cs, const int32_t* gpu, const 
         {
           const int cref = c.miRefIdx[l] < 0 ? -1 : c.miRefIdx[l];
           same &= ref[l] == cref;
-          // (IBC has a block vector without a reference index)
-          if( ref[l] >= 0 || ( kind == 3 && l == 0 ) )
+          // IBC has a block vector without a reference index.
+          if( ref[l] >= 0 || ( kind == kMotionKindIbc && l == 0 ) )
           {
             same &= g[2 * l] == c.mv[l].getHor() && g[2 * l + 1] == c.mv[l].getVer();
           }
@@ -113,7 +120,7 @@ static void compareMotion( const CodingStructure& cs, const int32_t* gpu, const 
                  "GPU motion derivation: POC %d at (%d,%d) kind %d: GPU ref %d,%d mv (%d,%d) (%d,%d), CPU ref %d,%d mv (%d,%d) (%d,%d)\n",
                  cs.picture->poc, x0 + 4 * x, y0 + 4 * y, kind, ref[0], ref[1], g[0], g[1], g[2], g[3], c.miRefIdx[0], c.miRefIdx[1],
                  c.mv[0].getHor(), c.mv[0].getVer(), c.mv[1].getHor(), c.mv[1].getVer() );
-            // the CU there, as the CPU left it
+            // The CU there, as the CPU left it
             if( const CodingUnit* cu = cs.getCU( Position( x0 + 4 * x, y0 + 4 * y ), CHANNEL_TYPE_LUMA ) )
             {
               msg( WARNING,
@@ -130,7 +137,7 @@ static void compareMotion( const CodingStructure& cs, const int32_t* gpu, const 
   }
 }
 
-// Compares the deblocking parameters as dbparams.slang wrote them (2 words per 4x4 block and direction) with vvdec's
+// Compares the deblocking parameters as dbparams.slang wrote them (kLfpWords per 4x4 block and direction) with vvdec's
 // LoopFilterParam.
 static void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const LoopFilterParam* cpu, FrontEndStats& stats )
 {
@@ -141,8 +148,8 @@ static void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const Lo
   for( size_t i = 0; i < n; i++ )
   {
     const LoopFilterParam& c = cpu[i];
-    const uint32_t         a = gpu[2 * i];
-    const uint32_t         b = gpu[2 * i + 1];
+    const uint32_t         a = gpu[kLfpWords * i];
+    const uint32_t         b = gpu[kLfpWords * i + 1];
     stats.lfpCompared++;
     stats.lfpEdges += c.bs != 0 ? 1 : 0;
     const bool same = int8_t( a & 0xff ) == c.qp[0] && int8_t( ( a >> 8 ) & 0xff ) == c.qp[1] && int8_t( ( a >> 16 ) & 0xff ) == c.qp[2]
@@ -167,18 +174,14 @@ static void compareLfp( const CodingStructure& cs, const uint32_t* gpu, const Lo
   }
 }
 
-// Compares one of the GPU's job lists (count jobs) with the CTU tasks' (list 0: residual, 1: inter, 2: intra jobs).
+// Compares one of the GPU's job buffers (count jobs; list is its JobKind) with the CTU tasks' jobs of that kind.
 template<typename Job>
 static void compareJobs( const CodingStructure& cs, int list, const uint32_t* gpu, size_t count, const std::vector<std::vector<Job>>& cpu,
                          FrontEndStats& stats )
 {
-  static const char* const names[3] = { "residuals'", "inter's", "intra's" };
-  constexpr size_t         words    = sizeof( Job ) / sizeof( uint32_t );
-  size_t                   total    = 0;
-  for( const auto& ctu: cpu )
-  {
-    total += ctu.size();
-  }
+  static const char* const names[kJobKinds] = { "residuals'", "inter's", "intra's" };
+  constexpr size_t         words            = sizeof( Job ) / sizeof( uint32_t );
+  const size_t             total            = countPerCtu( cpu );
   if( total != count )
   {
     stats.jobsMismatched[list] += std::max( total, count );
@@ -217,8 +220,8 @@ static void compareJobs( const CodingStructure& cs, int list, const uint32_t* gp
   }
 }
 
-// Compares the intra bands in wave order as intrasort.slang made them (12 words each, count bands, each band's wait
-// in waits) with the CTU tasks' jobs, put into that order as GpuRecon::recordIntra does.
+// Compares the intra bands in wave order as intrasort.slang made them (kIntraJobWords each, count bands, each band's
+// wait in waits) with the CTU tasks' jobs, put into that order as GpuRecon::uploadIntraJobs does.
 static void compareSorted( const CodingStructure& cs, const uint32_t* gpu, const uint32_t* waits, size_t count, const std::vector<std::vector<IntraJob>>& cpu,
                            FrontEndStats& stats )
 {
@@ -266,14 +269,15 @@ static void compareSorted( const CodingStructure& cs, const uint32_t* gpu, const
         IntraJob       band = job;
         band.setRows( row, std::min( rows, job.height() - row ) );
         stats.sortedCompared++;
-        if( memcmp( &band, gpu + size_t( at ) * 12, sizeof( IntraJob ) ) != 0 || waits[at] != first[job.wave()] )
+        const uint32_t* gpuBand = gpu + size_t( at ) * kIntraJobWords;
+        if( memcmp( &band, gpuBand, sizeof( IntraJob ) ) != 0 || waits[at] != first[job.wave()] )
         {
           stats.sortedMismatched++;
           if( stats.jobsReported < kMaxReports )
           {
             stats.jobsReported++;
             msg( WARNING, "GPU intra order: POC %d band %u (wave %d): GPU %08x %08x %08x wait %u, CPU %08x %08x %08x wait %u\n", cs.picture->poc, at,
-                 job.wave(), gpu[at * 12], gpu[at * 12 + 1], gpu[at * 12 + 7], waits[at], band.w[0], band.w[1], band.w[7], first[job.wave()] );
+                 job.wave(), gpuBand[0], gpuBand[1], gpuBand[7], waits[at], band.w[0], band.w[1], band.w[7], first[job.wave()] );
           }
         }
       }
@@ -325,6 +329,40 @@ static void compareEdges( const CodingStructure& cs, const uint32_t* gpu, const 
   }
 }
 
+// Returns the CTU tasks' inter jobs in the order of the job buffer (uploadInterJobs): the regular tiles, then the BDOF
+// tiles, then the affine pairs, all in one list.
+static std::vector<std::vector<InterJob>> interJobsInBufferOrder( const std::vector<std::vector<InterJob>>& perCtu )
+{
+  enum Part
+  {
+    kRegular = 0,
+    kBdof    = 1,
+    kAffine  = 2,
+  };
+  std::vector<std::vector<InterJob>> ordered( 1 );
+  for( int part = kRegular; part <= kAffine; part++ )
+  {
+    for( const auto& ctu: perCtu )
+    {
+      for( size_t i = 0; i < ctu.size(); i++ )
+      {
+        const uint32_t flags  = ctu[i].flags();
+        const int      inPart = flags & InterJob::kAffine ? kAffine : flags & InterJob::kBdof ? kBdof : kRegular;
+        if( inPart == part )
+        {
+          ordered[0].push_back( ctu[i] );
+          if( flags & InterJob::kAffine )
+          {
+            ordered[0].push_back( ctu[i + 1] );
+          }
+        }
+        i += flags & InterJob::kAffine ? 1 : 0;   // an affine pair's second job
+      }
+    }
+  }
+  return ordered;
+}
+
 void GpuRecon::compareFrontEnd( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp, const PictureJobs* jobs )
 {
   compareMotion( cs, reinterpret_cast<const int32_t*>( m_check.motion.mapped ), cpu, m_check.stats );
@@ -335,49 +373,28 @@ void GpuRecon::compareFrontEnd( const CodingStructure& cs, const MotionInfo* cpu
   m_check.lfpRecorded = false;
   if( m_check.jobsRecorded && jobs )
   {
-    // jobs.slang's totals of the residual, inter (its three parts) and intra jobs, after its blocks' counts
-    const uint32_t* lists     = reinterpret_cast<const uint32_t*>( m_check.jobBlocks.mapped ) + size_t( m_frontEnd.jobBlockCount ) * 5;
-    const uint32_t  totals[3] = { lists[0], lists[1] + lists[3] + lists[4], lists[2] };
-    const auto      count     = [&]( int k ) { return std::min<size_t>( totals[k], m_frontEnd.jobCapacity[k] ); };
+    // jobs.slang's totals of the residual, inter (its three lists) and intra jobs, after its blocks' sums
+    const uint32_t* lists = reinterpret_cast<const uint32_t*>( m_check.jobBlocks.mapped ) + size_t( m_frontEnd.jobBlockCount ) * kJobLists;
+    const uint32_t  totals[kJobKinds] = { lists[kListTrafo], lists[kListInter] + lists[kListInterBdof] + lists[kListInterAffine], lists[kListIntra] };
+    const auto      count             = [&]( int k ) { return std::min<size_t>( totals[k], m_frontEnd.jobCapacity[k] ); };
     if( jobs->trafo )
     {
-      compareJobs( cs, 0, reinterpret_cast<const uint32_t*>( m_check.jobs[0].mapped ), totals[0] > m_frontEnd.jobCapacity[0] ? totals[0] : count( 0 ),
-                   *jobs->trafo, m_check.stats );
+      compareJobs( cs, kTrafoJobs, reinterpret_cast<const uint32_t*>( m_check.jobs[kTrafoJobs].mapped ),
+                   totals[kTrafoJobs] > m_frontEnd.jobCapacity[kTrafoJobs] ? totals[kTrafoJobs] : count( kTrafoJobs ), *jobs->trafo, m_check.stats );
     }
     if( jobs->inter )
     {
-      // the CTU tasks' inter jobs in recordInter's order: the regular jobs, then BDOF's, then the affine pairs
-      std::vector<std::vector<InterJob>> parts( 1 );
-      for( int part = 0; part < 3; part++ )
-      {
-        for( const auto& ctu: *jobs->inter )
-        {
-          for( size_t i = 0; i < ctu.size(); i++ )
-          {
-            const uint32_t flags = ctu[i].w[1] >> 16;
-            const int      in    = flags & InterJob::kAffine ? 2 : flags & InterJob::kBdof ? 1 : 0;
-            if( in == part )
-            {
-              parts[0].push_back( ctu[i] );
-              if( flags & InterJob::kAffine )
-              {
-                parts[0].push_back( ctu[i + 1] );
-              }
-            }
-            i += flags & InterJob::kAffine ? 1 : 0;
-          }
-        }
-      }
-      compareJobs( cs, 1, reinterpret_cast<const uint32_t*>( m_check.jobs[1].mapped ), totals[1] > m_frontEnd.jobCapacity[1] ? totals[1] : count( 1 ),
-                   parts, m_check.stats );
+      compareJobs( cs, kInterJobs, reinterpret_cast<const uint32_t*>( m_check.jobs[kInterJobs].mapped ),
+                   totals[kInterJobs] > m_frontEnd.jobCapacity[kInterJobs] ? totals[kInterJobs] : count( kInterJobs ),
+                   interJobsInBufferOrder( *jobs->inter ), m_check.stats );
     }
     if( jobs->intra )
     {
-      compareJobs( cs, 2, reinterpret_cast<const uint32_t*>( m_check.jobs[2].mapped ), totals[2] > m_frontEnd.jobCapacity[2] ? totals[2] : count( 2 ),
-                   *jobs->intra, m_check.stats );
-      // intrasort.slang's band count, and its flag for a wave past 65535
+      compareJobs( cs, kIntraJobs, reinterpret_cast<const uint32_t*>( m_check.jobs[kIntraJobs].mapped ),
+                   totals[kIntraJobs] > m_frontEnd.jobCapacity[kIntraJobs] ? totals[kIntraJobs] : count( kIntraJobs ), *jobs->intra, m_check.stats );
+      // intrasort.slang's band count, and its flag for a wave past the waves it can order
       const uint32_t* info = reinterpret_cast<const uint32_t*>( m_check.sortInfo.mapped );
-      if( info[2] != 0 )
+      if( info[FrontEndCheck::kSortInfoFlags] != 0 )
       {
         msg( WARNING, "GPU intra order: POC %d: a wave past 65535\n", cs.picture->poc );
         m_check.stats.sortedMismatched++;
@@ -385,7 +402,7 @@ void GpuRecon::compareFrontEnd( const CodingStructure& cs, const MotionInfo* cpu
       else
       {
         compareSorted( cs, reinterpret_cast<const uint32_t*>( m_check.sortedBands.mapped ), reinterpret_cast<const uint32_t*>( m_check.bandWaits.mapped ),
-                       std::min<size_t>( info[0], m_frontEnd.sortCapacity ), *jobs->intra, m_check.stats );
+                       std::min<size_t>( info[FrontEndCheck::kSortInfoBandCount], m_frontEnd.sortCapacity ), *jobs->intra, m_check.stats );
       }
     }
   }

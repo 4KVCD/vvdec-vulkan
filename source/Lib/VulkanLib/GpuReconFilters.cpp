@@ -81,8 +81,9 @@ void GpuRecon::recordLmcs( const CodingStructure& cs, const Planes& planes, VkDe
 {
   const PreCalcValues& pcv = *cs.pcv;
   LmcsPush             push{};
+  static constexpr unsigned kGroupSamples = 256;   // the samples of a row that one workgroup maps
   push.plane       = planes.addr[COMPONENT_Y];
-  push.lut         = m_lmcs.addr + m_lmcsCount * sizeof( int16_t );   // the inverse mapping
+  push.lut         = lmcsInverse();
   push.ctus        = ctus;
   push.stride      = planes.stride[COMPONENT_Y];
   push.width       = pcv.lumaWidth;
@@ -90,8 +91,7 @@ void GpuRecon::recordLmcs( const CodingStructure& cs, const Planes& planes, VkDe
   push.ctuLog2     = getLog2( pcv.maxCUWidth );
   push.widthInCtus = pcv.widthInCtus;
   CHECK( pcv.lumaWidth % 4 != 0, "Vulkan: LMCS takes 4 luma samples at a time" );
-  // one workgroup per 256 samples of a row
-  dispatch( kShader_lmcs, push, uint32_t( ( pcv.lumaWidth + 255 ) / 256 ), uint32_t( pcv.lumaHeight ) );
+  dispatch( kShader_lmcs, push, uint32_t( ( pcv.lumaWidth + kGroupSamples - 1 ) / kGroupSamples ), uint32_t( pcv.lumaHeight ) );
   mark( "lmcs" );
 }
 
@@ -112,7 +112,12 @@ static_assert( sizeof( DeblockPush ) == 128, "DeblockPush: the layout of deblock
 // deblock.slang's workgroups: a thread per edge, 64 threads each
 static constexpr int kDeblockEdgesPerGroup = 64;
 
-// the index of the lowest bit set in v (v must not be 0)
+// The boundary strengths in LoopFilterParam::bs, 2 bits per component (LoopFilter.cpp's BsSet): luma's in bits 0 and
+// 1, Cb's and Cr's in bits 2 to 5
+static constexpr uint8_t kLumaBsBits   = 0x03;
+static constexpr uint8_t kChromaBsBits = 0x3c;
+
+// Returns the index of the lowest bit set in v (v must not be 0).
 static inline int lowestBit( uint32_t v )
 {
 #ifdef _MSC_VER
@@ -133,7 +138,7 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
   {
     return;
   }
-  const int  n      = int( pcv.maxCUWidth ) >> 2;   // 4x4 blocks across a CTU (at most 32, so a row fits the bits of an int)
+  const int  n      = int( pcv.maxCUWidth ) >> 2;   // 4x4 blocks across a CTU (at most 32, so a row fits the bits of a uint32_t)
   const int  x0     = ( ctuRsAddr % int( pcv.widthInCtus ) ) * int( pcv.maxCUWidth );
   const int  y0     = ( ctuRsAddr / int( pcv.widthInCtus ) ) * int( pcv.maxCUHeight );
   const bool chroma = isChromaEnabled( pcv.chrFormat );
@@ -150,14 +155,14 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
     const int gridX  = dir == 0 ? across : ( 4 >> sx ) << sx;
     const int gridY  = dir == 0 ? ( 4 >> sy ) << sy : across;
     CHECKD( ( gridX & ( gridX - 1 ) ) || ( gridY & ( gridY - 1 ) ), "the chroma grid is a power of 2" );
-    // The 4x4 blocks inside the picture, row by row. (No divisions: this runs for every CTU, between its motion and
-    // its jobs.)
+    // The 4x4 blocks inside the picture, row by row. Keep this free of divisions: it runs for every CTU, between the
+    // CTU's motion and its jobs.
     for( int r = 0; r < rows; r++ )
     {
       const LoopFilterParam* row      = lfp + r * n;
       const int              ly       = y0 + r * 4;
       const bool             chromaOn = chroma && ( ly & ( gridY - 1 ) ) == 0;
-      // the row's blocks with an edge, as bits (no branch per block: most have no edge)
+      // The row's blocks with an edge, as bits, without a branch per block: most blocks have no edge.
       uint32_t any = 0;
       for( int c = 0; c < cols; c++ )
       {
@@ -169,12 +174,12 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
         any                      &= any - 1;
         const LoopFilterParam& p  = row[c];
         const int              lx = x0 + c * 4;
-        if( p.bs & 3 )
+        if( p.bs & kLumaBsBits )
         {
           edges.lists[dir].push_back(
             { uint32_t( lx ) | uint32_t( ly ) << 16, uint32_t( uint8_t( p.qp[0] ) ) | uint32_t( p.bs ) << 8 | uint32_t( p.sideMaxFiltLength ) << 16 } );
         }
-        if( chromaOn && ( p.bs & 0x3c ) && ( lx & ( gridX - 1 ) ) == 0 )
+        if( chromaOn && ( p.bs & kChromaBsBits ) && ( lx & ( gridX - 1 ) ) == 0 )
         {
           edges.lists[2 + dir].push_back( { uint32_t( lx >> sx ) | uint32_t( ly >> sy ) << 16,
                                             uint32_t( uint8_t( p.qp[1] ) ) | uint32_t( uint8_t( p.qp[2] ) ) << 8 | uint32_t( p.bs ) << 16
@@ -185,11 +190,13 @@ void GpuRecon::listEdges( const CodingStructure& cs, int ctuRsAddr, EdgeLists& e
   }
 }
 
-// The deblocking parameters: per CTU, 8 bytes (whether its slice disables deblocking, then the slice's beta and tc
-// offsets of luma, Cb and Cr)
+// The deblocking parameters: per CTU, kDeblockCtuBytes bytes: whether its slice disables deblocking, then the slice's
+// beta and tc offsets of luma, Cb and Cr, then a byte of padding
+static constexpr size_t kDeblockCtuBytes = 8;
+
 size_t GpuRecon::deblockParamSize( const CodingStructure& cs )
 {
-  return alignUp( size_t( cs.pcv->sizeInCtus ) * 8, 256 );
+  return alignUp( size_t( cs.pcv->sizeInCtus ) * kDeblockCtuBytes, 256 );
 }
 
 bool GpuRecon::prepareDeblock( const CodingStructure& cs, uint8_t* base )
@@ -198,7 +205,7 @@ bool GpuRecon::prepareDeblock( const CodingStructure& cs, uint8_t* base )
   for( int ctuIdx = 0; ctuIdx < (int) cs.pcv->sizeInCtus; ctuIdx++ )
   {
     const Slice& slice = *cs.getCtuData( ctuIdx ).slice;
-    int8_t*      ctu   = reinterpret_cast<int8_t*>( base + ctuIdx * 8 );
+    int8_t*      ctu   = reinterpret_cast<int8_t*>( base + ctuIdx * kDeblockCtuBytes );
     ctu[0] = slice.getDeblockingFilterDisable() ? 1 : 0;
     ctu[1] = int8_t( slice.getDeblockingFilterBetaOffsetDiv2() );
     ctu[2] = int8_t( slice.getDeblockingFilterTcOffsetDiv2() );
@@ -214,7 +221,7 @@ bool GpuRecon::prepareDeblock( const CodingStructure& cs, uint8_t* base )
 
 void GpuRecon::uploadCpuEdges( const std::vector<EdgeLists>& edges, size_t first[5] )
 {
-  // the four lists, one after the other, of all the CTUs
+  // The four lists of all the CTUs, one list after the other
   first[0] = 0;
   for( int l = 0; l < 4; l++ )
   {
@@ -224,11 +231,8 @@ void GpuRecon::uploadCpuEdges( const std::vector<EdgeLists>& edges, size_t first
       first[l + 1] += ctu.lists[l].size();
     }
   }
-  if( m_cpuJobs.edges.size < first[4] * sizeof( Edge ) )
-  {
-    m_ctx->free( m_cpuJobs.edges );
-    m_cpuJobs.edges = m_ctx->alloc( std::max<size_t>( first[4], 1024 ) * 2 * sizeof( Edge ), MemKind::Upload );
-  }
+  // A new buffer gets twice the room needed (and room for at least 2048 edges), so that it seldom grows again.
+  replaceIfSmaller( m_cpuJobs.edges, first[4] * sizeof( Edge ), std::max<size_t>( first[4], 1024 ) * 2 * sizeof( Edge ), MemKind::Upload );
   Edge* all = reinterpret_cast<Edge*>( m_cpuJobs.edges.mapped );
   for( int l = 0; l < 4; l++ )
   {
@@ -244,17 +248,16 @@ void GpuRecon::uploadCpuEdges( const std::vector<EdgeLists>& edges, size_t first
 // intervals. The planes, the direction and the edge list are set per dispatch.
 static void deblockPush( const CodingStructure& cs, VkDeviceAddress params, VkDeviceAddress tables, DeblockPush& push )
 {
-  const PreCalcValues& pcv    = *cs.pcv;
-  const SPS&           sps    = *cs.sps;
-  const bool           chroma = isChromaEnabled( pcv.chrFormat );
+  const PreCalcValues& pcv = *cs.pcv;
+  const SPS&           sps = *cs.sps;
   push             = DeblockPush{};
   push.ctus        = params;
   push.tables      = tables;
   push.ctuLog2     = getLog2( pcv.maxCUWidth );
   push.widthInCtus = pcv.widthInCtus;
   push.bitDepth    = sps.getBitDepth();
-  push.scaleX      = chroma ? getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) : 0;
-  push.scaleY      = chroma ? getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) : 0;
+  push.scaleX      = chromaShiftX( pcv.chrFormat );
+  push.scaleY      = chromaShiftY( pcv.chrFormat );
   // LADF (luma-adaptive deblocking): its intervals' QP offsets and lower bounds
   if( sps.getLadfEnabled() )
   {
@@ -270,9 +273,9 @@ static void deblockPush( const CodingStructure& cs, VkDeviceAddress params, VkDe
   }
 }
 
-// Dispatches shader on one edge list, a thread per edge: with the GPU front end, its list of pass (counted on the GPU);
-// otherwise the CPU front end's list number list, as uploadCpuEdges laid the lists out (first: each list's first edge,
-// then the total).
+// Dispatches shader on one edge list, a thread per edge. With the GPU front end, that is the front end's list of pass,
+// counted on the GPU. Otherwise it is the CPU front end's list number list, as uploadCpuEdges laid the lists out
+// (first: each list's first edge, then the total).
 void GpuRecon::dispatchEdgeList( int shader, FrontPass pass, const size_t first[5], int list, DeblockPush& push )
 {
   push.edges   = m_useFrontEnd ? m_frontEnd.edges.addr : m_cpuJobs.edges.addr + first[list] * sizeof( Edge );
@@ -301,7 +304,7 @@ void GpuRecon::recordDeblock( const CodingStructure& cs, const Planes& planes, V
   CHECK_FATAL( planes.addr[COMPONENT_Y] % 8 != 0 || planes.stride[COMPONENT_Y] % 4 != 0, "Vulkan: the luma rows are not 8-byte aligned" );
   CHECK( chroma && planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
 
-  // The CPU front end's edges are uploaded (the GPU front end's are in its buffer, with their counts on the GPU).
+  // The CPU front end's edges are uploaded. The GPU front end's are in its buffer already, with their counts.
   size_t first[5] = { 0, 0, 0, 0, 0 };
   if( !m_useFrontEnd )
   {
@@ -380,12 +383,15 @@ static void setVirtualBoundaries( const PicHeader& picHeader, Push& push )
   }
 }
 
-// SAO's parameters: per CTU and component, 8 int16_t (sao.slang): the type (-1: off), the band position, the
-// neighbours' availability, then the four offsets. Then the list of the CTUs' components whose SAO is on, the ones
-// sao.slang filters: per entry a uint32_t, the CTU's raster index | the component << 24.
+// SAO's parameters: per CTU and component, kSaoComponentWords int16_t (sao.slang): the type (-1: off), the band
+// position, the neighbours' availability, a word of padding, then the four offsets. Then the list of the CTUs'
+// components whose SAO is on, the ones sao.slang filters: per entry a uint32_t, the CTU's raster index | the
+// component << 24.
+static constexpr size_t kSaoComponentWords = 8;
+
 static size_t saoListOffset( const CodingStructure& cs )
 {
-  return size_t( cs.pcv->sizeInCtus ) * 3 * 8 * sizeof( int16_t );
+  return size_t( cs.pcv->sizeInCtus ) * 3 * kSaoComponentWords * sizeof( int16_t );
 }
 
 size_t GpuRecon::saoParamSize( const CodingStructure& cs )
@@ -401,7 +407,7 @@ bool GpuRecon::prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8
   uint32_t* list    = reinterpret_cast<uint32_t*>( base + saoListOffset( cs ) );
   uint32_t  entries = 0;
 
-  // in raster order: a merged CTU copies the parameters of its left or above neighbour
+  // Resolve the merges in raster order: a merged CTU copies the parameters of its left or above neighbour.
   for( int ctuIdx = 0; ctuIdx < numCtus; ctuIdx++ )
   {
     sao.reconstructCtuParam( cs, ctuIdx );
@@ -413,9 +419,9 @@ bool GpuRecon::prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8
     int16_t            avail = -1;   // worked out when a component of the CTU uses SAO
     for( int comp = 0; comp < 3; comp++ )
     {
-      int16_t*         ctu    = ctus + ( ctuIdx * 3 + comp ) * 8;
+      int16_t*         ctu    = ctus + ( ctuIdx * 3 + comp ) * kSaoComponentWords;
       const SAOOffset& offset = param[comp];
-      memset( ctu, 0, 8 * sizeof( int16_t ) );
+      memset( ctu, 0, kSaoComponentWords * sizeof( int16_t ) );
       ctu[0] = -1;
       if( comp >= numComp || offset.modeIdc == SAO_MODE_OFF )
       {
@@ -428,7 +434,7 @@ bool GpuRecon::prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8
       }
       list[entries++] = uint32_t( ctuIdx ) | uint32_t( comp ) << 24;
       ctu[0]          = int16_t( offset.typeIdc );
-      ctu[2] = avail;
+      ctu[2]          = avail;
       if( offset.typeIdc == SAO_TYPE_BO )
       {
         ctu[1] = int16_t( offset.typeAuxInfo );
@@ -439,6 +445,7 @@ bool GpuRecon::prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8
       }
       else
       {
+        // Edge offset: the classes 0, 1, 3 and 4 (class 2 has no offset)
         ctu[4] = int16_t( offset.offset[0] );
         ctu[5] = int16_t( offset.offset[1] );
         ctu[6] = int16_t( offset.offset[3] );
@@ -453,8 +460,8 @@ bool GpuRecon::prepareSao( CodingStructure& cs, SampleAdaptiveOffset& sao, uint8
 void GpuRecon::recordSao( const CodingStructure& cs, const Planes& planes, VkDeviceAddress params )
 {
   const PreCalcValues& pcv = *cs.pcv;
-  // Per list entry, a ring: the rows above and below the CTU (its width and 2 samples more each), the columns left and
-  // right of it
+  // Per list entry, a ring of the deblocked samples around the CTU: the rows above and below it (its width and 2
+  // samples more each), and the columns left and right of it
   const int    ringSlot = 2 * ( int( pcv.maxCUWidth ) + 2 ) + 2 * int( pcv.maxCUHeight );
   const size_t ringSize = size_t( m_prepared.saoEntries ) * size_t( ringSlot ) * sizeof( int16_t );
   m_ctx->ensure( m_saoRing, ringSize, MemKind::Device );
@@ -478,7 +485,7 @@ void GpuRecon::recordSao( const CodingStructure& cs, const Planes& planes, VkDev
   push.scaleY       = getComponentScaleY( COMPONENT_Cb, pcv.chrFormat );
   push.ringSlot     = ringSlot;
   setVirtualBoundaries( *cs.picHeader, push );
-  // the planes whose groups of 4 samples the shader may load and store whole (8-byte aligned)
+  // The planes whose groups of 4 samples the shader may load and store whole (8-byte aligned)
   for( int comp = 0; comp < (int) getNumberValidComponents( pcv.chrFormat ); comp++ )
   {
     if( planes.addr[comp] % 8 == 0 && planes.stride[comp] % 4 == 0 )
@@ -487,7 +494,7 @@ void GpuRecon::recordSao( const CodingStructure& cs, const Planes& planes, VkDev
     }
   }
   CHECK( getNumberValidComponents( pcv.chrFormat ) > 1 && planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
-  // pass 0 saves the rings, pass 1 filters the CTUs in place: a workgroup per entry each
+  // Pass 0 saves the rings, pass 1 filters the CTUs in place, each with a workgroup per entry.
   bind( kShader_sao );
   push.pass = 0;
   pushConstants( push );
@@ -499,8 +506,11 @@ void GpuRecon::recordSao( const CodingStructure& cs, const Planes& planes, VkDev
   mark( "sao" );
 }
 
-// ALF's parameters: the filter tables (luma sets [16 fixed + 8 APS][transpose][class][13], chroma
-// [APS][alternative][7], CC-ALF [APS][component][filter][8]), then 8 bytes per CTU (alf.slang)
+// ALF's parameters (alf.slang): the filter tables (luma sets [16 fixed + 8 APS][transpose][class][13], chroma
+// [APS][alternative][7], CC-ALF [APS][component][filter][8]), then kAlfCtuBytes bytes per CTU (writeAlfCtu)
+constexpr size_t  kAlfCtuBytes = 8;
+constexpr uint8_t kAlfOff      = 255;   // a CTU's filter (set, alternative, CC-ALF filter) when that filter is off
+
 constexpr size_t kAlfSetSize     = MAX_NUM_ALF_TRANSPOSE_ID * MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_LUMA_COEFF;
 constexpr size_t kAlfChromaSize  = ALF_CTB_MAX_NUM_APS * MAX_NUM_ALF_ALTERNATIVES_CHROMA * MAX_NUM_ALF_CHROMA_COEFF;
 constexpr size_t kAlfCcSize      = ALF_CTB_MAX_NUM_APS * 2 * MAX_NUM_CC_ALF_FILTERS * MAX_NUM_CC_ALF_CHROMA_COEFF;
@@ -514,11 +524,11 @@ static_assert( kAlfSetSize == 4 * 25 * 13, "the layout of shaders/alf.slang" );
 
 size_t GpuRecon::alfParamSize( const CodingStructure& cs )
 {
-  return alignUp( kAlfCtus + size_t( cs.pcv->sizeInCtus ) * 8, 256 );
+  return alignUp( kAlfCtus + size_t( cs.pcv->sizeInCtus ) * kAlfCtuBytes, 256 );
 }
 
-// The filter tables at base: the fixed luma sets, then the luma, chroma and CC-ALF filters of the APSs the slices
-// use, each at its APS's place
+// Writes the filter tables at base: the fixed luma sets, then the luma, chroma and CC-ALF filters of the APSs that
+// the slices use, each at its APS's place.
 static void writeAlfFilterTables( const CodingStructure& cs, const AdaptiveLoopFilter& alfFilter, uint8_t* base )
 {
   int16_t* lumaCoeff   = reinterpret_cast<int16_t*>( base + kAlfLumaCoeff );
@@ -569,28 +579,29 @@ static void writeAlfFilterTables( const CodingStructure& cs, const AdaptiveLoopF
   }
 }
 
-// CTU ctuIdx's 8 bytes at ctu: the luma filter set (255: off), the chroma APS, each chroma component's alternative
-// (255: off), each chroma component's CC-ALF filter (255: off), then the CTU's clipped sides (virtual boundaries on
-// them; slice, tile and subpicture boundaries without loop filtering across) and its raster-slice corners. Returns
-// whether such a boundary clips the CTU or virtual boundaries split it (the BOUNDS shaders are needed then).
+// Writes CTU ctuIdx's kAlfCtuBytes bytes at ctu: the luma filter set, the chroma APS, each chroma component's
+// alternative, each chroma component's CC-ALF filter (kAlfOff for a filter that is off), then the CTU's clipped sides
+// and its raster-slice corners. A side is clipped by a virtual boundary on it, or by a slice, tile or subpicture
+// boundary that loop filtering may not cross. Returns whether such a boundary clips the CTU or virtual boundaries
+// split it: the BOUNDS shaders are needed then.
 static bool writeAlfCtu( const CodingStructure& cs, int ctuIdx, uint8_t* ctu )
 {
   const PreCalcValues& pcv     = *cs.pcv;
   const CtuData&       ctuData = cs.getCtuData( ctuIdx );
   const Slice*         slice   = ctuData.slice;
   const CtuAlfData&    alf     = ctuData.alfParam;
-  ctu[0] = 255;
+  ctu[0] = kAlfOff;
   if( alf.alfCtuEnableFlag[COMPONENT_Y] )
   {
     const int index = alf.alfCtbFilterIndex;
     ctu[0] = uint8_t( index < NUM_FIXED_FILTER_SETS ? index : NUM_FIXED_FILTER_SETS + slice->getAlfApsIdsLuma()[index - NUM_FIXED_FILTER_SETS] );
   }
   ctu[1] = uint8_t( slice->getAlfApsIdChroma() & ( ALF_CTB_MAX_NUM_APS - 1 ) );
-  ctu[2] = alf.alfCtuEnableFlag[COMPONENT_Cb] ? alf.alfCtuAlternative[0] : 255;
-  ctu[3] = alf.alfCtuEnableFlag[COMPONENT_Cr] ? alf.alfCtuAlternative[1] : 255;
-  ctu[4] = slice->getCcAlfEnabledFlag( 1 ) && alf.ccAlfFilterControl[0] ? uint8_t( slice->getCcAlfCbApsId() * 4 + alf.ccAlfFilterControl[0] - 1 ) : 255;
-  ctu[5] = slice->getCcAlfEnabledFlag( 2 ) && alf.ccAlfFilterControl[1] ? uint8_t( slice->getCcAlfCrApsId() * 4 + alf.ccAlfFilterControl[1] - 1 ) : 255;
-  const Position pos( ( ctuIdx % pcv.widthInCtus ) * pcv.maxCUWidth, ( ctuIdx / pcv.widthInCtus ) * pcv.maxCUHeight );
+  ctu[2] = alf.alfCtuEnableFlag[COMPONENT_Cb] ? alf.alfCtuAlternative[0] : kAlfOff;
+  ctu[3] = alf.alfCtuEnableFlag[COMPONENT_Cr] ? alf.alfCtuAlternative[1] : kAlfOff;
+  ctu[4] = slice->getCcAlfEnabledFlag( 1 ) && alf.ccAlfFilterControl[0] ? uint8_t( slice->getCcAlfCbApsId() * 4 + alf.ccAlfFilterControl[0] - 1 ) : kAlfOff;
+  ctu[5] = slice->getCcAlfEnabledFlag( 2 ) && alf.ccAlfFilterControl[1] ? uint8_t( slice->getCcAlfCrApsId() * 4 + alf.ccAlfFilterControl[1] - 1 ) : kAlfOff;
+  const Position pos = ctuPosition( pcv, unsigned( ctuIdx ) );
   const Area     area( pos, Size( std::min( pcv.maxCUWidth, pcv.lumaWidth - pos.x ), std::min( pcv.maxCUHeight, pcv.lumaHeight - pos.y ) ) );
   bool           clipTop, clipBottom, clipLeft, clipRight;
   int            numHor, numVer, horPos[3], verPos[3], rasterPad;
@@ -607,18 +618,19 @@ bool GpuRecon::prepareAlf( const CodingStructure& cs, const AdaptiveLoopFilter& 
   bool bounds = false;
   for( int ctuIdx = 0; ctuIdx < (int) cs.pcv->sizeInCtus; ctuIdx++ )
   {
-    bounds |= writeAlfCtu( cs, ctuIdx, base + kAlfCtus + ctuIdx * 8 );
+    bounds |= writeAlfCtu( cs, ctuIdx, base + kAlfCtus + ctuIdx * kAlfCtuBytes );
   }
   return bounds;
 }
 
-// alf.slang's workgroups along a side of samples samples: a workgroup takes 32x32 samples (8x8 threads of 4x4)
+// Returns alf.slang's workgroups along a side of samples samples: a workgroup takes 32x32 samples (8x8 threads of 4x4
+// samples).
 static uint32_t alfGroups( int samples )
 {
   return uint32_t( ( ( samples + 3 ) / 4 + 7 ) / 8 );
 }
 
-// Luma (alf.slang loads and stores the rows 8 bytes at a time, from multiples of 4 samples)
+// Luma. alf.slang loads and stores the rows 8 bytes at a time, from multiples of 4 samples.
 void GpuRecon::recordAlfLuma( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params, AlfPush& push )
 {
   const PreCalcValues& pcv = *cs.pcv;
@@ -637,8 +649,8 @@ void GpuRecon::recordAlfLuma( const CodingStructure& cs, const Planes& src, cons
 }
 
 // Chroma, ALF and CC-ALF. Pass 0 filters the blocks of the CTUs with ALF or CC-ALF on a chroma component into the
-// scratch planes (dst); pass 1 copies those blocks back into the twin (src), where the others stay (the caller swaps
-// only the luma planes).
+// scratch planes (dst). Pass 1 copies those blocks back into the twin (src), where the other blocks stay: the caller
+// swaps only the luma planes.
 void GpuRecon::recordAlfChroma( const CodingStructure& cs, const Planes& src, const Planes& dst, VkDeviceAddress params, AlfPush& push )
 {
   const PreCalcValues& pcv = *cs.pcv;
@@ -658,7 +670,7 @@ void GpuRecon::recordAlfChroma( const CodingStructure& cs, const Planes& src, co
   push.scaleY    = getComponentScaleY( COMPONENT_Cb, pcv.chrFormat );
   push.width     = pcv.lumaWidth >> push.scaleX;
   push.height    = pcv.lumaHeight >> push.scaleY;
-  // the chroma blocks' rows read and written 8 bytes at a time where all the planes' rows start 8-byte aligned
+  // The chroma blocks' rows are read and written 8 bytes at a time when all the planes' rows start 8-byte aligned.
   push.aligned = 1;
   for( const Planes* p: { &src, &dst } )
   {
@@ -692,7 +704,8 @@ void GpuRecon::recordAlf( const CodingStructure& cs, const Planes& src, const Pl
   push.lumaHeight  = pcv.lumaHeight;
   push.lumaStride  = src.stride[COMPONENT_Y];
   setVirtualBoundaries( *cs.picHeader, push );
-  // (with boundaries, m_prepared.alfBounds from prepareAlf: the BOUNDS variants)
+  // When a boundary clips a CTU or virtual boundaries split one, the BOUNDS variants run (m_prepared.alfBounds, from
+  // prepareAlf).
   recordAlfLuma( cs, src, dst, params, push );
   if( isChromaEnabled( pcv.chrFormat ) )
   {

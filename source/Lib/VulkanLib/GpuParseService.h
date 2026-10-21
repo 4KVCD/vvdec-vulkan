@@ -95,6 +95,15 @@ struct StagedRecords
   Buffer cus, tus, cuMeta, tuMeta;
 };
 
+// After an overflow (ParseSlot::Progress::Overflow), a parse starts again with room for a quarter more records and
+// levels than it counted, plus these to spare.
+static constexpr size_t kOverflowRecordsSpare = 64;
+static constexpr size_t kOverflowLevelsSpare  = 4096;
+inline size_t roomAfterOverflow( size_t counted, size_t spare )
+{
+  return counted * 5 / 4 + spare;
+}
+
 // One picture's parse on the GPU
 class ParseSlot
 {

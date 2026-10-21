@@ -60,6 +60,8 @@ POSSIBILITY OF SUCH DAMAGE.
 namespace vvdec
 {
 class CodingStructure;
+class Slice;
+struct Picture;
 
 namespace gpu
 {
@@ -98,6 +100,20 @@ struct CuRecord
   //      the above neighbour is available (CodingUnit::left, above); bit 18: SMVD
   // w22..w31: reserved
   uint32_t w[32];
+
+  // Accessors for the fields the C++ code reads back (the shaders read the words above directly)
+  uint32_t x() const { return w[0] & 0xffff; }
+  uint32_t y() const { return w[0] >> 16; }
+  uint32_t width() const { return w[1] & 0xff; }
+  uint32_t height() const { return ( w[1] >> 8 ) & 0xff; }
+  uint32_t predMode() const { return ( w[1] >> 16 ) & 3; }
+  uint32_t flags() const { return w[1] >> 18; }
+  uint32_t firstTu() const { return w[16] & 0xffff; }
+  uint32_t numTus() const { return w[16] >> 16; }
+  bool     rootCbf() const { return ( w[17] & ( 1u << 18 ) ) != 0; }
+  uint32_t chromaX() const { return w[19] & 0xffff; }
+  uint32_t chromaY() const { return w[19] >> 16; }
+  bool     hasLuma() const { return ( w[20] & ( 1u << 17 ) ) != 0; }
 };
 
 // A TU as the parse leaves it: 16 words.
@@ -117,6 +133,17 @@ struct CuRecord
 struct TuRecord
 {
   uint32_t w[16];
+
+  // Accessors for the fields the C++ code reads back (the shaders read the words above directly)
+  uint32_t x() const { return w[0] & 0xffff; }
+  uint32_t y() const { return w[0] >> 16; }
+  uint32_t width() const { return w[1] & 0xff; }
+  uint32_t height() const { return ( w[1] >> 8 ) & 0xff; }
+  bool     hasLuma() const { return ( w[1] & ( 1u << 16 ) ) != 0; }
+  uint32_t chromaWidth() const { return w[3] & 0xff; }
+  uint32_t chromaHeight() const { return ( w[3] >> 8 ) & 0xff; }
+  bool     hasChroma() const { return ( w[3] & ( 1u << 16 ) ) != 0; }
+  uint32_t cuIndex() const { return w[8]; }
 };
 
 // A CTU: 4 words.
@@ -128,6 +155,10 @@ struct TuRecord
 struct CtuRecord
 {
   uint32_t w[4];
+
+  uint32_t firstCu() const { return w[0]; }
+  uint32_t numCus() const { return w[1] & 0xffff; }
+  uint32_t firstTu() const { return w[3]; }
 };
 
 // Appends the CU and TU records of a CTU, in decoding order, to cus and tus.
@@ -136,29 +167,34 @@ void writeCuRecords( CodingStructure& cs, int ctuRsAddr, std::vector<CuRecord>& 
 void writeCtuRecords( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus,
                       CtuRecord* out );
 
-// A picture's slice table: one word per CTU with the index of its slice, then one record of 64 words per slice
-// (its POC, reference lists and colocated picture). For TMVP, a slice record points to the colocated picture's
-// motion and slice table. sliceTableWords() returns the table's size in words.
+// A picture's slice table: one word per CTU with the index of its slice, then one record of kSliceRecordWords words
+// per slice (its POC, reference lists and colocated picture). For TMVP, a slice record points to the colocated
+// picture's motion and slice table. sliceTableWords() returns the table's size in words.
+static constexpr size_t kSliceRecordWords = 64;
 size_t sliceTableWords( const CodingStructure& cs );
 void   writeSliceTable( const CodingStructure& cs, uint32_t* table );
+// The colocated picture of a slice (TMVP's), or null for an intra slice or a colocated index past the list
+const Picture* colocatedPicture( const Slice& slice );
 
 // The most room each of the front end's lists of a picture can need (in jobs, intra bands and deblocking edges),
-// worked out from its records.
+// worked out from its records. Each count includes kFrontCapacitySpare to spare.
 struct FrontCapacities
 {
   size_t trafo = 0, inter = 0, intra = 0, bands = 0, edges = 0;
 };
+static constexpr size_t kFrontCapacitySpare = 64;
 FrontCapacities frontCapacities( const CodingStructure& cs, const std::vector<std::vector<CuRecord>>& cus, const std::vector<std::vector<TuRecord>>& tus );
 
 // The constant tables that jobs.slang reads (its T_* tables, taken from vvdec): kJobTableWords words.
 static constexpr size_t kJobTableWords = 2048;
 void writeJobTables( uint32_t* out );
-// The per-slice words that jobs.slang reads (its JobSlice), 256 words per slice of the picture:
+// The per-slice words that jobs.slang reads (its JobSlice), kJobSliceWords words per slice of the picture:
 // w0: slice type (2 bits); bit 2: LMCS; bit 3: dependent quantisation; bit 4: explicit scaling lists
 // w[32 + 16 * list + refIdx]: the reference picture's slot in refs (8 bits); bit 8: scaled (RPR); bit 9: the same
 //     size as the picture; bits 10..12: weights present for Y, Cb, Cr
 // w[64 + 3 * (16 * list + refIdx) + component]: weighted prediction's weight (int16_t), offset (int8_t, bits 16..23)
 //     and log2 denominator (from bit 24)
+static constexpr size_t kJobSliceWords = 256;
 void writeJobSlices( const CodingStructure& cs, const RefTable& refs, uint32_t* out );
 
 }   // namespace gpu

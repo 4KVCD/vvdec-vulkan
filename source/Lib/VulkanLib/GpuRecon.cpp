@@ -75,6 +75,9 @@ static constexpr size_t kFrontCounts = 32;
 // The constant tables
 // ====================================================================================================================
 
+// The number of entries of all the transform matrices together, as trafo.slang lays them out.
+static constexpr size_t kTransformMatrixEntries = 8180;
+
 // The transform matrices, in the order trafo.slang expects: DCT-II of 2 to 64 points, then DST-VII and DCT-VIII of
 // 4 to 32 points.
 static Buffer uploadTransformMatrices( Context* ctx )
@@ -89,7 +92,7 @@ static Buffer uploadTransformMatrices( Context* ctx )
   {
     count += size_t( matrix.second ) * matrix.second;
   }
-  CHECK_FATAL( count != 8180, "Vulkan: the transform matrices are not those of shaders/trafo.slang" );
+  CHECK_FATAL( count != kTransformMatrixEntries, "Vulkan: the transform matrices are not those of shaders/trafo.slang" );
   Buffer   buf = ctx->alloc( count * sizeof( int16_t ), MemKind::Upload );
   int16_t* to  = reinterpret_cast<int16_t*>( buf.mapped );
   for( const auto& matrix: matrices )
@@ -189,7 +192,7 @@ static Buffer uploadGeoWeights( Context* ctx )
 GpuRecon::GpuRecon( Context* context, SharedReconBuffers* shared ) : m_ctx( context ), m_shared( shared )
 {
   CHECK_FATAL( !shared, "Vulkan: a GpuRecon without the buffers the decoder's instances share" );
-  // the compute queue's commands: a picture's first part, its rest and its early rows
+  // The compute queue's command buffers: a picture's first part, its rest and its early rows.
   m_pool = m_ctx->createCommandPool( m_ctx->queueFamily() );
   VkCommandBuffer cmds[3];
   m_ctx->allocateCommandBuffers( m_pool, 3, cmds );
@@ -199,7 +202,7 @@ GpuRecon::GpuRecon( Context* context, SharedReconBuffers* shared ) : m_ctx( cont
   m_fence            = m_ctx->createFence();
   m_fenceFirst       = m_ctx->createFence();
 
-  // the front end's commands on an async compute queue
+  // The front end's two command buffers on an async compute queue.
   if( m_ctx->asyncQueue() )
   {
     m_poolFrontEnd = m_ctx->createCommandPool( m_ctx->asyncFamily() );
@@ -212,7 +215,7 @@ GpuRecon::GpuRecon( Context* context, SharedReconBuffers* shared ) : m_ctx( cont
     m_asyncQueue    = m_ctx->takeAsyncQueue();
   }
 
-  // the downloads' commands on the copy queue
+  // The downloads' command buffers on the copy queue.
   if( m_ctx->transferQueue() )
   {
     for( Download& download: m_downloads )
@@ -237,7 +240,7 @@ GpuRecon::GpuRecon( Context* context, SharedReconBuffers* shared ) : m_ctx( cont
     {
       for( Download& download: m_downloads )
       {
-        download.queries = m_ctx->createTimestampQueries( 2 );
+        download.queries = m_ctx->createTimestampQueries( kDownloadMarks );
       }
     }
   }
@@ -270,7 +273,9 @@ GpuRecon::~GpuRecon()
   {
     m_ctx->free( buf );
   }
-  giveFrontEnd();   // (its ranges first: release frees buffers of their own)
+  // Give the front end's shared ranges back first: release() frees the remaining buffers with Context::free, which
+  // refuses ranges.
+  giveFrontEnd();
   m_frontEnd.release( m_ctx );
   m_check.release( m_ctx );
   m_parse.release( m_ctx );
@@ -297,10 +302,11 @@ void GpuRecon::beginCommands( bool resetPool )
     vk.vkCmdWriteTimestamp( m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_queries, m_marks++ );
   }
 
-  // What earlier submissions wrote (the reference pictures) must be visible to this one. Not after the picture's
-  // early rows (resetPool false): their submission began with this barrier, and the rest of the first part neither
-  // reads nor writes what the early rows or the work submitted since write (the early rows' tiles; other pictures'
-  // planes and scratch planes), so the GPU may start it while the early rows are still running (VideoQ 1080p +0.5%).
+  // What earlier submissions wrote, such as the reference pictures, must be visible to these commands. After the
+  // picture's early rows (resetPool false) the barrier is left out: the early rows' submission began with it, and the
+  // rest of the first part neither reads nor writes what the early rows or the work submitted since then write (the
+  // early rows' tiles, other pictures' planes and scratch planes). So the GPU may start the rest of the first part
+  // while the early rows still run (VideoQ 1080p +0.5%).
   if( resetPool )
   {
     fullBarrier();
@@ -311,22 +317,22 @@ void GpuRecon::splitCommands()
 {
   const Api& vk = m_ctx->api();
 
-  // The first part's writes, DMVR's refinements in host memory among them, become visible to the CPU.
+  // The first part's writes, among them DMVR's refinements in host memory, become visible to the CPU.
   hostReadBarrier();
   vk.vkEndCommandBuffer( m_cmd );
-  // Submitted at once: the rest is recorded while it runs.
+  // Submit the first part at once, so that the GPU runs it while the rest is recorded.
   vk.vkResetFences( m_ctx->device(), 1, &m_fenceFirst );
   m_submitted     = std::chrono::steady_clock::now();
   m_firstValue     = m_ctx->submitFirst( m_cmdFirst, m_fenceFirst, m_waitFrontEnd1, m_firstParseWait );
   m_waitFrontEnd1  = VK_NULL_HANDLE;
   m_firstParseWait = 0;
 
-  // The rest, after what the first part wrote
+  // The rest begins with a barrier over what the first part wrote.
   m_cmd = m_cmdRest;
   m_ctx->beginOneTime( m_cmd );
   fullBarrier();
-  // In the GPU profile, the time until the rest begins (other pictures' work may run between the parts) counts on
-  // its own, not as the picture's or its next pass's.
+  // In the GPU profile, the time until the rest begins counts on its own, not as the picture's or as its next pass's:
+  // other pictures' work may run between the two parts.
   if( m_queries )
   {
     mark( "between the parts" );
@@ -338,9 +344,10 @@ int GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
 {
   const Api& vk = m_ctx->api();
 
-  // A picture with stand-ins of its planes (the GPU parsed it) is downloaded only when it is about to be output
-  // (PlanePool::startDownload), from its twins. Otherwise, without a copy queue, the download ends the rest's
-  // commands. The rest's writes become visible to the CPU (and to the copies).
+  // A picture with stand-ins of its planes (the GPU parsed it) is downloaded from its twins only when it is about to
+  // be output (PlanePool::startDownload). Any other picture is downloaded now: without a copy queue, the download's
+  // copies end the rest's commands; with one, they are a submission of their own. Either way the rest's writes
+  // become visible to the CPU and to the copies.
   const bool downloads = hostPictureAddresses( pic, nullptr, nullptr );
   if( downloads && !m_ctx->transferQueue() )
   {
@@ -371,8 +378,7 @@ int GpuRecon::submitPicture( const PelStorage& pic, bool waitFirst )
 
 void GpuRecon::recordDownload( const PelStorage& pic, int turn )
 {
-  // The copies of the picture's planes on the GPU to host memory, in the commands of the download whose turn it is
-  // (the other download may still be running).
+  // The copies go into the commands of the download whose turn it is; the other download may still be running.
   const Api& vk       = m_ctx->api();
   Download&  download = m_downloads[turn];
   CHECK_FATAL( download.pending.load( std::memory_order_acquire ), "Vulkan: a download not waited for (endDownload) before its commands are reused" );
@@ -380,7 +386,7 @@ void GpuRecon::recordDownload( const PelStorage& pic, int turn )
   m_ctx->beginOneTime( download.cmd );
   if( download.queries )
   {
-    vk.vkCmdResetQueryPool( download.cmd, download.queries, 0, 2 );
+    vk.vkCmdResetQueryPool( download.cmd, download.queries, 0, kDownloadMarks );
     vk.vkCmdWriteTimestamp( download.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, download.queries, 0 );
   }
   for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
@@ -404,7 +410,9 @@ void GpuRecon::endCompute()
 {
   m_ctx->waitForFence( m_fence, "the GPU" );
   readTimestamps( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - m_submitted ).count() );
-  giveFrontEnd();   // (the rest done: so are the front end's parts, which the picture's parts wait for)
+  // The rest is done, and so are the front end's parts, which the picture's parts wait for: the front end's ranges
+  // are free.
+  giveFrontEnd();
 }
 
 void GpuRecon::endDownload( int turn )
@@ -413,15 +421,13 @@ void GpuRecon::endDownload( int turn )
   {
     return;
   }
-  const Api& vk       = m_ctx->api();
-  Download&  download = m_downloads[turn];
+  Download& download = m_downloads[turn];
   m_ctx->waitForFence( download.fence, "the GPU" );
   if( download.queries )
   {
-    uint64_t stamps[2];
-    vk.vkGetQueryPoolResults( m_ctx->device(), download.queries, 0, 2, sizeof( stamps ), stamps, sizeof( uint64_t ),
-                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT );
-    m_ctx->addTime( "download (copies)", double( stamps[1] - stamps[0] ) * m_ctx->timestampPeriod() * 1e-6 );
+    uint64_t stamps[kDownloadMarks];
+    getTimestamps( download.queries, kDownloadMarks, stamps );
+    m_ctx->addTime( "download (copies)", ticksToMs( stamps[1] - stamps[0] ) );
   }
   download.pending.store( false, std::memory_order_release );
 }
@@ -430,7 +436,7 @@ void GpuRecon::mark( const char* label )
 {
   if( m_cmd == m_cmdFrontEnd1 || m_cmd == m_cmdFrontEnd2 )
   {
-    return;   // the async queue's time overlaps the compute queue's: not counted
+    return;   // the async queue's time overlaps the compute queue's, so it is not counted
   }
   if( m_cmd == m_cmdEarlyRows )
   {
@@ -448,18 +454,26 @@ void GpuRecon::mark( const char* label )
   }
 }
 
+void GpuRecon::getTimestamps( VkQueryPool queries, uint32_t count, uint64_t* stamps ) const
+{
+  m_ctx->api().vkGetQueryPoolResults( m_ctx->device(), queries, 0, count, count * sizeof( uint64_t ), stamps, sizeof( uint64_t ),
+                                      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT );
+}
+
+double GpuRecon::ticksToMs( uint64_t ticks ) const
+{
+  return double( ticks ) * ( m_ctx->timestampPeriod() * 1e-6 );
+}
+
 void GpuRecon::readTimestamps( double waited )
 {
-  const Api& vk = m_ctx->api();
   if( !m_queries || m_marks <= 1 )
   {
     return;
   }
   m_ctx->addTime( "wait (CPU)", waited );
   uint64_t stamps[kMaxMarks];
-  vk.vkGetQueryPoolResults( m_ctx->device(), m_queries, 0, m_marks, sizeof( stamps ), stamps, sizeof( uint64_t ),
-                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT );
-  const double toMs = m_ctx->timestampPeriod() * 1e-6;
+  getTimestamps( m_queries, m_marks, stamps );
   // The early rows' passes count with the rest's passes of the same name: a picture's trafo or inter time is its
   // early rows' plus its rest's.
   double   earlyRows[kEarlyRowsMarks] = {};
@@ -467,17 +481,16 @@ void GpuRecon::readTimestamps( double waited )
   if( m_earlyRowsQueries && m_earlyRowsMarks > 1 )
   {
     uint64_t earlyStamps[kEarlyRowsMarks];
-    vk.vkGetQueryPoolResults( m_ctx->device(), m_earlyRowsQueries, 0, m_earlyRowsMarks, sizeof( earlyStamps ), earlyStamps, sizeof( uint64_t ),
-                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT );
+    getTimestamps( m_earlyRowsQueries, m_earlyRowsMarks, earlyStamps );
     for( uint32_t j = 1; j < m_earlyRowsMarks; j++ )
     {
-      earlyRows[j] = double( earlyStamps[j] - earlyStamps[j - 1] ) * toMs;
+      earlyRows[j] = ticksToMs( earlyStamps[j] - earlyStamps[j - 1] );
     }
     earlyRowsSpan = earlyStamps[m_earlyRowsMarks - 1] - earlyStamps[0];
   }
   for( uint32_t i = 1; i < m_marks; i++ )
   {
-    double time = double( stamps[i] - stamps[i - 1] ) * toMs;
+    double time = ticksToMs( stamps[i] - stamps[i - 1] );
     for( uint32_t j = 1; j < m_earlyRowsMarks; j++ )
     {
       if( earlyRows[j] > 0 && strcmp( m_earlyRowsLabels[j], m_labels[i] ) == 0 )
@@ -496,7 +509,7 @@ void GpuRecon::readTimestamps( double waited )
     }
   }
   const uint64_t between = m_gapMark > 0 ? stamps[m_gapMark] - stamps[m_gapMark - 1] : 0;
-  m_ctx->addTime( "submission (GPU)", double( stamps[m_marks - 1] - stamps[0] - between + earlyRowsSpan ) * toMs );
+  m_ctx->addTime( "submission (GPU)", ticksToMs( stamps[m_marks - 1] - stamps[0] - between + earlyRowsSpan ) );
 }
 
 // --- Barriers ---
@@ -580,7 +593,8 @@ VkDeviceAddress GpuRecon::frontEndCount( FrontPass pass ) const
 
 GpuRecon::Planes GpuRecon::hostPlanes( const PelStorage& pic )
 {
-  // (none for a picture with stand-ins of its planes: the GPU parsed it, so no pass reads its planes in host memory)
+  // A picture with stand-ins of its planes has no planes in host memory: the GPU parsed it, so no pass reads them.
+  // Its Planes stay all 0 then.
   Planes planes{};
   if( !hostPictureAddresses( pic, planes.addr, planes.stride ) )
   {
@@ -644,11 +658,34 @@ struct RefEntry
 };
 static_assert( sizeof( RefEntry ) == 64, "the reference table laid out differently from shaders/inter.slang's" );
 
+// RPR: the scaling ratio of refPic as the picture's slices reference it, horizontally and vertically (1 <<
+// SCALE_RATIO_BITS when no slice references it). The ratio is the same in every slice of the picture; the last
+// reference found wins.
+static std::pair<int, int> referenceScalingRatio( const CodingStructure& cs, const Picture* refPic )
+{
+  std::pair<int, int> ratio( 1 << SCALE_RATIO_BITS, 1 << SCALE_RATIO_BITS );
+  for( const Slice* slice: cs.picture->slices )
+  {
+    for( int list = 0; list < 2; list++ )
+    {
+      for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ); refIdx++ )
+      {
+        if( slice->getRefPic( RefPicList( list ), refIdx ) == refPic )
+        {
+          ratio.first  = slice->getScalingRatio( RefPicList( list ), refIdx ).first;
+          ratio.second = slice->getScalingRatio( RefPicList( list ), refIdx ).second;
+        }
+      }
+    }
+  }
+  return ratio;
+}
+
 void GpuRecon::writeRefTable( const CodingStructure& cs, const PictureJobs& jobs, const PelStorage& pic, std::vector<const Picture*>& uploads )
 {
-  // A reference picture the GPU parsed gets its planes for its output, and gives them back, on other threads
-  // (PlanePool), which moves its twins from one set of plane records to the other. Its records are read under the
-  // pool's lock, or a read could find them half swapped: a wrong address for the GPU, or a layout check failing.
+  // A reference picture that the GPU parsed gets its planes for its output, and gives them back, on other threads
+  // (PlanePool), which moves its twins from one set of plane records to the other. Read its records under the pool's
+  // lock: otherwise a read could find them half swapped, which gives the GPU a wrong address or fails a layout check.
   std::unique_lock<std::mutex> lock;
   if( jobs.planes )
   {
@@ -656,11 +693,7 @@ void GpuRecon::writeRefTable( const CodingStructure& cs, const PictureJobs& jobs
   }
   const RefTable& refs = *jobs.refs;
   const size_t    size = std::max<size_t>( refs.pictures().size(), 1 ) * sizeof( RefEntry );
-  if( m_refs.size < size )
-  {
-    m_ctx->free( m_refs );
-    m_refs = m_ctx->alloc( std::max<size_t>( size, 1024 ), MemKind::Upload );
-  }
+  replaceIfSmaller( m_refs, size, std::max<size_t>( size, kMinRefTableBytes ), MemKind::Upload );
   RefEntry* table = reinterpret_cast<RefEntry*>( m_refs.mapped );
   for( const void* ref: refs.pictures() )
   {
@@ -672,24 +705,11 @@ void GpuRecon::writeRefTable( const CodingStructure& cs, const PictureJobs& jobs
     entry.cr      = planes.addr[COMPONENT_Cr];
     entry.size    = uint32_t( refPic->lwidth() ) | uint32_t( refPic->lheight() ) << 16;
     entry.strides = uint32_t( planes.stride[COMPONENT_Y] ) | uint32_t( planes.stride[COMPONENT_Cb] ) << 16;
-    // RPR: the scaling ratio of the slices' reference (the same for every slice of the picture), and the
-    // reference's scaling window (xPredInterBlkRPR)
-    entry.scaled = refPic->isRefScaled( cs.pps.get() ) ? 1 : 0;
-    entry.ratioX = entry.ratioY = 1 << SCALE_RATIO_BITS;
-    for( const Slice* slice: cs.picture->slices )
-    {
-      for( int list = 0; list < 2; list++ )
-      {
-        for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ); refIdx++ )
-        {
-          if( slice->getRefPic( RefPicList( list ), refIdx ) == refPic )
-          {
-            entry.ratioX = slice->getScalingRatio( RefPicList( list ), refIdx ).first;
-            entry.ratioY = slice->getScalingRatio( RefPicList( list ), refIdx ).second;
-          }
-        }
-      }
-    }
+    // RPR: the scaling ratio of the slices' reference, and the reference's scaling window (xPredInterBlkRPR).
+    entry.scaled                    = refPic->isRefScaled( cs.pps.get() ) ? 1 : 0;
+    const std::pair<int, int> ratio = referenceScalingRatio( cs, refPic );
+    entry.ratioX                    = ratio.first;
+    entry.ratioY                    = ratio.second;
     const Window& window = refPic->slices[0]->getPPS()->getScalingWindow();
     entry.winLeft        = window.getWindowLeftOffset() * SPS::getWinUnitX( cs.sps->getChromaFormatIdc() );
     entry.winTop         = window.getWindowTopOffset() * SPS::getWinUnitY( cs.sps->getChromaFormatIdc() );
@@ -703,57 +723,64 @@ void GpuRecon::writeRefTable( const CodingStructure& cs, const PictureJobs& jobs
   }
 }
 
+bool subpicturesTreatedAsPictures( const PPS& pps )
+{
+  bool any = false;
+  for( int i = 0; pps.getNumSubPics() > 1 && i < pps.getNumSubPics(); i++ )
+  {
+    any |= pps.getSubPic( i ).getTreatedAsPicFlag();
+  }
+  return any;
+}
+
+Position ctuPosition( const PreCalcValues& pcv, unsigned ctu )
+{
+  return Position( ( ctu % pcv.widthInCtus ) * pcv.maxCUWidth, ( ctu / pcv.widthInCtus ) * pcv.maxCUHeight );
+}
+
 VkDeviceAddress GpuRecon::subpicRects( const CodingStructure& cs )
 {
   const PPS&           pps = *cs.pps;
   const PreCalcValues& pcv = *cs.pcv;
-  bool                 on  = false;
-  for( int i = 0; pps.getNumSubPics() > 1 && i < pps.getNumSubPics(); i++ )
-  {
-    on |= pps.getSubPic( i ).getTreatedAsPicFlag();
-  }
-  if( !on )
+  if( !subpicturesTreatedAsPictures( pps ) )
   {
     return 0;
   }
+  // Per CTU, 4 uint16_t: left, top, right and bottom.
   const size_t size = alignUp( size_t( pcv.sizeInCtus ) * 4 * sizeof( uint16_t ), 256 );
-  if( m_subpics.size < size )
-  {
-    m_ctx->free( m_subpics );
-    m_subpics = m_ctx->alloc( size, MemKind::Upload );
-  }
+  replaceIfSmaller( m_subpics, size, size, MemKind::Upload );
   uint16_t* rects = reinterpret_cast<uint16_t*>( m_subpics.mapped );
   for( unsigned ctu = 0; ctu < pcv.sizeInCtus; ctu++ )
   {
-    const Position pos( ( ctu % pcv.widthInCtus ) * pcv.maxCUWidth, ( ctu / pcv.widthInCtus ) * pcv.maxCUHeight );
-    const SubPic&  sub   = pps.getSubPicFromPos( pos );
-    const bool     asPic = sub.getTreatedAsPicFlag();
-    rects[ctu * 4]       = uint16_t( asPic ? sub.getSubPicLeft() : 0 );
-    rects[ctu * 4 + 1]   = uint16_t( asPic ? sub.getSubPicTop() : 0 );
-    rects[ctu * 4 + 2]   = uint16_t( asPic ? sub.getSubPicRight() : pcv.lumaWidth - 1 );
-    rects[ctu * 4 + 3]   = uint16_t( asPic ? sub.getSubPicBottom() : pcv.lumaHeight - 1 );
+    const SubPic& sub   = pps.getSubPicFromPos( ctuPosition( pcv, ctu ) );
+    const bool    asPic = sub.getTreatedAsPicFlag();
+    rects[ctu * 4]      = uint16_t( asPic ? sub.getSubPicLeft() : 0 );
+    rects[ctu * 4 + 1]  = uint16_t( asPic ? sub.getSubPicTop() : 0 );
+    rects[ctu * 4 + 2]  = uint16_t( asPic ? sub.getSubPicRight() : pcv.lumaWidth - 1 );
+    rects[ctu * 4 + 3]  = uint16_t( asPic ? sub.getSubPicBottom() : pcv.lumaHeight - 1 );
   }
   return m_subpics.addr;
 }
 
+void GpuRecon::replaceIfSmaller( Buffer& buf, size_t needed, size_t allocated, MemKind kind )
+{
+  if( buf.size < needed )
+  {
+    m_ctx->free( buf );
+    buf = m_ctx->alloc( allocated, kind );
+  }
+}
+
 uint8_t* GpuRecon::params( size_t size )
 {
-  if( m_params.size < size )
-  {
-    m_ctx->free( m_params );
-    m_params = m_ctx->alloc( size, MemKind::Upload );
-  }
+  replaceIfSmaller( m_params, size, size, MemKind::Upload );
   return m_params.mapped;
 }
 
 Mv* GpuRecon::dmvrMvCache( size_t count )
 {
   const size_t size = count * sizeof( Mv );
-  if( m_dmvr.size < size )
-  {
-    m_ctx->free( m_dmvr );
-    m_dmvr = m_ctx->alloc( size, MemKind::HostCached );
-  }
+  replaceIfSmaller( m_dmvr, size, size, MemKind::HostCached );
   return reinterpret_cast<Mv*>( m_dmvr.mapped );
 }
 
@@ -763,39 +790,42 @@ Mv* GpuRecon::dmvrMvCache( size_t count )
 
 void GpuRecon::setPicture( const PelStorage& pic, const LmcsTables* tables, bool defer, const int* scalingMatrices, size_t scalingCount )
 {
-  // (the instance's previous picture is done: its work no longer reads these, nor its front end's ranges, should
-  // endCompute not have given them back)
+  // The instance's previous picture is done, so its work no longer reads the buffers rewritten here. Its front end's
+  // ranges are given back here too, in case endCompute did not run for it.
   giveFrontEnd();
   m_scalingOn = scalingMatrices != nullptr;
   if( scalingMatrices )
   {
-    // the matrices' factors, a byte each (the scaling lists' coefficients are 1 .. 255; 0 where a matrix has none)
-    if( m_scaling.size < scalingCount )
-    {
-      m_ctx->free( m_scaling );
-      m_scaling = m_ctx->alloc( alignUp( scalingCount, 256 ), MemKind::Upload );
-    }
-    for( size_t i = 0; i < scalingCount; i++ )
-    {
-      CHECK( scalingMatrices[i] < 0 || scalingMatrices[i] > 255, "a scaling list's coefficient out of range" );
-      m_scaling.mapped[i] = uint8_t( scalingMatrices[i] );
-    }
+    uploadScalingMatrices( scalingMatrices, scalingCount );
   }
   m_lmcsOn = tables != nullptr;
   if( tables )
   {
-    m_lmcsCount       = tables->fwd.size();
-    const size_t size = m_lmcsCount * ( 2 * sizeof( int16_t ) + sizeof( int32_t ) );
-    if( m_lmcs.size < size )
-    {
-      m_ctx->free( m_lmcs );
-      m_lmcs = m_ctx->alloc( size, MemKind::Upload );
-    }
-    memcpy( m_lmcs.mapped, tables->fwd.data(), m_lmcsCount * sizeof( int16_t ) );
-    memcpy( m_lmcs.mapped + m_lmcsCount * sizeof( int16_t ), tables->inv.data(), m_lmcsCount * sizeof( int16_t ) );
-    memcpy( m_lmcs.mapped + m_lmcsCount * 2 * sizeof( int16_t ), tables->chromaScale.data(), m_lmcsCount * sizeof( int32_t ) );
+    uploadLmcsTables( *tables );
   }
-  m_deferOn = defer;   // (bindDeferPlanes gives them room when the picture's work is recorded)
+  m_deferOn = defer;   // bindDeferPlanes gives the planes room when the picture's work is recorded
+}
+
+void GpuRecon::uploadScalingMatrices( const int* matrices, size_t count )
+{
+  // The matrices' factors, a byte each: the scaling lists' coefficients are 1 .. 255, and 0 where a matrix has none.
+  replaceIfSmaller( m_scaling, count, alignUp( count, 256 ), MemKind::Upload );
+  for( size_t i = 0; i < count; i++ )
+  {
+    CHECK( matrices[i] < 0 || matrices[i] > 255, "a scaling list's coefficient out of range" );
+    m_scaling.mapped[i] = uint8_t( matrices[i] );
+  }
+}
+
+void GpuRecon::uploadLmcsTables( const LmcsTables& tables )
+{
+  // The forward and the inverse luma mapping (int16_t each), then the chroma scales (int32_t), one after the other.
+  m_lmcsCount       = tables.fwd.size();
+  const size_t size = m_lmcsCount * ( 2 * sizeof( int16_t ) + sizeof( int32_t ) );
+  replaceIfSmaller( m_lmcs, size, size, MemKind::Upload );
+  memcpy( m_lmcs.mapped, tables.fwd.data(), m_lmcsCount * sizeof( int16_t ) );
+  memcpy( m_lmcs.mapped + m_lmcsCount * sizeof( int16_t ), tables.inv.data(), m_lmcsCount * sizeof( int16_t ) );
+  memcpy( m_lmcs.mapped + m_lmcsCount * 2 * sizeof( int16_t ), tables.chromaScale.data(), m_lmcsCount * sizeof( int32_t ) );
 }
 
 void GpuRecon::bindDeferPlanes( const PelStorage& pic )
@@ -804,8 +834,8 @@ void GpuRecon::bindDeferPlanes( const PelStorage& pic )
   {
     return;
   }
-  // the planes inter prediction keeps predictions aside in, laid out as the picture's planes (from their first
-  // sample)
+  // The planes in which inter prediction keeps predictions aside, laid out as the picture's planes from their first
+  // sample on.
   size_t size = 0;
   size_t at[MAX_NUM_COMPONENT];
   for( size_t comp = 0; comp < pic.bufs.size(); comp++ )
@@ -815,7 +845,7 @@ void GpuRecon::bindDeferPlanes( const PelStorage& pic )
   }
   if( m_defer.size < size )
   {
-    // (the planes may be the instances' shared ones, which another instance's picture queued before may still use)
+    // The planes may be the instances' shared ones, which the work another instance queued before may still use.
     m_ctx->freeAfterQueued( m_defer );
     m_defer = m_ctx->alloc( size, MemKind::Device );
   }
@@ -839,7 +869,7 @@ GpuRecon::SharedDeferTurn::~SharedDeferTurn()
 {
   if( m_shared )
   {
-    swapBuffers();   // (the instance's own back, before the lock goes)
+    swapBuffers();   // the instance's own planes come back before the lock is released
   }
 }
 
@@ -855,8 +885,8 @@ SharedReconBuffers::~SharedReconBuffers()
 
 void GpuRecon::prepareFilters( CodingStructure& cs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf )
 {
-  // the parameters, one after the other: deblocking's, ALF's, SAO's, then LMCS's (per CTU, whether its slice uses
-  // LMCS: rspCtuBcw maps its luma back)
+  // The parameters, one after the other: deblocking's, ALF's, SAO's, then LMCS's. LMCS's are a byte per CTU that
+  // says whether the CTU's slice uses LMCS, so that rspCtuBcw maps its luma back.
   m_prepared.dbSize   = deblockParamSize( cs );
   m_prepared.alfSize  = alf ? alfParamSize( cs ) : 0;
   m_prepared.saoSize  = sao ? saoParamSize( cs ) : 0;
@@ -884,15 +914,16 @@ void GpuRecon::startEarlyRows( CodingStructure& cs, const PictureJobs& jobs, siz
   {
     writeRefTable( cs, jobs, pic, uploads );
   }
-  // the early rows come only with the CPU front end, which shares nothing (their work comes before startPicture's)
+  // The early rows come only with the CPU front end, which shares no buffers with the other instances. (Shared
+  // buffers are held from startPicture on, and the early rows' work comes before it.)
   CHECK_FATAL( jobs.shared, "Vulkan: the early rows of a picture with shared buffers" );
   m_useFrontEnd   = false;
   m_frontEndTrafo = false;
   m_frontEndInter = false;
   bindDeferPlanes( pic );
 
-  // The early rows' commands, after what earlier submissions wrote. The pool is reset: the instance's previous
-  // picture is done.
+  // The early rows' commands begin with a barrier over what earlier submissions wrote. The pool can be reset: the
+  // instance's previous picture is done.
   m_cmd = m_cmdEarlyRows;
   vk.vkResetCommandPool( m_ctx->device(), m_pool, 0 );
   m_ctx->beginOneTime( m_cmd );
@@ -916,7 +947,8 @@ void GpuRecon::startEarlyRows( CodingStructure& cs, const PictureJobs& jobs, siz
     recordInter( cs, *jobs.inter, 0, ctus, m_cpuJobs.earlyInter, planes );
   }
   vk.vkEndCommandBuffer( m_cmd );
-  // Submitted now. The first part's commands, submitted after these, begin with a barrier over them.
+  // Submit the early rows now. The rest of the picture's first part, submitted later, runs without a barrier over
+  // them (see beginCommands); the picture's rest begins with one (splitCommands).
   m_ctx->submitFirst( m_cmd, VK_NULL_HANDLE );
   for( const Picture* refPic: uploads )
   {
@@ -938,11 +970,11 @@ void GpuRecon::takePictureSettings( CodingStructure& cs, const PictureJobs& jobs
   bindDeferPlanes( pic );
 }
 
-// The GPU front end runs on the async compute queue, beside the work submitted before: its passes are latency-bound (a
-// few waves each, the motion derivation one per CTU row), and the reconstruction of the pictures before keeps the GPU
-// busy meanwhile. Part 1 of a picture the GPU parsed waits there for the picture's parsed records
-// (recordFrontEndAsync). Otherwise the first part holds the front end (and for a picture the GPU parsed, waits for its
-// records itself).
+// The GPU front end runs on an async compute queue, beside the work submitted before. Its passes are latency-bound (a
+// few waves each, and the motion derivation one per CTU row), and the reconstruction of the pictures before keeps the
+// GPU busy meanwhile. There, the front end's part 1 waits for the picture's parsed records when the GPU parsed the
+// picture (recordFrontEndAsync). When the front end does not run on the async queue, the picture's first part holds
+// it, and for a picture the GPU parsed, the first part itself waits for the parsed records.
 bool GpuRecon::startFrontEnd( const CodingStructure& cs, const PictureJobs& jobs )
 {
   const bool async = jobs.useFrontEnd && jobs.cus && m_cmdFrontEnd1 != VK_NULL_HANDLE;
@@ -974,8 +1006,8 @@ void GpuRecon::recordRest( const CodingStructure& cs, const PictureJobs& jobs, P
   computeToTransferBarrier();
   if( inScratch )
   {
-    // The luma result is in the scratch plane: it becomes the picture's luma twin, and its former twin the scratch
-    // plane (they have the same size). (The chroma result is in the twin: recordAlf.)
+    // The luma result is in the scratch plane: it becomes the picture's luma twin, and the former twin becomes the
+    // scratch plane (they have the same size). The chroma result is already in the twin (recordAlfChroma).
     std::swap( planeTwin( pic, COMPONENT_Y ), m_scratch[COMPONENT_Y] );
   }
 }
@@ -983,7 +1015,8 @@ void GpuRecon::recordRest( const CodingStructure& cs, const PictureJobs& jobs, P
 int GpuRecon::startPicture( CodingStructure& cs, const PictureJobs& jobs, bool deblock, SampleAdaptiveOffset* sao, const AdaptiveLoopFilter* alf,
                             PelStorage& pic, bool waitFirst )
 {
-  // With the GPU's parse, the shared deferred-prediction planes, held until the picture's rest is submitted (the return)
+  // With the GPU's parse, the instance holds the shared deferred-prediction planes until the picture's rest is
+  // submitted, that is until this function returns.
   const SharedDeferTurn deferTurn( *this, jobs.shared );
   takePictureSettings( cs, jobs, deblock, sao, alf, pic );
 
@@ -1050,7 +1083,8 @@ void GpuRecon::recordFirstPart( const CodingStructure& cs, const PictureJobs& jo
     recordTrafo( cs, jobs.useFrontEnd ? noTrafo : *jobs.trafo, jobs.earlyCtus, jobs.useFrontEnd ? 0 : jobs.trafo->size(), m_cpuJobs.trafo,
                  hostPlanes( pic ), planes );
   };
-  // With the front end here, the residuals go to the GPU beside its last passes (recordFrontEnd's beside)
+  // When the front end is recorded here rather than on the async queue, the residuals are recorded beside its last
+  // passes, without a barrier between them (recordFrontEnd's beside).
   bool trafoDone = false;
   if( ( jobs.cus || jobs.parsed ) && !frontEndAsync )
   {

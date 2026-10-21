@@ -138,8 +138,8 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
                             const Planes& levels, const Planes& planes )
 {
   CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
-  // (the levels in the picture in host memory, when the CPU parsed it: none for a picture the GPU parsed, whose levels
-  // are in parsedLevels)
+  // levels is the picture in host memory when the CPU parsed it. A picture that the GPU parsed has none there: its
+  // levels are in parsedLevels.
   CHECK( levels.addr[COMPONENT_Y] && ( levels.stride[COMPONENT_Y] != planes.stride[COMPONENT_Y] || levels.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cb] ),
          "the levels laid out differently" );
   // Without the front end, the CTU tasks' jobs are uploaded.
@@ -154,14 +154,14 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   }
 
   TrafoPush push{};
-  push.jobs         = m_useFrontEnd ? m_frontEnd.jobs[0].addr : buf.addr;
+  push.jobs         = m_useFrontEnd ? m_frontEnd.jobs[kTrafoJobs].addr : buf.addr;
   push.plane0       = planes.addr[COMPONENT_Y];
   push.plane1       = planes.addr[COMPONENT_Cb];
   push.plane2       = planes.addr[COMPONENT_Cr];
   push.levels0      = levels.addr[COMPONENT_Y];
   push.levels1      = levels.addr[COMPONENT_Cb];
   push.levels2      = levels.addr[COMPONENT_Cr];
-  push.parsedLevels = m_frontEnd.recordLevels;   // (the GPU parse's: its jobs say where in them)
+  push.parsedLevels = m_frontEnd.recordLevels;   // the GPU parse's levels; its jobs say where in them
   push.matrices     = m_tables.transform.addr;
   push.lfnst        = m_tables.lfnst.addr;
   push.scaling      = m_scalingOn ? m_scaling.addr : 0;
@@ -171,7 +171,7 @@ void GpuRecon::recordTrafo( const CodingStructure& cs, const std::vector<std::ve
   push.countAt      = frontEndCount( kPassTrafo );
   push.bitDepth     = cs.sps->getBitDepth();
 
-  // one workgroup per job
+  // One workgroup per job
   bind( kShader_trafo );
   pushConstants( push );
   if( m_useFrontEnd )
@@ -225,14 +225,14 @@ GpuRecon::InterCounts GpuRecon::uploadInterJobs( const std::vector<std::vector<I
     return counts;
   }
   ensureJobUpload( m_ctx, buf, total * sizeof( InterJob ) );
-  // The BDOF tiles go after the others, then the affine ones (two jobs each), for dispatches of the inter_bdof and
-  // inter_affine variants of their own: their code would slow the others down. (The front end lays its jobs out the
-  // same way.)
+  // The BDOF tiles go after the others, then the affine ones (two jobs each), so that the inter_bdof and inter_affine
+  // variants get dispatches of their own: their code would slow the other tiles down. The front end lays its jobs out
+  // the same way.
   for( size_t ctu = ctuBegin; ctu < ctuEnd; ctu++ )
   {
     for( size_t i = 0; i < jobs[ctu].size(); i++ )
     {
-      const uint32_t flags = jobs[ctu][i].w[1] >> 16;
+      const uint32_t flags = jobs[ctu][i].flags();
       counts.bdof   += flags & InterJob::kBdof ? 1 : 0;
       counts.affine += flags & InterJob::kAffine ? 2 : 0;
       i             += flags & InterJob::kAffine ? 1 : 0;
@@ -252,7 +252,7 @@ GpuRecon::InterCounts GpuRecon::uploadInterJobs( const std::vector<std::vector<I
     }
     for( size_t i = 0; i < jobs[ctu].size(); i++ )
     {
-      const uint32_t flags = jobs[ctu][i].w[1] >> 16;
+      const uint32_t flags = jobs[ctu][i].flags();
       if( flags & InterJob::kAffine )
       {
         *affine++ = jobs[ctu][i];
@@ -296,11 +296,13 @@ static bool anyReferenceScaled( const CodingStructure& cs )
 // bounds).
 static bool planesSuitTiles( const PelStorage& pic, const VkDeviceAddress addr[MAX_NUM_COMPONENT] )
 {
+  static constexpr VkDeviceSize kRowAlignment = 16;   // bytes
+  static constexpr VkDeviceSize kMinMargin    = 16;   // samples
   for( int comp = 0; comp < (int) pic.bufs.size(); comp++ )
   {
     const VkDeviceSize left  = gpuLayout( pic, ComponentID( comp ) ).origin / sizeof( Pel );
     const VkDeviceSize right = VkDeviceSize( pic.bufs[comp].stride ) - left - pic.bufs[comp].width;
-    if( addr[comp] % 16 != 0 || pic.bufs[comp].stride * sizeof( Pel ) % 16 != 0 || left < 16 || right < 16 )
+    if( addr[comp] % kRowAlignment != 0 || pic.bufs[comp].stride * sizeof( Pel ) % kRowAlignment != 0 || left < kMinMargin || right < kMinMargin )
     {
       return false;
     }
@@ -320,17 +322,17 @@ void GpuRecon::interPush( const CodingStructure& cs, const Planes& planes, Inter
   push.dst0 = planes.addr[COMPONENT_Y];
   push.dst1 = planes.addr[COMPONENT_Cb];
   push.dst2 = planes.addr[COMPONENT_Cr];
-  // DMVR's refinements for vvdec's DMVR MV cache. With the GPU front end nothing reads them, as the GPU stores the
-  // refined motion for TMVP itself (colMotion, below), so the address is 0 and the shader skips those writes to host
-  // memory.
+  // DMVR's refinements for vvdec's DMVR MV cache. With the GPU front end nothing reads them, because the GPU stores
+  // the refined motion for TMVP itself (colMotion, below). The address is 0 then, and the shader skips those writes to
+  // host memory.
   push.dmvr = m_useFrontEnd ? 0 : m_dmvr.addr;
-  // DMVR's refinements go into the picture's colocated motion (for TMVP), in memory from the GPU's picture allocator
-  // (Picture::gpuMemory).
+  // DMVR's refinements also go into the picture's colocated motion for TMVP, which is in memory from the GPU's picture
+  // allocator (Picture::gpuMemory).
   CHECK_FATAL( !cs.m_colMiAllocation, "Vulkan: the colocated motion out of the GPU's reach" );
   push.colMotion = static_cast<HostPlane*>( cs.m_colMiAllocation )->host.addr;
   if( m_lmcsOn )
   {
-    push.lmcsFwd = m_lmcs.addr;
+    push.lmcsFwd = lmcsForward();
   }
   push.defer0      = m_deferPlanes.addr[COMPONENT_Y];
   push.defer1      = m_deferPlanes.addr[COMPONENT_Cb];
@@ -346,16 +348,13 @@ void GpuRecon::interPush( const CodingStructure& cs, const Planes& planes, Inter
   push.ctuSize     = pcv.maxCUWidth;
   push.bitDepth    = cs.sps->getBitDepth();
   push.numComp     = int32_t( getNumberValidComponents( pcv.chrFormat ) );
-  push.scaleX      = push.numComp > 1 ? getComponentScaleX( COMPONENT_Cb, pcv.chrFormat ) : 0;
-  push.scaleY      = push.numComp > 1 ? getComponentScaleY( COMPONENT_Cb, pcv.chrFormat ) : 0;
+  push.scaleX      = chromaShiftX( pcv.chrFormat );
+  push.scaleY      = chromaShiftY( pcv.chrFormat );
   push.wide        = planesSuitTiles( cs.picture->m_bufs[PIC_RECONSTRUCTION], planes.addr ) ? 1 : 0;
   push.wrapSps     = cs.sps->getUseWrapAround() ? 1 : 0;
   push.wrapPps     = pps.getUseWrapAround() ? 1 : 0;
   push.wrapOffset  = pps.getUseWrapAround() ? pps.getWrapAroundOffset() : 0;
-  for( int i = 0; pps.getNumSubPics() > 1 && i < pps.getNumSubPics(); i++ )
-  {
-    push.subpicOn |= pps.getSubPic( i ).getTreatedAsPicFlag() ? 1 : 0;
-  }
+  push.subpicOn    = subpicturesTreatedAsPictures( pps ) ? 1 : 0;
   // RPR: the picture's scaling window and its chroma's siting
   const Window& window = pps.getScalingWindow();
   push.curWinLeft      = window.getWindowLeftOffset() * SPS::getWinUnitX( cs.sps->getChromaFormatIdc() );
@@ -381,7 +380,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   interPush( cs, planes, push );
   if( push.subpicOn )
   {
-    // each CTU's rectangle (its subpicture's or the picture's), written with the picture's first jobs
+    // Each CTU's rectangle (its subpicture's or the picture's), written along with the picture's first jobs
     push.subpics = ctuBegin == 0 ? subpicRects( cs ) : m_subpics.addr;
   }
 
@@ -394,8 +393,8 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   const int* shaders  = kInterShaders[constant ? 1 : 0];
   if( m_useFrontEnd )
   {
-    // each set from its first job, with its count on the GPU
-    push.jobs  = m_frontEnd.jobs[1].addr;
+    // Each set from its first job, with its count on the GPU
+    push.jobs  = m_frontEnd.jobs[kInterJobs].addr;
     push.count = -1;
     for( int set = 0; set < kInterSets; set++ )
     {
@@ -408,7 +407,7 @@ void GpuRecon::recordInter( const CodingStructure& cs, const std::vector<std::ve
   }
   else
   {
-    // one workgroup per tile, the sets one after another in buf
+    // One workgroup per tile; the sets lie one after another in buf.
     const size_t setJobs[kInterSets] = { counts.regular, counts.bdof, counts.affine };
     push.jobs                        = buf.addr;
     for( int set = 0; set < kInterSets; set++ )
@@ -439,10 +438,12 @@ struct IntraPush
   VkDeviceAddress countAt;
 };
 static_assert( sizeof( IntraPush ) == 136, "IntraPush: the layout of intra.slang's Params" );
+// The words of intra.slang's sync buffer (the counts of the jobs taken and done come first)
+static constexpr size_t kIntraSyncWords = 64;
 
 size_t GpuRecon::uploadIntraJobs( const std::vector<std::vector<IntraJob>>& jobs )
 {
-  // The jobs, wave by wave, with a big block cut into bands of rows (IntraJob::bands), one workgroup each.
+  // The jobs go up wave by wave, a big block cut into bands of rows (IntraJob::bands), one workgroup per band.
   int    maxWave = 0;
   size_t total   = 0;
   for( const auto& ctu: jobs )
@@ -457,7 +458,7 @@ size_t GpuRecon::uploadIntraJobs( const std::vector<std::vector<IntraJob>>& jobs
   {
     return 0;
   }
-  // each wave's first band
+  // Each wave's first band: first[w] is the number of bands of the waves before w.
   std::vector<uint32_t> first( size_t( maxWave ) + 2, 0 );
   for( const auto& ctu: jobs )
   {
@@ -508,7 +509,7 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   }
   if( !m_intraSync.valid() )
   {
-    m_intraSync = m_ctx->alloc( 256, MemKind::Device );
+    m_intraSync = m_ctx->alloc( kIntraSyncWords * sizeof( uint32_t ), MemKind::Device );
   }
 
   const PreCalcValues& pcv = *cs.pcv;
@@ -542,19 +543,19 @@ void GpuRecon::recordIntra( const CodingStructure& cs, const std::vector<std::ve
   push.picHeight  = pcv.lumaHeight;
   if( m_lmcsOn )
   {
-    push.lmcsScale = m_lmcs.addr + m_lmcsCount * 2 * sizeof( int16_t );
+    push.lmcsScale = lmcsChromaScales();
   }
   push.defer0 = m_deferPlanes.addr[COMPONENT_Y];
   push.defer1 = m_deferPlanes.addr[COMPONENT_Cb];
   push.defer2 = m_deferPlanes.addr[COMPONENT_Cr];
   CHECK( planes.stride[COMPONENT_Cb] != planes.stride[COMPONENT_Cr], "the chroma planes differ in stride" );
 
-  // The counts of the jobs taken and done start from zero; they and what the work before wrote (the residuals,
-  // inter's predictions) become visible to the jobs.
+  // The counts of the jobs taken and done start from zero. They, and what the work before wrote (the residuals,
+  // inter's predictions), become visible to the jobs.
   m_ctx->api().vkCmdFillBuffer( m_cmd, m_intraSync.buffer, 0, 2 * sizeof( uint32_t ), 0 );
   memoryBarrier( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT );
-  // all the waves in one dispatch, one workgroup per band
+  // All the waves in one dispatch, one workgroup per band
   bind( kShader_intra );
   pushConstants( push );
   if( m_useFrontEnd )
