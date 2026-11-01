@@ -694,27 +694,27 @@ int DecLib::finishPicture( Picture* pcPic, MsgLevel msgl )
       m_gpuPlanes->acquire( *pcPic );   // it may have failed before it got its planes
     }
 #endif
+    // The exception of the parse or of the thread-pool tasks, if any: kept to be thrown out once, and cleared from
+    // reconDone (so the picture can be used as a reference) before the grey fill, whose unlocking of reconDone would
+    // otherwise rethrow it -- the picture then never finished, and never output (a picture whose GPU parse failed)
+    const std::exception_ptr failure = pcPic->parseDone.hasException() ? pcPic->parseDone.getException()
+                                       : pcPic->reconDone.hasException() ? pcPic->reconDone.getException()
+                                                                         : nullptr;
+    if( failure )
+    {
+      pcPic->waitForAllTasks();
+      pcPic->reconDone.clearException();
+    }
     pcPic->fillGrey( pcPic->cs->sps.get() );
     pcPic->progress = Picture::finished;
 
-    // if the picture has an exception set (originating from thread-pool tasks), don't return here, but rethrow the exception
-    try
+    if( failure )
     {
-      pcPic->parseDone.checkAndRethrowException();
-      pcPic->reconDone.checkAndRethrowException();
-    }
-    catch( ... )
-    {
-      pcPic->waitForAllTasks();
-
-      // need to clear exception so we can use it as reference picture
-      pcPic->reconDone.clearException();
-      pcPic->reconDone.unlock();
       pcPic->error = true;
       if( !pcPic->exceptionThrownOut )
       {
         pcPic->exceptionThrownOut = true;
-        throw;
+        std::rethrow_exception( failure );
       }
     }
 
