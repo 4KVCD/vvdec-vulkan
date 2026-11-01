@@ -114,6 +114,17 @@ struct TrafoJob
   void setScalingList( int offset ) { w[7] = uint32_t( offset + 1 ); }
 };
 
+// IBC: the block vector (bvx, bvy) of the w x h block at (x, y) limited so that the block copies from inside its plane
+// (planeW x planeH samples). Wherever the reference already lies inside the plane, as in every stream decoded right,
+// it changes nothing; a damaged slice's vector would otherwise make intra.slang read outside the plane's memory (the
+// GPU's device lost). Before the vector is packed (it then fits 16 bits) and its wave rectangle made. The GPU front end
+// has the same (clampBlockVector, shaders/jobs.slang).
+inline void clampBlockVector( int& bvx, int& bvy, int x, int y, int w, int h, int planeW, int planeH )
+{
+  bvx = std::min( std::max( bvx, -x ), planeW - x - w );
+  bvy = std::min( std::max( bvy, -y ), planeH - y - h );
+}
+
 // A transform block of one component that intra.slang predicts and reconstructs. 12 words.
 struct IntraJob
 {

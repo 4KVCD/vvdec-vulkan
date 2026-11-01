@@ -480,7 +480,16 @@ void cuQpDelta( int predQp )
     {
       dqp = -dqp;
     }
-    qpY = ( ( predQp + dqp + ( MAX_QP + 1 ) + 2 * g_qpBdOffset ) % ( ( MAX_QP + 1 ) + g_qpBdOffset ) ) - g_qpBdOffset;
+    // CuQpDeltaVal's range (the CPU's CHECK_READ_RANGE): outside it a damaged slice gives the substream up, the QP
+    // left at predQp; inside it the QP below stays in [-g_qpBdOffset, MAX_QP], which the dequantisation tables index
+    if( dqp < -( 32 + g_qpBdOffset / 2 ) || dqp > 31 + g_qpBdOffset / 2 )
+    {
+      g_error = true;
+    }
+    else
+    {
+      qpY = ( ( predQp + dqp + ( MAX_QP + 1 ) + 2 * g_qpBdOffset ) % ( ( MAX_QP + 1 ) + g_qpBdOffset ) ) - g_qpBdOffset;
+    }
   }
   g_cu.qp = qpY;
 }

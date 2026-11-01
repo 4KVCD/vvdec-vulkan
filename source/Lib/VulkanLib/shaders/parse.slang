@@ -776,6 +776,30 @@ uint decodeBinTrm()
   return 0;
 }
 
+// The CPU parse's checks after a CTU that ends a substream -- its last, or a tile/WPP-row end inside it (DecSlice.cpp
+// parseSlice): the terminating bin (end_of_slice_one_bit / end_of_subset_one_bit) is 1, the arithmetic decoder ends on
+// the stop pattern (BinDecoder::finish), and at the slice's end (sliceEnd) no byte is left: the CPU wants the bytes
+// after it to be 0 (CABACReader::remaining_bytes), and the host strips trailing zero bytes from the slice data. A
+// damaged slice fails them; the substream then gives up, so the garbage it parsed never reaches the reconstruction.
+bool substreamEndValid( bool sliceEnd )
+{
+  if( decodeBinTrm() == 0 )
+  {
+    return false;
+  }
+  // The last byte the decoder read, from pc.bits (the readByte window is not valid after a resume, and a CTU may
+  // read no byte). One past the substream's bytes is a zero, which fails the pattern, as the CPU's zero bytes appended
+  // there do.
+  const uint at   = g_pos - 1u;
+  const uint last = g_pos <= g_end ? ( uni( pc.bits[at >> 2] ) >> ( ( at & 3u ) * 8u ) ) & 0xffu : 0u;
+  // A terminating bin of 1 does not renormalise: g_bitsNeeded is in [-8, -1], so the shift in [0, 7]
+  if( ( ( last << uint( 8 + g_bitsNeeded ) ) & 0xffu ) != 0x80u )
+  {
+    return false;
+  }
+  return !sliceEnd || g_pos == g_end;
+}
+
 // Decodes a truncated unary code of up to maxSymbol, its first bin with context ctxId0 and the others with ctxIdN
 // (CABACReader::unary_max_symbol)
 int unaryMaxSymbol( int ctxId0, int ctxIdN, int maxSymbol )
@@ -1125,6 +1149,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int first   = int( uni( st[kStFirstCtu] ) );
   const int count   = int( uni( st[kStCtus] ) );
   g_slice           = int( uni( st[kStSlice] ) );
+  // Whether the substream's last CTU ends its slice (else a tile or WPP row with an entry point): the substreams are
+  // listed slice by slice, in order (GpuParse.cpp listSliceCtus)
+  const bool endsSlice =
+    stream + 1 == pc.numStreams || int( uni( pc.streams[( stream + 1 ) * kStreamWords + kStSlice] ) ) != g_slice;
   for( int i = g_lane; i < kSliceWords; i += 32 )
   {
     s_slice[i] = pc.slices[g_slice * kSliceStride + i];
@@ -1190,9 +1218,13 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
     {
       saveContexts( slot );
     }
-    if( ( flags & kCtuTerminate ) != 0 )
+    // The end of a substream, or of a tile or WPP row inside one (after which the next CTU restarts the decoder at
+    // the next byte): checked as the CPU checks it. A failure gives the substream up after this CTU, which is still
+    // marked parsed below (giveUpSubstream marks the ones from k + 1).
+    const bool lastCtu = k + 1 == count;
+    if( !g_error && ( ( flags & kCtuTerminate ) != 0 || lastCtu ) && !substreamEndValid( lastCtu && endsSlice ) )
     {
-      decodeBinTrm();   // end_of_subset_one_bit (1); the next CTU restarts the decoder at the next byte
+      g_error = true;
     }
     // Write the CTU's numbers of CUs and TUs, make everything the CTU wrote visible, then mark it parsed for the
     // substreams that wait for it

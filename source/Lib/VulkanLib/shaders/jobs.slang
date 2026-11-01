@@ -613,6 +613,16 @@ void setBlockVector( inout uint w[kJobWords], int x, int y )
   w[6] = uint( uint16_t( int16_t( x ) ) ) | uint( uint16_t( int16_t( y ) ) ) << 16;
 }
 
+// The block vector `bv` of the w x h block at (x, y) limited so that the block copies from inside its plane (planeW x
+// planeH samples). Wherever the reference already lies inside the plane, as in every stream decoded right, it changes
+// nothing; a damaged slice's vector would otherwise read outside the plane's memory (the GPU's device lost). Before
+// the vector is packed (it then fits 16 bits) and the job's wave rectangle made from it. The CPU front end has the
+// same (gpu::clampBlockVector, GpuJobs.h).
+int2 clampBlockVector( int2 bv, int x, int y, int w, int h, int planeW, int planeH )
+{
+  return int2( clamp( bv.x, -x, planeW - x - w ), clamp( bv.y, -y, planeH - y - h ) );
+}
+
 // IntraJob::setCiip: planar's weight in the blend
 void setCiip( inout uint w[kJobWords], int intraWeight )
 {
@@ -1283,16 +1293,16 @@ void ibcJobs( Cu cu, Motion m, inout Out o )
       {
         continue;
       }
-      const int bvx = comp == 0 ? bv.x : bv.x >> scaleX( 1 );
-      const int bvy = comp == 0 ? bv.y : bv.y >> scaleY( 1 );
-      uint      flags = 0;
+      const int2 scaled = comp == 0 ? bv : int2( bv.x >> scaleX( 1 ), bv.y >> scaleY( 1 ) );
+      const int2 vec    = clampBlockVector( scaled, area.x, area.y, area.z, area.w, pc.width >> scaleX( ch ), pc.height >> scaleY( ch ) );
+      uint       flags  = 0;
       if( cbfOf( tu, comp ) || ( comp != 0 && tu.jointCbCr != 0 ) )
       {
         flags |= kIntraResidual;
       }
       uint w[kJobWords];
       setIntra( w, area.x, area.y, area.z, area.w, comp, kIntraIbc, 0, flags, 0, 0 );
-      setBlockVector( w, bvx, bvy );
+      setBlockVector( w, vec.x, vec.y );
       if( comp != 0 && cu.rootCbf && ( pc.ph & kPhLmcs ) != 0 && ( pc.ph & kPhLmcsChroma ) != 0 && sliceLmcs( jslice ) && area.z * area.w > 4
           && ( cbfOf( tu, comp ) || tu.jointCbCr != 0 ) )
       {

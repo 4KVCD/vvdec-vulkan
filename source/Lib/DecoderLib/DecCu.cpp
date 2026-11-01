@@ -520,8 +520,12 @@ void DecCu::xGpuIbcJobs( CodingUnit& cu, std::vector<gpu::IntraJob>& jobs, gpu::
       }
 
       const ComponentID compID = area.compID();
-      const int         bvx    = isLuma( compID ) ? bv.hor : bv.hor >> getComponentScaleX( compID, cu.chromaFormat );
-      const int         bvy    = isLuma( compID ) ? bv.ver : bv.ver >> getComponentScaleY( compID, cu.chromaFormat );
+      const int         scaleX = getComponentScaleX( compID, cu.chromaFormat );
+      const int         scaleY = getComponentScaleY( compID, cu.chromaFormat );
+      int               bvx    = isLuma( compID ) ? bv.hor : bv.hor >> scaleX;
+      int               bvy    = isLuma( compID ) ? bv.ver : bv.ver >> scaleY;
+      gpu::clampBlockVector( bvx, bvy, area.x, area.y, area.width, area.height, int( cu.cs->pcv->lumaWidth ) >> scaleX,
+                             int( cu.cs->pcv->lumaHeight ) >> scaleY );
 
       const int flags = hasResidual( tu, compID ) ? gpu::IntraJob::kResidual : 0;
 
