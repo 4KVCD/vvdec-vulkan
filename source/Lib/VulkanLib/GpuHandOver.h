@@ -64,8 +64,10 @@ class PlanePool;
 // this GPU (Context::importBuffer; VideoMetricsLab's VMAF engine) or into imported host memory
 // (Context::importHostBuffer; Vship's frame buffers), by one compute pass a plane (shaders/handover.slang) on the
 // compute queue, each copy signalling the context's hand-over timeline (Context::submitHandOver) that the other
-// device waits for. The picture is not downloaded to host memory: its twins hold it until the application gives it
-// back. One HandOver per decoder; its copies may be asked for from any one thread at a time.
+// device waits for. With the GPU's parse ahead the picture is not downloaded to host memory: its twins hold it until
+// the application gives it back. With the CPU's parse the GPU downloads every picture to its host planes, which the
+// copies read; a copy that read them keeps them from being written again until it is done (Picture::handOverValue).
+// One HandOver per decoder; its copies may be asked for from any one thread at a time.
 class HandOver
 {
 public:

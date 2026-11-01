@@ -73,6 +73,8 @@ private:
   UserAllocator*                  m_gpuStandIns = nullptr;
   std::function<void( Picture& )> m_releaseGpuPlanes;
   std::function<void( Picture& )> m_releaseGpuHostPlanes;   // only the planes, of a picture output (its twins stay)
+  // With the hand-over: whether its timeline has reached a value; with wait, waits for it (and throws when that fails)
+  std::function<bool( uint64_t value, bool wait )> m_handOverReached;
 #endif
   int                                m_tuneInDelay    = 0;
   bool                               m_firstOutputPic = true;
@@ -97,6 +99,9 @@ public:
     m_releaseGpuPlanes     = std::move( release );
     m_releaseGpuHostPlanes = std::move( releaseHost );
   }
+  // With the hand-over (set before the first picture): a picture whose host planes a hand-over copy reads
+  // (Picture::handOverValue) is written again only once reached says the copy is done
+  void setHandOverReached( std::function<bool( uint64_t value, bool wait )> reached ) { m_handOverReached = std::move( reached ); }
 #endif
   void restart()
   {
@@ -118,6 +123,9 @@ private:
   // VVDEC_GPU_PARSE=2: a finished picture's planes back to the GPU's pool (gpu::PlanePool) once it may be reused, or
   // only its planes (its twins stay) once it was output and the application gave it back
   void releaseGpuPlanes( Picture& pic );
+  // Whether no hand-over copy still reads the picture's host planes; with wait, waits until none does (and throws
+  // when that fails). Always true without the hand-over.
+  bool handOverDone( const Picture& pic, bool wait ) const;
 
 public:
 #endif

@@ -203,6 +203,7 @@ uint64_t HandOver::pack( Picture& pic, PlanePool* pool, const Plane* planes, int
   CHECK_FATAL( pic.progress < Picture::reconstructed, "Vulkan: a picture handed over before its work on the GPU is done" );
   CHECK_FATAL( count < 1 || count > MAX_NUM_COMPONENT, "Vulkan: a hand-over of no planes or too many" );
   HandOverParams params[MAX_NUM_COMPONENT]{};
+  bool           fromHost = false;   // the copy reads the host planes (planeOrigin), not the twins
   {
     // The planes' records stay put meanwhile (a picture the pool handles on another thread)
     std::unique_lock<std::mutex> planesLock;
@@ -210,6 +211,7 @@ uint64_t HandOver::pack( Picture& pic, PlanePool* pool, const Plane* planes, int
     {
       planesLock = pool->lockPlanes();
     }
+    fromHost = !pic.gpuNeedsDownload;
     for( int i = 0; i < count; i++ )
     {
       const Plane& plane  = planes[i];
@@ -276,6 +278,13 @@ uint64_t HandOver::pack( Picture& pic, PlanePool* pool, const Plane* planes, int
   // The timeline's signal makes the copy's writes available to the other device
   copy.value   = m_ctx->submitHandOver( copy.cmd, copy.fence );
   copy.pending = true;   // only once submitted: a fence of a failed submission is never signalled
+  if( fromHost )
+  {
+    // The decoder writes the host planes again only once the copy has read them (the CPU's parse writes a reused
+    // picture's planes; the twins' writers are ordered after the copy on the queue). The application holds the
+    // picture until this returns, so no reuse can come before the store.
+    pic.handOverValue.store( copy.value, std::memory_order_release );
+  }
   return copy.value;
 }
 

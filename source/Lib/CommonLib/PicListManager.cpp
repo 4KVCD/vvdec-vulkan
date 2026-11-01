@@ -185,6 +185,15 @@ Picture* PicListManager::getNewPicBuffer( const SPS& sps, const PPS& pps, const 
     {
       continue;
     }
+#if VVDEC_VULKAN
+    // Its host planes are written again from here on (the new picture's set-up, the CPU's parse): only once no
+    // hand-over copy reads them any more. Then what a check skipped while one did (markUnusedPicturesReusable).
+    handOverDone( *pic, true );
+    if( m_releaseGpuPlanes )
+    {
+      releaseGpuPlanes( *pic );
+    }
+#endif
 
     if ( externAllocator )
     {
@@ -336,7 +345,9 @@ void PicListManager::markUnusedPicturesReusable()
 #if VVDEC_VULKAN
 void PicListManager::releaseGpuPlanes( Picture& pic )
 {
-  if( pic.progress != Picture::finished )
+  // Its planes would go to another picture: not while a hand-over copy reads them (only checked here, as this runs on
+  // the application's unref and close too: tried again at the next markUnusedPicturesReusable or reuse)
+  if( pic.progress != Picture::finished || !handOverDone( pic, false ) )
   {
     return;
   }
@@ -348,6 +359,12 @@ void PicListManager::releaseGpuPlanes( Picture& pic )
   {
     m_releaseGpuHostPlanes( pic );   // (output, and given back: but still referenced)
   }
+}
+
+bool PicListManager::handOverDone( const Picture& pic, bool wait ) const
+{
+  const uint64_t value = pic.handOverValue.load( std::memory_order_acquire );
+  return value == 0 || !m_handOverReached || m_handOverReached( value, wait );
 }
 #endif
 

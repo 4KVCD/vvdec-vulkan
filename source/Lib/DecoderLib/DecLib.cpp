@@ -495,6 +495,7 @@ void DecLib::destroy()
   // After the last picture buffer is gone, because the pictures' stand-ins are the pool's
   m_gpuPlanes.reset();
   m_handOver.reset();   // its commands, before the device goes
+  m_picListManager.setHandOverReached( nullptr );
   if( m_gpu )
   {
     gpu::Context::release();
@@ -846,11 +847,34 @@ void DecLib::prepareOutput( Picture* pcPic )
 }
 
 #if VVDEC_VULKAN
+// The modes the hand-over is made for: the CPU's parse, and the GPU's parse ahead (VVDEC_GPU_PARSE=2). Not the GPU's
+// parse into the host planes (VVDEC_GPU_PARSE=1, as DecLibRecon tells it) or the check of the GPU's front end against
+// the CPU's (VVDEC_GPU_MIDER=1): both untested with it.
+static bool handOverTested( const gpu::Context& gpu )
+{
+  const gpu::Options& options = gpu.options();
+  return !options.frontEndCheck && !( options.parse && options.frontEnd );
+}
+
+// How long a picture's reuse waits for a hand-over copy still reading its host planes: a hung GPU, not a slow copy
+static constexpr uint64_t kHandOverReuseWaitNs = 10'000'000'000ull;
+
 bool DecLib::setHandOver()
 {
-  if( !m_handOver && m_gpu && m_gpuPlanes && m_gpu->canHandOver() )
+  if( !m_handOver && m_gpu && m_gpu->canHandOver() && handOverTested( *m_gpu ) )
   {
     m_handOver = std::make_unique<gpu::HandOver>( m_gpu );
+    // Through the timeline itself, not HandOver::waitFor, which would time these checks as the application's waits
+    // (VVDEC_HANDOVER_TIMES=1)
+    m_picListManager.setHandOverReached( [gpu = m_gpu]( uint64_t value, bool wait ) {
+      const VkResult result = gpu->waitHandOver( value, wait ? kHandOverReuseWaitNs : 0 );
+      if( wait && result != VK_SUCCESS )
+      {
+        // Fatal, not recoverable: decoding on would write planes a copy may still read
+        THROW_FATAL( "Vulkan: a hand-over copy of a picture to be reused did not finish (" << int( result ) << ")" );
+      }
+      return result == VK_SUCCESS;
+    } );
   }
   return m_handOver != nullptr;
 }

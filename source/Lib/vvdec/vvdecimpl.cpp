@@ -726,7 +726,7 @@ int VVDecImpl::handOverEnable()
     return VVDEC_OK;
   }
 #endif
-  m_cErrorString = "handOverEnable: this decoder cannot hand its pictures over (the GPU's parse and Vulkan's external memory are needed)";
+  m_cErrorString = "handOverEnable: this decoder cannot hand its pictures over (the GPU's reconstruction with the CPU's parse or the GPU's parse ahead, not VVDEC_GPU_PARSE=1 or VVDEC_GPU_MIDER=1, and Vulkan's external memory are needed)";
   return VVDEC_ERR_NOT_SUPPORTED;
 }
 
