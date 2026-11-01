@@ -61,6 +61,7 @@ bool decodeStream( const char* path, int maxFrames, bool gpu, const std::functio
   vvdec_params_default( &params );
   params.threads = -1;
   params.gpu     = gpu ? 1 : 0;
+  params.filmGrainSynthesis = false;   // the hand-over takes no grain synthesis: both decodes without the grain
   vvdecDecoder* dec = vvdec_decoder_open( &params );
   if( !dec || ( onOpen && !onOpen( dec ) ) )
   {

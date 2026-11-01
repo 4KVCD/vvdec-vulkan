@@ -719,9 +719,10 @@ VVDEC_DECL int vvdec_set_tracing( const char* file, const char* rule );
  These functions, vvdec_decode and vvdec_frame_unref must not run at the same time on one decoder. */
 
 /* vvdec_handover_enable
- Turns the hand-over on, before the first picture is decoded.
- \retval     VVDEC_OK, or VVDEC_ERR_NOT_SUPPORTED when the decoder cannot hand over (not on the GPU, no GPU parse, or
-             a device without the extensions)
+ Turns the hand-over on, before the first picture is decoded; the decoder must have been opened with
+ filmGrainSynthesis off (the grain is added from host memory).
+ \retval     VVDEC_OK, or VVDEC_ERR_NOT_SUPPORTED when the decoder cannot hand over (film grain synthesis on, not on
+             the GPU, no GPU parse, or a device without the extensions)
 */
 VVDEC_DECL int vvdec_handover_enable( vvdecDecoder * );
 

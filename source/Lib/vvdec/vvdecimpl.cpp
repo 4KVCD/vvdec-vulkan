@@ -713,6 +713,12 @@ int VVDecImpl::getNumberOfErrorsPictureHashSEI()
 int VVDecImpl::handOverEnable()
 {
   if( !m_bInitialized ){ return VVDEC_ERR_INITIALIZE; }
+  if( m_enableFilmGrain )
+  {
+    // the grain is added from the pictures' host planes, which handed-over pictures do not fill
+    m_cErrorString = "handOverEnable: the hand-over needs film grain synthesis off (vvdecParams.filmGrainSynthesis)";
+    return VVDEC_ERR_NOT_SUPPORTED;
+  }
 #if VVDEC_VULKAN
   if( m_cDecLib->setHandOver() )
   {
