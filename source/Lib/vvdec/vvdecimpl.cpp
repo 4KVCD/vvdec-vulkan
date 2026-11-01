@@ -831,9 +831,9 @@ int VVDecImpl::handOverPack( vvdecFrame* frame, void* imported, uint64_t offset,
     m_cErrorString = "handOverPack: no such frame or buffer, or a rectangle outside them";
     return VVDEC_ERR_PARAMETER;
   }
-  if( pic->cs->sps->getBitDepths().recon <= 8 || !pic->gpuNeedsDownload )
+  if( !pic->gpuNeedsDownload )
   {
-    return VVDEC_ERR_NOT_SUPPORTED;   // in host memory (DecLib::prepareOutput): not handed over
+    return VVDEC_ERR_NOT_SUPPORTED;   // in host memory (a picture the CPU wrote: an error picture filled in grey)
   }
   // The frame's visible picture starts at the conformance window's top-left sample (as xAddPicture crops it)
   const Window& conf    = pic->cs->pps->getConformanceWindowPresentFlag() ? pic->cs->pps->getConformanceWindow() : pic->cs->sps->getConformanceWindow();
@@ -1282,6 +1282,14 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
   }
 
   bool bCreateStorage = ( bitDepths.recon == 8 );   // for 8bit output we need to copy the lib picture from unsigned short into unsigned char buffer
+#if VVDEC_VULKAN
+  // A picture handed over (DecLib::prepareOutput did not download it) has no samples in host memory, so no 8-bit copy
+  // of them: its frame keeps the picture, and describes planes that must not be read (vvdec.h's hand-over)
+  if( m_cDecLib->handOver() && pcPic->gpuNeedsDownload )
+  {
+    bCreateStorage = false;
+  }
+#endif
 
   if( m_enableFilmGrain )
   {

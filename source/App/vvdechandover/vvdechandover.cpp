@@ -329,9 +329,10 @@ int main( int argc, char** argv )
   };
   const bool gpu = decodeStream( stream, maxFrames, true, [&]( vvdecDecoder* dec, vvdecFrame* frame, int index ) {
     const int      width = int( frame->width ), height = int( frame->height );
-    const uint32_t stride = uint32_t( width ) * 2;
+    const int      bytes  = frame->bitDepth > 8 ? 2 : 1;   // as the CPU's frames have them
+    const uint32_t stride = uint32_t( width * bytes );
     uint64_t       value  = 0;
-    const int      ret    = vvdec_handover_pack( dec, frame, imported, 0, stride, 2, 0, 0, 0, width, height, &value );
+    const int      ret    = vvdec_handover_pack( dec, frame, imported, 0, stride, bytes, 0, 0, 0, width, height, &value );
     if( ret == VVDEC_ERR_NOT_SUPPORTED )
     {
       notHandedOver++;   // in host memory (8-bit, film grain): not this check's
@@ -342,7 +343,7 @@ int main( int argc, char** argv )
       fprintf( stderr, "frame %d: pack %d (%s)\n", index, ret, vvdec_get_last_error( dec ) );
       return false;
     }
-    const uint64_t got = hashLuma( other.mapped, size_t( width ) * 2, stride, height );
+    const uint64_t got = hashLuma( other.mapped, size_t( width ) * bytes, stride, height );
     if( index < int( expected.size() ) && got == expected[index] )
     {
       same++;

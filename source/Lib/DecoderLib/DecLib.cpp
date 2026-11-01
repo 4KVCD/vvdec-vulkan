@@ -828,9 +828,9 @@ void DecLib::prepareOutput( Picture* pcPic )
   {
     return;
   }
-  if( m_handOver && pcPic->cs->sps->getBitDepths().recon > 8 )
+  if( m_handOver )
   {
-    return;   // handed over from its twins (VVDecImpl::handOverPack), not downloaded; 8-bit output copies its planes
+    return;   // handed over from its twins (VVDecImpl::handOverPack), not downloaded
   }
   m_gpuPlanes->finishDownload( *pcPic );
   for( Picture* next: m_picListManager.nextOutputs( kOutputsDownloadedAhead ) )

@@ -132,7 +132,7 @@ public:
   ThreadPool& getThreadPool() { return *m_decodeThreadPool; }
 #if VVDEC_VULKAN
   gpu::Context* gpu() const { return m_gpu; }   // null when the pictures are reconstructed on the CPU
-  // The hand-over (gpu::HandOver): a 10-bit picture the GPU parses is not downloaded when it is output; its twins hold
+  // The hand-over (gpu::HandOver): a picture the GPU parses is not downloaded when it is output; its twins hold
   // it until the application gives it back, and handOver() packs it into buffers another device imported. Only with
   // the GPU's parse (its PlanePool keeps the twins until then) on a device that can hand over. False when not.
   bool            setHandOver();

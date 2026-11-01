@@ -711,11 +711,12 @@ VVDEC_DECL bool vvdec_is_nal_unit_slice ( vvdecNalType t );
 */
 VVDEC_DECL int vvdec_set_tracing( const char* file, const char* rule );
 
-/* The hand-over (the GPU's reconstruction with its parse, VVDEC_GPU_PARSE=2; Windows): decoded 10-bit pictures copied
- on the GPU straight into another Vulkan device's buffers on the same GPU, without downloading them to host memory.
- The other device exports its buffers (opaque Win32 handles of dedicated allocations) and imports the decoder's
- timeline semaphore, which each copy signals. A picture handed over this way has no samples in host memory: its
- vvdecFrame's planes must not be read. 8-bit pictures, and pictures with film grain added, still come in host memory.
+/* The hand-over (the GPU's reconstruction with its parse, VVDEC_GPU_PARSE=2; Windows): decoded pictures copied on the
+ GPU straight into another Vulkan device's buffers on the same GPU, without downloading them to host memory (film
+ grain synthesis off). The other device exports its buffers (opaque Win32 handles of dedicated allocations) and imports
+ the decoder's timeline semaphore, which each copy signals. A picture handed over this way has no samples in host
+ memory: its vvdecFrame's planes must not be read (an 8-bit one's describe 8-bit samples there are not). A picture
+ the CPU wrote (an error picture) is in host memory and not handed over (vvdec_handover_pack says so).
  These functions, vvdec_decode and vvdec_frame_unref must not run at the same time on one decoder. */
 
 /* vvdec_handover_enable
