@@ -299,6 +299,23 @@ public:
   // A discrete GPU: its shaders reach host memory across the bus, slowly (GpuFilmGrain copies its frames instead)
   bool               discrete()        const { return m_discrete; }
 
+  // --- The hand-over: pictures copied into another Vulkan device's buffers on this GPU ---
+  // (VideoMetricsLab's VMAF engine: its buffers are imported here, and the copies into them signal a timeline
+  // semaphore that device waits for, exported to it.) Where the GPU has VK_KHR_external_memory_win32 and
+  // VK_KHR_external_semaphore_win32 (Windows), the device is made with them, whatever the decoder's mode: the context
+  // is shared by the process's decoders, and the first one makes it.
+  bool canHandOver() const { return m_handOverTimeline != VK_NULL_HANDLE; }
+  // Imports another device's export (an opaque Win32 handle of a dedicated allocation of `bytes`, from memory type
+  // `memoryType` of a device with these UUIDs) as a buffer the shaders reach by its device address. False, with a
+  // warning, when this device cannot: another GPU or driver, or no hand-over. The caller still closes the handle.
+  bool importBuffer( void* handle, uint64_t bytes, uint32_t memoryType, const uint8_t deviceUuid[VK_UUID_SIZE],
+                     const uint8_t driverUuid[VK_UUID_SIZE], Buffer& imported );
+  void releaseImport( Buffer& imported );
+  // The hand-over's timeline semaphore as an opaque Win32 handle (the caller closes it), or null; and the last value
+  // a hand-over copy signals (the copies are numbered under the compute queue's lock, in submission order).
+  void*    exportHandOverTimeline();
+  uint64_t handOverValue() const { return m_handOverValue; }
+
   // --- Profiling (VVDEC_GPU_PROFILE=1) ---
   // The decoder instances add up the GPU time of their passes (addTime); the totals are printed when the context
   // is destroyed, with the memory in use now and at its peak: heap 0 is the GPU's own memory, heap 1 the
@@ -386,6 +403,7 @@ private:
     bool        shaderInfo = false, shaderClock = false, subgroupBallot = false, maintenance5 = false, pipelineBinary = false;
     const char* globalPriority = nullptr;   // VK_KHR_global_priority, else VK_EXT_global_priority, if the device has one
     bool        executables    = false;     // VK_KHR_pipeline_executable_properties (when profiling)
+    bool        externalMemoryWin32 = false, externalSemaphoreWin32 = false;   // the hand-over's (Windows)
   };
   DeviceExtensions findExtensions() const;
   // createDevice's steps: the queues to create (returns their number), whether the shaders may run in waves of 32
@@ -397,6 +415,7 @@ private:
   bool createDevice( const VkPhysicalDeviceProperties& props, bool subgroupSizeControl, const AsyncQueueLayout& async );
   void getQueues( const AsyncQueueLayout& async );
   bool createPipelineLayout();
+  void makeHandOver();   // createDevice's, with the hand-over's extensions: its timeline, UUIDs and function
 
   // the parse queue (one of the async family's), its lock (its own, or the async queue's it shares) and timeline
   VkQueue                          m_parseQueue    = VK_NULL_HANDLE;
@@ -464,6 +483,13 @@ private:
   std::atomic<int64_t>             m_memoryNow[2]  = { { 0 }, { 0 } };
   std::atomic<int64_t>             m_memoryPeak[2] = { { 0 }, { 0 } };
   PFN_vkGetShaderInfoAMD           m_getShaderInfo = nullptr;   // VK_AMD_shader_info, on AMD when profiling or writing machine code
+  // The hand-over (canHandOver): its exportable timeline, the last value signalled (guarded by m_queueMutex), this
+  // device's UUIDs, and vkGetSemaphoreWin32HandleKHR (PFN_vkGetSemaphoreWin32HandleKHR, kept untyped: the Win32
+  // types are only in the .cpp)
+  VkSemaphore                      m_handOverTimeline = VK_NULL_HANDLE;
+  uint64_t                         m_handOverValue    = 0;
+  uint8_t                          m_deviceUuid[VK_UUID_SIZE]{}, m_driverUuid[VK_UUID_SIZE]{};
+  PFN_vkVoidFunction               m_getSemaphoreWin32Handle = nullptr;
   // VK_KHR_pipeline_executable_properties, when profiling without VK_AMD_shader_info: the shaders' statistics
   PFN_vkGetPipelineExecutablePropertiesKHR m_getExecutables          = nullptr;
   PFN_vkGetPipelineExecutableStatisticsKHR m_getExecutableStatistics = nullptr;

@@ -62,6 +62,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#  include <vulkan/vulkan_win32.h>   // the hand-over's opaque Win32 handles
 #else
 #  include <dlfcn.h>
 #  include <sys/stat.h>
@@ -457,6 +458,10 @@ Context::DeviceExtensions Context::findExtensions() const
     found.maintenance5 |= strcmp( extension.extensionName, kExtMaintenance5 ) == 0;
     found.pipelineBinary |= strcmp( extension.extensionName, kExtPipelineBinary ) == 0;
     found.executables |= m_options.profile && strcmp( extension.extensionName, kExtExecutables ) == 0;
+#ifdef _WIN32
+    found.externalMemoryWin32 |= strcmp( extension.extensionName, VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME ) == 0;
+    found.externalSemaphoreWin32 |= strcmp( extension.extensionName, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME ) == 0;
+#endif
     if( strcmp( extension.extensionName, "VK_KHR_global_priority" ) == 0 )
     {
       found.globalPriority = "VK_KHR_global_priority";
@@ -642,6 +647,15 @@ bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgro
   {
     features.enablePipelineBinaries();
   }
+  // The hand-over (canHandOver): another device's buffers imported, a timeline semaphore exported
+  const bool handOver = found.externalMemoryWin32 && found.externalSemaphoreWin32;
+#ifdef _WIN32
+  if( handOver )
+  {
+    features.extensions.push_back( VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME );
+    features.extensions.push_back( VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME );
+  }
+#endif
 
   // Every queue at low global priority (VVDEC_GPU_PRIORITY=normal: not), so that other programs' GPU work, the
   // desktop's, goes first; a device that refuses it is made without. Intel Graphics, VideoQ 4K beside a 60 Hz probe
@@ -687,6 +701,10 @@ bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgro
 #define VVDEC_VK_LOAD_DEVICE( name ) m_api.name = (PFN_##name) m_api.vkGetDeviceProcAddr( m_device, #name );
   VVDEC_VK_DEVICE_FUNCS( VVDEC_VK_LOAD_DEVICE )
 #undef VVDEC_VK_LOAD_DEVICE
+  if( handOver )
+  {
+    makeHandOver();
+  }
   if( found.shaderInfo )
   {
     m_getShaderInfo = (PFN_vkGetShaderInfoAMD) m_api.vkGetDeviceProcAddr( m_device, "vkGetShaderInfoAMD" );
@@ -1342,6 +1360,7 @@ Context::~Context()
     destroySemaphore( m_timeline );
     destroySemaphore( m_parseTimeline );
     destroySemaphore( m_parseCopyTimeline );
+    destroySemaphore( m_handOverTimeline );
     m_api.vkDestroyDevice( m_device, nullptr );
   }
   delete[] m_pipelines;
@@ -2110,6 +2129,130 @@ void Context::destroySemaphore( VkSemaphore semaphore )
   {
     m_api.vkDestroySemaphore( m_device, semaphore, nullptr );
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------- hand-over
+
+void Context::makeHandOver()
+{
+#ifdef _WIN32
+  VkPhysicalDeviceIDProperties ids{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+  VkPhysicalDeviceProperties2  props{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+  props.pNext = &ids;
+  m_api.vkGetPhysicalDeviceProperties2( m_physical, &props );
+  memcpy( m_deviceUuid, ids.deviceUUID, VK_UUID_SIZE );
+  memcpy( m_driverUuid, ids.driverUUID, VK_UUID_SIZE );
+  m_getSemaphoreWin32Handle = m_api.vkGetDeviceProcAddr( m_device, "vkGetSemaphoreWin32HandleKHR" );
+  VkExportSemaphoreCreateInfo exported{ VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
+  exported.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+  VkSemaphoreTypeCreateInfo type{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+  type.pNext         = &exported;
+  type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  VkSemaphoreCreateInfo info{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+  info.pNext = &type;
+  if( !m_getSemaphoreWin32Handle || m_api.vkCreateSemaphore( m_device, &info, nullptr, &m_handOverTimeline ) != VK_SUCCESS )
+  {
+    m_handOverTimeline = VK_NULL_HANDLE;   // no hand-over (canHandOver)
+    msg( WARNING, "Vulkan: no hand-over on %s (no exportable timeline semaphore)\n", m_deviceName.c_str() );
+  }
+#endif
+}
+
+bool Context::importBuffer( void* handle, uint64_t bytes, uint32_t memoryType, const uint8_t deviceUuid[VK_UUID_SIZE],
+                            const uint8_t driverUuid[VK_UUID_SIZE], Buffer& imported )
+{
+#ifdef _WIN32
+  if( !canHandOver() || memcmp( deviceUuid, m_deviceUuid, VK_UUID_SIZE ) || memcmp( driverUuid, m_driverUuid, VK_UUID_SIZE )
+      || memoryType >= m_memProps.memoryTypeCount )
+  {
+    msg( WARNING, "Vulkan: the buffer to import is another GPU's or driver's, or this device has no hand-over\n" );
+    return false;
+  }
+  Buffer buf;
+  buf.kind = MemKind::Device;
+  buf.size = bytes;
+  VkExternalMemoryBufferCreateInfo external{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+  external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+  VkBufferCreateInfo info{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+  info.pNext = &external;
+  info.size  = bytes;
+  info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  if( m_api.vkCreateBuffer( m_device, &info, nullptr, &buf.buffer ) != VK_SUCCESS )
+  {
+    msg( WARNING, "Vulkan: vkCreateBuffer failed for an imported buffer\n" );
+    return false;
+  }
+  VkMemoryRequirements req;
+  m_api.vkGetBufferMemoryRequirements( m_device, buf.buffer, &req );
+  // As the exporter allocated it: a dedicated allocation; and reached here by its device address
+  VkMemoryDedicatedAllocateInfo dedicated{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+  dedicated.buffer = buf.buffer;
+  VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+  flags.pNext = &dedicated;
+  flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  VkImportMemoryWin32HandleInfoKHR import{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+  import.pNext      = &flags;
+  import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+  import.handle     = handle;
+  VkMemoryAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+  allocInfo.pNext           = &import;
+  allocInfo.allocationSize  = bytes;
+  allocInfo.memoryTypeIndex = memoryType;
+  if( !( req.memoryTypeBits & ( 1u << memoryType ) ) || m_api.vkAllocateMemory( m_device, &allocInfo, nullptr, &buf.memory ) != VK_SUCCESS
+      || m_api.vkBindBufferMemory( m_device, buf.buffer, buf.memory, 0 ) != VK_SUCCESS )
+  {
+    if( buf.memory )
+    {
+      m_api.vkFreeMemory( m_device, buf.memory, nullptr );
+    }
+    m_api.vkDestroyBuffer( m_device, buf.buffer, nullptr );
+    msg( WARNING, "Vulkan: importing a buffer of %llu bytes failed\n", (unsigned long long) bytes );
+    return false;
+  }
+  VkBufferDeviceAddressInfo address{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+  address.buffer  = buf.buffer;
+  buf.addr        = m_api.vkGetBufferDeviceAddress( m_device, &address );
+  buf.memorySize  = bytes;
+  imported        = buf;
+  return true;
+#else
+  (void) handle, (void) bytes, (void) memoryType, (void) deviceUuid, (void) driverUuid, (void) imported;
+  return false;
+#endif
+}
+
+void Context::releaseImport( Buffer& imported )
+{
+  if( imported.buffer )
+  {
+    m_api.vkDestroyBuffer( m_device, imported.buffer, nullptr );
+  }
+  if( imported.memory )
+  {
+    m_api.vkFreeMemory( m_device, imported.memory, nullptr );
+  }
+  imported = Buffer{};
+}
+
+void* Context::exportHandOverTimeline()
+{
+#ifdef _WIN32
+  if( !canHandOver() )
+  {
+    return nullptr;
+  }
+  VkSemaphoreGetWin32HandleInfoKHR info{ VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR };
+  info.semaphore  = m_handOverTimeline;
+  info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+  HANDLE handle   = nullptr;
+  if( ( (PFN_vkGetSemaphoreWin32HandleKHR) m_getSemaphoreWin32Handle )( m_device, &info, &handle ) != VK_SUCCESS )
+  {
+    return nullptr;
+  }
+  return handle;
+#else
+  return nullptr;
+#endif
 }
 
 void Context::destroyQueries( VkQueryPool queries )
