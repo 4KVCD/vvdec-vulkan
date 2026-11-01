@@ -1555,7 +1555,7 @@ static bool anyWaveSize( int shaderId )
   {
   case kShader_alf_luma: case kShader_alf_chroma: case kShader_alf_luma_bounds: case kShader_alf_chroma_bounds:
   case kShader_sao: case kShader_deblock_luma_ver: case kShader_deblock_luma_hor: case kShader_deblock_chroma:
-  case kShader_intra: case kShader_trafo: case kShader_lmcs: case kShader_filmgrain: case kShader_dbparams:
+  case kShader_intra: case kShader_trafo: case kShader_lmcs: case kShader_filmgrain: case kShader_handover: case kShader_dbparams:
   case kShader_dbparams_sub: case kShader_edges:
     return true;
   default:
@@ -1851,6 +1851,28 @@ uint64_t Context::submitFirst( VkCommandBuffer first, VkFence firstDone, VkSemap
     THROW_FATAL( "Vulkan: vkQueueSubmit failed (" << result << ")" );
   }
   return signalValue;
+}
+
+uint64_t Context::submitHandOver( VkCommandBuffer cmd, VkFence done )
+{
+  CHECK_FATAL( !canHandOver(), "Vulkan: a hand-over copy without the hand-over's timeline" );
+  VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+  info.commandBufferCount = 1;
+  info.pCommandBuffers    = &cmd;
+  VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+  std::lock_guard<std::mutex>   lock( m_queueMutex );
+  const uint64_t                value = ++m_handOverValue;
+  info.signalSemaphoreCount          = 1;
+  info.pSignalSemaphores             = &m_handOverTimeline;
+  timeline.signalSemaphoreValueCount = 1;
+  timeline.pSignalSemaphoreValues    = &value;
+  info.pNext                         = &timeline;
+  const VkResult result = m_api.vkQueueSubmit( m_queue, 1, &info, done );
+  if( result != VK_SUCCESS )
+  {
+    THROW_FATAL( "Vulkan: vkQueueSubmit failed for a hand-over copy (" << result << ")" );
+  }
+  return value;
 }
 
 void Context::submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, VkSemaphore done, uint64_t waitParse )

@@ -54,6 +54,9 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "CommonLib/Picture.h"
 
 #include "Utilities/ThreadPool.h"
+#if VVDEC_VULKAN
+#  include "VulkanLib/GpuHandOver.h"
+#endif
 
 namespace vvdec
 {
@@ -92,6 +95,8 @@ class DecLib
   // it parses, which they have only once their work goes to the GPU
   std::unique_ptr<gpu::ParseService> m_gpuParseService;
   std::unique_ptr<gpu::PlanePool>    m_gpuPlanes;
+  // The hand-over (setHandOver): the pictures' copies into another Vulkan device's buffers
+  std::unique_ptr<gpu::HandOver>     m_handOver;
 #endif
 
 public:
@@ -127,6 +132,12 @@ public:
   ThreadPool& getThreadPool() { return *m_decodeThreadPool; }
 #if VVDEC_VULKAN
   gpu::Context* gpu() const { return m_gpu; }   // null when the pictures are reconstructed on the CPU
+  // The hand-over (gpu::HandOver): a 10-bit picture the GPU parses is not downloaded when it is output; its twins hold
+  // it until the application gives it back, and handOver() packs it into buffers another device imported. Only with
+  // the GPU's parse (its PlanePool keeps the twins until then) on a device that can hand over. False when not.
+  bool            setHandOver();
+  gpu::HandOver*  handOver() const { return m_handOver.get(); }
+  gpu::PlanePool* gpuPlanes() const { return m_gpuPlanes.get(); }
 #endif
 
 private:

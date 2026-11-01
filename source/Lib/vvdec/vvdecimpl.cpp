@@ -202,6 +202,15 @@ int VVDecImpl::uninit()
     msg( INFO, "GPU: film grain of %d frames on the GPU, %d on the CPU\n", m_grainFramesGpu, m_grainFramesCpu );
   }
   m_gpuFilmGrain.reset();   // before the GPU context goes
+  if( m_cDecLib->handOver() )
+  {
+    m_cDecLib->handOver()->wait();   // no copy into the imported buffers is pending when they are freed
+  }
+  for( gpu::Buffer& imported: m_handOverImports )
+  {
+    m_cDecLib->gpu()->releaseImport( imported );
+  }
+  m_handOverImports.clear();
 #endif
   // destroy internal classes
   m_cDecLib->destroy();
@@ -697,6 +706,128 @@ int VVDecImpl::getNumberOfErrorsPictureHashSEI()
 
   uint32_t iErrors = m_cDecLib->getNumberOfChecksumErrorsDetected();
   return iErrors;
+}
+
+// ---------------------------------------------------------------------------------------------------------- hand-over
+
+int VVDecImpl::handOverEnable()
+{
+  if( !m_bInitialized ){ return VVDEC_ERR_INITIALIZE; }
+#if VVDEC_VULKAN
+  if( m_cDecLib->setHandOver() )
+  {
+    return VVDEC_OK;
+  }
+#endif
+  m_cErrorString = "handOverEnable: this decoder cannot hand its pictures over (the GPU's parse and Vulkan's external memory are needed)";
+  return VVDEC_ERR_NOT_SUPPORTED;
+}
+
+int VVDecImpl::handOverDevice( uint8_t* deviceUuid, uint8_t* driverUuid )
+{
+  if( !m_bInitialized ){ return VVDEC_ERR_INITIALIZE; }
+#if VVDEC_VULKAN
+  if( m_cDecLib->handOver() )
+  {
+    memcpy( deviceUuid, m_cDecLib->gpu()->deviceUuid(), VK_UUID_SIZE );
+    memcpy( driverUuid, m_cDecLib->gpu()->driverUuid(), VK_UUID_SIZE );
+    return VVDEC_OK;
+  }
+#endif
+  (void) deviceUuid, (void) driverUuid;
+  return VVDEC_ERR_NOT_SUPPORTED;
+}
+
+void* VVDecImpl::handOverTimeline()
+{
+  if( !m_bInitialized ){ return nullptr; }
+#if VVDEC_VULKAN
+  if( m_cDecLib->handOver() )
+  {
+    return m_cDecLib->gpu()->exportHandOverTimeline();
+  }
+#endif
+  return nullptr;
+}
+
+void* VVDecImpl::handOverImport( void* handle, uint64_t bytes, uint32_t memoryType, const uint8_t* deviceUuid, const uint8_t* driverUuid )
+{
+  if( !m_bInitialized ){ return nullptr; }
+#if VVDEC_VULKAN
+  gpu::Buffer imported;
+  if( m_cDecLib->handOver() && m_cDecLib->gpu()->importBuffer( handle, bytes, memoryType, deviceUuid, driverUuid, imported ) )
+  {
+    m_handOverImports.push_back( imported );
+    return &m_handOverImports.back();
+  }
+#endif
+  (void) handle, (void) bytes, (void) memoryType, (void) deviceUuid, (void) driverUuid;
+  m_cErrorString = "handOverImport: the buffer could not be imported";
+  return nullptr;
+}
+
+int VVDecImpl::handOverRelease( void* imported )
+{
+  if( !m_bInitialized ){ return VVDEC_ERR_INITIALIZE; }
+#if VVDEC_VULKAN
+  for( auto it = m_handOverImports.begin(); it != m_handOverImports.end(); ++it )
+  {
+    if( &*it == imported )
+    {
+      m_cDecLib->handOver()->wait();
+      m_cDecLib->gpu()->releaseImport( *it );
+      m_handOverImports.erase( it );
+      return VVDEC_OK;
+    }
+  }
+#endif
+  (void) imported;
+  return VVDEC_ERR_PARAMETER;
+}
+
+int VVDecImpl::handOverPack( vvdecFrame* frame, void* imported, uint64_t offset, uint32_t stride, int bytesPerSample, int shift, int x,
+                             int y, int width, int height, uint64_t* value )
+{
+  if( !m_bInitialized ){ return VVDEC_ERR_INITIALIZE; }
+#if VVDEC_VULKAN
+  gpu::HandOver* handOver = m_cDecLib->handOver();
+  if( !handOver )
+  {
+    return VVDEC_ERR_NOT_SUPPORTED;
+  }
+  const gpu::Buffer* dst = nullptr;
+  for( const gpu::Buffer& buffer: m_handOverImports )
+  {
+    dst = &buffer == imported ? &buffer : dst;
+  }
+  Picture* pic = nullptr;
+  for( auto& entry: m_rcFrameList )
+  {
+    pic = &std::get<vvdecFrame>( entry ) == frame ? std::get<Picture*>( entry ) : pic;
+  }
+  if( !dst || !pic || ( bytesPerSample != 1 && bytesPerSample != 2 ) || x < 0 || y < 0 || width <= 0 || height <= 0
+      || x + width > int( frame->width ) || y + height > int( frame->height )
+      || offset + uint64_t( height - 1 ) * stride + uint64_t( width ) * bytesPerSample > dst->size )
+  {
+    m_cErrorString = "handOverPack: no such frame or buffer, or a rectangle outside them";
+    return VVDEC_ERR_PARAMETER;
+  }
+  if( pic->cs->sps->getBitDepths().recon <= 8 || !pic->gpuNeedsDownload )
+  {
+    return VVDEC_ERR_NOT_SUPPORTED;   // in host memory (DecLib::prepareOutput): not handed over
+  }
+  // The frame's visible picture starts at the conformance window's top-left sample (as xAddPicture crops it)
+  const Window& conf    = pic->cs->pps->getConformanceWindowPresentFlag() ? pic->cs->pps->getConformanceWindow() : pic->cs->sps->getConformanceWindow();
+  const int     confLeft = conf.getWindowLeftOffset() * SPS::getWinUnitX( pic->cs->sps->getChromaFormatIdc() );
+  const int     confTop  = conf.getWindowTopOffset() * SPS::getWinUnitY( pic->cs->sps->getChromaFormatIdc() );
+  *value = handOver->pack( *pic, m_cDecLib->gpuPlanes(), COMPONENT_Y, *dst, offset, stride, bytesPerSample, shift, confLeft + x,
+                           confTop + y, width, height );
+  return VVDEC_OK;
+#else
+  (void) frame, (void) imported, (void) offset, (void) stride, (void) bytesPerSample, (void) shift, (void) x, (void) y,
+    (void) width, (void) height, (void) value;
+  return VVDEC_ERR_NOT_SUPPORTED;
+#endif
 }
 
 const char* VVDecImpl::getErrorMsg( int nRet )

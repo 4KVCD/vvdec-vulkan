@@ -23,6 +23,7 @@ set( VVDEC_GPU_SHADERS
   "trafo|trafo"
   "lmcs|lmcs"
   "filmgrain|filmgrain"
+  "handover|handover"
   "mider|mider"
   "mider_lite|mider|LITE=1"
   "mider_cumap|mider|CUMAP=1"

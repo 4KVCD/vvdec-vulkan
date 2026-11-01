@@ -340,6 +340,46 @@ VVDEC_DECL int vvdec_get_hash_error_count( vvdecDecoder *dec )
 }
 
 
+VVDEC_DECL int vvdec_handover_enable( vvdecDecoder *dec )
+{
+  auto d = (vvdec::VVDecImpl*)dec;
+  return d ? d->catchExceptions( &vvdec::VVDecImpl::handOverEnable ) : VVDEC_ERR_INITIALIZE;
+}
+
+VVDEC_DECL int vvdec_handover_device( vvdecDecoder *dec, uint8_t deviceUuid[16], uint8_t driverUuid[16] )
+{
+  auto d = (vvdec::VVDecImpl*)dec;
+  return d ? d->catchExceptions( &vvdec::VVDecImpl::handOverDevice, deviceUuid, driverUuid ) : VVDEC_ERR_INITIALIZE;
+}
+
+VVDEC_DECL void* vvdec_handover_timeline( vvdecDecoder *dec )
+{
+  auto d = (vvdec::VVDecImpl*)dec;
+  return d ? d->catchExceptions( &vvdec::VVDecImpl::handOverTimeline ) : nullptr;
+}
+
+VVDEC_DECL void* vvdec_handover_import( vvdecDecoder *dec, void* handle, uint64_t bytes, uint32_t memoryType,
+                                        const uint8_t deviceUuid[16], const uint8_t driverUuid[16] )
+{
+  auto d = (vvdec::VVDecImpl*)dec;
+  return d ? d->catchExceptions( &vvdec::VVDecImpl::handOverImport, handle, bytes, memoryType, deviceUuid, driverUuid ) : nullptr;
+}
+
+VVDEC_DECL int vvdec_handover_release( vvdecDecoder *dec, void* imported )
+{
+  auto d = (vvdec::VVDecImpl*)dec;
+  return d ? d->catchExceptions( &vvdec::VVDecImpl::handOverRelease, imported ) : VVDEC_ERR_INITIALIZE;
+}
+
+VVDEC_DECL int vvdec_handover_pack( vvdecDecoder *dec, vvdecFrame* frame, void* imported, uint64_t offset, uint32_t stride,
+                                    int bytesPerSample, int shift, int x, int y, int width, int height, uint64_t* value )
+{
+  auto d = (vvdec::VVDecImpl*)dec;
+  return d ? d->catchExceptions( &vvdec::VVDecImpl::handOverPack, frame, imported, offset, stride, bytesPerSample, shift, x, y,
+                                 width, height, value )
+           : VVDEC_ERR_INITIALIZE;
+}
+
 VVDEC_DECL const char* vvdec_get_dec_information( vvdecDecoder *dec )
 {
   auto d = (vvdec::VVDecImpl*)dec;

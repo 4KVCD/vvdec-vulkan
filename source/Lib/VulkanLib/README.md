@@ -137,6 +137,8 @@ output frames, not to the reference pictures.
 - `GpuFrontEnd.*`: the CU, TU and CTU records the CPU writes for the GPU front end, and the tables its shaders read.
 - `GpuJobs.h`: the job structures shared by the CPU and the shaders.
 - `GpuFilmGrain.*`: film grain synthesis on the output frames.
+- `GpuHandOver.*`: the hand-over (`vvdec_handover_*`): the output pictures copied from their twins into another
+  Vulkan device's buffers on the same GPU (`handover.slang`), without downloading them; checked by `vvdechandover`.
 - `shaders/*.slang`: one file per pass (some with variants, see `cmake/modules/vvdecVulkanShaders.cmake`). The build
   embeds their SPIR-V in the generated `vvdec_gpu/GpuShaders.h`, which only `GpuContext.cpp` includes; the other
   files name shaders through `vvdec_gpu/GpuShaderIds.h`. The passes share a few includes: `common.slang` (sample

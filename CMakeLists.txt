@@ -500,6 +500,9 @@ set( VVDEC_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/source/Lib" )
 add_subdirectory( "source/Lib/vvdec" )
 add_subdirectory( "source/App/vvdecapp" )
 add_subdirectory( "source/App/vvdecbatch" )
+if( VVDEC_ENABLE_VULKAN AND WIN32 )
+  add_subdirectory( "source/App/vvdechandover" )   # the hand-over's check
+endif()
 
 # enable testing with ctest
 enable_testing()

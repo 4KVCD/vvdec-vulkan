@@ -245,6 +245,9 @@ public:
                    VkSemaphore waitFront = VK_NULL_HANDLE );
   // Other work on the compute queue, which signals done.
   void submit( VkCommandBuffer cmd, VkFence done ) { submitFirst( cmd, done ); }
+  // A hand-over copy (GpuHandOver) on the compute queue: signals done and the hand-over's timeline, with the value it
+  // returns (numbered under the queue's lock, so the values reach the other device in order whatever the thread).
+  uint64_t submitHandOver( VkCommandBuffer cmd, VkFence done );
 
   // --- The film grain's queue ---
   // The film grain on the output frames (GpuFilmGrain) needs only the downloaded frame. So it runs on a queue of its
@@ -305,6 +308,8 @@ public:
   // VK_KHR_external_semaphore_win32 (Windows), the device is made with them, whatever the decoder's mode: the context
   // is shared by the process's decoders, and the first one makes it.
   bool canHandOver() const { return m_handOverTimeline != VK_NULL_HANDLE; }
+  const uint8_t* deviceUuid() const { return m_deviceUuid; }   // VK_UUID_SIZE bytes each (with the hand-over)
+  const uint8_t* driverUuid() const { return m_driverUuid; }
   // Imports another device's export (an opaque Win32 handle of a dedicated allocation of `bytes`, from memory type
   // `memoryType` of a device with these UUIDs) as a buffer the shaders reach by its device address. False, with a
   // warning, when this device cannot: another GPU or driver, or no hand-over. The caller still closes the handle.

@@ -480,6 +480,10 @@ void DecLib::destroy()
 
 #if VVDEC_VULKAN
   m_gpuShared.reset();   // like the instances' own buffers, after their work is done
+  if( m_handOver )
+  {
+    m_handOver->wait();   // the hand-over's copies read twins that are freed now
+  }
   if( m_gpuPlanes )
   {
     m_gpuPlanes->waitDownloads();   // the downloads started ahead write into planes that are freed now
@@ -490,6 +494,7 @@ void DecLib::destroy()
 #if VVDEC_VULKAN
   // After the last picture buffer is gone, because the pictures' stand-ins are the pool's
   m_gpuPlanes.reset();
+  m_handOver.reset();   // its commands, before the device goes
   if( m_gpu )
   {
     gpu::Context::release();
@@ -823,6 +828,10 @@ void DecLib::prepareOutput( Picture* pcPic )
   {
     return;
   }
+  if( m_handOver && pcPic->cs->sps->getBitDepths().recon > 8 )
+  {
+    return;   // handed over from its twins (VVDecImpl::handOverPack), not downloaded; 8-bit output copies its planes
+  }
   m_gpuPlanes->finishDownload( *pcPic );
   for( Picture* next: m_picListManager.nextOutputs( kOutputsDownloadedAhead ) )
   {
@@ -835,6 +844,17 @@ void DecLib::prepareOutput( Picture* pcPic )
   (void) pcPic;
 #endif
 }
+
+#if VVDEC_VULKAN
+bool DecLib::setHandOver()
+{
+  if( !m_handOver && m_gpu && m_gpuPlanes && m_gpu->canHandOver() )
+  {
+    m_handOver = std::make_unique<gpu::HandOver>( m_gpu );
+  }
+  return m_handOver != nullptr;
+}
+#endif
 
 void DecLib::checkPictureHashSEI( Picture* pcPic )
 {

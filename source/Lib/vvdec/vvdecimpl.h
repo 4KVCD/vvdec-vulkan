@@ -197,6 +197,15 @@ public:
 
   int getNumberOfErrorsPictureHashSEI( );
 
+  // The hand-over (vvdec.h's vvdec_handover_*)
+  int   handOverEnable();
+  int   handOverDevice( uint8_t* deviceUuid, uint8_t* driverUuid );
+  void* handOverTimeline();
+  void* handOverImport( void* handle, uint64_t bytes, uint32_t memoryType, const uint8_t* deviceUuid, const uint8_t* driverUuid );
+  int   handOverRelease( void* imported );
+  int   handOverPack( vvdecFrame* frame, void* imported, uint64_t offset, uint32_t stride, int bytesPerSample, int shift, int x,
+                      int y, int width, int height, uint64_t* value );
+
   int setAndRetErrorMsg( int Ret, std::string errString = "" );
 
   const char* getDecoderInfo();
@@ -268,6 +277,9 @@ private:
   std::unique_ptr<DecLib>                  m_cDecLib;
 
   std::list<FrameListEntry>                m_rcFrameList;
+#if VVDEC_VULKAN
+  std::list<gpu::Buffer>                   m_handOverImports;   // the other device's buffers imported (handOverImport)
+#endif
   std::list<FrameListEntry>::iterator      m_pcFrameNext = m_rcFrameList.begin();
 
   FrameStorageMap                          m_cFrameStorageMap;       // map of frame storage class( converted frames)

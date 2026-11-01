@@ -711,6 +711,55 @@ VVDEC_DECL bool vvdec_is_nal_unit_slice ( vvdecNalType t );
 */
 VVDEC_DECL int vvdec_set_tracing( const char* file, const char* rule );
 
+/* The hand-over (the GPU's reconstruction with its parse, VVDEC_GPU_PARSE=2; Windows): decoded 10-bit pictures copied
+ on the GPU straight into another Vulkan device's buffers on the same GPU, without downloading them to host memory.
+ The other device exports its buffers (opaque Win32 handles of dedicated allocations) and imports the decoder's
+ timeline semaphore, which each copy signals. A picture handed over this way has no samples in host memory: its
+ vvdecFrame's planes must not be read. 8-bit pictures, and pictures with film grain added, still come in host memory.
+ These functions, vvdec_decode and vvdec_frame_unref must not run at the same time on one decoder. */
+
+/* vvdec_handover_enable
+ Turns the hand-over on, before the first picture is decoded.
+ \retval     VVDEC_OK, or VVDEC_ERR_NOT_SUPPORTED when the decoder cannot hand over (not on the GPU, no GPU parse, or
+             a device without the extensions)
+*/
+VVDEC_DECL int vvdec_handover_enable( vvdecDecoder * );
+
+/* vvdec_handover_device
+ The decoder's Vulkan device's deviceUUID and driverUUID (VK_UUID_SIZE bytes each): the other device must have the
+ same to import from it or export to it.
+*/
+VVDEC_DECL int vvdec_handover_device( vvdecDecoder *, uint8_t deviceUuid[16], uint8_t driverUuid[16] );
+
+/* vvdec_handover_timeline
+ The timeline semaphore the copies signal, as an opaque Win32 handle the caller closes (null when there is none).
+*/
+VVDEC_DECL void* vvdec_handover_timeline( vvdecDecoder * );
+
+/* vvdec_handover_import
+ Imports another device's buffer: an opaque Win32 handle (the caller still closes it) of a dedicated allocation of
+ `bytes`, from memory type `memoryType` of a device with these UUIDs. Returns the buffer for vvdec_handover_pack, or
+ null.
+*/
+VVDEC_DECL void* vvdec_handover_import( vvdecDecoder *, void* handle, uint64_t bytes, uint32_t memoryType,
+                                        const uint8_t deviceUuid[16], const uint8_t driverUuid[16] );
+
+/* vvdec_handover_release
+ Frees an imported buffer, once no copy into it is pending (after vvdec_frame_unref of the frames copied there).
+*/
+VVDEC_DECL int vvdec_handover_release( vvdecDecoder *, void* imported );
+
+/* vvdec_handover_pack
+ Copies the luma plane of a frame the decoder gave out (not yet given back) into an imported buffer: the rectangle
+ (x, y, width, height) of the frame's visible picture, to `offset`, rows `stride` bytes apart, samples of
+ bytesPerSample bytes (1 or 2, little-endian), each shifted left by `shift` (2: an 8-bit picture widened to 10).
+ *value receives the timeline semaphore's value the copy signals.
+ \retval     VVDEC_OK, VVDEC_ERR_NOT_SUPPORTED (no hand-over, or a picture that came in host memory), or
+             VVDEC_ERR_PARAMETER
+*/
+VVDEC_DECL int vvdec_handover_pack( vvdecDecoder *, vvdecFrame* frame, void* imported, uint64_t offset, uint32_t stride,
+                                    int bytesPerSample, int shift, int x, int y, int width, int height, uint64_t* value );
+
 VVDEC_NAMESPACE_END
 
 #ifdef __cplusplus
