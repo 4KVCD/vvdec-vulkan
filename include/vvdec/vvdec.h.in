@@ -714,9 +714,11 @@ VVDEC_DECL int vvdec_set_tracing( const char* file, const char* rule );
 /* The hand-over (the GPU's reconstruction with its parse, VVDEC_GPU_PARSE=2; Windows): decoded pictures copied on the
  GPU straight into another Vulkan device's buffers on the same GPU, without downloading them to host memory (film
  grain synthesis off). The other device exports its buffers (opaque Win32 handles of dedicated allocations) and imports
- the decoder's timeline semaphore, which each copy signals. A picture handed over this way has no samples in host
- memory: its vvdecFrame's planes must not be read (an 8-bit one's describe 8-bit samples there are not). A picture
- the CPU wrote (an error picture) is in host memory and not handed over (vvdec_handover_pack says so).
+ the decoder's timeline semaphore, which each copy signals; or the copies go into host memory the decoder imports
+ (vvdec_handover_import_host: another device's mapped buffers), visible to the host once the timeline reaches the
+ copy's value. In hand-over mode no vvdecFrame's planes may be read: a picture on the GPU has no samples in host
+ memory, and the planes of one held in host memory (an error picture, or one the CPU parsed) are the decoder's own
+ 16-bit samples (an 8-bit frame's describe 8-bit samples there are not); both are handed over alike.
  These functions, vvdec_decode and vvdec_frame_unref must not run at the same time on one decoder. */
 
 /* vvdec_handover_enable
@@ -746,6 +748,14 @@ VVDEC_DECL void* vvdec_handover_timeline( vvdecDecoder * );
 VVDEC_DECL void* vvdec_handover_import( vvdecDecoder *, void* handle, uint64_t bytes, uint32_t memoryType,
                                         const uint8_t deviceUuid[16], const uint8_t driverUuid[16] );
 
+/* vvdec_handover_import_host
+ Imports `bytes` of host memory at `host` (it stays the caller's; another device's mapped memory may be imported):
+ both multiples of the device's minImportedHostPointerAlignment (4 KiB on the GPUs tried; 64 KiB is always enough).
+ Returns the buffer for vvdec_handover_pack and vvdec_handover_pack_frame, or null (the device cannot import host
+ memory, or the driver refuses this memory).
+*/
+VVDEC_DECL void* vvdec_handover_import_host( vvdecDecoder *, void* host, uint64_t bytes );
+
 /* vvdec_handover_release
  Frees an imported buffer, once no copy into it is pending (after vvdec_frame_unref of the frames copied there).
 */
@@ -754,18 +764,38 @@ VVDEC_DECL int vvdec_handover_release( vvdecDecoder *, void* imported );
 /* vvdec_handover_pack
  Copies the luma plane of a frame the decoder gave out (not yet given back) into an imported buffer: the rectangle
  (x, y, width, height) of the frame's visible picture, to `offset`, rows `stride` bytes apart, samples of
- bytesPerSample bytes (1 or 2, little-endian), each shifted left by `shift` (2: an 8-bit picture widened to 10).
+ bytesPerSample bytes (1 or 2, little-endian), each shifted left by `shift` (2: an 8-bit picture widened to 10; 6:
+ 10-bit samples in a 16-bit word's top bits, as P016).
  *value receives the timeline semaphore's value the copy signals.
- \retval     VVDEC_OK, VVDEC_ERR_NOT_SUPPORTED (no hand-over, or a picture that came in host memory), or
+ \retval     VVDEC_OK, VVDEC_ERR_NOT_SUPPORTED (no hand-over, or a picture in memory the GPU cannot reach), or
              VVDEC_ERR_PARAMETER
 */
 VVDEC_DECL int vvdec_handover_pack( vvdecDecoder *, vvdecFrame* frame, void* imported, uint64_t offset, uint32_t stride,
                                     int bytesPerSample, int shift, int x, int y, int width, int height, uint64_t* value );
 
+/* vvdec_handover_pack_frame
+ vvdec_handover_pack for the Y, U and V planes in one submission: plane c to offsets[c], rows strides[c] bytes apart.
+ The rectangle is in luma samples; a chroma plane's is subsampled as the picture is, so it must fall on whole chroma
+ samples (even x, y, width and height in 4:2:0).
+*/
+VVDEC_DECL int vvdec_handover_pack_frame( vvdecDecoder *, vvdecFrame* frame, void* imported, const uint64_t offsets[3],
+                                          const uint32_t strides[3], int bytesPerSample, int shift, int x, int y, int width,
+                                          int height, uint64_t* value );
+
 /* vvdec_handover_wait
  Waits until every copy vvdec_handover_pack submitted is done (for a caller that cannot wait on the timeline itself).
 */
 VVDEC_DECL int vvdec_handover_wait( vvdecDecoder * );
+
+/* vvdec_handover_wait_value
+ Waits until the copy that signals `value` (vvdec_handover_pack's or vvdec_handover_pack_frame's *value) and every copy
+ before it are done, at most timeoutNs nanoseconds. Unlike the other functions it may run on another thread beside
+ vvdec_decode, vvdec_frame_unref and the hand-over's other functions (not beside vvdec_decoder_close), and it leaves
+ vvdec_get_last_error's message alone. VVDEC_HANDOVER_TIMES=1 times the copies (printed at the info log level).
+ \retval     VVDEC_OK, VVDEC_TRY_AGAIN (the timeout passed first), VVDEC_ERR_UNSPECIFIED (the device was lost), or
+             VVDEC_ERR_NOT_SUPPORTED (no hand-over)
+*/
+VVDEC_DECL int vvdec_handover_wait_value( vvdecDecoder *, uint64_t value, uint64_t timeoutNs );
 
 VVDEC_NAMESPACE_END
 

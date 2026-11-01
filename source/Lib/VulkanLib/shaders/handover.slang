@@ -1,10 +1,13 @@
-// The hand-over's pack (GpuHandOver): a picture's plane copied from its twin -- 16-bit samples, rows the margins'
-// stride apart, which the decoder keeps for every bit depth -- into another device's buffer (VideoMetricsLab's VMAF
-// engine: a slot it exported, imported here), at that buffer's layout: rows pc.dstStride bytes apart, samples of
-// pc.dstBytes bytes, the visible picture only (the source starts at its top-left sample: the conformance window's
-// and the caller's crop applied). Each sample is shifted left by pc.shift on the way (an 8-bit picture scored beside
-// a 10-bit one: 2, as FFmpeg widens it), and stored in one byte (8 bits) or two (little-endian, low bits).
-// A thread takes four samples of a row; group.x the row's segment, group.y the row.
+// The hand-over's pack (GpuHandOver): a picture's plane copied from its twin or its host plane -- 16-bit samples,
+// rows the margins' stride apart, which the decoder keeps for every bit depth -- into another device's buffer
+// (VideoMetricsLab's VMAF engine: a slot it exported, imported here) or imported host memory (Vship's frames), at
+// that buffer's layout: rows pc.dstStride bytes apart, samples of pc.dstBytes bytes, the visible picture only (the
+// source starts at its top-left sample: the conformance window's and the caller's crop applied). Each sample is
+// shifted left by pc.shift on the way (an 8-bit picture scored beside a 10-bit one: 2, as FFmpeg widens it; 10-bit
+// samples in a 16-bit word's top bits, P016: 6), and stored in one byte (8 bits) or two (little-endian).
+// A thread takes four samples of a row, kThreads apart, so that a warp's store covers contiguous bytes: into host
+// memory across the bus, stores of four consecutive samples a thread (a warp's 2-byte pieces 8 bytes apart) took
+// 337 ms a 1080p 10-bit picture on an RTX 5090, contiguous ones 0.17 ms. group.x the row's segment, group.y the row.
 
 #include "common.slang"
 
@@ -17,7 +20,7 @@ struct Params
   int      width;      // samples a row
   int      height;     // rows
   int      dstBytes;   // 1 or 2
-  int      shift;      // 0, or 2 to widen 8-bit samples to 10
+  int      shift;      // 0; 2 to widen 8-bit samples to 10; 6 for 10-bit samples in the top bits
 };
 
 [[vk::push_constant]] Params pc;
@@ -31,7 +34,7 @@ static const int kSegment   = kThreads * kPerThread;
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
   const int row = int( group.y );
-  const int x0  = int( group.x ) * kSegment + int( local.x ) * kPerThread;
+  const int x0  = int( group.x ) * kSegment + int( local.x );
   if( row >= pc.height )
   {
     return;
@@ -40,10 +43,10 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   uint8_t* dst = pc.dst + row * pc.dstStride;
   for( int k = 0; k < kPerThread; k++ )
   {
-    const int x = x0 + k;
+    const int x = x0 + k * kThreads;
     if( x >= pc.width )
     {
-      break;
+      break;   // x only grows
     }
     const int v = int( *at( src, uint( x ) ) ) << pc.shift;
     if( pc.dstBytes == 2 )

@@ -50,6 +50,8 @@ OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMA
 
 #include "CommonLib/Picture.h"
 
+#include <cstdlib>
+
 namespace vvdec
 {
 namespace gpu
@@ -69,21 +71,41 @@ struct HandOverParams
 };
 static constexpr int kHandOverSegment = 1024;   // the samples of a row a workgroup takes (handover.slang)
 
+// A copy's timestamps (Copy::queries): its start, after its first barrier (earlier work done), its end
+enum HandOverStamp : uint32_t
+{
+  kStampStart,
+  kStampBarrier,
+  kStampEnd,
+  kStamps
+};
+
 HandOver::HandOver( Context* context ) : m_ctx( context ), m_copies( kCopies )
 {
+  const char* timed = getenv( "VVDEC_HANDOVER_TIMES" );
+  m_timed           = timed && atoi( timed ) != 0;
   for( Copy& copy: m_copies )
   {
     copy.pool = m_ctx->createCommandPool( m_ctx->queueFamily() );
     m_ctx->allocateCommandBuffers( copy.pool, 1, &copy.cmd );
     copy.fence = m_ctx->createFence();
+    if( m_timed )
+    {
+      copy.queries = m_ctx->createTimestampQueries( kStamps );   // the compute queue's family has timestamps
+    }
   }
 }
 
 HandOver::~HandOver()
 {
   wait();
+  if( m_timed && m_times.copies )
+  {
+    printTimes( "in all" );
+  }
   for( Copy& copy: m_copies )
   {
+    m_ctx->destroyQueries( copy.queries );
     m_ctx->destroyFence( copy.fence );
     m_ctx->destroyCommandPool( copy.pool );   // and its buffer
   }
@@ -98,35 +120,111 @@ void HandOver::wait()
     {
       m_ctx->api().vkWaitForFences( m_ctx->device(), 1, &copy.fence, VK_TRUE, UINT64_MAX );
       copy.pending = false;
+      if( m_timed )
+      {
+        addTimes( copy );
+      }
     }
   }
 }
 
-uint64_t HandOver::pack( Picture& pic, PlanePool* pool, ComponentID comp, const Buffer& dst, VkDeviceSize dstOffset, uint32_t dstStride,
-                         int dstBytes, int shift, int x, int y, int width, int height )
+VkResult HandOver::waitFor( uint64_t value, uint64_t timeoutNs )
+{
+  // Not under m_mutex: pack may wait on a ring slot's fence meanwhile
+  const VkResult result = m_ctx->waitHandOver( value, timeoutNs );
+  if( result == VK_SUCCESS && m_timed )
+  {
+    const Clock::time_point     now = Clock::now();
+    std::lock_guard<std::mutex> lock( m_mutex );
+    for( Copy& copy: m_copies )
+    {
+      if( copy.pending && copy.value == value && copy.waitedMs < 0 )
+      {
+        copy.waitedMs = std::chrono::duration<double, std::milli>( now - copy.submitted ).count();
+      }
+    }
+  }
+  return result;
+}
+
+void HandOver::addTimes( Copy& copy )
+{
+  uint64_t stamps[kStamps];
+  if( m_ctx->api().vkGetQueryPoolResults( m_ctx->device(), copy.queries, 0, kStamps, sizeof( stamps ), stamps, sizeof( stamps[0] ),
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT )
+      != VK_SUCCESS )
+  {
+    return;
+  }
+  const double msPerTick = m_ctx->timestampPeriod() * 1e-6;   // timestampPeriod: nanoseconds a tick
+  const double queuedMs  = double( stamps[kStampBarrier] - stamps[kStampStart] ) * msPerTick;
+  const double packMs    = double( stamps[kStampEnd] - stamps[kStampBarrier] ) * msPerTick;
+  m_times.copies++;
+  m_times.queuedMs += queuedMs;
+  m_times.packMs += packMs;
+  if( copy.waitedMs >= 0 )
+  {
+    m_times.waited++;
+    m_times.delayMs += copy.waitedMs - ( queuedMs + packMs );
+  }
+  if( m_times.copies % kTimesEvery == 0 )
+  {
+    printTimes( "so far" );
+  }
+}
+
+void HandOver::printTimes( const char* when ) const
+{
+  msg( INFO, "Vulkan hand-over, %s: %ld copies, means in ms: queued on the GPU %.3f, pack %.3f; before the GPU started it %.3f (%ld waited for)\n",
+       when, m_times.copies, m_times.queuedMs / double( m_times.copies ), m_times.packMs / double( m_times.copies ),
+       m_times.waited ? m_times.delayMs / double( m_times.waited ) : 0.0, m_times.waited );
+}
+
+// The address of the plane's top-left sample (0, 0) for the shaders, and its stride in samples: in the twin of a
+// picture on the GPU, else in its host plane. Called with the pool's lock held.
+static VkDeviceAddress planeOrigin( const Picture& pic, ComponentID comp, int& stride )
+{
+  const PelStorage& planes = pic.m_bufs[PIC_RECONSTRUCTION];
+  stride                   = int( planes.bufs[comp].stride );
+  if( pic.gpuNeedsDownload )
+  {
+    const Buffer& twin = planeTwin( planes, comp );
+    CHECK_FATAL( !twin.valid(), "Vulkan: a picture handed over without its twins" );
+    return twin.addr + gpuLayout( planes, comp ).origin;
+  }
+  VkDeviceAddress host[MAX_NUM_COMPONENT];
+  int             strides[MAX_NUM_COMPONENT];
+  CHECK_FATAL( !hostPictureAddresses( planes, host, strides ), "Vulkan: a picture handed over from memory the GPU cannot reach" );
+  return host[comp];
+}
+
+uint64_t HandOver::pack( Picture& pic, PlanePool* pool, const Plane* planes, int count, const Buffer& dst, int dstBytes, int shift )
 {
   CHECK_FATAL( pic.progress < Picture::reconstructed, "Vulkan: a picture handed over before its work on the GPU is done" );
-  HandOverParams params{};
+  CHECK_FATAL( count < 1 || count > MAX_NUM_COMPONENT, "Vulkan: a hand-over of no planes or too many" );
+  HandOverParams params[MAX_NUM_COMPONENT]{};
   {
-    // The twin's records stay put meanwhile (a picture the pool handles on another thread)
+    // The planes' records stay put meanwhile (a picture the pool handles on another thread)
     std::unique_lock<std::mutex> planesLock;
     if( pool )
     {
       planesLock = pool->lockPlanes();
     }
-    const PelStorage& planes = pic.m_bufs[PIC_RECONSTRUCTION];
-    const Buffer&     twin   = planeTwin( planes, comp );
-    CHECK_FATAL( !twin.valid(), "Vulkan: a picture handed over without its twins" );
-    const int stride = int( planes.bufs[comp].stride );
-    params.src       = twin.addr + gpuLayout( planes, comp ).origin + VkDeviceSize( y * stride + x ) * sizeof( Pel );
-    params.srcStride = stride;
+    for( int i = 0; i < count; i++ )
+    {
+      const Plane& plane  = planes[i];
+      int          stride = 0;
+      const VkDeviceAddress origin = planeOrigin( pic, plane.comp, stride );
+      params[i].src       = origin + VkDeviceSize( plane.y * stride + plane.x ) * sizeof( Pel );
+      params[i].srcStride = stride;
+      params[i].dst       = dst.addr + plane.dstOffset;
+      params[i].dstStride = int32_t( plane.dstStride );
+      params[i].width     = plane.width;
+      params[i].height    = plane.height;
+      params[i].dstBytes  = dstBytes;
+      params[i].shift     = shift;
+    }
   }
-  params.dst       = dst.addr + dstOffset;
-  params.dstStride = int32_t( dstStride );
-  params.width     = width;
-  params.height    = height;
-  params.dstBytes  = dstBytes;
-  params.shift     = shift;
 
   std::lock_guard<std::mutex> lock( m_mutex );
   Copy&                       copy = m_copies[m_next];
@@ -135,21 +233,50 @@ uint64_t HandOver::pack( Picture& pic, PlanePool* pool, ComponentID comp, const 
   if( copy.pending )
   {
     vk.vkWaitForFences( m_ctx->device(), 1, &copy.fence, VK_TRUE, UINT64_MAX );
+    if( m_timed )
+    {
+      addTimes( copy );
+    }
   }
   vk.vkResetCommandPool( m_ctx->device(), copy.pool, 0 );
   m_ctx->beginOneTime( copy.cmd );
+  if( m_timed )
+  {
+    vk.vkCmdResetQueryPool( copy.cmd, copy.queries, 0, kStamps );
+    vk.vkCmdWriteTimestamp( copy.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, copy.queries, kStampStart );
+  }
   // After the picture's reconstruction (earlier work on this queue), and after the other device's last read of dst,
   // which its own submissions finished before it asked for this copy
   m_ctx->memoryBarrier( copy.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT );
+  if( m_timed )
+  {
+    vk.vkCmdWriteTimestamp( copy.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, copy.queries, kStampBarrier );
+  }
   vk.vkCmdBindPipeline( copy.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_handover ) );
-  vk.vkCmdPushConstants( copy.cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( params ), &params );
-  vk.vkCmdDispatch( copy.cmd, uint32_t( ( width + kHandOverSegment - 1 ) / kHandOverSegment ), uint32_t( height ), 1 );
+  // The planes' copies write disjoint ranges: no barrier between them
+  for( int i = 0; i < count; i++ )
+  {
+    vk.vkCmdPushConstants( copy.cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( params[i] ), &params[i] );
+    vk.vkCmdDispatch( copy.cmd, uint32_t( ( params[i].width + kHandOverSegment - 1 ) / kHandOverSegment ), uint32_t( params[i].height ),
+                      1 );
+  }
+  // Into host memory, the writes must be made visible to the host: a fence or semaphore alone does not (for another
+  // device's memory the timeline's signal below is what counts, and this costs nothing)
+  m_ctx->memoryBarrier( copy.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_ACCESS_HOST_READ_BIT );
+  if( m_timed )
+  {
+    vk.vkCmdWriteTimestamp( copy.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, copy.queries, kStampEnd );
+  }
   vk.vkEndCommandBuffer( copy.cmd );
   vk.vkResetFences( m_ctx->device(), 1, &copy.fence );
-  copy.pending = true;
+  copy.waitedMs  = -1;
+  copy.submitted = Clock::now();
   // The timeline's signal makes the copy's writes available to the other device
-  return m_ctx->submitHandOver( copy.cmd, copy.fence );
+  copy.value   = m_ctx->submitHandOver( copy.cmd, copy.fence );
+  copy.pending = true;   // only once submitted: a fence of a failed submission is never signalled
+  return copy.value;
 }
 
 }   // namespace gpu

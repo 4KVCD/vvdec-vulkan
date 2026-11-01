@@ -462,6 +462,7 @@ Context::DeviceExtensions Context::findExtensions() const
     found.externalMemoryWin32 |= strcmp( extension.extensionName, VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME ) == 0;
     found.externalSemaphoreWin32 |= strcmp( extension.extensionName, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME ) == 0;
 #endif
+    found.externalMemoryHost |= strcmp( extension.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME ) == 0;
     if( strcmp( extension.extensionName, "VK_KHR_global_priority" ) == 0 )
     {
       found.globalPriority = "VK_KHR_global_priority";
@@ -656,6 +657,12 @@ bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgro
     features.extensions.push_back( VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME );
   }
 #endif
+  // ... and, where the device can, into host memory (another device's mapped buffers: Vship's frames)
+  const bool hostImport = handOver && found.externalMemoryHost;
+  if( hostImport )
+  {
+    features.extensions.push_back( VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME );
+  }
 
   // Every queue at low global priority (VVDEC_GPU_PRIORITY=normal: not), so that other programs' GPU work, the
   // desktop's, goes first; a device that refuses it is made without. Intel Graphics, VideoQ 4K beside a 60 Hz probe
@@ -704,6 +711,16 @@ bool Context::createDevice( const VkPhysicalDeviceProperties& props, bool subgro
   if( handOver )
   {
     makeHandOver();
+  }
+  if( hostImport && canHandOver() )
+  {
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT host{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT };
+    VkPhysicalDeviceProperties2                     hostProps{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+    hostProps.pNext = &host;
+    m_api.vkGetPhysicalDeviceProperties2( m_physical, &hostProps );
+    m_getHostPointerProperties =
+      (PFN_vkGetMemoryHostPointerPropertiesEXT) m_api.vkGetDeviceProcAddr( m_device, "vkGetMemoryHostPointerPropertiesEXT" );
+    m_hostImportAlignment = m_getHostPointerProperties ? host.minImportedHostPointerAlignment : 0;
   }
   if( found.shaderInfo )
   {
@@ -1875,6 +1892,15 @@ uint64_t Context::submitHandOver( VkCommandBuffer cmd, VkFence done )
   return value;
 }
 
+VkResult Context::waitHandOver( uint64_t value, uint64_t timeoutNs )
+{
+  VkSemaphoreWaitInfo info{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+  info.semaphoreCount = 1;
+  info.pSemaphores    = &m_handOverTimeline;
+  info.pValues        = &value;
+  return m_api.vkWaitSemaphores( m_device, &info, timeoutNs );
+}
+
 void Context::submitFront( int queue, VkCommandBuffer cmd, uint64_t waitFirst, VkSemaphore done, uint64_t waitParse )
 {
   VkSubmitInfo info{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -2241,6 +2267,74 @@ bool Context::importBuffer( void* handle, uint64_t bytes, uint32_t memoryType, c
   (void) handle, (void) bytes, (void) memoryType, (void) deviceUuid, (void) driverUuid, (void) imported;
   return false;
 #endif
+}
+
+bool Context::importHostBuffer( void* host, uint64_t bytes, Buffer& imported )
+{
+  const VkDeviceSize align = m_hostImportAlignment;
+  if( !align || !host || !bytes || reinterpret_cast<uintptr_t>( host ) % align || bytes % align )
+  {
+    msg( WARNING, "Vulkan: host memory to import that this device cannot take, or not aligned to %llu bytes\n",
+         (unsigned long long) align );
+    return false;
+  }
+  VkMemoryHostPointerPropertiesEXT pointer{ VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
+  if( m_getHostPointerProperties( m_device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &pointer ) != VK_SUCCESS )
+  {
+    msg( WARNING, "Vulkan: the driver does not take this host memory\n" );
+    return false;
+  }
+  Buffer buf;
+  buf.kind = MemKind::Device;   // written by the GPU only (the CPU's view is the caller's)
+  buf.size = bytes;
+  VkExternalMemoryBufferCreateInfo external{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+  external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+  VkBufferCreateInfo info{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+  info.pNext = &external;
+  info.size  = bytes;
+  info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  if( m_api.vkCreateBuffer( m_device, &info, nullptr, &buf.buffer ) != VK_SUCCESS )
+  {
+    msg( WARNING, "Vulkan: vkCreateBuffer failed for imported host memory\n" );
+    return false;
+  }
+  VkMemoryRequirements req;
+  m_api.vkGetBufferMemoryRequirements( m_device, buf.buffer, &req );
+  // A coherent type: the host reads the copies once the timeline's value is reached, with no invalidate of its own
+  const uint32_t types = req.memoryTypeBits & pointer.memoryTypeBits;
+  uint32_t       type  = 0;
+  while( type < m_memProps.memoryTypeCount
+         && !( ( types & ( 1u << type ) ) && ( m_memProps.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ) ) )
+  {
+    type++;
+  }
+  VkImportMemoryHostPointerInfoEXT import{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
+  import.handleType   = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+  import.pHostPointer = host;
+  VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+  flags.pNext = &import;
+  flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  VkMemoryAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+  allocInfo.pNext           = &flags;
+  allocInfo.allocationSize  = bytes;
+  allocInfo.memoryTypeIndex = type;
+  if( type == m_memProps.memoryTypeCount || m_api.vkAllocateMemory( m_device, &allocInfo, nullptr, &buf.memory ) != VK_SUCCESS
+      || m_api.vkBindBufferMemory( m_device, buf.buffer, buf.memory, 0 ) != VK_SUCCESS )
+  {
+    if( buf.memory )
+    {
+      m_api.vkFreeMemory( m_device, buf.memory, nullptr );
+    }
+    m_api.vkDestroyBuffer( m_device, buf.buffer, nullptr );
+    msg( WARNING, "Vulkan: importing %llu bytes of host memory failed\n", (unsigned long long) bytes );
+    return false;
+  }
+  VkBufferDeviceAddressInfo address{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+  address.buffer = buf.buffer;
+  buf.addr       = m_api.vkGetBufferDeviceAddress( m_device, &address );
+  buf.memorySize = bytes;
+  imported       = buf;
+  return true;
 }
 
 void Context::releaseImport( Buffer& imported )

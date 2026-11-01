@@ -60,6 +60,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "FilmGrain/FilmGrain.h"
 #if VVDEC_VULKAN
 #include "VulkanLib/GpuRecon.h"
+#include "VulkanLib/GpuPictureMemory.h"
 #endif
 
 namespace vvdec
@@ -804,8 +805,61 @@ int VVDecImpl::handOverWait()
   return VVDEC_ERR_NOT_SUPPORTED;
 }
 
+int VVDecImpl::handOverWaitValue( uint64_t value, uint64_t timeoutNs ) noexcept
+{
+  if( !m_bInitialized ){ return VVDEC_ERR_INITIALIZE; }
+#if VVDEC_VULKAN
+  if( gpu::HandOver* handOver = m_cDecLib->handOver() )
+  {
+    try
+    {
+      switch( handOver->waitFor( value, timeoutNs ) )
+      {
+      case VK_SUCCESS: return VVDEC_OK;
+      case VK_TIMEOUT: return VVDEC_TRY_AGAIN;
+      default:         return VVDEC_ERR_UNSPECIFIED;   // the device lost
+      }
+    }
+    catch( ... )   // the timing's lock
+    {
+      return VVDEC_ERR_UNSPECIFIED;
+    }
+  }
+#endif
+  (void) value, (void) timeoutNs;
+  return VVDEC_ERR_NOT_SUPPORTED;
+}
+
+void* VVDecImpl::handOverImportHost( void* host, uint64_t bytes )
+{
+  if( !m_bInitialized ){ return nullptr; }
+#if VVDEC_VULKAN
+  gpu::Buffer imported;
+  if( m_cDecLib->handOver() && m_cDecLib->gpu()->importHostBuffer( host, bytes, imported ) )
+  {
+    m_handOverImports.push_back( imported );
+    return &m_handOverImports.back();
+  }
+#endif
+  (void) host, (void) bytes;
+  m_cErrorString = "handOverImportHost: the host memory could not be imported";
+  return nullptr;
+}
+
 int VVDecImpl::handOverPack( vvdecFrame* frame, void* imported, uint64_t offset, uint32_t stride, int bytesPerSample, int shift, int x,
                              int y, int width, int height, uint64_t* value )
+{
+  return handOverCopy( frame, imported, 1, &offset, &stride, bytesPerSample, shift, x, y, width, height, value );
+}
+
+int VVDecImpl::handOverPackFrame( vvdecFrame* frame, void* imported, const uint64_t* offsets, const uint32_t* strides, int bytesPerSample,
+                                  int shift, int x, int y, int width, int height, uint64_t* value )
+{
+  return handOverCopy( frame, imported, 3, offsets, strides, bytesPerSample, shift, x, y, width, height, value );
+}
+
+int VVDecImpl::handOverCopy( vvdecFrame* frame, void* imported, int numPlanes, const uint64_t* offsets, const uint32_t* strides,
+                             int bytesPerSample, int shift, int x, int y, int width, int height, uint64_t* value )
 {
   if( !m_bInitialized ){ return VVDEC_ERR_INITIALIZE; }
 #if VVDEC_VULKAN
@@ -825,26 +879,44 @@ int VVDecImpl::handOverPack( vvdecFrame* frame, void* imported, uint64_t offset,
     pic = &std::get<vvdecFrame>( entry ) == frame ? std::get<Picture*>( entry ) : pic;
   }
   if( !dst || !pic || ( bytesPerSample != 1 && bytesPerSample != 2 ) || x < 0 || y < 0 || width <= 0 || height <= 0
-      || x + width > int( frame->width ) || y + height > int( frame->height )
-      || offset + uint64_t( height - 1 ) * stride + uint64_t( width ) * bytesPerSample > dst->size )
+      || numPlanes > int( frame->numPlanes ) )
   {
-    m_cErrorString = "handOverPack: no such frame or buffer, or a rectangle outside them";
+    m_cErrorString = "handOverPack: no such frame, buffer or plane";
     return VVDEC_ERR_PARAMETER;
   }
-  if( !pic->gpuNeedsDownload )
+  // In host memory the GPU cannot reach (no picture of the GPU path's)
+  if( !pic->gpuNeedsDownload && !gpu::hostPictureAddresses( pic->m_bufs[PIC_RECONSTRUCTION], nullptr, nullptr ) )
   {
-    return VVDEC_ERR_NOT_SUPPORTED;   // in host memory (a picture the CPU wrote: an error picture filled in grey)
+    m_cErrorString = "handOverPack: a picture in memory the GPU cannot reach";
+    return VVDEC_ERR_NOT_SUPPORTED;
   }
-  // The frame's visible picture starts at the conformance window's top-left sample (as xAddPicture crops it)
-  const Window& conf    = pic->cs->pps->getConformanceWindowPresentFlag() ? pic->cs->pps->getConformanceWindow() : pic->cs->sps->getConformanceWindow();
-  const int     confLeft = conf.getWindowLeftOffset() * SPS::getWinUnitX( pic->cs->sps->getChromaFormatIdc() );
-  const int     confTop  = conf.getWindowTopOffset() * SPS::getWinUnitY( pic->cs->sps->getChromaFormatIdc() );
-  *value = handOver->pack( *pic, m_cDecLib->gpuPlanes(), COMPONENT_Y, *dst, offset, stride, bytesPerSample, shift, confLeft + x,
-                           confTop + y, width, height );
+  // The frame's visible picture starts at the conformance window's top-left sample (as xAddPicture crops it); a
+  // chroma plane's rectangle is the luma's subsampled, which must then fall on whole chroma samples
+  const ChromaFormat chromaFormat = pic->cs->sps->getChromaFormatIdc();
+  const Window&      conf = pic->cs->pps->getConformanceWindowPresentFlag() ? pic->cs->pps->getConformanceWindow() : pic->cs->sps->getConformanceWindow();
+  const int          confLeft = conf.getWindowLeftOffset() * SPS::getWinUnitX( chromaFormat );
+  const int          confTop  = conf.getWindowTopOffset() * SPS::getWinUnitY( chromaFormat );
+  gpu::HandOver::Plane planes[MAX_NUM_COMPONENT];
+  for( int comp = 0; comp < numPlanes; comp++ )
+  {
+    const int sx = getComponentScaleX( ComponentID( comp ), chromaFormat ), sy = getComponentScaleY( ComponentID( comp ), chromaFormat );
+    const int maskX = ( 1 << sx ) - 1, maskY = ( 1 << sy ) - 1;
+    const vvdecPlane& plane = frame->planes[comp];
+    gpu::HandOver::Plane& copy = planes[comp];
+    copy = { ComponentID( comp ), offsets[comp], strides[comp], ( confLeft + x ) >> sx, ( confTop + y ) >> sy, width >> sx, height >> sy };
+    if( ( x | width ) & maskX || ( y | height ) & maskY || ( x >> sx ) + copy.width > int( plane.width )
+        || ( y >> sy ) + copy.height > int( plane.height )
+        || offsets[comp] + uint64_t( copy.height - 1 ) * strides[comp] + uint64_t( copy.width ) * bytesPerSample > dst->size )
+    {
+      m_cErrorString = "handOverPack: a rectangle outside the picture or the buffer, or not on whole chroma samples";
+      return VVDEC_ERR_PARAMETER;
+    }
+  }
+  *value = handOver->pack( *pic, m_cDecLib->gpuPlanes(), planes, numPlanes, *dst, bytesPerSample, shift );
   return VVDEC_OK;
 #else
-  (void) frame, (void) imported, (void) offset, (void) stride, (void) bytesPerSample, (void) shift, (void) x, (void) y,
-    (void) width, (void) height, (void) value;
+  (void) frame, (void) imported, (void) numPlanes, (void) offsets, (void) strides, (void) bytesPerSample, (void) shift, (void) x,
+    (void) y, (void) width, (void) height, (void) value;
   return VVDEC_ERR_NOT_SUPPORTED;
 #endif
 }
@@ -1283,9 +1355,11 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
 
   bool bCreateStorage = ( bitDepths.recon == 8 );   // for 8bit output we need to copy the lib picture from unsigned short into unsigned char buffer
 #if VVDEC_VULKAN
-  // A picture handed over (DecLib::prepareOutput did not download it) has no samples in host memory, so no 8-bit copy
-  // of them: its frame keeps the picture, and describes planes that must not be read (vvdec.h's hand-over)
-  if( m_cDecLib->handOver() && pcPic->gpuNeedsDownload )
+  // In hand-over mode no picture gets an 8-bit copy: one on the GPU (DecLib::prepareOutput did not download it) has
+  // no samples in host memory, and one held in host planes (an error picture, or one the CPU parsed) is handed over
+  // from those, so its frame must keep the picture and its planes. The frame describes planes that must not be read
+  // (vvdec.h's hand-over); film grain synthesis is off in this mode.
+  if( m_cDecLib->handOver() )
   {
     bCreateStorage = false;
   }

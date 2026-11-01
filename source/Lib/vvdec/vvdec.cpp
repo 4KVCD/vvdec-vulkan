@@ -365,6 +365,12 @@ VVDEC_DECL void* vvdec_handover_import( vvdecDecoder *dec, void* handle, uint64_
   return d ? d->catchExceptions( &vvdec::VVDecImpl::handOverImport, handle, bytes, memoryType, deviceUuid, driverUuid ) : nullptr;
 }
 
+VVDEC_DECL void* vvdec_handover_import_host( vvdecDecoder *dec, void* host, uint64_t bytes )
+{
+  auto d = (vvdec::VVDecImpl*)dec;
+  return d ? d->catchExceptions( &vvdec::VVDecImpl::handOverImportHost, host, bytes ) : nullptr;
+}
+
 VVDEC_DECL int vvdec_handover_release( vvdecDecoder *dec, void* imported )
 {
   auto d = (vvdec::VVDecImpl*)dec;
@@ -380,10 +386,27 @@ VVDEC_DECL int vvdec_handover_pack( vvdecDecoder *dec, vvdecFrame* frame, void* 
            : VVDEC_ERR_INITIALIZE;
 }
 
+VVDEC_DECL int vvdec_handover_pack_frame( vvdecDecoder *dec, vvdecFrame* frame, void* imported, const uint64_t offsets[3],
+                                          const uint32_t strides[3], int bytesPerSample, int shift, int x, int y, int width,
+                                          int height, uint64_t* value )
+{
+  auto d = (vvdec::VVDecImpl*)dec;
+  return d ? d->catchExceptions( &vvdec::VVDecImpl::handOverPackFrame, frame, imported, offsets, strides, bytesPerSample, shift, x,
+                                 y, width, height, value )
+           : VVDEC_ERR_INITIALIZE;
+}
+
 VVDEC_DECL int vvdec_handover_wait( vvdecDecoder *dec )
 {
   auto d = (vvdec::VVDecImpl*)dec;
   return d ? d->catchExceptions( &vvdec::VVDecImpl::handOverWait ) : VVDEC_ERR_INITIALIZE;
+}
+
+VVDEC_DECL int vvdec_handover_wait_value( vvdecDecoder *dec, uint64_t value, uint64_t timeoutNs )
+{
+  auto d = (vvdec::VVDecImpl*)dec;
+  // Not through catchExceptions, which writes the error message another thread's call may be using
+  return d ? d->handOverWaitValue( value, timeoutNs ) : VVDEC_ERR_INITIALIZE;
 }
 
 VVDEC_DECL const char* vvdec_get_dec_information( vvdecDecoder *dec )

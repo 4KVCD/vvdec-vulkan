@@ -204,8 +204,12 @@ public:
   void* handOverImport( void* handle, uint64_t bytes, uint32_t memoryType, const uint8_t* deviceUuid, const uint8_t* driverUuid );
   int   handOverRelease( void* imported );
   int   handOverWait();
+  int   handOverWaitValue( uint64_t value, uint64_t timeoutNs ) noexcept;   // touches no error message
+  void* handOverImportHost( void* host, uint64_t bytes );
   int   handOverPack( vvdecFrame* frame, void* imported, uint64_t offset, uint32_t stride, int bytesPerSample, int shift, int x,
                       int y, int width, int height, uint64_t* value );
+  int   handOverPackFrame( vvdecFrame* frame, void* imported, const uint64_t* offsets, const uint32_t* strides, int bytesPerSample,
+                           int shift, int x, int y, int width, int height, uint64_t* value );
 
   int setAndRetErrorMsg( int Ret, std::string errString = "" );
 
@@ -225,6 +229,9 @@ public:
   std::string                             m_cAdditionalErrorString;
 
 private:
+  // handOverPack's and handOverPackFrame's copy of numPlanes planes (1: luma; 3: Y, U and V), the rectangle in luma samples
+  int handOverCopy( vvdecFrame* frame, void* imported, int numPlanes, const uint64_t* offsets, const uint32_t* strides,
+                    int bytesPerSample, int shift, int x, int y, int width, int height, uint64_t* value );
   int xAddPicture                  ( Picture* pcPic );
   int xCreateFrame                 ( vvdecFrame&        frame,
                                      const CPelUnitBuf& rcPicBuf,

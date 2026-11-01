@@ -97,7 +97,7 @@ static constexpr size_t kGroupsPerRow = 32768;
   X( vkDestroyFence ) X( vkWaitForFences ) X( vkResetFences ) X( vkGetFenceStatus ) X( vkQueueSubmit )                  \
   X( vkQueueWaitIdle ) X( vkDeviceWaitIdle ) X( vkCreateQueryPool ) X( vkDestroyQueryPool ) X( vkCmdResetQueryPool )    \
   X( vkCmdWriteTimestamp ) X( vkGetQueryPoolResults ) X( vkCreateSemaphore ) X( vkDestroySemaphore )                 \
-  X( vkGetSemaphoreCounterValue )
+  X( vkGetSemaphoreCounterValue ) X( vkWaitSemaphores )
 
 struct Api
 {
@@ -315,11 +315,19 @@ public:
   // warning, when this device cannot: another GPU or driver, or no hand-over. The caller still closes the handle.
   bool importBuffer( void* handle, uint64_t bytes, uint32_t memoryType, const uint8_t deviceUuid[VK_UUID_SIZE],
                      const uint8_t driverUuid[VK_UUID_SIZE], Buffer& imported );
+  // Imports `bytes` of host memory at `host` (another device's mapped memory, such as Vship's frame buffers) as a
+  // buffer the shaders write by its device address (VK_EXT_external_memory_host). Both must be multiples of
+  // hostImportAlignment(), which is 0 where this device cannot import host memory. False, with a warning, else.
+  bool         importHostBuffer( void* host, uint64_t bytes, Buffer& imported );
+  VkDeviceSize hostImportAlignment() const { return m_hostImportAlignment; }
   void releaseImport( Buffer& imported );
   // The hand-over's timeline semaphore as an opaque Win32 handle (the caller closes it), or null; and the last value
   // a hand-over copy signals (the copies are numbered under the compute queue's lock, in submission order).
   void*    exportHandOverTimeline();
   uint64_t handOverValue() const { return m_handOverValue; }
+  // Waits until the hand-over's timeline reaches value, at most timeoutNs: VK_SUCCESS, VK_TIMEOUT, or the failure
+  // (VK_ERROR_DEVICE_LOST). Takes no lock: callable while copies are submitted on other threads (with the hand-over).
+  VkResult waitHandOver( uint64_t value, uint64_t timeoutNs );
 
   // --- Profiling (VVDEC_GPU_PROFILE=1) ---
   // The decoder instances add up the GPU time of their passes (addTime); the totals are printed when the context
@@ -409,6 +417,7 @@ private:
     const char* globalPriority = nullptr;   // VK_KHR_global_priority, else VK_EXT_global_priority, if the device has one
     bool        executables    = false;     // VK_KHR_pipeline_executable_properties (when profiling)
     bool        externalMemoryWin32 = false, externalSemaphoreWin32 = false;   // the hand-over's (Windows)
+    bool        externalMemoryHost = false;   // VK_EXT_external_memory_host: the hand-over into host memory
   };
   DeviceExtensions findExtensions() const;
   // createDevice's steps: the queues to create (returns their number), whether the shaders may run in waves of 32
@@ -495,6 +504,9 @@ private:
   uint64_t                         m_handOverValue    = 0;
   uint8_t                          m_deviceUuid[VK_UUID_SIZE]{}, m_driverUuid[VK_UUID_SIZE]{};
   PFN_vkVoidFunction               m_getSemaphoreWin32Handle = nullptr;
+  // VK_EXT_external_memory_host (importHostBuffer): its pointer alignment (0: none) and vkGetMemoryHostPointerPropertiesEXT
+  VkDeviceSize                            m_hostImportAlignment      = 0;
+  PFN_vkGetMemoryHostPointerPropertiesEXT m_getHostPointerProperties = nullptr;
   // VK_KHR_pipeline_executable_properties, when profiling without VK_AMD_shader_info: the shaders' statistics
   PFN_vkGetPipelineExecutablePropertiesKHR m_getExecutables          = nullptr;
   PFN_vkGetPipelineExecutableStatisticsKHR m_getExecutableStatistics = nullptr;
