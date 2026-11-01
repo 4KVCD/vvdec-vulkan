@@ -203,6 +203,7 @@ public:
   void* handOverTimeline();
   void* handOverImport( void* handle, uint64_t bytes, uint32_t memoryType, const uint8_t* deviceUuid, const uint8_t* driverUuid );
   int   handOverRelease( void* imported );
+  int   handOverWait();
   int   handOverPack( vvdecFrame* frame, void* imported, uint64_t offset, uint32_t stride, int bytesPerSample, int shift, int x,
                       int y, int width, int height, uint64_t* value );
 

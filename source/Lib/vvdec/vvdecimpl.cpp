@@ -785,6 +785,19 @@ int VVDecImpl::handOverRelease( void* imported )
   return VVDEC_ERR_PARAMETER;
 }
 
+int VVDecImpl::handOverWait()
+{
+  if( !m_bInitialized ){ return VVDEC_ERR_INITIALIZE; }
+#if VVDEC_VULKAN
+  if( m_cDecLib->handOver() )
+  {
+    m_cDecLib->handOver()->wait();
+    return VVDEC_OK;
+  }
+#endif
+  return VVDEC_ERR_NOT_SUPPORTED;
+}
+
 int VVDecImpl::handOverPack( vvdecFrame* frame, void* imported, uint64_t offset, uint32_t stride, int bytesPerSample, int shift, int x,
                              int y, int width, int height, uint64_t* value )
 {

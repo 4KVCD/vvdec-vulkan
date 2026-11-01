@@ -760,6 +760,11 @@ VVDEC_DECL int vvdec_handover_release( vvdecDecoder *, void* imported );
 VVDEC_DECL int vvdec_handover_pack( vvdecDecoder *, vvdecFrame* frame, void* imported, uint64_t offset, uint32_t stride,
                                     int bytesPerSample, int shift, int x, int y, int width, int height, uint64_t* value );
 
+/* vvdec_handover_wait
+ Waits until every copy vvdec_handover_pack submitted is done (for a caller that cannot wait on the timeline itself).
+*/
+VVDEC_DECL int vvdec_handover_wait( vvdecDecoder * );
+
 VVDEC_NAMESPACE_END
 
 #ifdef __cplusplus

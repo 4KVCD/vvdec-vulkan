@@ -380,6 +380,12 @@ VVDEC_DECL int vvdec_handover_pack( vvdecDecoder *dec, vvdecFrame* frame, void* 
            : VVDEC_ERR_INITIALIZE;
 }
 
+VVDEC_DECL int vvdec_handover_wait( vvdecDecoder *dec )
+{
+  auto d = (vvdec::VVDecImpl*)dec;
+  return d ? d->catchExceptions( &vvdec::VVDecImpl::handOverWait ) : VVDEC_ERR_INITIALIZE;
+}
+
 VVDEC_DECL const char* vvdec_get_dec_information( vvdecDecoder *dec )
 {
   auto d = (vvdec::VVDecImpl*)dec;
