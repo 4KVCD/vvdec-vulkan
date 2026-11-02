@@ -15,6 +15,7 @@
    The hand-over runs with the CPU's parse (the default) or the GPU's parse ahead (VVDEC_GPU_PARSE=2). Exit 0 when
    every picture is the same. */
 
+#define _CRT_SECURE_NO_WARNINGS   // getenv and sscanf, which MSVC's /WX build would otherwise refuse (C4996)
 #define VK_NO_PROTOTYPES
 #ifndef NOMINMAX
 #  define NOMINMAX
