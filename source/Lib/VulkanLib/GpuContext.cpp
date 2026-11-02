@@ -1573,7 +1573,7 @@ static bool anyWaveSize( int shaderId )
   case kShader_alf_luma: case kShader_alf_chroma: case kShader_alf_luma_bounds: case kShader_alf_chroma_bounds:
   case kShader_sao: case kShader_deblock_luma_ver: case kShader_deblock_luma_hor: case kShader_deblock_chroma:
   case kShader_intra: case kShader_trafo: case kShader_lmcs: case kShader_filmgrain: case kShader_handover: case kShader_dbparams:
-  case kShader_dbparams_sub: case kShader_edges:
+  case kShader_dbparams_sub: case kShader_edges: case kShader_filmgrain_halos:
     return true;
   default:
     return false;
@@ -1617,7 +1617,7 @@ static std::vector<int> precompileOrder( const Options& options, bool subgroupBa
                                            "deblock_luma_ver", "deblock_luma_hor", "deblock_chroma", "inter_affine_wide", "sao",     "alf_luma",
                                            "alf_chroma",      "jobs_waves",      "edges",          "parsecompact", "mider_cumap",     "lmcs",
                                            "parse_ctu64_lite", "mider_lite",     "inter",          "inter_bdof",   "inter_affine",   "alf_luma_bounds",
-                                           "alf_chroma_bounds", "filmgrain" };
+                                           "alf_chroma_bounds", "filmgrain",       "filmgrain_halos" };
   std::vector<int>         order;
   const auto               add = [&]( const std::string& name ) {
     for( int i = 0; i < kShaderCount; i++ )

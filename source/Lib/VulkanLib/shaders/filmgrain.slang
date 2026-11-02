@@ -1,9 +1,11 @@
 // Film grain synthesis for an output frame, as vvdec's FilmGrain and FilmGrainImpl
 // (the VFGS reference model) add it. A workgroup takes 1024 samples of a row of
 // one plane, four samples per thread. It first reads its samples (and one more
-// on each side) into shared memory: these are the intensities before any grain,
-// which lets the row be written in place. It then computes each sample's grain
-// in two steps:
+// on each side) into shared memory: these are the intensities before any grain.
+// The sample on each side belongs to a neighbouring workgroup, which may already
+// have written its grain there when dst is src (in place): the in-place grain
+// takes them from pc.halos, which the HALOS=1 variant fills from src first. It
+// then computes each sample's grain in two steps:
 // - The raw grain, into shared memory. The frame is divided into blocks of 16x16
 //   luma samples. From its seed, each block takes a random sign and an offset
 //   into a 64x64 pattern (luma or chroma); each sample's intensity picks which
@@ -16,6 +18,10 @@
 
 #include "common.slang"
 
+#ifndef HALOS
+#  define HALOS 0
+#endif
+
 struct Params
 {
   int16_t* src;        // the picture's plane, pointing at the frame's top-left sample
@@ -23,6 +29,8 @@ struct Params
   int8_t*  pattern;    // FilmGrainImpl's patterns [2][9][64][64]
   uint*    luts;       // sLUT[3][256], then pLUT[3][256], as bytes
   uint*    seeds;      // one seed per block (FilmGrain::prepareBlockSeeds), row of blocks after row of blocks
+  int16_t* halos;      // null, or the source samples on both sides of each boundary between two segments of a row
+                       // (haloIndex): needed when dst is src; written by the HALOS=1 variant
   int      srcStride;  // samples
   int      dstStride;  // bytes
   int      width;      // plane width within the frame, in samples
@@ -35,6 +43,7 @@ struct Params
   int      scaleShift;
   int      dstBytes;
   int      present;    // nonzero when the component has a grain model; otherwise the samples pass unchanged
+  int      rows;       // the plane's rows (HALOS=1)
 };
 
 [[vk::push_constant]] Params pc;
@@ -124,9 +133,17 @@ int grainOf( Block b, int i, int intensity, int oc1, int oc2 )
   return p;
 }
 
+// The segments of a row: one workgroup each (GpuFilmGrain dispatches as many)
+int segments() { return ( pc.width + kSegment - 1 ) / kSegment; }
+
+// Where pc.halos keeps the samples on both sides of the boundary at x = k * kSegment (0 < k < segments()) of a row:
+// x - 1, then x
+int haloIndex( int row, int k ) { return ( row * ( segments() - 1 ) + k - 1 ) * 2; }
+
 // Loads the component's LUTs, and the segment's samples of the row (four a thread, up to end, the row's length rounded
 // up to whole blocks) with one sample of halo on each side. Past the frame's width these are the picture's samples,
-// and past the picture's width its last sample (the border extension).
+// and past the picture's width its last sample (the border extension). A halo sample inside the frame is another
+// workgroup's: with pc.halos it comes from there.
 void loadSegment( int tid, int seg0, int row, int end )
 {
   if( tid < kLutWords )
@@ -146,13 +163,34 @@ void loadSegment( int tid, int seg0, int row, int end )
       s_row[1 + kPerThread * tid + k] = src[min( x0 + k, pc.readWidth - 1 )];
     }
   }
+  const bool halos = pc.halos != nullptr;
   if( tid == 0 && seg0 > 0 )
   {
-    s_row[0] = src[min( seg0 - 1, pc.readWidth - 1 )];
+    s_row[0] = halos ? pc.halos[haloIndex( row, seg0 / kSegment )] : src[min( seg0 - 1, pc.readWidth - 1 )];
   }
+  // (seg0 + kSegment < end means a next segment inside the frame: end - width < nb, and end and the segments'
+  // boundaries are multiples of nb, so no boundary lies in [width, end))
   if( tid == kThreads - 1 && seg0 + kSegment < end )
   {
-    s_row[kSegment + 1] = src[min( seg0 + kSegment, pc.readWidth - 1 )];
+    s_row[kSegment + 1] = halos ? pc.halos[haloIndex( row, seg0 / kSegment + 1 ) + 1]
+                                : src[min( seg0 + kSegment, pc.readWidth - 1 )];
+  }
+}
+
+// HALOS=1: the samples on both sides of each boundary between two segments of a row into pc.halos, before the grain
+// writes any of them in place: a thread per boundary of the plane's rows (index: row by row, the row's boundaries in
+// turn). Only for rows of more than one segment.
+void gatherHalos( int index )
+{
+  const int perRow = segments() - 1;
+  const int row    = index / perRow;
+  if( row < pc.rows )
+  {
+    const int k   = index - row * perRow + 1;
+    int16_t*  src = pc.src + row * pc.srcStride;
+    const int at  = haloIndex( row, k );
+    pc.halos[at]     = src[min( k * kSegment - 1, pc.readWidth - 1 )];
+    pc.halos[at + 1] = src[min( k * kSegment, pc.readWidth - 1 )];
   }
 }
 
@@ -246,11 +284,14 @@ void writeSegment( int tid, int x0, int bxi, int nb, int blocks, int row )
 }
 
 // One workgroup per segment of a row (group.x the segment, group.y the row): the samples, then their grain, then the
-// output
+// output. HALOS=1: gatherHalos, a thread per boundary.
 [shader( "compute" )]
 [numthreads( kThreads, 1, 1 )]
 void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
 {
+#if HALOS
+  gatherHalos( int( group.x ) * kThreads + int( local.x ) );
+#else
   const int tid    = int( local.x );
   const int seg0   = int( group.x ) * kSegment;
   const int row    = int( group.y );
@@ -268,4 +309,5 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   {
     writeSegment( tid, x0, bxi, nb, blocks, row );
   }
+#endif
 }

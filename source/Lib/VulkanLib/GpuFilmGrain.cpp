@@ -64,18 +64,78 @@ static constexpr size_t kLutBytes     = 256;                                // a
 static constexpr size_t kScaleLuts    = kPatternBytes;                      // where the sLUTs start
 static constexpr size_t kPatternLuts  = kScaleLuts + 3 * kLutBytes;         // where the pLUTs start
 static constexpr size_t kTableBytes   = kPatternLuts + 3 * kLutBytes;
-// The samples of a row that one workgroup of filmgrain.slang takes
+// The samples of a row that one workgroup of filmgrain.slang takes, and its threads
 static constexpr int    kGroupSamples = 1024;
+static constexpr int    kGroupThreads = 256;
 // The block seeds' buffer grows in steps of this many bytes.
 static constexpr size_t kSeedsStep    = 4096;
 
 // the push constants of shaders/filmgrain.slang
 struct FilmGrainPush
 {
-  VkDeviceAddress src, dst, pattern, luts, seeds;
-  int32_t         srcStride, dstStride, width, readWidth, lumaWidth, comp, subx, suby, bs, scaleShift, dstBytes, present;
+  VkDeviceAddress src, dst, pattern, luts, seeds, halos;
+  int32_t         srcStride, dstStride, width, readWidth, lumaWidth, comp, subx, suby, bs, scaleShift, dstBytes, present, rows;
 };
-static_assert( sizeof( FilmGrainPush ) == 88, "FilmGrainPush: the layout of filmgrain.slang's Params" );
+static_assert( sizeof( FilmGrainPush ) == 104, "FilmGrainPush: the layout of filmgrain.slang's Params" );
+
+// Whether the byte ranges [a, a + aBytes) and [b, b + bBytes) overlap
+static bool overlaps( VkDeviceAddress a, VkDeviceSize aBytes, VkDeviceAddress b, VkDeviceSize bBytes )
+{
+  return a < b + bBytes && b < a + aBytes;
+}
+
+// On an integrated GPU the shader works in the frames themselves. For a plane whose grain goes in place (dst is src,
+// the plane has grain, and its rows more than one segment), a workgroup must not read the samples next to its segment
+// from the plane: the neighbouring workgroup may already have written its grain there. So the samples on both sides of
+// each boundary between two segments are first copied into halos (filmgrain.slang, HALOS=1), and the grain reads them
+// from there (push[c].halos). srcSpan/dstSpan: the bytes each plane's grain reads and writes. A 4K 4:2:0 frame's
+// halos: 35 KB. A copy of the frame's planes (25 MB) instead cost 8.7 % (Intel Graphics of the 285K, Beekeeper 4K
+// with grain: 58.6 -> 53.5 fps); the halos cost nothing measurable there.
+static void recordHalos( Context* ctx, VkCommandBuffer cmd, Buffer& halos, int numPlanes, FilmGrainPush push[3], const VkDeviceSize srcSpan[3],
+                         const VkDeviceSize dstSpan[3] )
+{
+  VkDeviceSize boundaries[3] = {};   // per plane: its rows' boundaries between two segments
+  VkDeviceSize at[3] = {}, total = 0;
+  bool         inPlace[3] = {};
+  for( int c = 0; c < numPlanes; c++ )
+  {
+    // the planes' dispatches have no barriers between them: no plane's grain may write another's source
+    for( int d = 0; d < numPlanes; d++ )
+    {
+      CHECK( d != c && overlaps( push[c].dst, dstSpan[c], push[d].src, srcSpan[d] ), "film grain: a plane's output overlaps another plane's source" );
+    }
+    const int segments = ( push[c].width + kGroupSamples - 1 ) / kGroupSamples;
+    inPlace[c]         = push[c].present && segments > 1 && overlaps( push[c].dst, dstSpan[c], push[c].src, srcSpan[c] );
+    if( inPlace[c] )
+    {
+      // the halos take the place of exactly the samples the grain writes over
+      CHECK( push[c].dst != push[c].src || push[c].dstStride != 2 * push[c].srcStride || push[c].dstBytes != 2,
+             "film grain: an output that overlaps its source other than in place" );
+      boundaries[c] = VkDeviceSize( push[c].rows ) * ( segments - 1 );
+      at[c]         = total;
+      total        += ( boundaries[c] * 2 * sizeof( int16_t ) + 255 ) & ~VkDeviceSize( 255 );
+    }
+  }
+  if( total == 0 )
+  {
+    return;
+  }
+  ctx->ensure( halos, size_t( total ), MemKind::Device );
+  const Api& vk = ctx->api();
+  vk.vkCmdBindPipeline( cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipeline( kShader_filmgrain_halos ) );
+  for( int c = 0; c < numPlanes; c++ )
+  {
+    if( inPlace[c] )
+    {
+      push[c].halos = halos.addr + at[c];
+      vk.vkCmdPushConstants( cmd, ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push[c] ), &push[c] );
+      vk.vkCmdDispatch( cmd, uint32_t( ( boundaries[c] + kGroupThreads - 1 ) / kGroupThreads ), 1, 1 );
+    }
+  }
+  // the halos' writes before the grain's reads of them; and their reads of the planes before the grain's writes there
+  ctx->memoryBarrier( cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_SHADER_READ_BIT );
+}
 
 GpuFilmGrain::GpuFilmGrain( Context* ctx ) : m_ctx( ctx )
 {
@@ -105,6 +165,7 @@ GpuFilmGrain::~GpuFilmGrain()
     m_ctx->free( slot.seeds );
     m_ctx->free( slot.before );
     m_ctx->free( slot.after );
+    m_ctx->free( slot.halos );
   }
 }
 
@@ -192,23 +253,30 @@ int64_t GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane 
   vk.vkResetCommandPool( m_ctx->device(), slot.pool, 0 );
   m_ctx->beginOneTime( slot.cmd );
 
-  // On a discrete GPU, the planes' rows that the shader reads are copied into slot.before (whole, from the first row's
-  // sample 0 to the last row's last sample read), and it writes into slot.after, with the same layouts.
+  // The bytes of each plane that the shader reads and writes: whole rows, from the first row's sample 0 to the last
+  // row's last sample read or written
+  VkDeviceSize srcSpan[3], dstSpan[3];
+  for( int c = 0; c < numPlanes; c++ )
+  {
+    const int rows = lumaHeight / ( c ? impl.subY() : 1 );
+    const int cols = lumaWidth / ( c ? impl.subX() : 1 );
+    srcSpan[c]     = ( VkDeviceSize( rows - 1 ) * src[c].stride + src[c].readWidth ) * sizeof( int16_t );
+    dstSpan[c]     = VkDeviceSize( rows - 1 ) * dst[c].stride + VkDeviceSize( cols ) * dstBytes;
+  }
+
+  // On a discrete GPU, the planes' rows that the shader reads are copied into slot.before, and it writes into
+  // slot.after, with the same layouts.
   const bool      copies = m_ctx->discrete();
   VkDeviceAddress srcAt[3], dstAt[3];
   if( copies )
   {
-    VkDeviceSize srcSpan[3], dstSpan[3], srcTotal = 0, dstTotal = 0;
+    VkDeviceSize srcTotal = 0, dstTotal = 0;
     for( int c = 0; c < numPlanes; c++ )
     {
-      const int rows = lumaHeight / ( c ? impl.subY() : 1 );
-      const int cols = lumaWidth / ( c ? impl.subX() : 1 );
-      srcSpan[c]     = ( VkDeviceSize( rows - 1 ) * src[c].stride + src[c].readWidth ) * sizeof( int16_t );
-      dstSpan[c]     = VkDeviceSize( rows - 1 ) * dst[c].stride + VkDeviceSize( cols ) * dstBytes;
-      srcAt[c]       = srcTotal;
-      dstAt[c]       = dstTotal;
-      srcTotal      += ( srcSpan[c] + 255 ) & ~VkDeviceSize( 255 );
-      dstTotal      += ( dstSpan[c] + 255 ) & ~VkDeviceSize( 255 );
+      srcAt[c]  = srcTotal;
+      dstAt[c]  = dstTotal;
+      srcTotal += ( srcSpan[c] + 255 ) & ~VkDeviceSize( 255 );
+      dstTotal += ( dstSpan[c] + 255 ) & ~VkDeviceSize( 255 );
     }
     m_ctx->ensure( slot.before, size_t( srcTotal ), MemKind::Device );
     m_ctx->ensure( slot.after, size_t( dstTotal ), MemKind::Device );
@@ -223,29 +291,38 @@ int64_t GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane 
                           VK_ACCESS_SHADER_READ_BIT );
   }
 
+  FilmGrainPush push[3] = {};
+  for( int c = 0; c < numPlanes; c++ )
+  {
+    push[c].src        = copies ? srcAt[c] : src[c].addr;
+    push[c].dst        = copies ? dstAt[c] : dst[c].addr;
+    push[c].pattern    = slot.tables.addr;
+    push[c].luts       = slot.tables.addr + kScaleLuts;
+    push[c].seeds      = slot.seeds.addr;
+    push[c].srcStride  = src[c].stride;
+    push[c].dstStride  = dst[c].stride;
+    push[c].subx       = c ? impl.subX() : 1;
+    push[c].suby       = c ? impl.subY() : 1;
+    push[c].width      = lumaWidth / push[c].subx;
+    push[c].readWidth  = src[c].readWidth;
+    push[c].lumaWidth  = lumaWidth;
+    push[c].comp       = c;
+    push[c].bs         = impl.bitShift();
+    push[c].scaleShift = impl.scaleShift();
+    push[c].dstBytes   = dstBytes;
+    push[c].present    = grain.componentPresent( c ) ? 1 : 0;
+    push[c].rows       = lumaHeight / push[c].suby;
+  }
+  if( !copies )
+  {
+    recordHalos( m_ctx, slot.cmd, slot.halos, numPlanes, push, srcSpan, dstSpan );
+  }
+
   vk.vkCmdBindPipeline( slot.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_filmgrain ) );
   for( int c = 0; c < numPlanes; c++ )
   {
-    FilmGrainPush push{};
-    push.src        = copies ? srcAt[c] : src[c].addr;
-    push.dst        = copies ? dstAt[c] : dst[c].addr;
-    push.pattern    = slot.tables.addr;
-    push.luts       = slot.tables.addr + kScaleLuts;
-    push.seeds      = slot.seeds.addr;
-    push.srcStride  = src[c].stride;
-    push.dstStride  = dst[c].stride;
-    push.subx       = c ? impl.subX() : 1;
-    push.suby       = c ? impl.subY() : 1;
-    push.width      = lumaWidth / push.subx;
-    push.readWidth  = src[c].readWidth;
-    push.lumaWidth  = lumaWidth;
-    push.comp       = c;
-    push.bs         = impl.bitShift();
-    push.scaleShift = impl.scaleShift();
-    push.dstBytes   = dstBytes;
-    push.present    = grain.componentPresent( c ) ? 1 : 0;
-    vk.vkCmdPushConstants( slot.cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
-    vk.vkCmdDispatch( slot.cmd, uint32_t( ( push.width + kGroupSamples - 1 ) / kGroupSamples ), uint32_t( lumaHeight / push.suby ), 1 );
+    vk.vkCmdPushConstants( slot.cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push[c] ), &push[c] );
+    vk.vkCmdDispatch( slot.cmd, uint32_t( ( push[c].width + kGroupSamples - 1 ) / kGroupSamples ), uint32_t( push[c].rows ), 1 );
   }
   if( copies )
   {

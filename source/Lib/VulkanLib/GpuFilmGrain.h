@@ -59,9 +59,11 @@ namespace gpu
 // (VVDecImpl::xAddGrain). The frames are in host memory the GPU can reach: the pictures' planes, or the output's
 // copies of them. On a discrete GPU the shader works on copies of them in GPU memory (the copies in and out are in
 // the frame's commands): there its own reads and writes of host memory cross the bus one by one (RTX 5090, a 4K
-// frame's samples read and written: 1.6 s in host memory, 0.1 ms in its own). The grain of a frame is under way while
-// the decoder goes on (up to kSlots frames at a time); each frame has a ticket to wait for (VVDecImpl hands a frame
-// out once its grain is done).
+// frame's samples read and written: 1.6 s in host memory, 0.1 ms in its own). On an integrated GPU it works in the
+// frames themselves; when the grain goes into the picture in place, the samples at the ends of its workgroups'
+// segments are copied aside first (recordHalos in GpuFilmGrain.cpp). The grain of a frame is under way while the
+// decoder goes on (up to kSlots frames at a time); each frame has a ticket to wait for (VVDecImpl hands a frame out
+// once its grain is done).
 class GpuFilmGrain
 {
 public:
@@ -87,9 +89,9 @@ public:
   // slot (once the frame that had it before is done).
   uint32_t* seeds( size_t count );
   // Adds the grain to a frame of lumaWidth x lumaHeight luma samples, reading src (16 bits per sample) and writing
-  // dst (dstBytes per sample; dst may be src). The planes' subsampling, the bit depth and the grain models come from
-  // grain; the block seeds must already be written (seeds()). Returns at once, with the frame's ticket: src and dst
-  // must stay as they are until the ticket is done.
+  // dst (dstBytes per sample; dst may be src, but no plane's dst may overlap another plane's src). The planes'
+  // subsampling, the bit depth and the grain models come from grain; the block seeds must already be written (seeds()).
+  // Returns at once, with the frame's ticket: src and dst must stay as they are until the ticket is done.
   int64_t apply( const FilmGrain& grain, int numPlanes, const Plane src[3], const Plane dst[3], int dstBytes, int lumaWidth, int lumaHeight );
   // Whether the grain of the frame with the ticket is done; wait() returns once it is.
   bool done( int64_t ticket );
@@ -98,12 +100,14 @@ public:
 private:
   // The work of a frame: its tables (the grain patterns, then per component the scale table (sLUT), then the
   // pattern tables (pLUT)), its block seeds, on a discrete GPU the frame's copies in GPU memory (before and after the
-  // grain), its commands; and the ticket of its frame while the GPU may be at it.
+  // grain), on an integrated GPU the halos of the grain in place (recordHalos), its commands; and the ticket of its
+  // frame while the GPU may be at it.
   struct Slot
   {
     Buffer          tables;
     Buffer          seeds;
     Buffer          before, after;
+    Buffer          halos;
     std::vector<VkBufferCopy> rows;   // (the copies of the output's rows: kept for the next frame's)
     VkCommandPool   pool   = VK_NULL_HANDLE;
     VkCommandBuffer cmd    = VK_NULL_HANDLE;
