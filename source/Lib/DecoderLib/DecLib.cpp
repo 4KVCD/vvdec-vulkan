@@ -816,11 +816,13 @@ int DecLib::finishPicture( Picture* pcPic, MsgLevel msgl )
   return pcSlice->getPOC();
 }
 
+#if VVDEC_VULKAN
 // With the GPU's parse, the number of next pictures to output whose downloads start when a picture is output
 // (PlanePool). A picture's download is then usually done when its turn comes, and only these pictures and the ones the
 // application holds have their planes in host memory. Two are as fast as three and hold a picture's planes less; one
 // is about 1-2% slower at 1080p.
 static constexpr size_t kOutputsDownloadedAhead = 2;
+#endif
 
 void DecLib::prepareOutput( Picture* pcPic )
 {
