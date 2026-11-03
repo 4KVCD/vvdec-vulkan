@@ -58,12 +58,6 @@ namespace vvdec
 namespace gpu
 {
 
-// A slot's tables: FilmGrainImpl's patterns [2][VFGS_MAX_PATTERNS + 1][64][64], then sLUT[3][256] and pLUT[3][256]
-static constexpr size_t kPatternBytes = 2 * ( VFGS_MAX_PATTERNS + 1 ) * 64 * 64;
-static constexpr size_t kLutBytes     = 256;                                // a component's sLUT or pLUT
-static constexpr size_t kScaleLuts    = kPatternBytes;                      // where the sLUTs start
-static constexpr size_t kPatternLuts  = kScaleLuts + 3 * kLutBytes;         // where the pLUTs start
-static constexpr size_t kTableBytes   = kPatternLuts + 3 * kLutBytes;
 // The samples of a row that one workgroup of filmgrain.slang takes, and its threads
 static constexpr int    kGroupSamples = 1024;
 static constexpr int    kGroupThreads = 256;
@@ -137,6 +131,55 @@ static void recordHalos( Context* ctx, VkCommandBuffer cmd, Buffer& halos, int n
                       VK_ACCESS_SHADER_READ_BIT );
 }
 
+// The push constants of a pass's plane c (no halos)
+static FilmGrainPush pushOf( const GpuFilmGrain::Pass& pass, int c )
+{
+  FilmGrainPush push{};
+  push.src        = pass.planes[c].src;
+  push.dst        = pass.planes[c].dst;
+  push.pattern    = pass.tables;
+  push.luts       = pass.tables + FilmGrainTables::kScaleLuts;
+  push.seeds      = pass.seeds;
+  push.srcStride  = pass.planes[c].srcStride;
+  push.dstStride  = pass.planes[c].dstStride;
+  push.subx       = c ? pass.subX : 1;
+  push.suby       = c ? pass.subY : 1;
+  push.width      = pass.lumaWidth / push.subx;
+  push.readWidth  = pass.planes[c].readWidth;
+  push.lumaWidth  = pass.lumaWidth;
+  push.comp       = c;
+  push.bs         = pass.bitShift;
+  push.scaleShift = pass.scaleShift;
+  push.dstBytes   = pass.dstBytes;
+  push.present    = pass.present[c] ? 1 : 0;
+  push.rows       = pass.lumaHeight / push.suby;
+  return push;
+}
+
+// The grain's dispatches, a plane after the other (no barriers between them)
+static void dispatchGrain( Context* ctx, VkCommandBuffer cmd, int numPlanes, const FilmGrainPush push[3] )
+{
+  const Api& vk = ctx->api();
+  vk.vkCmdBindPipeline( cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipeline( kShader_filmgrain ) );
+  for( int c = 0; c < numPlanes; c++ )
+  {
+    // (a plane without an address would have the shader write at address 0, which loses the device)
+    CHECK( push[c].src == 0 || push[c].dst == 0, "film grain: a plane without its source or output address" );
+    vk.vkCmdPushConstants( cmd, ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push[c] ), &push[c] );
+    vk.vkCmdDispatch( cmd, uint32_t( ( push[c].width + kGroupSamples - 1 ) / kGroupSamples ), uint32_t( push[c].rows ), 1 );
+  }
+}
+
+void GpuFilmGrain::record( Context* ctx, VkCommandBuffer cmd, const Pass& pass )
+{
+  FilmGrainPush push[3];
+  for( int c = 0; c < pass.numPlanes; c++ )
+  {
+    push[c] = pushOf( pass, c );
+  }
+  dispatchGrain( ctx, cmd, pass.numPlanes, push );
+}
+
 GpuFilmGrain::GpuFilmGrain( Context* ctx ) : m_ctx( ctx )
 {
   for( Slot& slot: m_slots )
@@ -144,7 +187,7 @@ GpuFilmGrain::GpuFilmGrain( Context* ctx ) : m_ctx( ctx )
     slot.pool = m_ctx->createCommandPool( m_ctx->grainFamily() );
     m_ctx->allocateCommandBuffers( slot.pool, 1, &slot.cmd );
     slot.fence  = m_ctx->createFence();
-    slot.tables = m_ctx->alloc( kTableBytes, MemKind::Upload );
+    slot.tables = m_ctx->alloc( FilmGrainTables::kBytes, MemKind::Upload );
   }
 }
 
@@ -229,26 +272,11 @@ int64_t GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane 
   const Api&           vk   = m_ctx->api();
   Slot&                slot = m_slots[m_nextTicket % kSlots];   // seeds() freed it
   const FilmGrainImpl& impl = grain.impl();
-  // FilmGrainImpl::add_grain_block's checks, when a component has grain
-  bool anyPresent = false;
-  for( int c = 0; c < numPlanes; c++ )
+  if( grain.anyPresent( numPlanes ) )
   {
-    anyPresent |= grain.componentPresent( c );
+    grain.checkFrame( lumaWidth );
   }
-  if( anyPresent )
-  {
-    CHECK( lumaWidth <= 128, "wrong width" );
-    CHECK( impl.bitShift() != 0 && impl.bitShift() != 2, "wrong bs" );
-    CHECK( impl.scaleShift() + impl.bitShift() < 8 || impl.scaleShift() + impl.bitShift() > 13, "wrong scale_shift" );
-  }
-
-  // The tables as the synthesis has them now
-  memcpy( slot.tables.mapped, impl.patterns(), kPatternBytes );
-  for( int c = 0; c < 3; c++ )
-  {
-    memcpy( slot.tables.mapped + kScaleLuts + c * kLutBytes, impl.scaleLut( c ), kLutBytes );
-    memcpy( slot.tables.mapped + kPatternLuts + c * kLutBytes, impl.patternLut( c ), kLutBytes );
-  }
+  grain.writeTables( slot.tables.mapped );   // the tables as the synthesis has them now
 
   vk.vkResetCommandPool( m_ctx->device(), slot.pool, 0 );
   m_ctx->beginOneTime( slot.cmd );
@@ -291,39 +319,36 @@ int64_t GpuFilmGrain::apply( const FilmGrain& grain, int numPlanes, const Plane 
                           VK_ACCESS_SHADER_READ_BIT );
   }
 
-  FilmGrainPush push[3] = {};
+  Pass pass;
+  pass.numPlanes  = numPlanes;
+  pass.lumaWidth  = lumaWidth;
+  pass.lumaHeight = lumaHeight;
+  pass.dstBytes   = dstBytes;
+  pass.tables     = slot.tables.addr;
+  pass.seeds      = slot.seeds.addr;
+  pass.bitShift   = impl.bitShift();
+  pass.scaleShift = impl.scaleShift();
+  pass.subX       = impl.subX();
+  pass.subY       = impl.subY();
+  FilmGrainPush push[3];
   for( int c = 0; c < numPlanes; c++ )
   {
-    push[c].src        = copies ? srcAt[c] : src[c].addr;
-    push[c].dst        = copies ? dstAt[c] : dst[c].addr;
-    push[c].pattern    = slot.tables.addr;
-    push[c].luts       = slot.tables.addr + kScaleLuts;
-    push[c].seeds      = slot.seeds.addr;
-    push[c].srcStride  = src[c].stride;
-    push[c].dstStride  = dst[c].stride;
-    push[c].subx       = c ? impl.subX() : 1;
-    push[c].suby       = c ? impl.subY() : 1;
-    push[c].width      = lumaWidth / push[c].subx;
-    push[c].readWidth  = src[c].readWidth;
-    push[c].lumaWidth  = lumaWidth;
-    push[c].comp       = c;
-    push[c].bs         = impl.bitShift();
-    push[c].scaleShift = impl.scaleShift();
-    push[c].dstBytes   = dstBytes;
-    push[c].present    = grain.componentPresent( c ) ? 1 : 0;
-    push[c].rows       = lumaHeight / push[c].suby;
+    // The plane's fields one by one: MSVC 19.44 (/O2) compiled `pass.planes[c] = { ... }` followed by the inlined
+    // pushOf with pushOf's loads of src and dst ahead of the braced list's store, so the grain got addresses 0.
+    Pass::PlaneIo& plane = pass.planes[c];
+    plane.src            = copies ? srcAt[c] : src[c].addr;
+    plane.dst            = copies ? dstAt[c] : dst[c].addr;
+    plane.srcStride      = src[c].stride;
+    plane.dstStride      = dst[c].stride;
+    plane.readWidth      = src[c].readWidth;
+    pass.present[c]      = grain.componentPresent( c );
+    push[c]              = pushOf( pass, c );
   }
   if( !copies )
   {
     recordHalos( m_ctx, slot.cmd, slot.halos, numPlanes, push, srcSpan, dstSpan );
   }
-
-  vk.vkCmdBindPipeline( slot.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_filmgrain ) );
-  for( int c = 0; c < numPlanes; c++ )
-  {
-    vk.vkCmdPushConstants( slot.cmd, m_ctx->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push[c] ), &push[c] );
-    vk.vkCmdDispatch( slot.cmd, uint32_t( ( push[c].width + kGroupSamples - 1 ) / kGroupSamples ), uint32_t( push[c].rows ), 1 );
-  }
+  dispatchGrain( m_ctx, slot.cmd, numPlanes, push );
   if( copies )
   {
     // slot.after's rows into the output, row by row: the bytes between the rows (dst may be the picture) stay as they are

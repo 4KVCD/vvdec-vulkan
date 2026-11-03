@@ -12,6 +12,11 @@
    is waited for only after its picture went back to the decoder and it decoded on (the reuse guard's check; at a
    small --parse-delay, so that the picture is reused soon). --threads and --parse-delay set both decoders'.
 
+   With --grain both decodes add the film grain (vvdecParams.filmGrainSynthesis): the reference the CPU's (or with
+   --ref-gpu vvdec-vulkan's own), the hand-over's added in its copies. --pack-order (with --host) packs the pictures
+   other than one by one as they come: reverse (up to 8 held, then packed last first), twice (each packed twice) or
+   skip3 (every third not packed): each picture's grain must be its own whatever was packed before.
+
    The hand-over runs with the CPU's parse (the default) or the GPU's parse ahead (VVDEC_GPU_PARSE=2). Exit 0 when
    every picture is the same. */
 
@@ -101,17 +106,19 @@ uint64_t hashFrame( const vvdecFrame* frame, const Crop& crop, int shift, int ou
   return hash;
 }
 
-// The decoders' threads and parse delay (--threads, --parse-delay), for both decodes of a run
+// The decoders' threads, parse delay and film grain (--threads, --parse-delay, --grain), for both decodes of a run
 struct DecoderSettings
 {
-  int threads    = -1;
-  int parseDelay = -1;
+  int  threads    = -1;
+  int  parseDelay = -1;
+  bool grain      = false;
 };
 DecoderSettings s_decoder;
 
-// Decodes the stream; onFrame gets each picture in output order and may not keep it.
-bool decodeStream( const char* path, int maxFrames, bool gpu, const std::function<bool( vvdecDecoder*, vvdecFrame*, int )>& onFrame,
-                   const std::function<bool( vvdecDecoder* )>& onOpen )
+// Decodes the stream; onFrame gets each picture in output order. It may keep the picture (*kept = true), which it then
+// gives back itself (vvdec_frame_unref) by the time onEnd returns; onEnd runs once the stream is flushed (may be null).
+bool decodeStream( const char* path, int maxFrames, bool gpu, const std::function<bool( vvdecDecoder*, vvdecFrame*, int, bool* )>& onFrame,
+                   const std::function<bool( vvdecDecoder* )>& onOpen, const std::function<bool( vvdecDecoder* )>& onEnd = nullptr )
 {
   std::ifstream input( path, std::ios::in | std::ios::binary );
   if( !input )
@@ -124,7 +131,7 @@ bool decodeStream( const char* path, int maxFrames, bool gpu, const std::functio
   params.threads    = s_decoder.threads;
   params.parseDelay = s_decoder.parseDelay;
   params.gpu        = gpu ? 1 : 0;
-  params.filmGrainSynthesis = false;   // the hand-over takes no grain synthesis: both decodes without the grain
+  params.filmGrainSynthesis = s_decoder.grain;
   if( getenv( "VVDEC_HANDOVER_TIMES" ) )
   {
     params.logLevel = VVDEC_INFO;   // where the library prints the copies' times
@@ -140,11 +147,12 @@ bool decodeStream( const char* path, int maxFrames, bool gpu, const std::functio
   int  frames = 0;
   bool ok     = true;
   auto take   = [&]( vvdecFrame* frame ) {
+    bool kept = false;
     if( frame && ok && frames < maxFrames )
     {
-      ok = onFrame( dec, frame, frames++ );
+      ok = onFrame( dec, frame, frames++, &kept );
     }
-    if( frame )
+    if( frame && !kept )
     {
       vvdec_frame_unref( dec, frame );
     }
@@ -153,7 +161,13 @@ bool decodeStream( const char* path, int maxFrames, bool gpu, const std::functio
   {
     vvdecFrame* frame = nullptr;
     const int   ret   = vvdec_decode( dec, au, &frame );
-    if( ret != VVDEC_OK && ret != VVDEC_TRY_AGAIN && ret != VVDEC_EOF )
+    if( ret == VVDEC_ERR_DEC_INPUT )
+    {
+      // an access unit the decoder could not take, a warning as in vvdecapp (e.g. the leading pictures it skips while
+      // tuning in at a random access point)
+      fprintf( stderr, "decode warning: %s\n", vvdec_get_last_error( dec ) );
+    }
+    else if( ret != VVDEC_OK && ret != VVDEC_TRY_AGAIN && ret != VVDEC_EOF )
     {
       fprintf( stderr, "decode error %d: %s\n", ret, vvdec_get_last_error( dec ) );
       ok = false;
@@ -165,6 +179,10 @@ bool decodeStream( const char* path, int maxFrames, bool gpu, const std::functio
     vvdecFrame* frame = nullptr;
     ret               = vvdec_flush( dec, &frame );
     take( frame );
+  }
+  if( onEnd )
+  {
+    ok = onEnd( dec ) && ok;
   }
   vvdec_accessUnit_free( au );
   vvdec_decoder_close( dec );
@@ -338,10 +356,20 @@ Crop cropOf( const vvdecFrame* frame, const Crop& asked )
 // With lateWait each copy is waited for and checked only at the next picture, after its picture went back to the
 // decoder, which decoded on (VideoMetricsLab's VMAF route gives a picture back before its copy is done): the decoder
 // must not write the picture's host planes again before the copy is done (PicListManager's reuse guard).
-int checkHost( const char* stream, int maxFrames, const Crop& crop, int shift, bool refGpu, bool lateWait )
+// The orders of --pack-order
+enum class PackOrder
+{
+  kInTurn,    // each picture as it comes
+  kReverse,   // up to kHeld held, then packed last first
+  kTwice,     // each packed twice
+  kSkip3,     // every third not packed
+};
+constexpr size_t kHeld = 8;
+
+int checkHost( const char* stream, int maxFrames, const Crop& crop, int shift, bool refGpu, bool lateWait, PackOrder order )
 {
   std::vector<uint64_t> expected;
-  const bool            reference = decodeStream( stream, maxFrames, refGpu, [&]( vvdecDecoder*, vvdecFrame* frame, int ) {
+  const bool            reference = decodeStream( stream, maxFrames, refGpu, [&]( vvdecDecoder*, vvdecFrame* frame, int, bool* ) {
     const Crop c = cropOf( frame, crop );
     if( c.x < 0 || c.y < 0 || c.width <= 0 || c.height <= 0 || c.x + c.width > int( frame->width )
         || c.y + c.height > int( frame->height ) )
@@ -393,7 +421,7 @@ int checkHost( const char* stream, int maxFrames, const Crop& crop, int shift, b
     uint32_t strides[3]{};
     int      widths[3]{}, heights[3]{};
   };
-  int  same = 0, different = 0;
+  int  same = 0, different = 0, skipped = 0, packs = 0;
   auto wait = [&]( vvdecDecoder* dec, const Packed& p ) {
     const int waited = vvdec_handover_wait_value( dec, p.value, kWaitNs );
     if( waited != VVDEC_OK )
@@ -430,7 +458,8 @@ int checkHost( const char* stream, int maxFrames, const Crop& crop, int shift, b
   bool          hasPending = false;
   LARGE_INTEGER frequency, packTime{};
   QueryPerformanceFrequency( &frequency );
-  const bool gpu = decodeStream( stream, maxFrames, true, [&]( vvdecDecoder* dec, vvdecFrame* frame, int index ) {
+  // Packs the picture; with lateWait checks the copy before it, else waits for its own and checks it
+  auto pack = [&]( vvdecDecoder* dec, vvdecFrame* frame, int index ) {
     const Crop c  = cropOf( frame, crop );
     const int  sx = frame->planes[1].width < frame->width ? 1 : 0;
     const int  sy = frame->planes[1].height < frame->height ? 1 : 0;
@@ -454,6 +483,7 @@ int checkHost( const char* stream, int maxFrames, const Crop& crop, int shift, b
       fprintf( stderr, "frame %d: pack %d (%s)\n", index, ret, vvdec_get_last_error( dec ) );
       return false;
     }
+    packs++;
     if( !lateWait )
     {
       if( !wait( dec, p ) )
@@ -477,15 +507,51 @@ int checkHost( const char* stream, int maxFrames, const Crop& crop, int shift, b
       ok = check( dec, p ) && ok;
     }
     return ok;
-  }, onOpen );
-  const int packed = same + different;
-  printf( "%d pictures: %d the same as the reference's, %d different; %s %.3f ms a picture\n", int( expected.size() ), same,
-          different, lateWait ? "pack (waited later)" : "pack + wait", packed ? 1000.0 * packTime.QuadPart / frequency.QuadPart / packed : 0.0 );
+  };
+  // --pack-order reverse: the pictures held, packed last first once kHeld are (or at the end), then given back
+  std::vector<std::pair<vvdecFrame*, int>> held;
+  auto packHeld = [&]( vvdecDecoder* dec ) {
+    bool ok = true;
+    for( auto it = held.rbegin(); it != held.rend(); ++it )
+    {
+      ok = ok && pack( dec, it->first, it->second );
+    }
+    for( auto& frame: held )
+    {
+      vvdec_frame_unref( dec, frame.first );
+    }
+    held.clear();
+    return ok;
+  };
+  const bool gpu = decodeStream( stream, maxFrames, true, [&]( vvdecDecoder* dec, vvdecFrame* frame, int index, bool* kept ) {
+    switch( order )
+    {
+    case PackOrder::kReverse:
+      held.emplace_back( frame, index );
+      *kept = true;
+      return held.size() < kHeld || packHeld( dec );
+    case PackOrder::kTwice:
+      return pack( dec, frame, index ) && pack( dec, frame, index );
+    case PackOrder::kSkip3:
+      if( index % 3 == 2 )
+      {
+        skipped++;
+        return true;
+      }
+      return pack( dec, frame, index );
+    default:
+      return pack( dec, frame, index );
+    }
+  }, onOpen, packHeld );
+  const int checksPerPicture = order == PackOrder::kTwice ? 2 : 1;
+  printf( "%d pictures: %d checks the same as the reference's, %d different, %d pictures not packed; %s %.3f ms a pack\n",
+          int( expected.size() ), same, different, skipped, lateWait ? "pack (waited later)" : "pack + wait",
+          packs ? 1000.0 * packTime.QuadPart / frequency.QuadPart / packs : 0.0 );
   for( int s = 0; s < slots; s++ )
   {
     VirtualFree( buffers[s], 0, MEM_RELEASE );
   }
-  return gpu && different == 0 && same == int( expected.size() ) ? 0 : 1;
+  return gpu && different == 0 && same == ( int( expected.size() ) - skipped ) * checksPerPicture ? 0 : 1;
 }
 
 }   // namespace
@@ -496,6 +562,7 @@ int main( int argc, char** argv )
   int         maxFrames = 1 << 30;
   bool        host = false, refGpu = false, lateWait = false;
   int         shift = 0;
+  PackOrder   order = PackOrder::kInTurn;
   Crop        crop;
   for( int i = 1; i < argc; i++ )
   {
@@ -528,6 +595,20 @@ int main( int argc, char** argv )
     {
       lateWait = true;
     }
+    else if( !strcmp( argv[i], "--grain" ) )
+    {
+      s_decoder.grain = true;
+    }
+    else if( !strcmp( argv[i], "--pack-order" ) && value )
+    {
+      const std::string name = argv[++i];
+      order = name == "reverse" ? PackOrder::kReverse : name == "twice" ? PackOrder::kTwice : name == "skip3" ? PackOrder::kSkip3 : order;
+      if( order == PackOrder::kInTurn )
+      {
+        fprintf( stderr, "--pack-order: reverse, twice or skip3\n" );
+        return 2;
+      }
+    }
     else if( !strcmp( argv[i], "--threads" ) && value )
     {
       s_decoder.threads = atoi( argv[++i] );
@@ -539,18 +620,23 @@ int main( int argc, char** argv )
   }
   if( !stream )
   {
-    fprintf( stderr, "usage: vvdechandover -b stream.266 [-f frames] [--threads n] [--parse-delay n]"
-                     " [--host [--shift n] [--crop x,y,w,h] [--ref-gpu] [--late-wait]]\n" );
+    fprintf( stderr, "usage: vvdechandover -b stream.266 [-f frames] [--threads n] [--parse-delay n] [--grain]"
+                     " [--host [--shift n] [--crop x,y,w,h] [--ref-gpu] [--late-wait] [--pack-order reverse|twice|skip3]]\n" );
+    return 2;
+  }
+  if( order != PackOrder::kInTurn && ( !host || lateWait ) )
+  {
+    fprintf( stderr, "--pack-order goes with --host, without --late-wait\n" );
     return 2;
   }
   if( host )
   {
-    return checkHost( stream, maxFrames, crop, shift, refGpu, lateWait );
+    return checkHost( stream, maxFrames, crop, shift, refGpu, lateWait, order );
   }
 
   // The CPU's pictures: each one's luma hash
   std::vector<uint64_t> expected;
-  const bool cpu = decodeStream( stream, maxFrames, false, [&]( vvdecDecoder*, vvdecFrame* frame, int ) {
+  const bool cpu = decodeStream( stream, maxFrames, false, [&]( vvdecDecoder*, vvdecFrame* frame, int, bool* ) {
     const vvdecPlane& y = frame->planes[0];
     expected.push_back( hashLuma( y.ptr, size_t( y.width ) * y.bytesPerSample, y.stride, int( y.height ) ) );
     return true;
@@ -594,7 +680,7 @@ int main( int argc, char** argv )
     }
     return imported != nullptr;
   };
-  const bool gpu = decodeStream( stream, maxFrames, true, [&]( vvdecDecoder* dec, vvdecFrame* frame, int index ) {
+  const bool gpu = decodeStream( stream, maxFrames, true, [&]( vvdecDecoder* dec, vvdecFrame* frame, int index, bool* ) {
     const int      width = int( frame->width ), height = int( frame->height );
     const int      bytes  = frame->bitDepth > 8 ? 2 : 1;   // as the CPU's frames have them
     const uint32_t stride = uint32_t( width * bytes );
@@ -602,7 +688,7 @@ int main( int argc, char** argv )
     const int      ret    = vvdec_handover_pack( dec, frame, imported, 0, stride, bytes, 0, 0, 0, width, height, &value );
     if( ret == VVDEC_ERR_NOT_SUPPORTED )
     {
-      notHandedOver++;   // in host memory (8-bit, film grain): not this check's
+      notHandedOver++;   // in host memory the GPU cannot reach: not this check's
       return true;
     }
     if( ret != VVDEC_OK || !other.waitFor( value ) )

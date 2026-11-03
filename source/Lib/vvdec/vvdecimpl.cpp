@@ -714,12 +714,6 @@ int VVDecImpl::getNumberOfErrorsPictureHashSEI()
 int VVDecImpl::handOverEnable()
 {
   if( !m_bInitialized ){ return VVDEC_ERR_INITIALIZE; }
-  if( m_enableFilmGrain )
-  {
-    // the grain is added from the pictures' host planes, which handed-over pictures do not fill
-    m_cErrorString = "handOverEnable: the hand-over needs film grain synthesis off (vvdecParams.filmGrainSynthesis)";
-    return VVDEC_ERR_NOT_SUPPORTED;
-  }
 #if VVDEC_VULKAN
   if( m_cDecLib->setHandOver() )
   {
@@ -873,10 +867,15 @@ int VVDecImpl::handOverCopy( vvdecFrame* frame, void* imported, int numPlanes, c
   {
     dst = &buffer == imported ? &buffer : dst;
   }
-  Picture* pic = nullptr;
+  Picture*              pic   = nullptr;
+  const FilmGrainFrame* grain = nullptr;   // the grain the copy adds (null: none)
   for( auto& entry: m_rcFrameList )
   {
-    pic = &std::get<vvdecFrame>( entry ) == frame ? std::get<Picture*>( entry ) : pic;
+    if( &std::get<vvdecFrame>( entry ) == frame )
+    {
+      pic   = std::get<Picture*>( entry );
+      grain = std::get<std::unique_ptr<const FilmGrainFrame>>( entry ).get();
+    }
   }
   if( !dst || !pic || ( bytesPerSample != 1 && bytesPerSample != 2 ) || x < 0 || y < 0 || width <= 0 || height <= 0
       || numPlanes > int( frame->numPlanes ) )
@@ -912,7 +911,7 @@ int VVDecImpl::handOverCopy( vvdecFrame* frame, void* imported, int numPlanes, c
       return VVDEC_ERR_PARAMETER;
     }
   }
-  *value = handOver->pack( *pic, m_cDecLib->gpuPlanes(), planes, numPlanes, *dst, bytesPerSample, shift );
+  *value = handOver->pack( *pic, m_cDecLib->gpuPlanes(), planes, numPlanes, *dst, bytesPerSample, shift, grain );
   return VVDEC_OK;
 #else
   (void) frame, (void) imported, (void) numPlanes, (void) offsets, (void) strides, (void) bytesPerSample, (void) shift, (void) x,
@@ -1265,6 +1264,50 @@ int64_t VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft
 }
 #endif
 
+#if VVDEC_VULKAN
+std::unique_ptr<const FilmGrainFrame> VVDecImpl::xGrainForHandOver( const vvdecFrame& frame, int confLeft, int confTop )
+{
+  // As xAddGrain: the synthesis set up for the frame, and its block seeds (they go on from frame to frame)
+  m_filmGrainSynth->setDepth( frame.bitDepth );
+  m_filmGrainSynth->setColorFormat( frame.colorFormat );
+  const int width  = int( frame.planes[0].width );
+  const int height = int( frame.planes[0].height );
+  auto      grain  = std::make_unique<FilmGrainFrame>();
+  grain->seeds.resize( size_t( ( width + 15 ) / 16 ) * ( ( height + 15 ) / 16 ) );
+  m_filmGrainSynth->prepareBlockSeeds( width, height, grain->seeds.data() );
+
+  const bool anyGrain = m_filmGrainSynth->anyPresent( int( frame.numPlanes ) );
+  if( anyGrain )
+  {
+    m_filmGrainSynth->checkFrame( width );   // fails on the frame the CPU's synthesis fails on
+    const FilmGrainImpl& impl = m_filmGrainSynth->impl();
+    m_filmGrainSynth->writeTables( grain->tables );
+    grain->bitShift   = impl.bitShift();
+    grain->scaleShift = impl.scaleShift();
+    grain->subX       = impl.subX();
+    grain->subY       = impl.subY();
+    for( uint32_t c = 0; c < frame.numPlanes; c++ )
+    {
+      grain->present[c] = m_filmGrainSynth->componentPresent( int( c ) );
+    }
+    grain->width    = width;
+    grain->height   = height;
+    grain->confLeft = confLeft;
+    grain->confTop  = confTop;
+  }
+
+  if( m_filmGrainCharacteristicsState != FgcPersist )   // Not persistent
+  {
+    m_filmGrainCharacteristicsState = FgcNone;
+  }
+  if( !anyGrain )
+  {
+    return nullptr;   // the hand-over copies the frame as it is
+  }
+  return grain;
+}
+#endif
+
 void VVDecImpl::xGrainReap()
 {
 #if VVDEC_VULKAN
@@ -1358,7 +1401,7 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
   // In hand-over mode no picture gets an 8-bit copy: one on the GPU (DecLib::prepareOutput did not download it) has
   // no samples in host memory, and one held in host planes (an error picture, or one the CPU parsed) is handed over
   // from those, so its frame must keep the picture and its planes. The frame describes planes that must not be read
-  // (vvdec.h's hand-over); film grain synthesis is off in this mode.
+  // (vvdec.h's hand-over). The film grain, if on, is added by the hand-over's copies (xGrainForHandOver).
   if( m_cDecLib->handOver() )
   {
     bCreateStorage = false;
@@ -1382,7 +1425,11 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
       }
     }
     const bool fgsReuseBuffer = bitDepths.recon == 10 && !pcPic->stillReferenced;
+#if VVDEC_VULKAN
+    if( !fgsReuseBuffer && !m_cDecLib->handOver() )
+#else
     if( !fgsReuseBuffer )
+#endif
     {
       bCreateStorage |= m_filmGrainCharacteristicsState != FgcNone;
     }
@@ -1390,8 +1437,8 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
 #if VVDEC_VULKAN
   // the grain on the GPU, where the picture lives in host memory the GPU
   // reaches: in place, or into a copy it makes in memory it reaches too
-  const bool gpuGrain = m_enableFilmGrain && m_filmGrainCharacteristicsState != FgcNone && m_cDecLib->gpu() && !m_cUserAllocator.enabled
-                        && gpu::hostPictureAddresses( pcPic->m_bufs[PIC_RECONSTRUCTION], nullptr, nullptr );
+  const bool gpuGrain = m_enableFilmGrain && m_filmGrainCharacteristicsState != FgcNone && m_cDecLib->gpu() && !m_cDecLib->handOver()
+                        && !m_cUserAllocator.enabled && gpu::hostPictureAddresses( pcPic->m_bufs[PIC_RECONSTRUCTION], nullptr, nullptr );
 #else
   const bool gpuGrain = false;
 #endif
@@ -1592,14 +1639,19 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
 
   // Grain synthesis
   bool grainReadsPicture = false;   // the GPU's grain, under way, reads the picture, which is released once it is done
+  std::unique_ptr<const FilmGrainFrame> handOverGrain;
   if( m_enableFilmGrain && m_filmGrainCharacteristicsState != FgcNone )
   {
 #if VVDEC_VULKAN
     if( m_cDecLib->gpu() )
     {
-      ( gpuGrain ? m_grainFramesGpu : m_grainFramesCpu )++;
+      ( gpuGrain || m_cDecLib->handOver() ? m_grainFramesGpu : m_grainFramesCpu )++;
     }
-    if( gpuGrain )
+    if( m_cDecLib->handOver() )
+    {
+      handOverGrain = xGrainForHandOver( cFrame, confLeft, confTop );
+    }
+    else if( gpuGrain )
     {
       const int64_t ticket = xAddGrainGpu( &cFrame, pcPic, confLeft, confTop, bCreateStorage );
       grainReadsPicture    = bCreateStorage;
@@ -1611,7 +1663,7 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
     xAddGrain( &cFrame );
   }
 
-  m_rcFrameList.emplace_back( cFrame, bCreateStorage ? nullptr : pcPic );
+  m_rcFrameList.emplace_back( cFrame, bCreateStorage ? nullptr : pcPic, std::move( handOverGrain ) );
 
   if( m_pcFrameNext == m_rcFrameList.end() )
   {

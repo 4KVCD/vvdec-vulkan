@@ -55,6 +55,7 @@ OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMA
 namespace vvdec
 {
 struct Picture;
+struct FilmGrainFrame;
 
 namespace gpu
 {
@@ -67,6 +68,9 @@ class PlanePool;
 // device waits for. With the GPU's parse ahead the picture is not downloaded to host memory: its twins hold it until
 // the application gives it back. With the CPU's parse the GPU downloads every picture to its host planes, which the
 // copies read; a copy that read them keeps them from being written again until it is done (Picture::handOverValue).
+// A frame with film grain gets its grain in the copy: the grain shader (GpuFilmGrain::record) reads the frame -- the
+// twins, or the host planes (on a discrete GPU a copy of them in its memory first) -- and writes it with its grain
+// into a scratch in GPU memory, which the copy then reads.
 // One HandOver per decoder; its copies may be asked for from any one thread at a time.
 class HandOver
 {
@@ -88,9 +92,11 @@ public:
   // Copies `count` planes of the picture into dst, samples of dstBytes bytes (1 or 2), each shifted left by shift, in
   // one submission. A picture on the GPU is read from its twins; one held in host planes (gpuNeedsDownload clear: an
   // error picture the CPU filled, or one the CPU parsed, downloaded at submit) from those, which the GPU reaches too.
-  // pool: the decoder's PlanePool, whose lock guards the planes' records (null without one). Returns the hand-over
+  // pool: the decoder's PlanePool, whose lock guards the planes' records (null without one). grain: the frame's film
+  // grain, added in the copy (null: none); the planes are then the components 0 to count - 1. Returns the hand-over
   // timeline's value the copy signals; its writes are visible to the host once that value is reached.
-  uint64_t pack( Picture& pic, PlanePool* pool, const Plane* planes, int count, const Buffer& dst, int dstBytes, int shift );
+  uint64_t pack( Picture& pic, PlanePool* pool, const Plane* planes, int count, const Buffer& dst, int dstBytes, int shift,
+                 const FilmGrainFrame* grain = nullptr );
   // Waits for every copy submitted (before the pictures' twins may be freed: a seek, the decoder closing).
   void wait();
   // Waits until the copy that signals value (from pack) and the copies before it are done, at most timeoutNs:
@@ -113,6 +119,8 @@ private:
     VkQueryPool       queries = VK_NULL_HANDLE;
     Clock::time_point submitted;
     double            waitedMs = -1;
+    // With film grain: its tables and the frame's block seeds (Upload), written once the copy before is done
+    Buffer grainTables;
   };
   static constexpr size_t kCopies = 8;
 
@@ -130,6 +138,24 @@ private:
   static constexpr long kTimesEvery = 100;
   void addTimes( Copy& copy );   // a done copy's times, with m_mutex held
   void printTimes( const char* when ) const;
+  void waitPendingLocked();      // wait(), with m_mutex held
+  // A plane of the frame as its film grain reads it: the address of the frame's top-left sample and the stride
+  // (samples), the samples a row has from there to the picture's right edge, and the buffer it is in with that
+  // sample's offset there
+  struct GrainSource
+  {
+    VkDeviceAddress addr      = 0;
+    int             stride    = 0;
+    int             readWidth = 0;
+    VkBuffer        buffer    = VK_NULL_HANDLE;
+    VkDeviceSize    offset    = 0;
+  };
+  // The plane comp of the frame as its grain reads it, from the plane's origin (planeOrigin) and stride. With the
+  // planes' lock held.
+  static GrainSource grainSource( const Picture& pic, ComponentID comp, VkDeviceAddress origin, int stride, const FilmGrainFrame& grain );
+  // Records the frame's grain into the copy's commands, from src (count planes: components 0 to count - 1) into
+  // m_grainAfter; afterAt: where each plane's top-left sample is there. With m_mutex held.
+  void recordGrain( Copy& copy, const FilmGrainFrame& grain, const GrainSource* src, int count, bool fromHost, VkDeviceAddress* afterAt );
 
   Context*          m_ctx;
   std::mutex        m_mutex;
@@ -137,6 +163,10 @@ private:
   size_t            m_next  = 0;
   bool              m_timed = false;
   Times             m_times;
+  // The film grain's scratch in GPU memory, shared by the copies (each copy's start barrier orders it after the one
+  // before): the frame's planes with their grain (after), and on a discrete GPU the frame's planes copied from host
+  // memory (before). Grown only once every copy is done.
+  Buffer            m_grainBefore, m_grainAfter;
 };
 
 }   // namespace gpu

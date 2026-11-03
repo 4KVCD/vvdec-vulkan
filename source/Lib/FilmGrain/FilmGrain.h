@@ -85,6 +85,30 @@ struct fgs_sei
   int16_t  comp_model_value[3][256][SEI_MAX_MODEL_VALUES];
 };
 
+// The tables of the GPU's synthesis (VulkanLib/GpuFilmGrain, shaders/filmgrain.slang), bytes in this layout:
+// FilmGrainImpl's patterns [2][VFGS_MAX_PATTERNS + 1][64][64], then the components' sLUT[3][256], then their pLUT[3][256]
+struct FilmGrainTables
+{
+  static constexpr size_t kPatternBytes = 2 * ( VFGS_MAX_PATTERNS + 1 ) * 64 * 64;
+  static constexpr size_t kLutBytes     = 256;                          // a component's sLUT or pLUT
+  static constexpr size_t kScaleLuts    = kPatternBytes;                // where the sLUTs start
+  static constexpr size_t kPatternLuts  = kScaleLuts + 3 * kLutBytes;   // where the pLUTs start
+  static constexpr size_t kBytes        = kPatternLuts + 3 * kLutBytes;
+};
+
+// A frame's film grain, to be added on the GPU when the frame is handed over (vvdec_handover_pack): the synthesis'
+// state as it was when the frame was output -- its tables and the frame's block seeds, which go on from frame to frame
+// in output order -- and where the frame lies in its picture
+struct FilmGrainFrame
+{
+  uint8_t               tables[FilmGrainTables::kBytes];
+  std::vector<uint32_t> seeds;   // each 16x16 block's, a row of blocks after the other (FilmGrain::prepareBlockSeeds)
+  int                   bitShift = 0, scaleShift = 0, subX = 1, subY = 1;
+  bool                  present[3] = {};   // the components with grain
+  int                   width = 0, height = 0;      // the frame, in luma samples
+  int                   confLeft = 0, confTop = 0;  // its top-left sample in the picture, in luma samples
+};
+
 class FilmGrain
 {
   std::unique_ptr<FilmGrainImpl> m_impl;
@@ -110,6 +134,13 @@ public:
   // for the GPU's synthesis (VulkanLib/GpuFilmGrain)
   const FilmGrainImpl& impl() const { return *m_impl; }
   bool                 componentPresent( int c ) const { return fgs.comp_model_present_flag[c] != 0; }
+  // Whether one of the first numComponents components has grain
+  bool                 anyPresent( int numComponents ) const;
+  // FilmGrainImpl::add_grain_block's checks for a frame width luma samples wide, made up front (add_grain_line makes
+  // them for a component with grain, so call this only when anyPresent)
+  void                 checkFrame( int width ) const;
+  // The tables as the synthesis has them now, in FilmGrainTables' layout (FilmGrainTables::kBytes bytes)
+  void                 writeTables( uint8_t* tables ) const;
 
   void add_grain_line( void* Y, void* U, void* V, int y, int width );
 

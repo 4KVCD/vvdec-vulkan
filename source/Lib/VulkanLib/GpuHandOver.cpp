@@ -45,8 +45,11 @@ OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMA
 
 #include "GpuHandOver.h"
 
+#include "GpuFilmGrain.h"
 #include "GpuPictureMemory.h"
 #include "vvdec_gpu/GpuShaderIds.h"
+
+#include "FilmGrain/FilmGrain.h"
 
 #include "CommonLib/Picture.h"
 
@@ -108,12 +111,20 @@ HandOver::~HandOver()
     m_ctx->destroyQueries( copy.queries );
     m_ctx->destroyFence( copy.fence );
     m_ctx->destroyCommandPool( copy.pool );   // and its buffer
+    m_ctx->free( copy.grainTables );
   }
+  m_ctx->free( m_grainBefore );
+  m_ctx->free( m_grainAfter );
 }
 
 void HandOver::wait()
 {
   std::lock_guard<std::mutex> lock( m_mutex );
+  waitPendingLocked();
+}
+
+void HandOver::waitPendingLocked()
+{
   for( Copy& copy: m_copies )
   {
     if( copy.pending )
@@ -198,11 +209,100 @@ static VkDeviceAddress planeOrigin( const Picture& pic, ComponentID comp, int& s
   return host[comp];
 }
 
-uint64_t HandOver::pack( Picture& pic, PlanePool* pool, const Plane* planes, int count, const Buffer& dst, int dstBytes, int shift )
+HandOver::GrainSource HandOver::grainSource( const Picture& pic, ComponentID comp, VkDeviceAddress origin, int stride, const FilmGrainFrame& grain )
+{
+  const PelStorage& planes = pic.m_bufs[PIC_RECONSTRUCTION];
+  const int         sx     = getComponentScaleX( comp, planes.chromaFormat );
+  const int         sy     = getComponentScaleY( comp, planes.chromaFormat );
+  const HostPlane*  host   = pic.gpuNeedsDownload ? nullptr : hostPlane( planes, comp );
+  CHECK_FATAL( !pic.gpuNeedsDownload && !host, "Vulkan: a picture handed over from memory the GPU cannot reach" );
+  const Buffer&     buffer = pic.gpuNeedsDownload ? planeTwin( planes, comp ) : host->host;
+  GrainSource       src;
+  src.addr      = origin + VkDeviceSize( ( grain.confTop >> sy ) * stride + ( grain.confLeft >> sx ) ) * sizeof( Pel );
+  src.stride    = stride;
+  src.readWidth = int( planes.bufs[comp].width ) - ( grain.confLeft >> sx );
+  src.buffer    = buffer.buffer;
+  src.offset    = src.addr - buffer.addr + buffer.offset;
+  return src;
+}
+
+void HandOver::recordGrain( Copy& copy, const FilmGrainFrame& grain, const GrainSource* src, int count, bool fromHost, VkDeviceAddress* afterAt )
+{
+  // Each plane's samples the grain reads and writes, in the same layout in m_grainAfter (and m_grainBefore): whole
+  // rows, from the first row's sample 0 to the last row's last sample read
+  VkDeviceSize span[MAX_NUM_COMPONENT], at[MAX_NUM_COMPONENT], total = 0;
+  for( int c = 0; c < count; c++ )
+  {
+    const int rows = grain.height / ( c ? grain.subY : 1 );
+    span[c]        = ( VkDeviceSize( rows - 1 ) * src[c].stride + src[c].readWidth ) * sizeof( Pel );
+    at[c]          = total;
+    total         += ( span[c] + 255 ) & ~VkDeviceSize( 255 );
+  }
+  // On a discrete GPU, planes in host memory are first copied into its own memory: the grain shader's reads of host
+  // memory would cross the bus one by one (GpuFilmGrain)
+  const bool viaBefore = fromHost && m_ctx->discrete();
+  if( m_grainAfter.size < total || ( viaBefore && m_grainBefore.size < total ) )
+  {
+    waitPendingLocked();   // the copies under way may still read or write them
+    m_ctx->ensure( m_grainAfter, size_t( total ), MemKind::Device );
+    if( viaBefore )
+    {
+      m_ctx->ensure( m_grainBefore, size_t( total ), MemKind::Device );
+    }
+  }
+  // The tables and the seeds: the copy's own (its last use is done)
+  const size_t seedBytes = grain.seeds.size() * sizeof( uint32_t );
+  m_ctx->ensure( copy.grainTables, FilmGrainTables::kBytes + seedBytes, MemKind::Upload );
+  memcpy( copy.grainTables.mapped, grain.tables, FilmGrainTables::kBytes );
+  memcpy( copy.grainTables.mapped + FilmGrainTables::kBytes, grain.seeds.data(), seedBytes );
+
+  const Api& vk = m_ctx->api();
+  if( viaBefore )
+  {
+    for( int c = 0; c < count; c++ )
+    {
+      const VkBufferCopy region{ src[c].offset, at[c], span[c] };
+      vk.vkCmdCopyBuffer( copy.cmd, src[c].buffer, m_grainBefore.buffer, 1, &region );
+    }
+    m_ctx->memoryBarrier( copy.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_SHADER_READ_BIT );
+  }
+  GpuFilmGrain::Pass pass;
+  pass.numPlanes  = count;
+  pass.lumaWidth  = grain.width;
+  pass.lumaHeight = grain.height;
+  pass.dstBytes   = int( sizeof( Pel ) );
+  pass.tables     = copy.grainTables.addr;
+  pass.seeds      = copy.grainTables.addr + FilmGrainTables::kBytes;
+  pass.bitShift   = grain.bitShift;
+  pass.scaleShift = grain.scaleShift;
+  pass.subX       = grain.subX;
+  pass.subY       = grain.subY;
+  for( int c = 0; c < count; c++ )
+  {
+    // (field by field, as GpuFilmGrain::apply: MSVC miscompiled a braced list assigned to a plane there)
+    GpuFilmGrain::Pass::PlaneIo& plane = pass.planes[c];
+    afterAt[c]                         = m_grainAfter.addr + at[c];
+    plane.src                          = viaBefore ? m_grainBefore.addr + at[c] : src[c].addr;
+    plane.dst                          = afterAt[c];
+    plane.srcStride                    = src[c].stride;
+    plane.dstStride                    = src[c].stride * int( sizeof( Pel ) );
+    plane.readWidth                    = src[c].readWidth;
+    pass.present[c]                    = grain.present[c];
+  }
+  GpuFilmGrain::record( m_ctx, copy.cmd, pass );
+  // the grain's writes before the copy's reads
+  m_ctx->memoryBarrier( copy.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_SHADER_READ_BIT );
+}
+
+uint64_t HandOver::pack( Picture& pic, PlanePool* pool, const Plane* planes, int count, const Buffer& dst, int dstBytes, int shift,
+                         const FilmGrainFrame* grain )
 {
   CHECK_FATAL( pic.progress < Picture::reconstructed, "Vulkan: a picture handed over before its work on the GPU is done" );
   CHECK_FATAL( count < 1 || count > MAX_NUM_COMPONENT, "Vulkan: a hand-over of no planes or too many" );
   HandOverParams params[MAX_NUM_COMPONENT]{};
+  GrainSource    grainSrc[MAX_NUM_COMPONENT];
   bool           fromHost = false;   // the copy reads the host planes (planeOrigin), not the twins
   {
     // The planes' records stay put meanwhile (a picture the pool handles on another thread)
@@ -225,6 +325,11 @@ uint64_t HandOver::pack( Picture& pic, PlanePool* pool, const Plane* planes, int
       params[i].height    = plane.height;
       params[i].dstBytes  = dstBytes;
       params[i].shift     = shift;
+      if( grain )
+      {
+        CHECK_FATAL( plane.comp != ComponentID( i ), "Vulkan: a hand-over with film grain of planes out of order" );
+        grainSrc[i] = grainSource( pic, plane.comp, origin, stride, *grain );
+      }
     }
   }
 
@@ -235,6 +340,7 @@ uint64_t HandOver::pack( Picture& pic, PlanePool* pool, const Plane* planes, int
   if( copy.pending )
   {
     vk.vkWaitForFences( m_ctx->device(), 1, &copy.fence, VK_TRUE, UINT64_MAX );
+    copy.pending = false;
     if( m_timed )
     {
       addTimes( copy );
@@ -248,12 +354,30 @@ uint64_t HandOver::pack( Picture& pic, PlanePool* pool, const Plane* planes, int
     vk.vkCmdWriteTimestamp( copy.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, copy.queries, kStampStart );
   }
   // After the picture's reconstruction (earlier work on this queue), and after the other device's last read of dst,
-  // which its own submissions finished before it asked for this copy
-  m_ctx->memoryBarrier( copy.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT );
+  // which its own submissions finished before it asked for this copy; with film grain also after the copies before,
+  // which read and wrote the same scratch (recordGrain)
+  const VkPipelineStageFlags afterStages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | ( grain ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0 );
+  const VkAccessFlags        afterAccess =
+    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | ( grain ? VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0 );
+  m_ctx->memoryBarrier( copy.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, afterStages, afterAccess );
   if( m_timed )
   {
     vk.vkCmdWriteTimestamp( copy.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, copy.queries, kStampBarrier );
+  }
+  if( grain )
+  {
+    // The copy reads the planes with their grain, in m_grainAfter: the same rectangles, counted there from the frame's
+    // top-left sample (Plane's x and y count from the picture's)
+    const ChromaFormat chromaFormat = pic.m_bufs[PIC_RECONSTRUCTION].chromaFormat;
+    VkDeviceAddress    afterAt[MAX_NUM_COMPONENT];
+    recordGrain( copy, *grain, grainSrc, count, fromHost, afterAt );
+    for( int i = 0; i < count; i++ )
+    {
+      const int x = planes[i].x - ( grain->confLeft >> getComponentScaleX( planes[i].comp, chromaFormat ) );
+      const int y = planes[i].y - ( grain->confTop >> getComponentScaleY( planes[i].comp, chromaFormat ) );
+      CHECK_FATAL( x < 0 || y < 0, "Vulkan: a hand-over rectangle outside the frame with film grain" );
+      params[i].src = afterAt[i] + VkDeviceSize( y * params[i].srcStride + x ) * sizeof( Pel );
+    }
   }
   vk.vkCmdBindPipeline( copy.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ctx->pipeline( kShader_handover ) );
   // The planes' copies write disjoint ranges: no barrier between them

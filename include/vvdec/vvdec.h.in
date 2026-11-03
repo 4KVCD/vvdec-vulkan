@@ -713,7 +713,8 @@ VVDEC_DECL int vvdec_set_tracing( const char* file, const char* rule );
 
 /* The hand-over (the GPU's reconstruction, with the CPU's parse or the GPU's parse ahead, VVDEC_GPU_PARSE=2;
  Windows): decoded pictures copied on the GPU straight into another Vulkan device's buffers on the same GPU, with no
- copy by the CPU (film grain synthesis off). With the GPU's parse ahead a picture is not downloaded to host memory;
+ copy by the CPU. With film grain synthesis on, the copies add each frame's grain (as the CPU's synthesis would add
+ it); a frame's host planes never get it. With the GPU's parse ahead a picture is not downloaded to host memory;
  with the CPU's parse the GPU downloads each picture (the CPU's parse reads them) and the copies read those host
  planes. The other device exports its buffers (opaque Win32 handles of dedicated allocations) and imports
  the decoder's timeline semaphore, which each copy signals; or the copies go into host memory the decoder imports
@@ -724,11 +725,9 @@ VVDEC_DECL int vvdec_set_tracing( const char* file, const char* rule );
  These functions, vvdec_decode and vvdec_frame_unref must not run at the same time on one decoder. */
 
 /* vvdec_handover_enable
- Turns the hand-over on, before the first picture is decoded; the decoder must have been opened with
- filmGrainSynthesis off (the grain is added from host memory).
- \retval     VVDEC_OK, or VVDEC_ERR_NOT_SUPPORTED when the decoder cannot hand over (film grain synthesis on, not on
-             the GPU, a mode not made for it -- VVDEC_GPU_PARSE=1, VVDEC_GPU_MIDER=1 --, or a device without the
-             extensions)
+ Turns the hand-over on, before the first picture is decoded.
+ \retval     VVDEC_OK, or VVDEC_ERR_NOT_SUPPORTED when the decoder cannot hand over (not on the GPU, a mode not made
+             for it -- VVDEC_GPU_PARSE=1, VVDEC_GPU_MIDER=1 --, or a device without the extensions)
 */
 VVDEC_DECL int vvdec_handover_enable( vvdecDecoder * );
 

@@ -53,6 +53,7 @@ POSSIBILITY OF SUCH DAMAGE.
 namespace vvdec {
 
 class FilmGrain;
+struct FilmGrainFrame;
 
 static const char * const vvdecNalTypeNames[] = { "NAL_UNIT_CODED_SLICE_TRAIL", "NAL_UNIT_CODED_SLICE_STSA", "NAL_UNIT_CODED_SLICE_RADL", "NAL_UNIT_CODED_SLICE_RASL",
                                                   "NAL_UNIT_RESERVED_VCL_4", "NAL_UNIT_RESERVED_VCL_5", "NAL_UNIT_RESERVED_VCL_6",
@@ -249,6 +250,9 @@ private:
   // by confLeft and confTop), or with copied the GPU's copy in the frame's
   // storage. Returns the grain's ticket (gpu::GpuFilmGrain::apply).
   int64_t xAddGrainGpu             ( vvdecFrame *frame, Picture* pcPic, int confLeft, int confTop, bool copied );
+  // In hand-over mode: the frame's grain as the GPU adds it when the frame is
+  // handed over (gpu::HandOver::pack); null when no component has grain.
+  std::unique_ptr<const FilmGrainFrame> xGrainForHandOver( const vvdecFrame& frame, int confLeft, int confTop );
 #endif
   // Returns whether the frame with the sequence number seq may go out. It may
   // when the GPU adds no grain to it or when its grain is done. Otherwise
@@ -274,7 +278,9 @@ private:
   void vvdec_frame_reset(vvdecFrame *frame );
 
 private:
-  typedef std::tuple<vvdecFrame, Picture*> FrameListEntry;
+  // A frame out, the picture its planes are in (null when the frame has its own
+  // storage), and in hand-over mode its film grain (xGrainForHandOver)
+  typedef std::tuple<vvdecFrame, Picture*, std::unique_ptr<const FilmGrainFrame>> FrameListEntry;
   typedef std::map<uint64_t, FrameStorage> FrameStorageMap;
   typedef FrameStorageMap::value_type      FrameStorageMapType;
 

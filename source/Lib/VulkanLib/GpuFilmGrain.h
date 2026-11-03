@@ -97,6 +97,28 @@ public:
   bool done( int64_t ticket );
   void wait( int64_t ticket );
 
+  // A frame's grain as record() adds it: its tables (FilmGrainTables' layout) and block seeds in memory the GPU reads,
+  // the grain's parameters, and per plane the source (16 bits a sample) and the output
+  struct Pass
+  {
+    struct PlaneIo
+    {
+      VkDeviceAddress src = 0, dst = 0;   // the frame's top-left sample
+      int             srcStride = 0;      // samples
+      int             dstStride = 0;      // bytes
+      int             readWidth = 0;      // as Plane::readWidth
+    };
+    int             numPlanes = 0, lumaWidth = 0, lumaHeight = 0, dstBytes = 2;
+    VkDeviceAddress tables = 0, seeds = 0;
+    int             bitShift = 0, scaleShift = 0, subX = 1, subY = 1;
+    bool            present[3] = {};
+    PlaneIo         planes[3];
+  };
+  // Records the grain's dispatches into cmd (of a queue that runs compute); a plane's output must not overlap any
+  // plane's source.
+  // The caller orders the pass's reads and writes with barriers. (The hand-over's grain: GpuHandOver.)
+  static void record( Context* ctx, VkCommandBuffer cmd, const Pass& pass );
+
 private:
   // The work of a frame: its tables (the grain patterns, then per component the scale table (sLUT), then the
   // pattern tables (pLUT)), its block seeds, on a discrete GPU the frame's copies in GPU memory (before and after the

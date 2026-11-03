@@ -870,4 +870,31 @@ void FilmGrain::add_grain_line( void* Y, void* U, void* V, int y, int width )
   }
 }
 
+bool FilmGrain::anyPresent( int numComponents ) const
+{
+  bool any = false;
+  for( int c = 0; c < numComponents; c++ )
+  {
+    any |= componentPresent( c );
+  }
+  return any;
+}
+
+void FilmGrain::checkFrame( int width ) const
+{
+  CHECK( width <= 128, "wrong width" );
+  CHECK( m_impl->bitShift() != 0 && m_impl->bitShift() != 2, "wrong bs" );
+  CHECK( m_impl->scaleShift() + m_impl->bitShift() < 8 || m_impl->scaleShift() + m_impl->bitShift() > 13, "wrong scale_shift" );
+}
+
+void FilmGrain::writeTables( uint8_t* tables ) const
+{
+  memcpy( tables, m_impl->patterns(), FilmGrainTables::kPatternBytes );
+  for( int c = 0; c < 3; c++ )
+  {
+    memcpy( tables + FilmGrainTables::kScaleLuts + c * FilmGrainTables::kLutBytes, m_impl->scaleLut( c ), FilmGrainTables::kLutBytes );
+    memcpy( tables + FilmGrainTables::kPatternLuts + c * FilmGrainTables::kLutBytes, m_impl->patternLut( c ), FilmGrainTables::kLutBytes );
+  }
+}
+
 }   // namespace vvdec
