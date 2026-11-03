@@ -321,7 +321,10 @@ void CodingStructure::allocColMiMap( ptrdiff_t size )
 #if VVDEC_VULKAN
   if( colMiAllocator )
   {
-    m_colMiMap = static_cast<ColocatedMotionInfo*>( colMiAllocator->create( colMiAllocator->opaque, VVDEC_CT_Y, uint32_t( sizeof( ColocatedMotionInfo ) * size ),
+    // In the GPU's memory when the GPU front end derives the picture's motion, else in host memory, where the CPU front
+    // end writes and reads it. (A reused coding structure keeps the memory while the size stays the same.)
+    const vvdecComponentType comp = picture && picture->gpuDerivesMotion ? kGpuOnlyComponent : VVDEC_CT_Y;
+    m_colMiMap = static_cast<ColocatedMotionInfo*>( colMiAllocator->create( colMiAllocator->opaque, comp, uint32_t( sizeof( ColocatedMotionInfo ) * size ),
                                                                            MEMORY_ALIGN_DEF_SIZE, &m_colMiAllocation ) );
     CHECK( !m_colMiMap, "no memory for the colocated motion" );
   }
@@ -357,7 +360,7 @@ uint32_t* CodingStructure::gpuSliceTable( size_t words )
   {
     freeGpuSliceTable();
     CHECK( !colMiAllocator, "the GPU's slice table out of the GPU's reach" );
-    m_gpuSliceTable = static_cast<uint32_t*>( colMiAllocator->create( colMiAllocator->opaque, VVDEC_CT_Y, uint32_t( words * sizeof( uint32_t ) ),
+    m_gpuSliceTable = static_cast<uint32_t*>( colMiAllocator->create( colMiAllocator->opaque, kGpuOnlyComponent, uint32_t( words * sizeof( uint32_t ) ),
                                                                       MEMORY_ALIGN_DEF_SIZE, &m_gpuSliceAllocation ) );
     CHECK( !m_gpuSliceTable, "no memory for the GPU's slice table" );
     m_gpuSliceTableWords = words;

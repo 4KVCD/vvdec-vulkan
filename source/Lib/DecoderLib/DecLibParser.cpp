@@ -1047,6 +1047,11 @@ bool DecLibParser::xDecodeSliceMain( InputNALUnit& nalu )
 
   pcSlice->parseTaskParams.init( this, std::move( nalu.getBitstream() ) );
   pcSlice->parseTaskParams.clearColMotion = m_uiSliceSegmentIdx == 0;
+#if VVDEC_VULKAN
+  // Not when the GPU front end derives the picture's motion: it writes all of it, and the clear's writes into the GPU's
+  // memory crossed the bus (RTX 3070 without ReBAR, Beekeeper 4K: 2.7% fewer pictures a second with it)
+  pcSlice->parseTaskParams.clearColMotion &= !m_pcParsePic->gpuDerivesMotion;
+#endif
   pcSlice->parseDone.lock();
 
   auto expected = Picture::init;
@@ -1128,6 +1133,9 @@ void DecLibParser::xActivateParameterSets( const int layerId )
     // (gpu::PlanePool).
 #if VVDEC_VULKAN
     const bool gpuParses = m_gpuParseService && gpu::GpuRecon::parsesPictures( m_pcParsePic->gpuMemory, *sps );
+    // A picture whose motion the GPU front end derives gets its colocated motion in the GPU's memory
+    // (CodingStructure::allocColMiMap).
+    m_pcParsePic->gpuDerivesMotion = gpu::GpuRecon::derivesMotion( m_pcParsePic->gpuMemory, *sps );
     // A picture the GPU parses gets stand-ins of its planes, and its planes only when it is about to be output
     // (gpu::PlanePool). A picture the CPU parses gets its planes at once, because its parse writes the levels into
     // them.

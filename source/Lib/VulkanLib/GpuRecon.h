@@ -266,6 +266,11 @@ public:
   void                 compareFrontEnd( const CodingStructure& cs, const MotionInfo* cpu, const LoopFilterParam* lfp, const PictureJobs* jobs );
   const FrontEndStats& frontEndStats() const { return m_check.stats; }
 
+  // Whether the GPU front end derives the motion of a sequence's (sps) pictures whose buffers gpuMemory allocates
+  // (Picture::gpuMemory), as far as is known before their coding structures are set up (Picture::finalInit): requested,
+  // and the sequence within interSupported (which covers intra prediction and the residuals)
+  static bool derivesMotion( const UserAllocator* gpuMemory, const SPS& sps );
+
   // --- The GPU parse instead of the CPU's (VVDEC_GPU_PARSE=2; GpuReconParse.cpp, GpuParseService.h) ---
   // Whether the GPU parses the picture (sps: its slices') instead of the CPU: only when the GPU front end takes it.
   // The ParseService parses it then, and the front end reads its records from the picture's ParsedPicture

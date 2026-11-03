@@ -68,19 +68,22 @@ namespace gpu
 // The planes' records: host planes (HostPlane) and their stand-ins (StandIn)
 // ====================================================================================================================
 
-// The component type that PlanePool gives createHostPlane for the colocated motion of a picture whose work goes to the
-// GPU. Only the GPU front end writes that motion (mider.slang, and DMVR's refinements in inter.slang) and reads it (TMVP
-// in the next pictures), so it goes to GPU memory the CPU can map (MemKind::Upload): in host memory each of the GPU's
-// scattered writes and reads of it was snooped (Beekeeper slower 4K +1.8% at 15 W).
-static constexpr vvdecComponentType kColMotion = vvdecComponentType( VVDEC_MAX_NUM_COMPONENT );
+// The component type that createHostPlane gets for memory only the GPU's work reads after the CPU set it up: the
+// colocated motion of a picture whose motion the GPU front end derives (from PlanePool for a picture the GPU parses, from
+// CodingStructure::allocColMiMap for one the CPU parses) and the slice tables. Only the GPU front end writes that motion
+// (mider.slang, and DMVR's refinements in inter.slang) and reads it (TMVP in the next pictures), so it goes to GPU memory
+// the CPU can map (MemKind::Upload): in host memory each of the GPU's scattered writes and reads of it was snooped
+// (Beekeeper slower 4K +1.8% at 15 W) or crossed PCIe (RTX 5090, Beekeeper 4K QP 16: inter 7.6 ms a picture, 0.12 ms
+// in GPU memory).
+static constexpr vvdecComponentType kGpuOnly = CodingStructure::kGpuOnlyComponent;
 
 static void* createHostPlane( void* opaque, vvdecComponentType comp, uint32_t size, uint32_t, void** allocator )
 {
-  // A picture's planes come from the context's cache when it has some that fit (Context::allocHost). The colocated
-  // motion is never cached: it is in the scarce GPU memory that the CPU maps.
+  // A picture's planes come from the context's cache when it has some that fit (Context::allocHost). The memory for the
+  // GPU's work only (kGpuOnly) is never cached: it is in the scarce GPU memory that the CPU maps.
   Context*   context = static_cast<Context*>( opaque );
   HostPlane* plane   = new HostPlane;
-  plane->host        = comp == kColMotion ? context->alloc( size, MemKind::Upload ) : context->allocHost( size, MemKind::HostCached );
+  plane->host        = comp == kGpuOnly ? context->alloc( size, MemKind::Upload ) : context->allocHost( size, MemKind::HostCached );
   plane->bytes       = size;
   if( !plane->host.mapped )
   {
@@ -373,7 +376,7 @@ void PlanePool::acquireColMotionLocked( Picture& pic, bool gpuOnly )
   if( !c.allocation )
   {
     c.bytes = bytes;
-    c.map   = m_planes->create( m_planes->opaque, gpuOnly ? kColMotion : VVDEC_CT_Y, bytes, MEMORY_ALIGN_DEF_SIZE, &c.allocation );
+    c.map   = m_planes->create( m_planes->opaque, gpuOnly ? kGpuOnly : VVDEC_CT_Y, bytes, MEMORY_ALIGN_DEF_SIZE, &c.allocation );
     CHECK( !c.map, "no memory for the colocated motion" );
   }
   pic.cs->attachColMotion( static_cast<ColocatedMotionInfo*>( c.map ), c.allocation );

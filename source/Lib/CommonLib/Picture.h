@@ -230,6 +230,10 @@ public:
   // motion the CPU derives waits for gpuComputeDone
   bool                     gpuMotionLater  = false;
   UserAllocator*           gpuMemory       = nullptr;        // the GPU's allocator of the picture's buffers (PicListManager): its colocated motion too
+  // the GPU front end derives the picture's motion, as the parser expects it (set by DecLibParser before finalInit): its
+  // colocated motion goes to the GPU's memory (CodingStructure::allocColMiMap), and its parse does not clear it (when
+  // the CPU front end takes the picture after all, DecLibRecon clears it)
+  bool                     gpuDerivesMotion = false;
   // VVDEC_GPU_PARSE=2, the GPU parses the picture (gpu::ParseService): its CTUs the parse tasks claimed so far
   // (DecSlice::claimSlice), and once gpuParsed unlocks, what the GPU's parse left (null: it gave up)
   std::atomic_int          gpuClaimedCtus  { 0 };

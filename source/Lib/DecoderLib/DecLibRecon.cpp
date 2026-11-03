@@ -625,6 +625,12 @@ void DecLibRecon::decompressPicture( Picture* pcPic )
   // whether the GPU front end drives the picture (m_gpuFrontEnd, below)
   const bool gpuFrontEnd = m_gpuFrontEndRequested && m_gpuFilters && m_gpuIntra && m_gpuResidual && ( isIntra || m_gpuInter ) && cs.colMiAllocator;
   const bool cpuFrontEnd = !gpuFrontEnd;
+  // The parse left the colocated motion of a picture whose motion it expected the GPU front end to derive as it was
+  // (Picture::gpuDerivesMotion; the GPU writes all of it): the CPU front end needs it cleared.
+  if( cpuFrontEnd && pcPic->gpuDerivesMotion )
+  {
+    cs.clearColMotion();
+  }
 #else
   const bool cpuFrontEnd = true;
 #endif

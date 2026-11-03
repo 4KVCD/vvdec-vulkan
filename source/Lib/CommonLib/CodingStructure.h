@@ -294,6 +294,11 @@ public:
   // (gpu::GpuRecon); m_colMiAllocation the allocator's handle of it
   const UserAllocator*                   colMiAllocator = nullptr;
   void*                                  m_colMiAllocation = nullptr;
+  // colMiAllocator's component type for memory that only the GPU's work reads after the CPU set it up: the colocated
+  // motion of a picture whose motion the GPU front end derives (Picture::gpuDerivesMotion), and the slice table. It is
+  // GPU memory the CPU maps (gpu::PlanePool): in host memory each of the GPU's scattered reads and writes of it
+  // crossed the bus.
+  static constexpr vvdecComponentType    kGpuOnlyComponent = vvdecComponentType( VVDEC_MAX_NUM_COMPONENT );
   // the picture's slice table for the GPU's motion derivation
   // (gpu::writeSliceTable), in memory from colMiAllocator: its own, then as
   // the colocated picture's
