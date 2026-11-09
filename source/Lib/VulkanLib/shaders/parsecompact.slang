@@ -2,10 +2,10 @@
 // with a meta word (its CTU and its index in the CTU). This shader puts them in raster order of the CTUs, the layout
 // the host gives the CPU's parse's records (GpuFrontEnd.cpp's writeCuRecords and writeCtuRecords), which the front end
 // reads and the check compares word for word:
-// - pass 0 (one workgroup of 1024 threads), once every CTU is parsed, writes the CTU records: each CTU's first CU and
-//   first TU are the prefix sums of the CTUs' counts, which it works out 1024 CTUs at a time; it also writes the
-//   totals, with the parse's counters (the host records it after each round of the parse's dispatches, so it does
-//   nothing until the picture is parsed);
+// - pass 0 (one workgroup of 1024 threads; the host records it after each round of the parse's dispatches) writes the
+//   totals: after every round the parse's counters and the CTUs parsed so far, so that the host sees a picture outgrow
+//   its room early; once every CTU is parsed, also the CTU records (each CTU's first CU and first TU are the prefix
+//   sums of the CTUs' counts, which it works out 1024 CTUs at a time) and the numbers of CUs and TUs;
 // - passes 1 and 2 copy the staged CU and TU records to their places (32 CU records or 64 TU records a workgroup),
 //   pass 3 copies the CTU records (256 a workgroup) beside them.
 // The CHECK variant compares the coefficient levels the GPU's parse left (where each TU's record says) with those the
@@ -19,8 +19,10 @@
 #  define CHECK 0
 #endif
 
-// The totals' word that holds the number of the parse's step they are of (GpuParseService.cpp's kParseTotalsSerial)
-static const int kTotalsSerial = 15;
+// The totals' words that hold the CTUs parsed and the number of the parse's step they are of (GpuParseService.cpp's
+// kTotalParsedCtus and kTotalSerial)
+static const int kTotalsParsedCtus = 10;
+static const int kTotalsSerial     = 15;
 
 #if CHECK
 struct Params
@@ -127,7 +129,8 @@ struct Params
   uint* tus;        // out (pass 2): the TU records in raster order of the CTUs
   uint* ctus;       // the CTU records (CtuRecord, 4 words each): pass 0 writes them, passes 1 to 3 read them
   uint* ctusOut;    // out (pass 3): a copy of the CTU records
-  uint* totals;     // out (pass 0): the numbers of CUs and TUs, then the parse's 8 counters; [kTotalsSerial] serial
+  uint* totals;     // out (pass 0): the numbers of CUs and TUs (once all is parsed), the parse's 8 counters, the CTUs
+                    // parsed; [kTotalsSerial] serial
   int   numCtus;
   int   numCus;     // the CU records staged (passes 1 to 3)
   int   numTus;     // the TU records staged
@@ -141,7 +144,7 @@ static const uint kLocalBits = 12;   // parse.slang's: the bits of a meta word b
 
 groupshared uint s_cus[1024];   // pass 0: the prefix sums of a chunk of 1024 CTUs' numbers of CUs and TUs
 groupshared uint s_tus[1024];
-groupshared uint s_parsed;      // pass 0: 1 while every CTU looked at is parsed
+groupshared uint s_parsed;      // pass 0: the CTUs parsed
 
 [shader( "compute" )]
 [numthreads( 1024, 1, 1 )]
@@ -150,22 +153,36 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
   const int tid = int( local.x );
   if( pc.pass == 0 )
   {
-    // Pass 0, once every CTU is parsed (a substream marks each of its CTUs parsed, also those it gave up on)
+    // Pass 0: the CTUs parsed (a substream marks each of its CTUs parsed, also those it gave up on). Before all are,
+    // only the counters and the CTUs parsed are written: the parse only adds to the counters, so a picture whose
+    // counters outgrow its room now outgrows it in the end, and the host parses it again at once.
     if( tid == 0 )
     {
-      s_parsed = 1;
+      s_parsed = 0;
     }
     GroupMemoryBarrierWithGroupSync();
+    uint parsed = 0;
     for( int ctu = tid; ctu < pc.numCtus; ctu += 1024 )
     {
-      if( pc.sync[2 + ctu] == 0 )
-      {
-        s_parsed = 0;
-      }
+      parsed += pc.sync[2 + ctu] != 0 ? 1u : 0u;
+    }
+    parsed = WaveActiveSum( parsed );
+    if( WaveIsFirstLane() && parsed != 0 )
+    {
+      InterlockedAdd( s_parsed, parsed );
     }
     GroupMemoryBarrierWithGroupSync();
-    if( s_parsed == 0 )
+    if( s_parsed < uint( pc.numCtus ) )
     {
+      if( tid == 0 )
+      {
+        for( int i = 0; i < 8; i++ )
+        {
+          pc.totals[2 + i] = pc.counters[i];
+        }
+        pc.totals[kTotalsParsedCtus] = s_parsed;
+        pc.totals[kTotalsSerial]     = pc.serial;
+      }
       return;
     }
     // One workgroup goes through the CTUs 1024 at a time, one per thread; baseCu and baseTu count the CUs and TUs of
@@ -212,7 +229,8 @@ void main( uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID )
       {
         pc.totals[2 + i] = pc.counters[i];
       }
-      pc.totals[kTotalsSerial] = pc.serial;
+      pc.totals[kTotalsParsedCtus] = uint( pc.numCtus );
+      pc.totals[kTotalsSerial]     = pc.serial;
     }
     return;
   }

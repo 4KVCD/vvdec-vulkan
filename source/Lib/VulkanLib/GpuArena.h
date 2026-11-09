@@ -63,12 +63,13 @@ namespace gpu
 // fraction of a millisecond to allocate and again to free; buffers kept for reuse in power-of-two sizes would hold
 // about twice the memory in use at once (Beekeeper slower 4K: 176 to 195 MB for up to 96 MB in use) and need
 // hundreds of allocations, where the chunks need a dozen. A range is a Buffer that owns no memory
-// (Buffer::isRange): buffer is its chunk's, offset where it starts there; give() takes it back, Context::free refuses
-// it. A range goes into the smallest gap that holds it; a chunk with no range taken for idleTicks ticks is freed.
+// (Buffer::isRange): buffer is its chunk's, offset where it starts there (mapped too, in memory the CPU sees); give()
+// takes it back, Context::free refuses it. A range goes into the smallest gap that holds it; a chunk with no range
+// taken for idleTicks ticks is freed. The chunks are of one kind of memory (kind).
 class RangeArena
 {
 public:
-  RangeArena( Context* ctx, uint64_t idleTicks ) : m_ctx( ctx ), m_idleTicks( idleTicks ) {}
+  RangeArena( Context* ctx, uint64_t idleTicks, MemKind kind = MemKind::Device ) : m_ctx( ctx ), m_idleTicks( idleTicks ), m_kind( kind ) {}
   ~RangeArena();   // frees the chunks (the ranges still taken go with them)
   RangeArena( const RangeArena& )            = delete;
   RangeArena& operator=( const RangeArena& ) = delete;
@@ -80,7 +81,7 @@ public:
   // slower 4K, with up to 96 MB of records and levels at once, held 105 MB in 8 MB chunks, 112 MB in 16 MB ones and
   // 128 MB in 32 MB ones; Top Gun slower 1080p, with up to 76 MB at once, held 80 MB in 4 MB chunks.
   static VkDeviceSize chunkSizeFor( size_t lumaSamples );
-  // A range of GPU memory (MemKind::Device) of at least size bytes, in steps of kAlign
+  // A range of the arena's kind of memory of at least size bytes, in steps of kAlign
   Buffer take( VkDeviceSize size );
   // Takes the range back, for the next takes: the GPU must be done with it (or have its work on it queued before
   // whatever takes it next). range is left empty.
@@ -110,6 +111,7 @@ private:
 
   Context*                            m_ctx;
   uint64_t                            m_idleTicks;
+  MemKind                             m_kind;
   uint64_t                            m_ticks     = 0;
   VkDeviceSize                        m_chunkSize = kMaxChunkSize;
   std::vector<std::unique_ptr<Chunk>> m_chunks;   // in the order they were allocated

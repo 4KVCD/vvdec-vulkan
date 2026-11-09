@@ -95,7 +95,8 @@ Buffer RangeArena::take( VkDeviceSize size )
   range.buffer = chunk->buf.buffer;
   range.size   = size;
   range.addr   = chunk->buf.addr + start;
-  range.kind   = MemKind::Device;
+  range.mapped = chunk->buf.mapped ? chunk->buf.mapped + start : nullptr;
+  range.kind   = chunk->buf.kind;   // (an Upload chunk may have been allocated in host memory: Context::alloc)
   range.offset = start;
   return range;
 }
@@ -131,7 +132,7 @@ void RangeArena::tick()
 RangeArena::Chunk& RangeArena::addChunk( VkDeviceSize size )
 {
   auto chunk = std::make_unique<Chunk>();
-  chunk->buf = m_ctx->alloc( size_t( size ), MemKind::Device );
+  chunk->buf = m_ctx->alloc( size_t( size ), m_kind );
   chunk->gaps.emplace( 0, chunk->buf.size );
   m_chunks.push_back( std::move( chunk ) );
   return *m_chunks.back();

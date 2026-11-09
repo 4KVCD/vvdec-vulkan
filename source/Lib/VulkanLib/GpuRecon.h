@@ -666,7 +666,8 @@ private:
   // besides, its commands
   struct ParseCheck
   {
-    std::unique_ptr<ParseSlot> slot;   // the picture's parse
+    std::unique_ptr<SlotShared> shared;   // the memory of the slot's own buffers, the scan table
+    std::unique_ptr<ParseSlot>  slot;     // the picture's parse
     bool       recorded = false;       // compareParse has results to compare
     int        contexts = 0;           // parsectx.slang's context sets checked against vvdec's: 1 alike, -1 not
     // the records in raster order and the levels check's counts in host memory, for compareParse (the slot holds the

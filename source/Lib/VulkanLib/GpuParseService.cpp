@@ -85,20 +85,22 @@ static constexpr size_t   kParseBitsPadding  = 256;       // zero bytes after th
 static constexpr size_t   kParseBottomRowEntries = 64;    // per CTU, parsetree.slang's bottomRowsAt entries (2 words each)
 
 // The words of a step's totals, as parsecompact.slang's first pass writes them: the CUs and TUs that the CTUs counted,
-// then the parse's kParseCounters counters, and the number of the step they are of
+// then the parse's kParseCounters counters, the CTUs parsed, and the number of the step they are of. Every step writes
+// them; the numbers of CUs and TUs only once every CTU is parsed.
 enum TotalsWord : size_t
 {
-  kTotalCus       = 0,
-  kTotalTus       = 1,
-  kTotalStagedCus = 2,
-  kTotalStagedTus = 3,
-  kTotalRoomTrafo = 4,   // the room of the job lists, as frontCapacities counts it (without its margins)
-  kTotalRoomInter = 5,
-  kTotalRoomIntra = 6,
-  kTotalRoomBands = 7,
-  kTotalRoomEdges = 8,
-  kTotalLevels    = 9,
-  kTotalSerial    = 15,
+  kTotalCus        = 0,
+  kTotalTus        = 1,
+  kTotalStagedCus  = 2,
+  kTotalStagedTus  = 3,
+  kTotalRoomTrafo  = 4,   // the room of the job lists, as frontCapacities counts it (without its margins)
+  kTotalRoomInter  = 5,
+  kTotalRoomIntra  = 6,
+  kTotalRoomBands  = 7,
+  kTotalRoomEdges  = 8,
+  kTotalLevels     = 9,
+  kTotalParsedCtus = 10,   // the CTUs parsed by the end of the step
+  kTotalSerial     = 15,
 };
 
 // The first words of the sync buffer, which the parse counts in: the substreams' runs and the substreams given up on
@@ -226,12 +228,56 @@ static void startBarrier( Context* ctx, VkCommandBuffer cmd )
 // ParseSlot: one picture's parse
 // ====================================================================================================================
 
+SlotShared::SlotShared( Context* ctx )
+  : upload( ctx, 0, MemKind::Upload ), device( ctx, 0, MemKind::Device ), hostCached( ctx, 0, MemKind::HostCached )
+{
+  // A slot's buffers take a few hundred KB at 4K (most of it the slice data), so small chunks hold little memory for
+  // nothing with few slots (an integrated GPU's 16), and few allocations still serve the 100 or so of a discrete GPU.
+  for( RangeArena* arena: { &upload, &device, &hostCached } )
+  {
+    arena->setChunkSize( kSlotChunkSize );
+  }
+  // Written in host memory first: writeParseScans reads what it writes, and reads of upload memory (write-combined)
+  // are slow.
+  std::vector<uint32_t> tab( kParseScanTab );
+  writeParseScans( tab.data() );
+  scans = upload.take( tab.size() * sizeof( uint32_t ) );
+  memcpy( scans.mapped, tab.data(), tab.size() * sizeof( uint32_t ) );
+}
+
+SlotShared::~SlotShared()
+{
+  upload.give( scans );
+}
+
 ParseSlot::~ParseSlot()
 {
-  for( Buffer* buf: { &m_bits, &m_streams, &m_ctuList, &m_ctuInfo, &m_slices, &m_pic, &m_scans, &m_cus, &m_tus, &m_cuMeta, &m_tuMeta, &m_bottomRows,
-                      &m_wpp, &m_sync, &m_state, &m_ctuOut, &m_counters, &m_ctus, &m_totals, &m_levels } )
+  for( Buffer* buf: { &m_bits, &m_streams, &m_ctuList, &m_ctuInfo, &m_slices, &m_pic } )
   {
-    m_ctx->free( *buf );
+    m_shared->upload.give( *buf );
+  }
+  for( Buffer* buf: { &m_bottomRows, &m_wpp, &m_counters } )
+  {
+    m_shared->device.give( *buf );
+  }
+  for( Buffer* buf: { &m_sync, &m_state, &m_ctuOut, &m_ctus, &m_totals } )
+  {
+    m_shared->hostCached.give( *buf );
+  }
+  for( Buffer* buf: { &m_cus, &m_tus, &m_cuMeta, &m_tuMeta, &m_levels } )
+  {
+    m_ctx->free( *buf );   // (none from ParseService, which takes them back first)
+  }
+}
+
+void ParseSlot::ensure( RangeArena& arena, Buffer& buf, size_t size )
+{
+  // In steps of kGranule, so that a slot's buffers are taken again only now and then while the pictures' sizes vary
+  static constexpr size_t kGranule = 4096;
+  if( buf.size < size )
+  {
+    arena.give( buf );
+    buf = arena.take( alignUp( size, kGranule ) );
   }
 }
 
@@ -249,12 +295,12 @@ bool ParseSlot::prepare( const CodingStructure& cs, StagedRecords staged, Buffer
   m_ctu64   = cs.pcv->maxCUWidth <= 64;
 
   // The inputs: the slice data (followed by kParseBitsPadding zero bytes), the substreams, the CTUs in decoding order
-  // and their slices and tiles, the slices' parameters and contexts, the picture's parameters, the scans
+  // and their slices and tiles, the slices' parameters and contexts, the picture's parameters
   const auto upload = [&]( Buffer& buf, const void* data, size_t size ) {
-    m_ctx->ensure( buf, std::max<size_t>( size, 16 ), MemKind::Upload );
+    ensure( m_shared->upload, buf, std::max<size_t>( size, 16 ) );
     memcpy( buf.mapped, data, size );
   };
-  m_ctx->ensure( m_bits, m_in.bits.size() + kParseBitsPadding, MemKind::Upload );
+  ensure( m_shared->upload, m_bits, m_in.bits.size() + kParseBitsPadding );
   memcpy( m_bits.mapped, m_in.bits.data(), m_in.bits.size() );
   memset( m_bits.mapped + m_in.bits.size(), 0, kParseBitsPadding );
   upload( m_streams, m_in.streams.data(), m_in.streams.size() * sizeof( uint32_t ) );
@@ -262,22 +308,17 @@ bool ParseSlot::prepare( const CodingStructure& cs, StagedRecords staged, Buffer
   upload( m_ctuInfo, m_in.ctuInfo.data(), m_in.ctuInfo.size() * sizeof( uint32_t ) );
   upload( m_slices, m_in.slices.data(), m_in.slices.size() * sizeof( uint32_t ) );
   upload( m_pic, m_in.pic.data(), m_in.pic.size() * sizeof( int32_t ) );
-  if( !m_scans.mapped )
-  {
-    m_ctx->ensure( m_scans, kParseScanTab * sizeof( uint32_t ), MemKind::Upload );
-    writeParseScans( reinterpret_cast<uint32_t*>( m_scans.mapped ) );
-  }
 
   // What the parse writes. The counters take an atomic per CU, which is fast in GPU memory. The totals have two halves
   // (recordCompaction).
-  m_ctx->ensure( m_bottomRows, m_numCtus * kParseBottomRowEntries * 2 * sizeof( uint32_t ), MemKind::Device );
-  m_ctx->ensure( m_wpp, std::max<size_t>( m_in.wppSlots, 1 ) * m_in.contexts * sizeof( uint32_t ), MemKind::Device );
-  m_ctx->ensure( m_sync, ( 2 + m_numCtus ) * sizeof( uint32_t ), MemKind::HostCached );
-  m_ctx->ensure( m_state, std::max<size_t>( m_in.numStreams, 1 ) * kParseStateWords * sizeof( uint32_t ), MemKind::HostCached );
-  m_ctx->ensure( m_ctuOut, m_numCtus * kParseCtuOutWords * sizeof( uint32_t ), MemKind::HostCached );
-  m_ctx->ensure( m_counters, kParseCounters * sizeof( uint32_t ), MemKind::Device );
-  m_ctx->ensure( m_ctus, m_numCtus * sizeof( CtuRecord ), MemKind::HostCached );
-  m_ctx->ensure( m_totals, 2 * kParseTotals * sizeof( uint32_t ), MemKind::HostCached );
+  ensure( m_shared->device, m_bottomRows, m_numCtus * kParseBottomRowEntries * 2 * sizeof( uint32_t ) );
+  ensure( m_shared->device, m_wpp, std::max<size_t>( m_in.wppSlots, 1 ) * m_in.contexts * sizeof( uint32_t ) );
+  ensure( m_shared->hostCached, m_sync, ( 2 + m_numCtus ) * sizeof( uint32_t ) );
+  ensure( m_shared->hostCached, m_state, std::max<size_t>( m_in.numStreams, 1 ) * kParseStateWords * sizeof( uint32_t ) );
+  ensure( m_shared->hostCached, m_ctuOut, m_numCtus * kParseCtuOutWords * sizeof( uint32_t ) );
+  ensure( m_shared->device, m_counters, kParseCounters * sizeof( uint32_t ) );
+  ensure( m_shared->hostCached, m_ctus, m_numCtus * sizeof( CtuRecord ) );
+  ensure( m_shared->hostCached, m_totals, 2 * kParseTotals * sizeof( uint32_t ) );
   setStaged( staged );
   clear();
   return true;
@@ -336,7 +377,7 @@ void ParseSlot::recordClear( VkCommandBuffer cmd )
 {
   if( m_fresh )
   {
-    m_ctx->api().vkCmdFillBuffer( cmd, m_counters.buffer, 0, VK_WHOLE_SIZE, 0 );
+    m_ctx->api().vkCmdFillBuffer( cmd, m_counters.buffer, m_counters.offset, m_counters.size, 0 );
     m_fresh = false;
   }
 }
@@ -350,7 +391,7 @@ void ParseSlot::recordStep( VkCommandBuffer cmd, int32_t binBudget ) const
   push.ctuInfo    = m_ctuInfo.addr;
   push.slices     = m_slices.addr;
   push.pic        = m_pic.addr;
-  push.scanTab    = m_scans.addr;
+  push.scanTab    = m_shared->scans.addr;
   push.cus        = m_cus.addr;
   push.tus        = m_tus.addr;
   push.ctuOut     = m_ctuOut.addr;
@@ -409,6 +450,16 @@ ParseSlot::Progress ParseSlot::progress( uint32_t serial )
     done += state[s * kParseStateWords + kParseStateDone] != 0 ? 1 : 0;
     progress += state[s * kParseStateWords + kParseStateNextCtu];
   }
+  // The totals of the step asked about (each step writes them, also before the picture is parsed)
+  m_half                 = serial & 1u;
+  const uint32_t* sums   = totals();
+  const bool      ofStep = serial == 0 || sums[kTotalSerial] == serial;
+  // The staged records and the levels must be within their room. The parse only adds to its counts, so a picture
+  // that outgrows its room before it is parsed is parsed again at once, not after the rest of its parse.
+  if( ofStep && ( sums[kTotalStagedCus] > m_cuCap || sums[kTotalStagedTus] > m_tuCap || sums[kTotalLevels] > m_levelCap ) )
+  {
+    return Progress::Overflow;
+  }
   if( done < m_in.numStreams )
   {
     m_stalls       = progress == m_lastProgress ? m_stalls + 1 : 0;
@@ -417,8 +468,7 @@ ParseSlot::Progress ParseSlot::progress( uint32_t serial )
   }
   // The state is read as it is now. A step after the one asked about may have parsed the last CTUs; then the totals
   // of the step asked about are not the picture's, and the next step's totals are.
-  m_half = serial & 1u;
-  if( serial != 0 && totals()[kTotalSerial] != serial )
+  if( !ofStep || sums[kTotalParsedCtus] != m_numCtus )
   {
     return Progress::Parsing;
   }
@@ -426,13 +476,8 @@ ParseSlot::Progress ParseSlot::progress( uint32_t serial )
   {
     return Progress::Failed;
   }
-  // All parsed, and the compaction's first pass done. The staged records and the levels must be within their room,
-  // and there must be as many records as the CTUs counted.
-  const uint32_t* sums = totals();
-  if( sums[kTotalStagedCus] > m_cuCap || sums[kTotalStagedTus] > m_tuCap || sums[kTotalLevels] > m_levelCap )
-  {
-    return Progress::Overflow;
-  }
+  // All parsed and within the room, and the compaction's first pass done: there must be as many records as the CTUs
+  // counted.
   if( sums[kTotalCus] != sums[kTotalStagedCus] || sums[kTotalTus] != sums[kTotalStagedTus] )
   {
     return Progress::Failed;   // the CTUs' counts and the records staged disagree: a bug
@@ -458,19 +503,39 @@ void ParseSlot::restart( StagedRecords staged, Buffer levels )
   clear();
 }
 
+// A count of the parse so far, projected over the whole picture: in proportion to the CTUs parsed, counting the CTUs
+// that the substreams not yet done are in as parsed too (they hold records already), so that a projection from a
+// few CTUs is not far too high. A projection too low only costs another restart.
+size_t ParseSlot::projected( size_t counted ) const
+{
+  const size_t parsed = totals()[kTotalParsedCtus];
+  if( parsed >= m_numCtus )
+  {
+    return counted;
+  }
+  const uint32_t* state  = reinterpret_cast<const uint32_t*>( m_state.mapped );
+  size_t          inCtus = 0;
+  for( uint32_t s = 0; s < m_in.numStreams; s++ )
+  {
+    inCtus += state[s * kParseStateWords + kParseStateDone] == 0 ? 1 : 0;
+  }
+  const size_t touched = std::min( m_numCtus, parsed + inCtus );
+  return size_t( double( counted ) * double( m_numCtus ) / double( std::max<size_t>( touched, 1 ) ) );
+}
+
 size_t ParseSlot::cusCounted() const
 {
-  return totals()[kTotalStagedCus];
+  return projected( totals()[kTotalStagedCus] );
 }
 
 size_t ParseSlot::tusCounted() const
 {
-  return totals()[kTotalStagedTus];
+  return projected( totals()[kTotalStagedTus] );
 }
 
 size_t ParseSlot::levelsCounted() const
 {
-  return totals()[kTotalLevels];
+  return projected( totals()[kTotalLevels] );
 }
 
 Buffer ParseSlot::takeLevels()
@@ -609,7 +674,7 @@ void applyParsedSaoAlf( CodingStructure& cs, const ParsedPicture& parsed )
 // ====================================================================================================================
 
 ParseService::ParseService( Context* ctx, std::function<void()> wakeUp )
-  : m_ctx( ctx ), m_wakeUp( std::move( wakeUp ) ), m_records( ctx, kIdlePictures ), m_limits( ctx->discrete() ? kDiscreteLimits : kIntegratedLimits )
+  : m_ctx( ctx ), m_wakeUp( std::move( wakeUp ) ), m_slotShared( ctx ), m_records( ctx, kIdlePictures ), m_limits( ctx->discrete() ? kDiscreteLimits : kIntegratedLimits )
 {
   CHECK( !ctx->parseQueue(), "Vulkan: the GPU parse ahead of the reconstruction needs an async compute queue" );
   for( StepFrame& frame: m_frames )
@@ -850,7 +915,7 @@ ParseSlot* ParseService::takeSlot()
     m_free.pop_back();
     return slot;
   }
-  m_slots.push_back( std::make_unique<ParseSlot>( m_ctx ) );
+  m_slots.push_back( std::make_unique<ParseSlot>( m_ctx, m_slotShared ) );
   return m_slots.back().get();
 }
 

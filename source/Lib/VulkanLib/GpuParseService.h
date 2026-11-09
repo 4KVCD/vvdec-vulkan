@@ -104,11 +104,29 @@ inline size_t roomAfterOverflow( size_t counted, size_t spare )
   return counted * 5 / 4 + spare;
 }
 
+// What the parse slots of a ParseService (or GpuRecon's check) share: the memory of their own buffers (their inputs,
+// the parse's state, its outputs other than the records), ranges of a few large buffers in an arena for each kind of
+// memory; and the scan table, the same for every picture. A new slot with buffers of its own and its own scan table
+// took about 2.8 ms to set up on an RTX 5090 (187 ms for the 67 slots that a 4K stream at 245 Mb/s starts with), most
+// of it for the scan table. The slots keep their ranges, so the arenas are never ticked.
+struct SlotShared
+{
+  explicit SlotShared( Context* ctx );
+  ~SlotShared();
+  SlotShared( const SlotShared& )            = delete;
+  SlotShared& operator=( const SlotShared& ) = delete;
+
+  static constexpr VkDeviceSize kSlotChunkSize = VkDeviceSize( 2 ) << 20;   // the arenas' chunks
+  RangeArena upload, device, hostCached;
+  Buffer     scans;   // writeParseScans' table, a range of upload
+};
+
 // One picture's parse on the GPU
 class ParseSlot
 {
 public:
-  explicit ParseSlot( Context* ctx ) : m_ctx( ctx ) {}
+  // ctx's memory; the slot's own buffers are ranges of shared's arenas, and shared must outlive the slot
+  ParseSlot( Context* ctx, SlotShared& shared ) : m_ctx( ctx ), m_shared( &shared ) {}
   ~ParseSlot();
   ParseSlot( const ParseSlot& )            = delete;
   ParseSlot& operator=( const ParseSlot& ) = delete;
@@ -127,8 +145,9 @@ public:
   // picture in parse has a large substream.
   static constexpr int32_t kStepBins = 1 << 12;
   void recordStep( VkCommandBuffer cmd, int32_t binBudget = kStepBins ) const;
-  // Records into cmd the compaction's first pass, which does its work once every CTU is parsed: it writes each CTU's
-  // record (its first CU and TU in raster order) and the totals. serial is the step's number in ParseService (from 1).
+  // Records into cmd the compaction's first pass: after every step it writes the parse's counts so far into the
+  // totals, and once every CTU is parsed also each CTU's record (its first CU and TU in raster order) and the numbers
+  // of CUs and TUs. serial is the step's number in ParseService (from 1).
   // The totals go to the half of the totals buffer chosen by serial's parity and carry serial, so that one step's
   // totals stay intact while the next step runs.
   void recordCompaction( VkCommandBuffer cmd, uint32_t serial = 0 ) const;
@@ -138,7 +157,7 @@ public:
   {
     Parsing,    // substreams left to parse
     Done,       // all parsed and compacted
-    Overflow,   // all parsed, but with more records than the room: restart() and parse again
+    Overflow,   // more records or levels than the room (seen as soon as a step counts them): restart() and parse again
     Failed,     // a substream given up on (a broken bitstream), or none advanced for kParseMaxStalls submissions
   };
   // serial: the step whose totals to read (its compaction's serial); 0: the only ones (a step at a time)
@@ -146,7 +165,8 @@ public:
   // After Overflow: the records staged in staged and the levels written into levels (the slot's buffers taken back
   // first: takeStaged, takeLevels), and every substream back at its start
   void   restart( StagedRecords staged, Buffer levels );
-  // What the parse counted, also past the room: the CU and TU records, the levels
+  // What the parse counted, also past the room: the CU and TU records, the levels. After an Overflow seen before the
+  // picture was parsed, projected over the whole picture from the CTUs parsed.
   size_t cusCounted() const;
   size_t tusCounted() const;
   size_t levelsCounted() const;
@@ -177,8 +197,9 @@ public:
   uint32_t          errors() const;   // the substreams given up on, or left unparsed
   const uint32_t*   ctuRecords() const { return reinterpret_cast<const uint32_t*>( m_ctus.mapped ); }   // CtuRecord a CTU
   const uint32_t*   ctuOut() const { return reinterpret_cast<const uint32_t*>( m_ctuOut.mapped ); }     // kParseCtuOutWords a CTU
-  // The numbers of CUs and TUs (the CTUs' counts), then the parse's counters: the staged CU and TU records, the job
-  // lists' room (5 words) and the levels. These are the totals of the step that progress() read last.
+  // The numbers of CUs and TUs (the CTUs' counts, once all are parsed), then the parse's counters: the staged CU and
+  // TU records, the job lists' room (5 words) and the levels; then the CTUs parsed. These are the totals of the step
+  // that progress() read last.
   const uint32_t*   totals() const;
 
   Picture* picture  = nullptr;   // the picture parsed (ParseService)
@@ -190,14 +211,19 @@ private:
   void setStaged( StagedRecords staged );
   // Clears what the parse counts and where each substream is, for a parse from the start
   void clear();
+  // counted, a count of the totals read last, projected over the whole picture (a count of all of it once parsed)
+  size_t projected( size_t counted ) const;
+  // Makes buf, a range of arena or empty, at least size bytes
+  static void ensure( RangeArena& arena, Buffer& buf, size_t size );
 
-  Context*        m_ctx = nullptr;
+  Context*        m_ctx    = nullptr;
+  SlotShared*     m_shared = nullptr;
   ParseInput      m_in;
   size_t          m_numCtus = 0;
   bool            m_ctu64   = false;   // CTUs of 64 samples at most (prepare): the parse's _ctu64 variants
   VkDeviceAddress m_prof = 0;
   // the inputs (upload memory)
-  Buffer m_bits, m_streams, m_ctuList, m_ctuInfo, m_slices, m_pic, m_scans;
+  Buffer m_bits, m_streams, m_ctuList, m_ctuInfo, m_slices, m_pic;
   // what the parse writes: the staged records and their meta words (the caller's buffers: prepare to takeStaged),
   // each CTU's bottom rows (the CTU below reads them), WPP's saved contexts, the counters (the staged records, the
   // job lists' room) in GPU memory; the substreams' runs, the errors and each CTU's readiness (sync), each substream's
@@ -334,6 +360,7 @@ private:
   bool                    m_broken = false;   // the GPU failed: every picture fails
   std::vector<Picture*>   m_waiting;                              // enqueued, not started yet
   std::vector<ParsedPicture*> m_released;                         // given back
+  SlotShared              m_slotShared;                           // what the slots share
   std::vector<std::unique_ptr<ParseSlot>>      m_slots;           // all of them (the thread's)
   std::vector<ParseSlot*> m_free;                                 // reusable (the thread's)
   std::vector<ParseSlot*> m_parsing;                              // the pictures being parsed (the thread's)

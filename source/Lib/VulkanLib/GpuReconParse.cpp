@@ -238,7 +238,8 @@ void GpuRecon::recordParse( const CodingStructure& cs, const PictureJobs& jobs, 
   }
   if( !m_parse.slot )
   {
-    m_parse.slot = std::make_unique<ParseSlot>( m_ctx );
+    m_parse.shared = std::make_unique<SlotShared>( m_ctx );
+    m_parse.slot   = std::make_unique<ParseSlot>( m_ctx, *m_parse.shared );
   }
   ParseSlot& slot = *m_parse.slot;
   // The levels go into the slot's own buffer, for the check below; the CPU's parse has its levels in the picture.
@@ -334,6 +335,7 @@ void GpuRecon::compareParse( const CodingStructure& cs, const std::vector<std::v
 void GpuRecon::ParseCheck::release( Context* ctx )
 {
   slot.reset();
+  shared.reset();   // (after the slot, whose buffers are its ranges)
   for( Buffer* buf: { &outCus, &outTus, &outCtus, &check, &prof } )
   {
     ctx->free( *buf );
