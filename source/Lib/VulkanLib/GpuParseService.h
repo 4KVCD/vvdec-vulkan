@@ -142,7 +142,8 @@ public:
   void recordClear( VkCommandBuffer cmd );
   // Records into cmd one dispatch of the parse: each substream is parsed from where it stopped, up to binBudget bins
   // (a CU counts as 32 bins). The budget is kStepBins, or more while ParseService has few substreams in parse and every
-  // picture in parse has a large substream.
+  // picture in parse has a large substream, or while its parse is behind and no picture in parse has WPP
+  // (GpuParseService.cpp's kParseBinBudgetBehind).
   static constexpr int32_t kStepBins = 1 << 12;
   void recordStep( VkCommandBuffer cmd, int32_t binBudget = kStepBins ) const;
   // Records into cmd the compaction's first pass: after every step it writes the parse's counts so far into the

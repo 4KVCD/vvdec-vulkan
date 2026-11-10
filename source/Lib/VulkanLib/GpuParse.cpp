@@ -548,6 +548,7 @@ bool buildParseInput( const CodingStructure& cs, ParseInput& in )
   in.tuSlots        = in.cuSlots;
   in.wppSlots       = uint32_t( pcv.heightInCtus * pps.getNumTileColumns() );
   in.contexts       = CTX_COUNT;
+  in.wpp            = cs.sps->getEntropyCodingSyncEnabledFlag();
 
   writeCtuInfo( cs, in );
   for( size_t si = 0; si < pic.slices.size(); si++ )

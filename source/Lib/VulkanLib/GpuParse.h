@@ -105,6 +105,7 @@ struct ParseInput
   uint32_t              tuSlots    = 0;   // TU record slots per CTU (as many)
   uint32_t              wppSlots   = 0;   // slots for WPP's saved contexts: one per CTU row and tile column
   uint32_t              contexts   = 0;   // the number of context models (CTX_COUNT)
+  bool                  wpp        = false;   // WPP: a CTU row's substream waits for the row above (kCtuWaitAbove)
   // Whether the picture leaves off every tool parse.slang's LITE variants leave out (its SPS: SBT, affine, BCW, CIIP,
   // GPM, MMVD, SMVD, ISP, MRL, MIP, LFNST, explicit MTS, ACT, joint CbCr; its slices: dependent quantization)
   bool                  lite = false;

@@ -72,10 +72,19 @@ static constexpr size_t   kParseStateDone    = 1;         // kStDone: the substr
 // has a substream of at least kLargeStreamBytes, as all-intra pictures without WPP do: their short steps would leave
 // the GPU idle between submissions. Don't take long steps beside a small picture: it would wait for the long step to
 // end before it is handed over, and so would the pictures after it.
-static constexpr int32_t  kParseBinBudget    = ParseSlot::kStepBins;
-static constexpr int32_t  kParseBinBudgetFew = 1 << 16;
-static constexpr size_t   kFewStreams        = 32;
-static constexpr uint32_t kLargeStreamBytes  = 8192;
+// While the parse is behind (ParseLimits::minParsing pictures or more in parse) and no picture in parse has WPP, the
+// steps are kParseBinBudgetBehind bins long: the reconstruction then waits for the parse, and short steps only cost it.
+// A step lasts as long as its slowest substream, and a substream pauses only at the end of a CTU, so the short steps
+// of a stream with long CTUs (4K at a high bitrate: ~6,000 bins a CTU) are one CTU each: most substreams idle until
+// the largest CTU is parsed, and every step adds its compaction and its round trip (RTX 5090, 2x2 tiles without WPP,
+// Nocturne 4K: ~50 pictures in parse, ~2.5 ms a step for 4,096 bins). With WPP the steps stay short: a CTU row waits
+// for the row above, and through a long step it would wait idle (Intel 285K iGPU, 8 or more pictures in parse:
+// Beekeeper 4K -11%, 1080p -9% with long steps).
+static constexpr int32_t  kParseBinBudget       = ParseSlot::kStepBins;
+static constexpr int32_t  kParseBinBudgetBehind = ParseSlot::kStepBins * 4;
+static constexpr int32_t  kParseBinBudgetFew    = 1 << 16;
+static constexpr size_t   kFewStreams           = 32;
+static constexpr uint32_t kLargeStreamBytes     = 8192;
 static constexpr uint32_t kParseMaxStalls    = 4;         // submissions in a row without progress before giving up
 static constexpr uint32_t kParseLocalBits    = 12;        // a meta word: the CTU above the record's place in the CTU
 static constexpr size_t   kParseCounters     = 8;         // the staged CUs and TUs, the room of the 5 job lists, the levels
@@ -1169,12 +1178,17 @@ void ParseService::submitSteps()
   // The pictures' dispatches run side by side, with a barrier after each round; then their compactions' first passes.
   size_t streams  = 0;
   bool   allLarge = true;
+  bool   anyWpp   = false;
   for( const ParseSlot* slot: m_parsing )
   {
     streams += slot->input().numStreams;
     allLarge = allLarge && largestStreamBytes( slot->input() ) >= kLargeStreamBytes;
+    anyWpp   = anyWpp || slot->input().wpp;
   }
-  const int32_t budget = streams <= kFewStreams && allLarge ? kParseBinBudgetFew : kParseBinBudget;
+  const bool    behind = m_parsing.size() >= m_limits.minParsing && !anyWpp;
+  const int32_t budget = streams <= kFewStreams && allLarge ? kParseBinBudgetFew
+                         : behind                           ? kParseBinBudgetBehind
+                                                            : kParseBinBudget;
   for( uint32_t s = 0; s < kStepsPerSubmission; s++ )
   {
     for( const ParseSlot* slot: m_parsing )
