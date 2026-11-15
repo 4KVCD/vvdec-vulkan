@@ -330,6 +330,7 @@ bool Context::chooseDevice( VkPhysicalDeviceProperties& props )
   m_splitStores      = props.vendorID == kVendorNvidia;
   m_integerAddresses = props.vendorID == kVendorIntel;
   m_coherentReads    = props.vendorID == kVendorNvidia;
+  m_serialPipelines  = props.vendorID == kVendorNvidia;
   m_intel            = props.vendorID == kVendorIntel;
   // The compute queue on the GPU's compute engine (a compute-only family) instead of the graphics engine, where the
   // desktop's compositor runs, on Intel's GPUs (VVDEC_GPU_ENGINE=compute or 3d chooses). Intel Graphics (285K, driver
@@ -1078,6 +1079,16 @@ void Context::closePipelineBinaries()
 
 VkResult Context::createPipeline( int shaderId, uint32_t waveSize, VkComputePipelineCreateInfo& info, VkPipeline& pipe )
 {
+  // NVIDIA's driver (616.92, RTX 5090) now and then crashed inside vkCreateComputePipelines (an access violation in
+  // nvoglv64.dll) while pipelines were created on several threads at once, as libvmaf-fast's Vulkan engine did
+  // (fixed there the same way): on NVIDIA's GPUs one pipeline is created at a time in the process, whichever decoder
+  // and thread creates it.
+  static std::mutex            s_serialMutex;
+  std::unique_lock<std::mutex> serial( s_serialMutex, std::defer_lock );
+  if( m_serialPipelines )
+  {
+    serial.lock();
+  }
   if( !m_binaries )
   {
     return m_api.vkCreateComputePipelines( m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe );
@@ -1651,11 +1662,12 @@ void Context::startPrecompile()
 {
   m_precompileOrder = precompileOrder( m_options, m_subgroupBallot );
   // Compiles running side by side slow each other down (the parse shader takes 4.5 s alone, 7.1 s among 8), so a few
-  // threads serve better than many: a quarter of the cores, within these limits.
+  // threads serve better than many: a quarter of the cores, within these limits; one where pipelines are created one
+  // at a time (m_serialPipelines), as more would only wait for it.
   static constexpr unsigned kMinPrecompileThreads = 2;
   static constexpr unsigned kMaxPrecompileThreads = 4;
   const unsigned            cores                 = std::thread::hardware_concurrency();
-  const int                 threads               = int( std::min( kMaxPrecompileThreads, std::max( kMinPrecompileThreads, cores / 4 ) ) );
+  const int                 threads = m_serialPipelines ? 1 : int( std::min( kMaxPrecompileThreads, std::max( kMinPrecompileThreads, cores / 4 ) ) );
   // The threads keep the decoding threads' priority: those wait for these compiles (pipeline()), so on a CPU busy
   // with other programs' work, compiles at a lower priority stalled the first pictures of a stream for minutes
   // while the pipeline cache was empty.

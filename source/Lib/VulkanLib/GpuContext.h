@@ -362,6 +362,7 @@ private:
   bool                             m_splitStores      = false;   // the shaders' kSplitStores is set (NVIDIA's GPUs)
   bool                             m_integerAddresses = false;   // their kIntegerAddresses is set (Intel's GPUs)
   bool                             m_coherentReads    = false;   // their kCoherentReads is set (NVIDIA's GPUs)
+  bool                             m_serialPipelines  = false;   // one pipeline created at a time in the process (NVIDIA's GPUs, createPipeline)
   bool                             m_subgroupBallot = false;   // VK_EXT_shader_subgroup_ballot is on
 
   // the compute queue
