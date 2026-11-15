@@ -1,5 +1,18 @@
 # Changelog of vvdec-vulkan
 
+## v1.2.1 (2026-11-15)
+
+### Bug fixes
+
+- Fixed the first pictures of a stream waiting minutes on Windows when the shader cache was empty (a first run, or
+  after a driver update) and other programs kept the CPU busy: the shaders no longer compile at a lower priority than
+  the decoding that waits for them.
+- Fixed a rare crash in NVIDIA's driver while the shaders compiled for the first time (about one first run in five on
+  an RTX 5090): on NVIDIA's GPUs the shaders now compile one at a time. A first run with an empty shader cache takes
+  about 30 s longer there; later runs are as fast as before.
+- Fixed a decoder's close taking over 10 s on Intel's GPUs with an empty shader cache: the shaders of the GPU's parse
+  are no longer compiled ahead where the CPU parses.
+
 ## v1.2 (2026-11-10)
 
 - The GPU's parse (`VVDEC_GPU_PARSE=2`) decodes 4K streams with tiles and without WPP faster, at high bitrates
