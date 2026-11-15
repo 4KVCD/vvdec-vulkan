@@ -1620,9 +1620,10 @@ VkPipeline Context::pipeline( int shaderId )
 // Which shaders the background compiles, and in what order: the two parse variants a stream may take first (they
 // compile longest), then the shaders of a picture's work in the order the first picture uses them, then the variants
 // other streams take. The profiling and shuffle variants of the parse and the parse check only when the configuration
-// is set up for them, last.
-static std::vector<int> precompileOrder( const Options& options, bool subgroupBallot )
+// is set up for them, last. The parse's shaders (named parse...) only where the GPU parses (gpuParse).
+static std::vector<int> precompileOrder( const Options& options, bool subgroupBallot, bool gpuParse )
 {
+  const auto skipped = [gpuParse]( const std::string& name ) { return !gpuParse && name.compare( 0, 5, "parse" ) == 0; };
   static const char* const kFirstUse[] = { "parse",           "parse_ctu64",     "mider",          "jobs",        "dbparams",        "inter_wide",
                                            "inter_bdof_wide", "intra",           "jobs_count",     "dbparams_sub", "trafo",          "intrasort",
                                            "deblock_luma_ver", "deblock_luma_hor", "deblock_chroma", "inter_affine_wide", "sao",     "alf_luma",
@@ -1633,7 +1634,7 @@ static std::vector<int> precompileOrder( const Options& options, bool subgroupBa
   const auto               add = [&]( const std::string& name ) {
     for( int i = 0; i < kShaderCount; i++ )
     {
-      if( name == kShaders[i].name )
+      if( name == kShaders[i].name && !skipped( name ) )
       {
         order.push_back( i );
       }
@@ -1649,7 +1650,7 @@ static std::vector<int> precompileOrder( const Options& options, bool subgroupBa
     const bool        profile = name.find( "_prof" ) != std::string::npos;
     const bool        shuffle = name == "parse_shuffle";
     const bool        check   = name == "parsecheck";
-    const bool        wanted  = ( !profile || options.profile ) && ( !shuffle || !subgroupBallot ) && ( !check || options.parse );
+    const bool        wanted  = ( !profile || options.profile ) && ( !shuffle || !subgroupBallot ) && ( !check || options.parse ) && !skipped( name );
     if( wanted && std::find( order.begin(), order.end(), i ) == order.end() )
     {
       order.push_back( i );
@@ -1660,7 +1661,11 @@ static std::vector<int> precompileOrder( const Options& options, bool subgroupBa
 
 void Context::startPrecompile()
 {
-  m_precompileOrder = precompileOrder( m_options, m_subgroupBallot );
+  // The GPU parses with VVDEC_GPU_PARSE=1, or with =2 where it has a queue for the parse; otherwise (Intel's GPUs with
+  // =2) the CPU parses, and compiling the parse's shaders, which nothing would use, took 25-28 s each on the 285K's
+  // Intel Graphics with an empty cache, a decoder's close waiting past VideoMetricsLab's 10 s for the one in flight.
+  const bool gpuParse = m_options.parse || ( m_options.parseDrives && parseQueue() );
+  m_precompileOrder   = precompileOrder( m_options, m_subgroupBallot, gpuParse );
   // Compiles running side by side slow each other down (the parse shader takes 4.5 s alone, 7.1 s among 8), so a few
   // threads serve better than many: a quarter of the cores, within these limits; one where pipelines are created one
   // at a time (m_serialPipelines), as more would only wait for it.
