@@ -1656,13 +1656,12 @@ void Context::startPrecompile()
   static constexpr unsigned kMaxPrecompileThreads = 4;
   const unsigned            cores                 = std::thread::hardware_concurrency();
   const int                 threads               = int( std::min( kMaxPrecompileThreads, std::max( kMinPrecompileThreads, cores / 4 ) ) );
+  // The threads keep the decoding threads' priority: those wait for these compiles (pipeline()), so on a CPU busy
+  // with other programs' work, compiles at a lower priority stalled the first pictures of a stream for minutes
+  // while the pipeline cache was empty.
   for( int t = 0; t < threads; t++ )
   {
     m_precompileThreads.emplace_back( [this]() {
-#ifdef _WIN32
-      // The decoding threads come first.
-      SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL );
-#endif
       while( !m_precompileStop.load( std::memory_order_relaxed ) )
       {
         const int k = m_precompileNext.fetch_add( 1 );
