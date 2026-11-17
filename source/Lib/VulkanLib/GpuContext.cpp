@@ -216,6 +216,10 @@ bool Context::init()
   {
     startPrecompile();
   }
+  else
+  {
+    m_saveEachCompile.store( true );
+  }
   return true;
 }
 
@@ -889,7 +893,34 @@ static std::vector<uint8_t> pipelineKeyOf( int shaderId, uint32_t waveSize, bool
   return key;
 }
 
-// The file name in the user's cache directory (its directory made when missing), or empty when there is none
+// Makes dir and every folder above it that is missing, one at a time, as CreateDirectoryA and mkdir make one folder
+// only. One that exists already fails harmlessly; one that cannot be made shows as the file's write failing.
+static void makeDirectories( const std::string& dir )
+{
+#ifdef _WIN32
+  const char* const separators = "\\/";
+#else
+  const char* const separators = "/";   // a backslash is a name's character
+#endif
+  for( size_t at = dir.find_first_of( separators, 1 );; at = dir.find_first_of( separators, at + 1 ) )
+  {
+    const std::string folder = dir.substr( 0, at );
+#ifdef _WIN32
+    if( !( folder.size() == 2 && folder[1] == ':' ) )   // not a drive ("C:")
+    {
+      CreateDirectoryA( folder.c_str(), nullptr );
+    }
+#else
+    mkdir( folder.c_str(), 0755 );
+#endif
+    if( at == std::string::npos )
+    {
+      return;
+    }
+  }
+}
+
+// The file name in the user's cache directory (its folders made when missing), or empty when there is none
 static std::string defaultCacheFile( const char* name )
 {
 #ifdef _WIN32
@@ -899,7 +930,7 @@ static std::string defaultCacheFile( const char* name )
     return "";
   }
   const std::string dir = std::string( base ) + "\\vvdec";
-  CreateDirectoryA( dir.c_str(), nullptr );   // (fails when it exists)
+  makeDirectories( dir );
   return dir + "\\" + name;
 #else
   const char*       xdg  = getenv( "XDG_CACHE_HOME" );
@@ -909,9 +940,8 @@ static std::string defaultCacheFile( const char* name )
   {
     return "";
   }
-  mkdir( base.c_str(), 0755 );   // (fails when it exists)
   const std::string dir = base + "/vvdec";
-  mkdir( dir.c_str(), 0755 );
+  makeDirectories( dir );
   return dir + "/" + name;
 #endif
 }
@@ -1061,18 +1091,38 @@ void Context::openPipelineBinaries( const VkPhysicalDeviceProperties& props )
   m_binaries = b;
 }
 
+// Rewrites the file when binaries were added since it was last written
+void Context::savePipelineBinaries()
+{
+  PipelineBinaries* b = m_binaries;
+  if( !b || b->path.empty() )
+  {
+    return;
+  }
+  std::lock_guard<std::mutex> saving( m_saveMutex );   // one save at a time
+  {
+    std::lock_guard<std::mutex> lock( m_pipelineMutex );
+    if( !b->added )
+    {
+      return;
+    }
+  }
+  // Read outside m_pipelineMutex, so decoding threads creating pipelines from the binaries do not wait for the disk
+  auto                        inFile = b->read();
+  std::lock_guard<std::mutex> lock( m_pipelineMutex );
+  // Merge in the binaries that another decoder running at the same time added to the file meanwhile. Where both
+  // have binaries for a pipeline, ours are kept (insert does not replace).
+  for( auto& pipeline: inFile )
+  {
+    b->pipelines.insert( std::move( pipeline ) );
+  }
+  b->write();
+  b->added = false;
+}
+
 void Context::closePipelineBinaries()
 {
-  if( m_binaries && m_binaries->added && !m_binaries->path.empty() )
-  {
-    // Merge in the binaries that another decoder running at the same time added to the file meanwhile. Where both
-    // have binaries for a pipeline, ours are kept (insert does not replace).
-    for( auto& pipeline: m_binaries->read() )
-    {
-      m_binaries->pipelines.insert( std::move( pipeline ) );
-    }
-    m_binaries->write();
-  }
+  savePipelineBinaries();
   delete m_binaries;
   m_binaries = nullptr;
 }
@@ -1108,6 +1158,12 @@ VkResult Context::createPipeline( int shaderId, uint32_t waveSize, VkComputePipe
   if( result == VK_SUCCESS )
   {
     captureBinaries( key, pipe );
+    // A pipeline compiled after the ahead-of-time compiles (one this stream needed that they did not hold), or with
+    // them turned off, is saved at once: a run that is cancelled or crashes later does not compile it again.
+    if( m_saveEachCompile.load() )
+    {
+      savePipelineBinaries();
+    }
   }
   return result;
 }
@@ -1676,6 +1732,8 @@ void Context::startPrecompile()
   // The threads keep the decoding threads' priority: those wait for these compiles (pipeline()), so on a CPU busy
   // with other programs' work, compiles at a lower priority stalled the first pictures of a stream for minutes
   // while the pipeline cache was empty.
+  m_precompileRunning = threads;
+  m_lastSave          = std::chrono::steady_clock::now().time_since_epoch().count();
   for( int t = 0; t < threads; t++ )
   {
     m_precompileThreads.emplace_back( [this]() {
@@ -1694,8 +1752,31 @@ void Context::startPrecompile()
         {
           // Ignore the failure here: the decoding thread that needs this pipeline meets it again and reports it.
         }
+        saveEverySoOften();
+      }
+      // The last thread to finish saves what they compiled, so that it is kept from the moment it was made, not only
+      // once the decoder closes: a first run cancelled or crashing after it does not compile it all again next time.
+      // Not when the context is closing, which saves.
+      if( m_precompileRunning.fetch_sub( 1 ) == 1 && !m_precompileStop.load( std::memory_order_relaxed ) )
+      {
+        m_saveEachCompile.store( true );   // first: a pipeline compiled while this saves is then saved after it
+        savePipelineBinaries();
       }
     } );
+  }
+}
+
+// Saves what was compiled so far when the last save is a few seconds old (one thread saves, the others go on): a first
+// run ended outright during the ahead-of-time compiles (End task, a crash, a cancel that ends the process) keeps all
+// but the last few seconds' compiles. A save reads and rewrites the file, some MB, in about 10-20 ms.
+void Context::saveEverySoOften()
+{
+  static constexpr std::chrono::steady_clock::duration kSaveEvery = std::chrono::seconds( 3 );
+  const auto now  = std::chrono::steady_clock::now().time_since_epoch().count();
+  auto       last = m_lastSave.load();
+  if( now - last >= kSaveEvery.count() && m_lastSave.compare_exchange_strong( last, now ) )
+  {
+    savePipelineBinaries();
   }
 }
 

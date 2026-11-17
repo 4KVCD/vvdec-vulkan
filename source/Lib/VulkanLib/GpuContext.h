@@ -55,6 +55,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <vulkan/vulkan.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -459,6 +460,10 @@ private:
   std::vector<int>                 m_precompileOrder;
   std::atomic<int>                 m_precompileNext{ 0 };
   std::atomic<bool>                m_precompileStop{ false };
+  std::atomic<int>                 m_precompileRunning{ 0 };    // precompile threads still compiling
+  std::atomic<bool>                m_saveEachCompile{ false };  // the precompile done (or off): each compile saved at once
+  std::mutex                       m_saveMutex;                 // one savePipelineBinaries at a time
+  std::atomic<std::chrono::steady_clock::rep> m_lastSave{ 0 };  // when the precompile last saved (saveEverySoOften)
   // the compiled pipelines' binaries, kept in a file from one run to the next (VK_KHR_pipeline_binary: GpuContext.cpp's
   // PipelineBinaries; null without it)
   struct PipelineBinaries;
@@ -471,7 +476,9 @@ private:
   void                             captureBinaries( const std::vector<uint8_t>& key, VkPipeline pipe );   // (pipe compiled to capture them)
   void                             reportShader( int shaderId, VkPipeline pipe ) const;   // its registers, its machine code (VVDEC_GPU_ISA)
   void                             openPipelineBinaries( const VkPhysicalDeviceProperties& props );
-  void                             closePipelineBinaries();   // (the file rewritten when binaries were added)
+  void                             savePipelineBinaries();    // (the file rewritten when binaries were added)
+  void                             saveEverySoOften();        // (by the precompile threads)
+  void                             closePipelineBinaries();   // (saved, then freed)
 
   // the buffer pool (allocPooled, recycle)
   std::mutex                       m_poolMutex;
