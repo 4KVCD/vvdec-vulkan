@@ -1,5 +1,14 @@
 # Changelog of vvdec-vulkan
 
+## v1.2.2 (2026-11-17)
+
+### Bug fixes
+
+- Fixed the shaders compiling again from the start (about 45 s on an RTX 5090) after a first run that was ended while
+  they compiled: the compiled shaders are now saved as they are made, not only when the decoder closes.
+- Fixed the shaders compiling again at every run where the user's cache folder (AppData\Local, or ~/.cache) was
+  missing: the cache folder is now made with every missing folder above it.
+
 ## v1.2.1 (2026-11-15)
 
 ### Bug fixes
