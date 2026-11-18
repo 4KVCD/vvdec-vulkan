@@ -106,12 +106,56 @@ Context* Context::acquire()
 
 void Context::release()
 {
-  std::lock_guard<std::mutex> lock( s_mutex );
-  if( s_refs > 0 && --s_refs == 0 )
+  Context* last = nullptr;
   {
-    delete s_context;
-    s_context = nullptr;
+    std::lock_guard<std::mutex> lock( s_mutex );
+    if( s_refs > 0 && --s_refs == 0 )
+    {
+      last      = s_context;
+      s_context = nullptr;   // the next acquire() makes a new one, whether or not this one is gone yet
+    }
   }
+  if( last )
+  {
+    retire( last );
+  }
+}
+
+// Keeps the module that holds this code loaded for the rest of the process: a host that unloaded it (FreeLibrary,
+// dlclose) while a thread still ran its code would crash.
+static void pinThisModule()
+{
+#ifdef _WIN32
+  HMODULE module;
+  GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                      reinterpret_cast<LPCWSTR>( &pinThisModule ), &module );
+#else
+  Dl_info info;
+  if( dladdr( reinterpret_cast<void*>( &pinThisModule ), &info ) && info.dli_fname )
+  {
+    dlopen( info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE );   // the handle is kept on purpose
+  }
+#endif
+}
+
+// Deletes the context the last decoder let go of. Its ahead-of-time compiles stop taking shaders, but a compile in
+// flight cannot be cut short, and the shaders they compile when a stream ends are ones it did not need: where the
+// driver had not cached inter's shaders yet, the close after a one-picture stream waited 7.7-10.8 s for them (Intel
+// Graphics, 285K, driver 101.8991). While one runs, a thread of its own deletes the context once it is done, and the
+// close returns at once (0.1 s there); but not when profiling, whose report the deletion prints and a process ending
+// meanwhile would cut off.
+void Context::retire( Context* context )
+{
+  context->m_precompileStop.store( true );
+  if( context->m_precompileRunning.load() == 0 || context->m_profiling )
+  {
+    delete context;
+    return;
+  }
+  // What was compiled so far is saved now (10-20 ms), as a process often ends right after its last close
+  context->savePipelineBinaries();
+  pinThisModule();
+  std::thread( [context]() { delete context; } ).detach();
 }
 
 // Returns the value of the environment variable name, or an empty string when it is not set.
@@ -1397,7 +1441,9 @@ void Context::countMemory( MemKind kind, int64_t bytes )
 
 Context::~Context()
 {
-  stopPrecompile();
+  // The ahead-of-time compiles stop taking shaders; the one in flight is waited for only once the memory is freed, so
+  // that a context deleted in the background (retire) does not hold it meanwhile.
+  m_precompileStop.store( true );
   if( m_profiling && !m_times.empty() )
   {
     msg( INFO, "GPU profile (milliseconds):\n" );
@@ -1421,6 +1467,10 @@ Context::~Context()
       free( buf );
     }
     m_hostCache.clear();
+  }
+  stopPrecompile();   // the compiles use the pipelines and their binaries, freed from here on
+  if( m_device )
+  {
     closePipelineBinaries();
     if( m_profiling )
     {

@@ -165,9 +165,9 @@ struct Options
 class Context
 {
 public:
-  // The process-wide context. The first acquire() creates it and the last release() destroys it, except for the
-  // Vulkan instance, which stays for the rest of the process (see s_instance). acquire() returns null when no
-  // usable Vulkan device exists.
+  // The process-wide context. The first acquire() creates it and the last release() destroys it (in the background
+  // while an ahead-of-time compile finishes: retire), except for the Vulkan instance, which stays for the rest of the
+  // process (see s_instance). acquire() returns null when no usable Vulkan device exists.
   static Context* acquire();
   static void     release();
 
@@ -519,6 +519,7 @@ private:
   PFN_vkGetPipelineExecutablePropertiesKHR m_getExecutables          = nullptr;
   PFN_vkGetPipelineExecutableStatisticsKHR m_getExecutableStatistics = nullptr;
 
+  static void       retire( Context* context );   // (release's last: deleted now, or once its compile in flight ends)
   static std::mutex s_mutex;
   static Context*   s_context;
   static int        s_refs;
