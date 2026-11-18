@@ -1,5 +1,12 @@
 # Changelog of vvdec-vulkan
 
+## v1.2.3 (2026-11-18)
+
+### Bug fixes
+
+- Fixed closing the decoder taking up to 11 s on Intel GPUs whose driver had not cached the shaders yet: the close
+  no longer waits for shaders compiled ahead of time that the stream did not use.
+
 ## v1.2.2 (2026-11-17)
 
 ### Bug fixes
