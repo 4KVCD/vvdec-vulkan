@@ -1,5 +1,14 @@
 # Changelog of vvdec-vulkan
 
+## v1.2.4 (2026-11-26)
+
+### Bug fixes
+
+- Fixed film grain changing with where decoding started: each picture's grain now comes from its own coded data, so
+  a picture gets the same grain after a seek, a cut or a restart as in a decode from the start (upstream VVdeC PR
+  #486).
+- Fixed a colour component keeping the grain of an earlier film grain message when a new message left it out.
+
 ## v1.2.3 (2026-11-18)
 
 ### Bug fixes
