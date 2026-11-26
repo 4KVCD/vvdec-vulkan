@@ -1,5 +1,18 @@
 # Changelog of vvdec-vulkan
 
+## v1.2.5 (2026-11-26)
+
+### Changes
+
+- Film grain on ARM CPUs runs on Neon code (upstream VVdeC PR #450).
+
+### Bug fixes
+
+- Fixed film grain on 4:4:4, 4:2:2 and 4:0:0 video, on the CPU and the GPU: 4:4:4 chroma got far too strong grain,
+  4:2:2 left about 41 % of the chroma samples without grain, and 4:0:0 video stopped decoding at the first picture
+  with grain (upstream VVdeC PR #450).
+- Fixed wrong film grain where a scaling factor is 128 or more, in the x86 SIMD code (upstream VVdeC PR #449).
+
 ## v1.2.4 (2026-11-26)
 
 ### Bug fixes
