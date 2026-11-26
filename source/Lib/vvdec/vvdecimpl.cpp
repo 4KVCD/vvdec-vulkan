@@ -1139,7 +1139,7 @@ void VVDecImpl::xUpdateFGC( vvdecSEI* s )
   m_filmGrainCharacteristicsState = sei->filmGrainCharacteristicsPersistenceFlag ? FgcPersist : FgcDontPersist;
 }
 
-void VVDecImpl::xAddGrain( vvdecFrame* frame )
+void VVDecImpl::xAddGrain( vvdecFrame* frame, uint32_t seed )
 {
   if( m_filmGrainCharacteristicsState == FgcNone )
   {
@@ -1148,7 +1148,7 @@ void VVDecImpl::xAddGrain( vvdecFrame* frame )
 
   m_filmGrainSynth->setDepth( frame->bitDepth );
   m_filmGrainSynth->setColorFormat( frame->colorFormat );
-  m_filmGrainSynth->prepareBlockSeeds( frame->planes[0].width, frame->planes[0].height );
+  m_filmGrainSynth->prepareBlockSeeds( frame->planes[0].width, frame->planes[0].height, seed );
 
   struct GrainTaskData
   {
@@ -1212,7 +1212,7 @@ int64_t VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft
   m_filmGrainSynth->setColorFormat( frame->colorFormat );
   const int width  = int( frame->planes[0].width );
   const int height = int( frame->planes[0].height );
-  m_filmGrainSynth->prepareBlockSeeds( width, height, m_gpuFilmGrain->seeds( size_t( ( width + 15 ) / 16 ) * ( ( height + 15 ) / 16 ) ) );
+  m_filmGrainSynth->prepareBlockSeeds( width, height, pcPic->grainSeed, m_gpuFilmGrain->seeds( size_t( ( width + 15 ) / 16 ) * ( ( height + 15 ) / 16 ) ) );
 
   // The grain goes from the picture (at the frame's origin) into the frame: in
   // place, or into the copy in the frame's storage.
@@ -1265,16 +1265,16 @@ int64_t VVDecImpl::xAddGrainGpu( vvdecFrame* frame, Picture* pcPic, int confLeft
 #endif
 
 #if VVDEC_VULKAN
-std::unique_ptr<const FilmGrainFrame> VVDecImpl::xGrainForHandOver( const vvdecFrame& frame, int confLeft, int confTop )
+std::unique_ptr<const FilmGrainFrame> VVDecImpl::xGrainForHandOver( const vvdecFrame& frame, uint32_t seed, int confLeft, int confTop )
 {
-  // As xAddGrain: the synthesis set up for the frame, and its block seeds (they go on from frame to frame)
+  // As xAddGrain: the synthesis set up for the frame, and its block seeds
   m_filmGrainSynth->setDepth( frame.bitDepth );
   m_filmGrainSynth->setColorFormat( frame.colorFormat );
   const int width  = int( frame.planes[0].width );
   const int height = int( frame.planes[0].height );
   auto      grain  = std::make_unique<FilmGrainFrame>();
   grain->seeds.resize( size_t( ( width + 15 ) / 16 ) * ( ( height + 15 ) / 16 ) );
-  m_filmGrainSynth->prepareBlockSeeds( width, height, grain->seeds.data() );
+  m_filmGrainSynth->prepareBlockSeeds( width, height, seed, grain->seeds.data() );
 
   const bool anyGrain = m_filmGrainSynth->anyPresent( int( frame.numPlanes ) );
   if( anyGrain )
@@ -1649,7 +1649,7 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
     }
     if( m_cDecLib->handOver() )
     {
-      handOverGrain = xGrainForHandOver( cFrame, confLeft, confTop );
+      handOverGrain = xGrainForHandOver( cFrame, pcPic->grainSeed, confLeft, confTop );
     }
     else if( gpuGrain )
     {
@@ -1660,7 +1660,7 @@ int VVDecImpl::xAddPicture( Picture* pcPic )
     }
     else
 #endif
-    xAddGrain( &cFrame );
+    xAddGrain( &cFrame, pcPic->grainSeed );
   }
 
   m_rcFrameList.emplace_back( cFrame, bCreateStorage ? nullptr : pcPic, std::move( handOverGrain ) );

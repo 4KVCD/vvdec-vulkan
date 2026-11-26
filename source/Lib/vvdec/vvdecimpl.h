@@ -244,7 +244,7 @@ private:
                                      bool               gpuStorage = false );
 
   void xUpdateFGC                  ( vvdecSEI *sei );
-  void xAddGrain                   ( vvdecFrame *frame );
+  void xAddGrain                   ( vvdecFrame *frame, uint32_t seed );
 #if VVDEC_VULKAN
   // Adds the grain on the GPU. The frame's planes are the picture's (cropped
   // by confLeft and confTop), or with copied the GPU's copy in the frame's
@@ -252,7 +252,7 @@ private:
   int64_t xAddGrainGpu             ( vvdecFrame *frame, Picture* pcPic, int confLeft, int confTop, bool copied );
   // In hand-over mode: the frame's grain as the GPU adds it when the frame is
   // handed over (gpu::HandOver::pack); null when no component has grain.
-  std::unique_ptr<const FilmGrainFrame> xGrainForHandOver( const vvdecFrame& frame, int confLeft, int confTop );
+  std::unique_ptr<const FilmGrainFrame> xGrainForHandOver( const vvdecFrame& frame, uint32_t seed, int confLeft, int confTop );
 #endif
   // Returns whether the frame with the sequence number seq may go out. It may
   // when the GPU adds no grain to it or when its grain is done. Otherwise

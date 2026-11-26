@@ -97,8 +97,8 @@ struct FilmGrainTables
 };
 
 // A frame's film grain, to be added on the GPU when the frame is handed over (vvdec_handover_pack): the synthesis'
-// state as it was when the frame was output -- its tables and the frame's block seeds, which go on from frame to frame
-// in output order -- and where the frame lies in its picture
+// state as it was when the frame was output -- its tables and the frame's block seeds -- and where the frame lies in
+// its picture
 struct FilmGrainFrame
 {
   uint8_t               tables[FilmGrainTables::kBytes];
@@ -113,10 +113,6 @@ class FilmGrain
 {
   std::unique_ptr<FilmGrainImpl> m_impl;
 
-  uint32_t m_line_rnd               = 0xdeadbeef;
-  uint32_t m_line_rnd_up            = 0xdeadbeef;
-  uint32_t m_prev_frame_line_rnd_up = 0xdeadbeef;
-
   std::vector<uint32_t> m_line_seeds;
   fgs_sei               fgs;
 
@@ -128,8 +124,9 @@ public:
   void setDepth( int depth ) { m_impl->set_depth( depth ); }
   void setColorFormat( vvdecColorFormat fmt );
   // the frame's seeds; with blockSeeds, each 16x16 block's too (a row of blocks
-  // after the other), for the GPU's synthesis
-  void prepareBlockSeeds( int width, int height, uint32_t* blockSeeds = nullptr );
+  // after the other), for the GPU's synthesis. pictureSeed: from the picture's own coded data (Picture::grainSeed), so
+  // its grain does not depend on the pictures decoded before it
+  void prepareBlockSeeds( int width, int height, uint32_t pictureSeed, uint32_t* blockSeeds = nullptr );
 
   // for the GPU's synthesis (VulkanLib/GpuFilmGrain)
   const FilmGrainImpl& impl() const { return *m_impl; }
@@ -145,7 +142,6 @@ public:
   void add_grain_line( void* Y, void* U, void* V, int y, int width );
 
 private:
-  void set_seed( uint32_t seed );
   void init_sei();
 };
 

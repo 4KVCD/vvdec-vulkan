@@ -551,11 +551,6 @@ static int same_pattern( fgs_sei* cfg, int32_t a, int32_t b )
   return 1;
 }
 
-void FilmGrain::set_seed( uint32_t seed )
-{
-  m_line_rnd = m_line_rnd_up = seed;
-}
-
 /** Initialize "hardware" interface from FGS SEI parameters */
 void FilmGrain::init_sei()
 {
@@ -736,9 +731,10 @@ void FilmGrain::updateFGC( vvdecSEIFilmGrainCharacteristics* fgc )
   for( int c = 0; c < 3; c++ )
   {
     vvdecCompModel& cm = fgc->compModel[c];
+    // Each message says anew which components have grain: one left out has none, whatever an earlier message said
+    fgs.comp_model_present_flag[c] = cm.presentFlag ? 1 : 0;
     if( cm.presentFlag )
     {
-      fgs.comp_model_present_flag[c] = 1;
       fgs.num_intensity_intervals[c] = cm.numIntensityIntervals;
       fgs.num_model_values[c]        = cm.numModelValues;
       for( int i = 0; i < fgs.num_intensity_intervals[c]; i++ )
@@ -784,34 +780,18 @@ void FilmGrain::updateFGC( vvdecSEIFilmGrainCharacteristics* fgc )
   }
 
   init_sei();
-
-  //  if (!m_bFgs)
-  //    // TODO: get something random
-  //      // TODO: make seed also impact the pattern gen
-  //    set_seed(uint32_t seed);
 }
 
-void FilmGrain::prepareBlockSeeds( int width, int height, uint32_t* blockSeeds )
+void FilmGrain::prepareBlockSeeds( int width, int height, uint32_t pictureSeed, uint32_t* blockSeeds )
 {
+  // prng() never leaves 0, which would give every block the same pattern offset
+  uint32_t rnd = pictureSeed ? pictureSeed : 0xdeadbeef;
+
+  // Each line of 16x16 blocks starts where the line above left the random generator
   m_line_seeds.resize( ( height + 15 ) / 16 );
-
-  m_prev_frame_line_rnd_up = m_line_rnd_up;
-
-  uint32_t rnd = 0;
-  for( int y = 0; y < m_line_seeds.size(); ++y )
+  for( uint32_t& lineSeed: m_line_seeds )
   {
-    // Generate / backup / restore per-line random seeds (needed to make multi-line blocks)
-    if( y != 0 )
-    {
-      // new line of blocks
-      m_line_rnd_up = m_line_rnd;
-      m_line_rnd    = rnd;
-    }
-
-    m_line_seeds[y] = m_line_rnd;
-
-    // Crank random generator
-    rnd = m_line_rnd;
+    lineSeed = rnd;
     for( int x = 0; x < ( width + 15 ) / 16; ++x )
     {
       if( blockSeeds )
@@ -839,7 +819,8 @@ void FilmGrain::setColorFormat( vvdecColorFormat fmt )
 
 void FilmGrain::add_grain_line( void* Y, void* U, void* V, int y, int width )
 {
-  uint32_t rnd_up = y < 16 ? m_prev_frame_line_rnd_up : m_line_seeds[y / 16 - 1];
+  // The first line of blocks has no line above: add_grain_block blends no upper block there
+  uint32_t rnd_up = m_line_seeds[y < 16 ? 0 : y / 16 - 1];
   uint32_t rnd    = m_line_seeds[y / 16];
 
   int16_t grain[3][32];
